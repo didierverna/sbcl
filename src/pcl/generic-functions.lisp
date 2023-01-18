@@ -64,10 +64,10 @@
 
 (defgeneric object-plist (plist-mixin))
 
-(defgeneric short-combination-identity-with-one-argument
+(defgeneric short-method-combination-identity-with-one-argument
   (short-method-combination))
 
-(defgeneric short-combination-operator (short-method-combination))
+(defgeneric short-method-combination-operator (short-method-combination))
 
 (defgeneric slot-definition-class (slot-definition))
 

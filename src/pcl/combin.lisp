@@ -517,8 +517,8 @@
 (defun short-compute-effective-method
     (generic-function combin applicable-methods)
   (let ((type-name (method-combination-type-name combin))
-        (operator (short-combination-operator combin))
-        (ioa (short-combination-identity-with-one-argument combin))
+        (operator (short-method-combination-operator combin))
+        (ioa (short-method-combination-identity-with-one-argument combin))
         (order (car (method-combination-options combin)))
         (around ())
         (primary ()))

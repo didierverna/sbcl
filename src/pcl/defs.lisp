@@ -383,8 +383,8 @@
                      :reader long-method-combination-args-lambda-list)))
 
 (defclass short-method-combination (standard-method-combination)
-  ((operator :reader short-combination-operator :initarg :operator)
-   (identity-with-one-argument :reader short-combination-identity-with-one-argument
+  ((operator :reader short-method-combination-operator :initarg :operator)
+   (identity-with-one-argument :reader short-method-combination-identity-with-one-argument
     :initarg :identity-with-one-argument)))
 
 (defclass slot-definition (metaobject definition-source-mixin)
