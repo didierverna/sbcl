@@ -22,6 +22,22 @@
 ;;;; specification.
 
 (in-package "SB-PCL")
+
+
+;; Boring. This should belong to documentation.lisp but we need it here first.
+;; In fact, some stuff in documentation.lisp should be spread in other files.
+
+(defun random-documentation (name type)
+  (cdr (assoc type (info :random-documentation :stuff name))))
+
+(defun (setf random-documentation) (new-value name type)
+  (let ((pair (assoc type (info :random-documentation :stuff name))))
+    (if pair
+        (setf (cdr pair) new-value)
+        (push (cons type new-value)
+              (info :random-documentation :stuff name))))
+  new-value)
+
 
 ;;; FIXME: according to ANSI 3.4.10 this is supposed to allow &WHOLE
 ;;; in the long syntax. But it clearly does not, because if you write
@@ -96,17 +112,6 @@
 ;;;; effective method. So, we just implement that rule once. Each short
 ;;;; method combination object just reads the parameters out of the object
 ;;;; and runs the same rule.
-
-(defun random-documentation (name type)
-  (cdr (assoc type (info :random-documentation :stuff name))))
-
-(defun (setf random-documentation) (new-value name type)
-  (let ((pair (assoc type (info :random-documentation :stuff name))))
-    (if pair
-        (setf (cdr pair) new-value)
-        (push (cons type new-value)
-              (info :random-documentation :stuff name))))
-  new-value)
 
 (defun load-short-defcombin (type-name operator ioa doc source-location)
   (let ((info (make-method-combination-info
