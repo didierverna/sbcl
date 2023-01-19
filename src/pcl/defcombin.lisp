@@ -226,9 +226,10 @@ combination type."
 (defclass standard-standard-method-combination (standard-method-combination)
   ()
   (:metaclass method-combination-type)
-  (:documentation "The standard (standard) method combination class.
-This class is a singleton class: the only instance is that of the standard
-method combination."))
+  (:documentation "The standard method combination."))
+
+(setf (random-documentation 'standard 'method-combination)
+      "The standard method combination.")
 
 
 
