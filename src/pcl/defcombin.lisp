@@ -103,114 +103,195 @@ METHOD-COMBINATION-TYPE."
   (:documentation "Metaclass for long method combination types."))
 
 
+(defglobal **method-combination-types** (make-hash-table :test 'eq)
+  "The global method combination types hash table.
+This hash table maps names to method combination types.")
 
-
-;;; FIXME: according to ANSI 3.4.10 this is supposed to allow &WHOLE
-;;; in the long syntax. But it clearly does not, because if you write
-;;; (&WHOLE v) then you get (LAMBDA (&WHOLE V ...) ...) which is illegal
-;;;
-(defmacro define-method-combination (&whole form name . args)
-  (declare (ignore args))
-  (check-designator name 'define-method-combination)
-  `(progn
-     (with-single-package-locked-error
-         (:symbol ',name "defining ~A as a method combination"))
-     ,(if (and (cddr form)
-               (listp (caddr form)))
-          (expand-long-defcombin form)
-          (let* ((type-name (cadr form))
-                 (doc (getf (cddr form) :documentation (make-unbound-marker)))
-                 (ioa (getf (cddr form) :identity-with-one-argument nil))
-                 (operator (getf (cddr form) :operator type-name)))
-            (unless (or (unbound-marker-p doc) (stringp doc))
-              (%program-error "~@<~S argument to the short form of ~S must be a string.~:@>"
-                              :documentation 'define-method-combination))
-            `(load-short-defcombin ',type-name ',operator ',ioa
-                                   ,(unless (unbound-marker-p doc) doc)
-                                   (sb-c:source-location))))))
+;; #### NOTE: Let's not define a SETF method here. We wouldn't want it to be
+;; public.
+(defun find-method-combination-type (name &optional (errorp t))
+  "Find a NAMEd method combination type.
+If ERRORP (the default), throw an error if no such method combination type is
+found. Otherwise, return NIL."
+  (or (gethash name **method-combination-types**)
+      (when errorp
+        (error "There is no method combination type named ~A." name))))
 
-(defstruct method-combination-info
-  (lambda-list nil :type list)
-  (constructor (error "missing arg") :type function)
-  (cache nil :type list)
-  (source-location nil :type (or null sb-c:definition-source-location)))
-(defglobal **method-combinations** (make-hash-table :test 'eql))
+(defmethod find-method-combination
+    ((generic-function generic-function) name options)
+  "Find a method combination object for type NAME and options.
+If no method combination type exists by that NAME, return NIL.
+Otherwise, a (potentially new) method combination object is returned.
+The GENERIC-FUNCTION argument is ignored."
+  (let ((type (find-method-combination-type name nil)))
+    (when type
+      (or (gethash options (method-combination-type-%cache type))
+          (setf (gethash options (method-combination-type-%cache type))
+                (funcall (method-combination-%constructor type)
+                  options))))))
 
-(defmethod find-method-combination ((generic-function generic-function)
-                                    name options)
-  (let ((info (gethash name **method-combinations**)))
-    (when info
-      (or (cdr (assoc options (method-combination-info-cache info) :test #'equal))
-          (cdar (push (cons options (funcall (method-combination-info-constructor info) options))
-                      (method-combination-info-cache info)))))))
-
-;;;; standard method combination
-(setf (gethash 'standard **method-combinations**)
-      (make-method-combination-info
-       :constructor (lambda (options)
-                      (when options
-                        (method-combination-error "STANDARD method combination accepts no options."))
-                      *standard-method-combination*)
-       :cache (list (cons nil *standard-method-combination*))))
-
-(defun update-mcs (name new old frobmc)
-  (declare (function frobmc))
-  (setf (gethash name **method-combinations**) new)
-  ;; for correctness' sake we should probably lock
-  ;; **METHOD-COMBINATIONS** while we're updating things, to defend
-  ;; against defining gfs in one thread while redefining the method
-  ;; combination in another thread.
+(defun load-defcombin
+    (name new documentation &aux (old (find-method-combination-type name nil)))
+  "Register NEW method combination type under NAME with DOCUMENTATION.
+This function takes care of any potential redefinition of an existing method
+combination type."
   (when old
-    (setf (method-combination-info-cache new) (method-combination-info-cache old))
-    (setf (method-combination-info-cache old) nil)
-    (dolist (entry (method-combination-info-cache new))
-      (let* ((mc (cdr entry))
-             (gfs (method-combination-%generic-functions mc)))
-        (funcall frobmc mc)
-        (flet ((flush (gf)
-                 (flush-effective-method-cache gf)
-                 (reinitialize-instance gf)))
-          (map-hashset #'flush gfs))))))
+    (setf (slot-value new '%cache) (method-combination-type-%cache old))
+    (maphash (lambda (options combination)
+               (declare (ignore options))
+               (change-class combination new))
+             (method-combination-type-%cache new)))
+  (setf (gethash name **method-combination-types**) new)
+  (setf (random-documentation name 'method-combination) documentation)
+  name)
+
+
+
 
-;;;; short method combinations
-;;;;
-;;;; Short method combinations all follow the same rule for computing the
-;;;; effective method. So, we just implement that rule once. Each short
-;;;; method combination object just reads the parameters out of the object
-;;;; and runs the same rule.
+;; ===================
+;; Method Combinations
+;; ===================
 
-(defun load-short-defcombin (type-name operator ioa doc source-location)
-  (let ((info (make-method-combination-info
-               :lambda-list '(&optional (order :most-specific-first))
-               :source-location source-location
-               :constructor (lambda (options)
-                              (short-combine-methods type-name options operator ioa source-location doc))))
-        (old-info (gethash type-name **method-combinations**)))
-    (flet ((frobber (mc)
-             (change-class mc 'short-method-combination
-                           :operator operator :identity-with-one-argument ioa
-                           'source source-location :documentation doc)))
-      (update-mcs type-name info old-info #'frobber)))
-  (setf (random-documentation type-name 'method-combination) doc)
-  type-name)
+;; This section completes the minimal instalment of the method combinations
+;; hierarchy that was elaborated in defs.lisp.
 
-(defun short-combine-methods (type-name options operator ioa source-location doc)
-  (cond ((null options) (setq options '(:most-specific-first)))
-        ((equal options '(:most-specific-first)))
-        ((equal options '(:most-specific-last)))
-        (t
-         (method-combination-error
-          "Illegal options to a short method combination type.~%~
-           The method combination type ~S accepts one option which~%~
-           must be either :MOST-SPECIFIC-FIRST or :MOST-SPECIFIC-LAST."
-          type-name)))
-  (make-instance 'short-method-combination
-                 :type-name type-name
-                 :options options
-                 :operator operator
-                 :identity-with-one-argument ioa
-                 'source source-location
-                 :documentation doc))
+(defmethod update-generic-function-for-redefined-method-combination
+    ((function generic-function)
+     (previous standard-method-combination)
+     (current standard-method-combination))
+  "Flush the effective method cache and reinitialize FUNCTION."
+  (flush-effective-method-cache function)
+  (reinitialize-instance function))
+
+(defmethod update-instance-for-different-class :after
+    ((previous standard-method-combination)
+     (current standard-method-combination)
+     &key &allow-other-keys)
+  "Inform every function using CURRENT method combination that it has changed."
+  (map-hashset
+   (lambda (gf)
+     (declare (ignore ignore))
+     (update-generic-function-for-redefined-method-combination gf current))
+   (method-combination-%generic-functions current)))
+
+
+;; -----------------------------------
+;; Method combination pseudo-accessors
+;; -----------------------------------
+
+;; These provide direct access to properties that belong to the method
+;; combination type rather to the method combination itself.
+
+;; #### FIXME: some potentially usefull information is missing (like the
+;; generic-function-symbol of the long form), or, maybe some of those are
+;; actually useless. I need to verify which stuff is actually used (like, in
+;; compute-effective-method etc.).
+
+(defmethod method-combination-type-name
+    ((combination standard-method-combination))
+  "Return method COMBINATION's type name."
+  (method-combination-type-name (class-of combination)))
+
+(defmethod method-combination-lambda-list
+    ((combination standard-method-combination))
+  "Return method COMBINATION's lambda-list."
+  (method-combination-type-lambda-list (class-of combination)))
+
+(defmethod short-method-combination-operator
+    ((combination short-method-combination))
+  "Return short method COMBINATION's operator."
+  (short-method-combination-type-operator (class-of combination)))
+
+(defmethod short-method-combination-identity-with-one-argument
+    ((combination short-method-combination))
+  "Return short method COMBINATION's identity-with-one-argument."
+  (short-method-combination-type-identity-with-one-argument
+   (class-of combination)))
+
+(defmethod long-method-combination-args-lambda-list
+    ((combination long-method-combination))
+  "Return long method COMBINATION's args-lambda-list."
+  (long-method-combination-type-args-lambda-list (class-of combination)))
+
+
+;; ---------------------------
+;; standard method combination
+;; ---------------------------
+
+;; #### WARNING: we work with CLOS layer 1 (the macro level) below because
+;; it's much simpler to create the specialization of COMPUTE-EFFECTIVE-METHOD
+;; this way. The unfortunate side effect of that is that the class below is
+;; defined globally, which I don't really want (all other concrete method
+;; combination classes are anonymous; even the built-in short ones).
+(defclass standard-standard-method-combination (standard-method-combination)
+  ()
+  (:metaclass method-combination-type)
+  (:documentation "The standard (standard) method combination class.
+This class is a singleton class: the only instance is that of the standard
+method combination."))
+
+
+
+;; -------------------------
+;; short method combinations
+;; -------------------------
+
+;; Short method combinations all follow the same rule for computing the
+;; effective method. So, we just implement that rule once. Each short method
+;; combination object just reads the parameters out of the object and runs the
+;; same rule.
+
+(defmethod initialize-instance :before
+    ((instance short-method-combination)
+     &key options &allow-other-keys
+     &aux (name (method-combination-type-name instance)))
+  "Check the validity of OPTIONS for a short method combination INSTANCE."
+  (when (cdr options)
+    (method-combination-error
+     "Illegal options to the ~S short method combination.~%~
+      Short method combinations accept a single ORDER argument."
+     name))
+  (unless (member (car options) '(:most-specific-first :most-specific-last))
+    (method-combination-error
+     "Illegal ORDER option to the ~S short method combination.~%~
+      ORDER must be either :MOST-SPECIFIC-FIRST or :MOST-SPECIFIC-LAST."
+     name)))
+
+(defun load-short-defcombin
+    (name operator identity-with-one-argument documentation class
+     source-location
+     &aux (class (find-class class)))
+  "Register a new short method combination type under NAME."
+  (unless (subtypep class 'short-method-combination)
+    (method-combination-error
+     "Invalid method combination class: ~A.~%~
+      When defining a method combination type in short form, the provided~%~
+      method combination class must be a subclass of SHORT-METHOD-COMBINATION."
+     class))
+  ;; #### NOTE: we can't change-class class metaobjects, so we need to
+  ;; recreate a brand new one.
+  (let ((new (make-instance 'short-method-combination-type
+               'source source-location
+               :direct-superclasses (list class)
+               :documentation documentation
+               :type-name name
+               :operator operator
+               :identity-with-one-argument identity-with-one-argument)))
+    (setf (slot-value new '%constructor)
+          (lambda (options)
+            (funcall #'make-instance
+              ;; #### NOTE: in principle, short method combinations would only
+              ;; have at most two different instances, because the only
+              ;; possible choice for options is :MOST-SPECIFIC-FIRST or
+              ;; :MOST-SPECIFIC-LAST. However, thanks to the line below, the
+              ;; caches will keep track of the options provided by the
+              ;; programmer. It's nice because it's informative. As a result,
+              ;; if the method combination is used without any argument, or
+              ;; explicitly with :MOST-SPECIFIC-FIRST, we will end up with 2
+              ;; different yet identical instances (so possibly 3 in total if
+              ;; :MOST-SPECIFIC-LAST appears as well). Not such a big deal.
+              new :options (or options '(:most-specific-first)))))
+    (load-defcombin name new documentation)))
 
 (defmethod invalid-qualifiers ((gf generic-function)
                                (combin short-method-combination)
@@ -235,8 +316,11 @@ METHOD-COMBINATION-TYPE."
       of DEFINE-METHOD-COMBINATION and so requires all methods have ~
       either ~{the single qualifier ~S~^ or ~}.~@:>"
      method gf why type-name (short-method-combination-qualifiers type-name))))
-
-;;;; long method combinations
+
+
+;; ------------------------
+;; Long method combinations
+;; ------------------------
 
 (defun expand-long-defcombin (form)
   (let ((type-name (cadr form))
@@ -245,55 +329,65 @@ METHOD-COMBINATION-TYPE."
         (method-group-specifiers (cadddr form))
         (body (cddddr form))
         (args-option ())
-        (gf-var nil))
+        (gf-var nil)
+        (mc-class 'long-method-combination))
     (unless method-group-specifiers-presentp
-      (%program-error "~@<The long form of ~S requires a list of method group specifiers.~:@>"
-                      'define-method-combination))
+      (%program-error
+       "~@<The long form of ~S requires a list of method group specifiers.~:@>"
+       'define-method-combination))
     (when (and (consp (car body)) (eq (caar body) :arguments))
       (setq args-option (cdr (pop body))))
     (when (and (consp (car body)) (eq (caar body) :generic-function))
       (unless (and (cdar body) (symbolp (cadar body)) (null (cddar body)))
-        (%program-error "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
-                        :generic-function 'define-method-combination))
+        (%program-error
+         "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
+         :generic-function 'define-method-combination))
       (setq gf-var (cadr (pop body))))
+    (when (and (consp (car body)) (eq (caar body) :method-combination-class))
+      (unless (and (cdar body) (symbolp (cadar body)) (null (cddar body)))
+        (%program-error
+         "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
+         :method-combination-class 'define-method-combination))
+      (setq mc-class (cadr (pop body))))
     (multiple-value-bind (documentation function)
         (make-long-method-combination-function
-          type-name lambda-list method-group-specifiers args-option gf-var
-          body)
-      `(load-long-defcombin ',type-name ',documentation #',function
-                            ',lambda-list ',args-option (sb-c:source-location)))))
+         type-name lambda-list method-group-specifiers args-option gf-var
+         body)
+      `(load-long-defcombin
+        ',type-name ',documentation #',function ',lambda-list
+        ',args-option ',mc-class (sb-c:source-location)))))
 
-(define-load-time-global *long-method-combination-functions* (make-hash-table :test 'eq))
-
-(defun load-long-defcombin (type-name doc function lambda-list args-lambda-list source-location)
-  (let ((info (make-method-combination-info
+(defun load-long-defcombin
+    (name documentation function lambda-list args-lambda-list class
+     source-location
+     &aux (class (find-class class)))
+  (unless (subtypep class 'long-method-combination)
+    (method-combination-error
+     "Invalid method combination class: ~A.~%~
+      When defining a method combination type in long form, the provided~%~
+      method combination class must be a subclass of LONG-METHOD-COMBINATION."
+     class))
+  ;; #### NOTE: we can't change-class class metaobjects, so we need to
+  ;; recreate a brand new one.
+  (let ((new (make-instance 'long-method-combination-type
+               'source source-location
+               :direct-superclasses (list class)
+               :documentation documentation
+               :type-name name
                :lambda-list lambda-list
-               :constructor (lambda (options)
-                              (make-instance 'long-method-combination
-                                             :type-name type-name
-                                             :options options
-                                             :args-lambda-list args-lambda-list
-                                             'source source-location
-                                             :documentation doc))
-               :source-location source-location))
-        (old-info (gethash type-name **method-combinations**)))
-    (flet ((frobber (mc)
-             (change-class mc 'long-method-combination
-                           :type-name type-name :args-lambda-list args-lambda-list
-                           'source source-location :documentation doc)))
-      (update-mcs type-name info old-info #'frobber)))
-  (setf (gethash type-name *long-method-combination-functions*) function)
-  (setf (random-documentation type-name 'method-combination) doc)
-  type-name)
+               :args-lambda-list args-lambda-list
+               :function function)))
+    (setf (slot-value new '%constructor)
+          (lambda (options) (funcall #'make-instance new :options options)))
+    (load-defcombin name new documentation)))
 
-(defmethod compute-effective-method ((generic-function generic-function)
-                                     (combin long-method-combination)
-                                     applicable-methods)
-  (funcall (gethash (method-combination-type-name combin)
-                    *long-method-combination-functions*)
-           generic-function
-           combin
-           applicable-methods))
+(defmethod compute-effective-method
+    ((function generic-function)
+     (combination long-method-combination)
+     applicable-methods)
+  "Call the long method COMBINATION type's specific function."
+  (funcall (long-method-combination-type-%function (class-of combination))
+    function combination applicable-methods))
 
 (defun make-long-method-combination-function
        (type-name ll method-group-specifiers args-option gf-var body)
@@ -586,9 +680,99 @@ METHOD-COMBINATION-TYPE."
                            (frob optional no nopt values)
                            values)))))
 
-;;; The built-in method combination types as taken from page 1-31 of
-;;; 88-002R. Note that the STANDARD method combination type is defined
-;;; by hand in the file combin.lisp.
+
+
+
+;; ===========
+;; Entry Point
+;; ===========
+
+;; FIXME: according to ANSI 3.4.10 this is supposed to allow &WHOLE in the
+;; long syntax. But it clearly does not, because if you write (&WHOLE v) then
+;; you get (LAMBDA (&WHOLE V ...) ...) which is illegal
+
+;; #### WARNING: I'm not sure if the handling of a :method-combination-class
+;; option below would be considered as standard-compliant or
+;; standard-breaking. There are places (like DEFGENERIC) where the standard
+;; explicitly allows implementations to extend an arguments list. Not here,
+;; but then again, it doesn't forbid it explicitly either. In any case, since
+;; this is just a macro, we can always provide another one, say,
+;; DEFINE-METHOD-COMBINATION-TYPE, which would be an even better name for it
+;; anyway.
+
+(defmacro define-method-combination (&whole form name . args)
+  (declare (ignore args))
+  (check-designator name 'define-method-combination)
+  `(progn
+     (with-single-package-locked-error
+         (:symbol ',name "defining ~A as a method combination"))
+     ,(if (and (cddr form)
+               (listp (caddr form)))
+        (expand-long-defcombin form)
+        (let* ((type-name (cadr form))
+               (doc (getf (cddr form) :documentation (make-unbound-marker)))
+               (ioa (getf (cddr form) :identity-with-one-argument nil))
+               (operator (getf (cddr form) :operator type-name))
+               (class (getf (cddr form) :method-combination-class
+                            'short-method-combination)))
+          (unless (or (unbound-marker-p doc) (stringp doc))
+            (%program-error
+             "~@<~S argument to the short form of ~S must be a string.~:@>"
+             :documentation 'define-method-combination))
+          `(load-short-defcombin ',type-name ',operator ',ioa
+                                 ,(unless (unbound-marker-p doc) doc)
+                                 ',class
+                                 (sb-c:source-location))))))
+
+
+
+
+;; ========================
+;; Infrastructure Injection
+;; ========================
+
+;; #### NOTE: here, we need to take care of converting the two early method
+;; combinations that were defined in the bootstrap phase (STANDARD and OR).
+
+(defun substitute-method-combination (new old)
+  "Substitute NEW for OLD method combination.
+OLD is an early method combination object (either the STANDARD or the OR one).
+NEW is the corresponding full-blown object in the complete infrastructure.
+This function transfers the generic functions cache from the old to the new
+object, and updates all such generic functions to point to the new method
+combination object."
+  (setf (slot-value new '%generic-functions)
+        (method-combination-%generic-functions old))
+  (map-hashset (lambda (gf)
+                 (setf (generic-function-method-combination gf) new))
+               (method-combination-%generic-functions new)))
+
+
+;; ---------------------------
+;; Standard method combination
+;; ---------------------------
+
+(let* ((class (find-class 'standard-standard-method-combination))
+       (instance (make-instance class)))
+  (setf (slot-value class 'type-name) 'standard)
+  (setf (slot-value class '%constructor)
+        (lambda (options)
+          (when options
+            (method-combination-error
+             "The standard method combination accepts no options."))
+          instance))
+  (setf (gethash nil (method-combination-type-%cache class)) instance)
+  (setf (gethash 'standard **method-combination-types**) class)
+  (substitute-method-combination instance *standard-method-combination*)
+  (setq *standard-method-combination* instance))
+
+
+;; ------------------------------------
+;; Built-in (short) method combinations
+;; ------------------------------------
+
+;;; The built-in method combination types as taken from page 1-31 of 88-002R.
+
 (define-method-combination +      :identity-with-one-argument t)
 (define-method-combination and    :identity-with-one-argument t)
 (define-method-combination append :identity-with-one-argument nil)
@@ -597,13 +781,13 @@ METHOD-COMBINATION-TYPE."
 (define-method-combination min    :identity-with-one-argument t)
 (define-method-combination nconc  :identity-with-one-argument t)
 (define-method-combination progn  :identity-with-one-argument t)
-
-;;; we made OR (:MOST-SPECIFIC-FIRST) earlier in the build; hook it in
 (define-method-combination or     :identity-with-one-argument t)
-(let ((info (gethash 'or **method-combinations**)))
-  (aver info)
-  (aver (null (method-combination-info-cache info)))
-  (setf (method-combination-info-cache info)
-        (list (cons '(:most-specific-first) *or-method-combination*))))
-(add-to-weak-hashset #'make-specializer-form-using-class
-                     (method-combination-%generic-functions *or-method-combination*))
+
+(let* ((or-class (find-method-combination-type 'or))
+       (or-instance (funcall (method-combination-%constructor or-class)
+                      '(:most-specific-first))))
+  (setf (gethash '(:most-specific-first)
+                 (method-combination-type-%cache or-class))
+        or-instance)
+  (substitute-method-combination or-instance *or-method-combination*)
+  (setq *or-method-combination* or-instance))
