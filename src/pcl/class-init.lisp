@@ -296,7 +296,6 @@
       ;; Create the STANDARD method combination object.
       (multiple-value-bind (method-combination set-slot)
           (make-method-combination 'standard-method-combination)
-        (funcall set-slot 'source nil)
         (funcall set-slot 'type-name 'standard)
         (funcall set-slot 'options '())
         (funcall set-slot '%generic-functions (make-gf-hashset))
@@ -304,7 +303,6 @@
       ;; Create an OR method combination object.
       (multiple-value-bind (method-combination set-slot)
           (make-method-combination 'short-method-combination)
-        (funcall set-slot 'source 'nil)
         (funcall set-slot 'type-name 'or)
         (funcall set-slot 'operator 'or)
         (funcall set-slot 'identity-with-one-argument t)

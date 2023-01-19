@@ -369,8 +369,7 @@
                    :weakness t
                    :synchronized t))
 
-(defclass standard-method-combination (definition-source-mixin
-                                       method-combination)
+(defclass standard-method-combination (method-combination)
   ((type-name :reader method-combination-type-name :initarg :type-name)
    (options :reader method-combination-options :initarg :options)
    (%generic-functions :initform (make-gf-hashset)
