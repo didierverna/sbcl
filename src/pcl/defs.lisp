@@ -362,8 +362,7 @@
 (defclass global-boundp-method (accessor-method) ())
 (defclass global-makunbound-method (accessor-method) ())
 
-(defclass method-combination (metaobject)
-  ((%documentation :initform nil :initarg :documentation)))
+(defclass method-combination (metaobject) ())
 
 (defun make-gf-hashset ()
   (make-hashset 64 #'eq #'fsc-instance-hash
