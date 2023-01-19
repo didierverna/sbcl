@@ -286,27 +286,40 @@
       (function (documentation expander 'function)))))
 
 ;;; method combinations
-(defmethod documentation ((x method-combination) (doc-type (eql 't)))
-  (slot-value x '%documentation))
+
+;; #### NOTE: (DOCUMENTATION OBJECT T) is automatically supported on method
+;; combination types because we set the documentation class slot when we
+;; create them in LOAD-*-DEFCOMBIN.
 
 (defmethod documentation
-    ((x method-combination) (doc-type (eql 'method-combination)))
-  (slot-value x '%documentation))
+    ((x method-combination-type) (doc-type (eql 'method-combination)))
+  (documentation x t))
+
+(defmethod (setf documentation)
+    (value (x method-combination-type) (doc-type (eql 'method-combination)))
+  (setf (documentation x t) value))
+
+(defmethod documentation ((x standard-method-combination) (doc-type (eql t)))
+  (documentation (class-of x) t))
+
+(defmethod (setf documentation)
+    (value (x standard-method-combination) (doc-type (eql t)))
+  (setf (documentation (class-of x) t) value))
+
+(defmethod documentation
+    ((x standard-method-combination) (doc-type (eql 'method-combination)))
+  (documentation (class-of x) t))
+
+(defmethod (setf documentation)
+    (value (x standard-method-combination) (doc-type (eql 'method-combination)))
+  (setf (documentation (class-of x) t) value))
 
 (defmethod documentation ((x symbol) (doc-type (eql 'method-combination)))
   (random-documentation x 'method-combination))
 
 (defmethod (setf documentation)
-    (new-value (x method-combination) (doc-type (eql 't)))
-  (setf (slot-value x '%documentation) new-value))
-
-(defmethod (setf documentation)
-    (new-value (x method-combination) (doc-type (eql 'method-combination)))
-  (setf (slot-value x '%documentation) new-value))
-
-(defmethod (setf documentation)
-    (new-value (x symbol) (doc-type (eql 'method-combination)))
-  (setf (random-documentation x 'method-combination) new-value))
+    (value (x symbol) (doc-type (eql 'method-combination)))
+  (setf (random-documentation x 'method-combination) value))
 
 ;;; methods
 (defmethod documentation ((x standard-method) (doc-type (eql 't)))
