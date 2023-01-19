@@ -385,6 +385,11 @@ not be declared, for example for efficiency reasons.
 
 NOTE: This generic function is part of an SBCL-specific experimental
 protocol. Interface subject to change."))
+
+(defgeneric update-generic-function-for-redefined-method-combination
+    (function previous current)
+  (:documentation
+   "Inform generic FUNCTION that its method combination was redefined."))
 
 ;;;; 4 arguments
 
