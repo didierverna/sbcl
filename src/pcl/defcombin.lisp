@@ -24,8 +24,10 @@
 (in-package "SB-PCL")
 
 
+
 ;; Boring. This should belong to documentation.lisp but we need it here first.
 ;; In fact, some stuff in documentation.lisp should be spread in other files.
+;; -- dv
 
 (defun random-documentation (name type)
   (cdr (assoc type (info :random-documentation :stuff name))))
@@ -37,6 +39,70 @@
         (push (cons type new-value)
               (info :random-documentation :stuff name))))
   new-value)
+
+
+
+
+;; ========================
+;; Method Combination Types
+;; ========================
+
+;; #### NOTE: one could be tempted to put this in defs.lisp, alongside with
+;; the METHOD-COMBINATION hierarchy, but it's preferable to keep it here for
+;; the following reasons.
+;; 1. defs.lisp has some limitations due to the fact that it's used during
+;;    bootstrap (there is no :documentation option to DEFCLASS, I don't think
+;;    VALIDATE-SUPERCLASS is available, etc.).
+;; 2. the bootstrap code creates two (early) specific method combination
+;;    objects (STANDARD and (OR :MOST-SPECIFIC-FIRST)) which are stored
+;;    respectively in *STANDARD-METHOD-COMBINATION* and
+;;    *OR-METHOD-COMBINATION*. These objects are created before the full
+;;    method combination architecture is in place, but they're enough to
+;;    bootstrap the whole thing. So we can leave them be until this file is
+;;    loaded, and convert them to the final machinery eventually.
+
+;; #### WARNING: trying to hijack the NAME slot in anonymous class metaobjects
+;; (that is, classes that are not meant to be registered globally) is
+;; dangerous, especially during bootstrap. I've seen very strange errors
+;; occurring when trying to do so. Hence the TYPE-NAME slot below.
+(defclass method-combination-type (standard-class)
+  ((type-name :initarg :type-name :reader method-combination-type-name)
+   (lambda-list :initform nil :initarg :lambda-list
+                :reader method-combination-type-lambda-list)
+   ;; A reader without "type" in the name seems more readable to me.
+   (%constructor :reader method-combination-%constructor)
+   (%cache :initform (make-hash-table :test #'equal)
+           :reader method-combination-type-%cache))
+  (:documentation "Metaclass for method combination types.
+It is the base class for short and long method combination types metaclasses.
+This only class directly implemented as this class is the standard method
+combination class."))
+
+(defmethod validate-superclass
+    ((class method-combination-type) (superclass standard-class))
+  "Validate the creation of subclasses of METHOD-COMBINATION implemented as
+METHOD-COMBINATION-TYPE."
+  t)
+
+
+(defclass short-method-combination-type (method-combination-type)
+  ((lambda-list :initform '(&optional (order :most-specific-first)))
+   (operator :initarg :operator
+             :reader short-method-combination-type-operator)
+   (identity-with-one-argument
+    :initarg :identity-with-one-argument
+    :reader short-method-combination-type-identity-with-one-argument))
+  (:documentation "Metaclass for short method combination types."))
+
+
+(defclass long-method-combination-type (method-combination-type)
+  ((args-lambda-list :initform nil :initarg :args-lambda-list
+                     :reader long-method-combination-type-args-lambda-list)
+   (%function :initarg :function
+              :reader long-method-combination-type-%function))
+  (:documentation "Metaclass for long method combination types."))
+
+
 
 
 ;;; FIXME: according to ANSI 3.4.10 this is supposed to allow &WHOLE
