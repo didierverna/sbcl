@@ -371,7 +371,8 @@
                    :synchronized t))
 
 (defclass standard-method-combination (method-combination)
-  ((options :initarg :options :reader method-combination-options)
+  ((options :initform nil :initarg :options
+            :reader method-combination-options)
    (%generic-functions :initform (make-gf-hashset)
                        :reader method-combination-%generic-functions)))
 
