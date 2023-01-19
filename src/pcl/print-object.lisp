@@ -81,11 +81,17 @@
                       (method-specializers method)))))
       (call-next-method)))
 
-(defmethod print-object ((mc standard-method-combination) stream)
-  (print-unreadable-object (mc stream :type t :identity t)
+(defmethod print-object ((type method-combination-type) stream)
+  (print-unreadable-object (type stream :type t :identity t)
     (format stream "~S ~:S"
-            (slot-value-for-printing mc 'type-name)
-            (slot-value-for-printing mc 'options))))
+      (slot-value-for-printing type 'type-name)
+      (slot-value-for-printing type 'lambda-list))))
+
+(defmethod print-object ((combination standard-method-combination) stream)
+  (print-unreadable-object (combination stream :type t :identity t)
+    (format stream "~S ~:S"
+      (slot-value-for-printing (class-of combination) 'type-name)
+      (slot-value-for-printing combination 'options))))
 
 (defun named-object-print-function (instance stream
                                     &optional (properly-named-p t)
