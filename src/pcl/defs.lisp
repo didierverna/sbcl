@@ -362,6 +362,7 @@
 (defclass global-boundp-method (accessor-method) ())
 (defclass global-makunbound-method (accessor-method) ())
 
+
 (defclass method-combination (metaobject) ())
 
 (defun make-gf-hashset ()
@@ -370,20 +371,31 @@
                    :synchronized t))
 
 (defclass standard-method-combination (method-combination)
-  ((type-name :reader method-combination-type-name :initarg :type-name)
-   (options :reader method-combination-options :initarg :options)
+  ((options :initarg :options :reader method-combination-options)
    (%generic-functions :initform (make-gf-hashset)
                        :reader method-combination-%generic-functions)))
 
-(defclass long-method-combination (standard-method-combination)
-  ((function :initarg :function :reader long-method-combination-function)
-   (args-lambda-list :initarg :args-lambda-list
-                     :reader long-method-combination-args-lambda-list)))
-
 (defclass short-method-combination (standard-method-combination)
-  ((operator :reader short-method-combination-operator :initarg :operator)
-   (identity-with-one-argument :reader short-method-combination-identity-with-one-argument
-    :initarg :identity-with-one-argument)))
+  ())
+
+(defclass long-method-combination (standard-method-combination)
+  ())
+
+;; #### NOTE: the two classes below are only here to allow us to create the
+;; initial versions of the STANDARD and OR method combinations, before the
+;; full architecture is in place. They specifically contain information that
+;; is required but will eventually be accessible from the method combination's
+;; metaclasses. It works because we're using the same accessor names.
+(defclass early-standard-method-combination (standard-method-combination)
+  ((type-name :initarg :type-name :reader method-combination-type-name)))
+
+(defclass early-short-method-combination (short-method-combination)
+  ((type-name :initarg :type-name :reader method-combination-type-name)
+   (operator :initarg :operator :reader short-method-combination-operator)
+   (identity-with-one-argument
+    :initarg :identity-with-one-argument
+    :reader short-method-combination-identity-with-one-argument)))
+
 
 (defclass slot-definition (metaobject definition-source-mixin)
   ((name
