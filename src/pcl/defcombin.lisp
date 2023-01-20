@@ -175,7 +175,8 @@ combination type."
   (map-hashset
    (lambda (gf)
      (declare (ignore ignore))
-     (update-generic-function-for-redefined-method-combination gf current))
+     (update-generic-function-for-redefined-method-combination
+      gf previous current))
    (method-combination-%generic-functions current)))
 
 
