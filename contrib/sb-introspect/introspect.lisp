@@ -326,7 +326,7 @@ If an unsupported TYPE is requested, the function will return NIL.
         ;; for each method combination object instantiated with a particular
         ;; set of options. That would in fact be the source of the first
         ;; generic function using that combination type with those options.
-        (let ((type (sb-pcl::find-method-combination-type name nil)))
+        (let ((type (sb-pcl:find-method-combination-type name nil)))
           (when type (find-definition-source type))))
        ((:package)
         (when (symbolp name)
