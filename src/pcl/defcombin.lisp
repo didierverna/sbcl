@@ -549,7 +549,9 @@ combination type."
   (loop (cond ((and (null pattern) (null qualifiers))
                (return t))
               ((eq pattern '*) (return t))
-              ((and pattern qualifiers (eq (car pattern) (car qualifiers)))
+              ((and pattern qualifiers
+                    (or (eq (car pattern) '*)
+                        (eq (car pattern) (car qualifiers))))
                (pop pattern)
                (pop qualifiers))
               (t (return nil)))))
@@ -654,7 +656,7 @@ combination type."
             ;; it result in the actual arguments of the generic-function
             ;; not the frobbed list.
             ,,(when whole
-                ``(setq ,',whole .gf-args.))
+                ``(setq ,',(car whole) .gf-args.))
             ,inner-result.)))))
 
 ;;; Partition VALUES into three sections: required, optional, and the

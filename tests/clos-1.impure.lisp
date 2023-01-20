@@ -316,3 +316,35 @@
                             (method-self-call a b :z j :j 10)))
       (and warning
            (not sb-kernel:redefinition-warning))))
+
+(define-method-combination qualifier-pattern-element-wild ()
+  ((qpew (:qpew *)))
+  `(1+ (call-method ,(first qpew))))
+
+(defgeneric qualifier-pattern-element-wild-fun (x)
+  (:method-combination qualifier-pattern-element-wild)
+  (:method :qpew * ((x integer)) x)
+  (:method :qpew t ((x ratio)) x)
+  (:method :qpew 1 2 ((x symbol)) 3))
+
+(with-test (:name :method-combination-qualfier-pattern-element-wild)
+  (assert (= (qualifier-pattern-element-wild-fun 1) 2))
+  (assert (= (qualifier-pattern-element-wild-fun 1/2) 3/2))
+  (assert-error (qualifier-pattern-element-wild-fun t)))
+
+(define-method-combination method-combination-arguments-whole ()
+  ((methods *))
+  (:arguments &whole args)
+  (:generic-function gf)
+  `(list* ,gf ,args))
+
+(defgeneric method-combination-arguments-whole-fun (a &key key-1)
+  (:method-combination method-combination-arguments-whole)
+  (:method (a &key key-1 key-2)
+    (declare (ignore a key-1 key-2))))
+
+(with-test (:name :method-combination-arguments-whole)
+  (assert (equal (method-combination-arguments-whole-fun 1 :key-1 2)
+                 (list #'method-combination-arguments-whole-fun 1 :key-1 2)))
+  (assert (equal (method-combination-arguments-whole-fun 1)
+                 (list #'method-combination-arguments-whole-fun 1))))
