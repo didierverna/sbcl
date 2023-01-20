@@ -61,11 +61,15 @@
 ;;    bootstrap the whole thing. So we can leave them be until this file is
 ;;    loaded, and convert them to the final machinery eventually.
 
+(defclass method-combination-type (standard-class)
+  ()
+  (:documentation "Metaclass for all method combination types."))
+
 ;; #### WARNING: trying to hijack the NAME slot in anonymous class metaobjects
 ;; (that is, classes that are not meant to be registered globally) is
 ;; dangerous, especially during bootstrap. I've seen very strange errors
 ;; occurring when trying to do so. Hence the TYPE-NAME slot below.
-(defclass method-combination-type (standard-class)
+(defclass standard-method-combination-type (method-combination-type)
   ((type-name :initarg :type-name :reader method-combination-type-name)
    (lambda-list :initform nil :initarg :lambda-list
                 :reader method-combination-type-lambda-list)
@@ -73,19 +77,19 @@
    (%constructor :reader method-combination-%constructor)
    (%cache :initform (make-hash-table :test #'equal)
            :reader method-combination-type-%cache))
-  (:documentation "Metaclass for method combination types.
+  (:documentation "Metaclass for standard method combination types.
 It is the base class for short and long method combination types metaclasses.
 This only class directly implemented as this class is the standard method
 combination class."))
 
 (defmethod validate-superclass
-    ((class method-combination-type) (superclass standard-class))
+    ((class standard-method-combination-type) (superclass standard-class))
   "Validate the creation of subclasses of METHOD-COMBINATION implemented as
-METHOD-COMBINATION-TYPE."
+STANDARD-METHOD-COMBINATION-TYPE."
   t)
 
 
-(defclass short-method-combination-type (method-combination-type)
+(defclass short-method-combination-type (standard-method-combination-type)
   ((lambda-list :initform '(&optional (order :most-specific-first)))
    (operator :initarg :operator
              :reader short-method-combination-type-operator)
@@ -95,7 +99,7 @@ METHOD-COMBINATION-TYPE."
   (:documentation "Metaclass for short method combination types."))
 
 
-(defclass long-method-combination-type (method-combination-type)
+(defclass long-method-combination-type (standard-method-combination-type)
   ((args-lambda-list :initform nil :initarg :args-lambda-list
                      :reader long-method-combination-type-args-lambda-list)
    (%function :initarg :function
@@ -225,7 +229,7 @@ combination type."
 ;; combination classes are anonymous; even the built-in short ones).
 (defclass standard-standard-method-combination (standard-method-combination)
   ()
-  (:metaclass method-combination-type)
+  (:metaclass standard-method-combination-type)
   (:documentation "The standard method combination."))
 
 (setf (random-documentation 'standard 'method-combination)
