@@ -34,7 +34,6 @@
            "FUNCTION-ARGLIST"
            "FUNCTION-LAMBDA-LIST"
            "FUNCTION-TYPE"
-           "METHOD-COMBINATION-LAMBDA-LIST"
            "DEFTYPE-LAMBDA-LIST"
            "VALID-FUNCTION-NAME-P"
            "FIND-DEFINITION-SOURCE"
@@ -322,10 +321,13 @@ If an unsupported TYPE is requested, the function will return NIL.
                       (not (eq type :condition)))
               (find-definition-source class)))))
        ((:method-combination)
-        (let ((info (gethash name sb-pcl::**method-combinations**)))
-          (when info
-            (translate-source-location
-             (sb-pcl::method-combination-info-source-location info)))))
+        ;; #### TODO: it would actually be nice here to return the source for
+        ;; the method combination type definition, but also a list of sources
+        ;; for each method combination object instantiated with a particular
+        ;; set of options. That would in fact be the source of the first
+        ;; generic function using that combination type with those options.
+        (let ((type (sb-pcl::find-method-combination-type name nil)))
+          (when type (find-definition-source type))))
        ((:package)
         (when (symbolp name)
           (let ((package (find-package name)))
@@ -404,6 +406,9 @@ If an unsupported TYPE is requested, the function will return NIL.
        (t
         nil)))))
 
+;; #### TODO: add a specific case in there for method combination objects,
+;; which would return the source of the generic function at the origin of
+;; their instantiation.
 (defun find-definition-source (object)
   (typecase object
     ((or sb-pcl::condition-class sb-pcl::structure-class)
@@ -411,10 +416,6 @@ If an unsupported TYPE is requested, the function will return NIL.
        (when classoid
          (translate-source-location
           (sb-kernel::classoid-source-location classoid)))))
-    (method-combination
-     (car
-      (find-definition-sources-by-name
-       (sb-pcl::method-combination-type-name object) :method-combination)))
     (package
      (translate-source-location (sb-impl::package-source-location object)))
     ((or class sb-mop:slot-definition)
@@ -528,18 +529,6 @@ value."
     (if (functionp f)
         (values (%fun-lambda-list f) t)
         (values nil nil))))
-
-(defun method-combination-lambda-list (method-combination)
-  "Return the lambda-list of METHOD-COMBINATION designator.
-METHOD-COMBINATION can be a method combination object,
-or a method combination name."
-  (let* ((name (etypecase method-combination
-                 (symbol method-combination)
-                 (method-combination
-                  (sb-pcl::method-combination-type-name method-combination))))
-         (info (or (gethash name sb-pcl::**method-combinations**)
-                   (error "~S: no such method combination." name))))
-    (sb-pcl::method-combination-info-lambda-list info)))
 
 (defun function-type (function-designator)
   "Returns the ftype of FUNCTION-DESIGNATOR, or NIL."
