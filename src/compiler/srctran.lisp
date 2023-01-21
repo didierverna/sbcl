@@ -5324,8 +5324,6 @@
                                                        (case op
                                                          ((< <=) '(> >=))
                                                          ((> >=) '(< <=))))
-                                                 (not (unless-vop-existsp (:translate range<)
-                                                        (csubtypep (lvar-type a) (specifier-type 'integer))))
                                                  (csubtypep (lvar-type b) (specifier-type 'fixnum))
                                                  (csubtypep (lvar-type b2) (specifier-type 'fixnum))
                                                  (let ((after-then (next-node then)))
@@ -5340,55 +5338,82 @@
                                                                   (node-lvar then))
                                                               (eq (next-node ref)
                                                                   (next-node then)))))))
-                                        (when (and (cast-p (lvar-use a))
-                                                   (type= (cast-type-to-check (lvar-use a))
-                                                          (specifier-type 'real)))
-                                          (delete-cast (lvar-use a)))
-                                        (kill-if-branch-1 if (if-test if)
-                                                          (node-block if)
-                                                          alternative)
-                                        (setf (lvar-dest b) then)
-                                        (setf (combination-args then)
-                                              (case op
-                                                ((>= >)
-                                                 (list b a2 b2))
-                                                (t
-                                                 (list b2 a2 b))))
-                                        (let ((form `(,(case op
-                                                         (>=
-                                                          (case op2
-                                                            (<= 'range<=)
-                                                            (< 'range<=<)))
-                                                         (>
-                                                          (case op2
-                                                            (<= 'range<<=)
-                                                            (< 'range<)))
-                                                         (<=
-                                                          (case op2
-                                                            (>= 'range<=)
-                                                            (> 'range<<=)))
-                                                         (<
-                                                          (case op2
-                                                            (>= 'range<=<)
-                                                            (> 'range<))))
-                                                      l x h)))
-
+                                        (let ((form (cond ((or (not (csubtypep (lvar-type a) (specifier-type 'integer)))
+                                                               (and (vop-existsp :translate range<)
+                                                                    (or (vop-existsp :named range<)
+                                                                        (and (constant-lvar-p b)
+                                                                             (constant-lvar-p b2)))))
+                                                           `(,(case op
+                                                                (>=
+                                                                 (case op2
+                                                                   (<= 'range<=)
+                                                                   (< 'range<=<)))
+                                                                (>
+                                                                 (case op2
+                                                                   (<= 'range<<=)
+                                                                   (< 'range<)))
+                                                                (<=
+                                                                 (case op2
+                                                                   (>= 'range<=)
+                                                                   (> 'range<<=)))
+                                                                (<
+                                                                 (case op2
+                                                                   (>= 'range<=<)
+                                                                   (> 'range<))))
+                                                             l x h))
+                                                          ((csubtypep (lvar-type a) (specifier-type 'fixnum))
+                                                           (return-from try))
+                                                          (t
+                                                           `(and (fixnump x)
+                                                                 ,(case op
+                                                                    (>=
+                                                                     (case op2
+                                                                       (<= '(<= l (truly-the fixnum x) h))
+                                                                       (< '(and (<= l (truly-the fixnum x)) (< (truly-the fixnum x) h)))))
+                                                                    (>
+                                                                     (case op2
+                                                                       (<= '(and (< l (truly-the fixnum x)) (<= (truly-the fixnum x) h)))
+                                                                       (< '(< l (truly-the fixnum x) h))))
+                                                                    (<=
+                                                                     (case op2
+                                                                       (>= '(<= l (truly-the fixnum x) h))
+                                                                       (> '(and (< l (truly-the fixnum x)) (<= (truly-the fixnum x) h)))))
+                                                                    (<
+                                                                     (case op2
+                                                                       (>= '(and (<= l (truly-the fixnum x)) (< (truly-the fixnum x) h)))
+                                                                       (> '(< l (truly-the fixnum x) h))))))))))
+                                          (kill-if-branch-1 if (if-test if)
+                                                            (node-block if)
+                                                            alternative)
+                                          (setf (combination-args node) nil)
+                                          (setf (lvar-dest b) then
+                                                (lvar-dest a) then)
+                                          (flush-combination node)
+                                          (setf (combination-args then)
+                                                (case op
+                                                  ((>= >)
+                                                   (list b a b2))
+                                                  (t
+                                                   (list b2 a b))))
+                                          (flush-dest a2)
                                           (transform-call then
                                                           `(lambda (l x h)
                                                              ,(if reverse-if
                                                                   `(not ,form)
                                                                   form))
-                                                          'range<))
-                                        t)))))
-                           (unless (try)
-                             (setf op2 (invert op2))
-                             (try t)))))))))
+                                                          'range<)
+                                          t))))))
+                           (cond ((try))
+                                 (t
+                                  (setf op2 (invert op2))
+                                  (try t))))))))))
         (when (and (if-p if)
                    (immediately-used-p (node-lvar node) node t))
-          (unless (try (if-consequent if) (if-alternative if))
-            ;; Deal with (not (< .. ...)) which is transformed from >=.
-            (setf op (invert op))
-            (try (if-alternative if) (if-consequent if))))))))
+          (cond ((try (if-consequent if) (if-alternative if)))
+                (t
+                 ;; Deal with (not (< .. ...)) which is transformed from >=.
+                 (setf op (invert op))
+                 (try (if-alternative if) (if-consequent if)))))))))
 
 (defoptimizer (> optimizer) ((a b) node)
   (range-transform '> a b node))
