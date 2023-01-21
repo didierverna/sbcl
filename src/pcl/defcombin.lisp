@@ -264,21 +264,29 @@ combination type."
      name)))
 
 (defun load-short-defcombin
-    (name operator identity-with-one-argument documentation class
+    (name operator identity-with-one-argument documentation
+     mc-class mct-class
      source-location
-     &aux (class (find-class class)))
+     &aux (mc-class (find-class mc-class)) (mct-class (find-class mct-class)))
   "Register a new short method combination type under NAME."
-  (unless (subtypep class 'short-method-combination)
+  (unless (subtypep mc-class 'short-method-combination)
     (method-combination-error
      "Invalid method combination class: ~A.~%~
       When defining a method combination type in short form, the provided~%~
       method combination class must be a subclass of SHORT-METHOD-COMBINATION."
-     class))
+     mc-class))
+  (unless (subtypep mct-class 'short-method-combination-type)
+    (method-combination-error
+     "Invalid method combination type class: ~A.~%~
+      When defining a method combination type in short form, the provided~%~
+      method combination type class must be a subclass of
+      SHORT-METHOD-COMBINATION-TYPE."
+     mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
-  (let ((new (make-instance 'short-method-combination-type
+  (let ((new (make-instance mct-class
                'source source-location
-               :direct-superclasses (list class)
+               :direct-superclasses (list mc-class)
                :documentation documentation
                :type-name name
                :operator operator
@@ -336,7 +344,8 @@ combination type."
         (body (cddddr form))
         (args-option ())
         (gf-var nil)
-        (mc-class 'long-method-combination))
+        (mc-class 'long-method-combination)
+        (mct-class 'long-method-combination-type))
     (unless method-group-specifiers-presentp
       (%program-error
        "~@<The long form of ~S requires a list of method group specifiers.~:@>"
@@ -355,29 +364,44 @@ combination type."
          "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
          :method-combination-class 'define-method-combination))
       (setq mc-class (cadr (pop body))))
+    (when (and (consp (car body))
+               (eq (caar body) :method-combination-type-class))
+      (unless (and (cdar body) (symbolp (cadar body)) (null (cddar body)))
+        (%program-error
+         "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
+         :method-combination-type-class 'define-method-combination))
+      (setq mct-class (cadr (pop body))))
     (multiple-value-bind (documentation function)
         (make-long-method-combination-function
          type-name lambda-list method-group-specifiers args-option gf-var
          body)
       `(load-long-defcombin
         ',type-name ',documentation #',function ',lambda-list
-        ',args-option ',mc-class (sb-c:source-location)))))
+        ',args-option ',mc-class ',mct-class (sb-c:source-location)))))
 
 (defun load-long-defcombin
-    (name documentation function lambda-list args-lambda-list class
+    (name documentation function lambda-list args-lambda-list
+     mc-class mct-class
      source-location
-     &aux (class (find-class class)))
-  (unless (subtypep class 'long-method-combination)
+     &aux (mc-class (find-class mc-class)) (mct-class (find-class mct-class)))
+  (unless (subtypep mc-class 'long-method-combination)
     (method-combination-error
      "Invalid method combination class: ~A.~%~
       When defining a method combination type in long form, the provided~%~
       method combination class must be a subclass of LONG-METHOD-COMBINATION."
-     class))
+     mc-class))
+  (unless (subtypep mct-class 'long-method-combination-type)
+    (method-combination-error
+     "Invalid method combination type class: ~A.~%~
+      When defining a method combination type in long form, the provided~%~
+      method combination type class must be a subclass of
+      LONG-METHOD-COMBINATION-TYPE."
+     mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
-  (let ((new (make-instance 'long-method-combination-type
+  (let ((new (make-instance mct-class
                'source source-location
-               :direct-superclasses (list class)
+               :direct-superclasses (list mc-class)
                :documentation documentation
                :type-name name
                :lambda-list lambda-list
@@ -699,14 +723,14 @@ combination type."
 ;; long syntax. But it clearly does not, because if you write (&WHOLE v) then
 ;; you get (LAMBDA (&WHOLE V ...) ...) which is illegal
 
-;; #### WARNING: I'm not sure if the handling of a :method-combination-class
-;; option below would be considered as standard-compliant or
-;; standard-breaking. There are places (like DEFGENERIC) where the standard
-;; explicitly allows implementations to extend an arguments list. Not here,
-;; but then again, it doesn't forbid it explicitly either. In any case, since
-;; this is just a macro, we can always provide another one, say,
-;; DEFINE-METHOD-COMBINATION-TYPE, which would be an even better name for it
-;; anyway.
+;; #### WARNING: I'm not sure if the handling of the :method-combination-class
+;; and :method-combination-type-class options below would be considered as
+;; standard-compliant or standard-breaking. There are places (like DEFGENERIC)
+;; where the standard explicitly allows implementations to extend an arguments
+;; list. Not here, but then again, it doesn't forbid it explicitly either. In
+;; any case, since this is just a macro, we can always provide another one,
+;; say, DEFINE-METHOD-COMBINATION-TYPE, which would be an even better name for
+;; it anyway.
 
 (defmacro define-method-combination (&whole form name . args)
   (declare (ignore args))
@@ -721,15 +745,17 @@ combination type."
                (doc (getf (cddr form) :documentation (make-unbound-marker)))
                (ioa (getf (cddr form) :identity-with-one-argument nil))
                (operator (getf (cddr form) :operator type-name))
-               (class (getf (cddr form) :method-combination-class
-                            'short-method-combination)))
+               (mc-class (getf (cddr form) :method-combination-class
+                               'short-method-combination))
+               (mct-class (getf (cddr form) :method-combination-type-class
+                                'short-method-combination-type)))
           (unless (or (unbound-marker-p doc) (stringp doc))
             (%program-error
              "~@<~S argument to the short form of ~S must be a string.~:@>"
              :documentation 'define-method-combination))
           `(load-short-defcombin ',type-name ',operator ',ioa
                                  ,(unless (unbound-marker-p doc) doc)
-                                 ',class
+                                 ',mc-class ',mct-class
                                  (sb-c:source-location))))))
 
 
