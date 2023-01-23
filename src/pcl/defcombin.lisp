@@ -174,7 +174,6 @@ combination type."
   "Inform every function using CURRENT method combination that it has changed."
   (map-hashset
    (lambda (gf)
-     (declare (ignore ignore))
      (update-generic-function-for-redefined-method-combination
       gf previous current))
    (method-combination-%generic-functions current)))
