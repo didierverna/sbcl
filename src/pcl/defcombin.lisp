@@ -100,8 +100,8 @@ STANDARD-METHOD-COMBINATION-TYPE."
 
 
 (defclass long-method-combination-type (standard-method-combination-type)
-  ((args-lambda-list :initform nil :initarg :args-lambda-list
-                     :reader long-method-combination-type-args-lambda-list)
+  ((%args-lambda-list :initform nil :initarg :args-lambda-list
+                      :reader long-method-combination-type-%args-lambda-list)
    (%function :initarg :function
               :reader long-method-combination-type-%function))
   (:documentation "Metaclass for long method combination types."))
@@ -212,10 +212,10 @@ combination type."
   (short-method-combination-type-identity-with-one-argument
    (class-of combination)))
 
-(defmethod long-method-combination-args-lambda-list
+(defmethod long-method-combination-%args-lambda-list
     ((combination long-method-combination))
   "Return long method COMBINATION's args-lambda-list."
-  (long-method-combination-type-args-lambda-list (class-of combination)))
+  (long-method-combination-type-%args-lambda-list (class-of combination)))
 
 
 ;; ---------------------------

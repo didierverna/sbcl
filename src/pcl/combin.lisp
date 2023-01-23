@@ -278,7 +278,7 @@
              ;; Otherwise the METHOD-COMBINATION slot is not bound.
              (let ((combin (generic-function-method-combination gf)))
                (and (long-method-combination-p combin)
-                    (long-method-combination-args-lambda-list combin)))))
+                    (long-method-combination-%args-lambda-list combin)))))
           (name `(emf ,(generic-function-name gf))))
       (cond
         (error-p
