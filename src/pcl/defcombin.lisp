@@ -264,9 +264,12 @@ combination type."
 
 (defun load-short-defcombin
     (name operator identity-with-one-argument documentation
-     mc-class mct-class
+     mc-class mct-spec
      source-location
-     &aux (mc-class (find-class mc-class)) (mct-class (find-class mct-class)))
+     &aux (mc-class (find-class mc-class))
+          (mct-class (find-class (if (symbolp mct-spec)
+                                   mct-spec
+                                   (car mct-spec)))))
   "Register a new short method combination type under NAME."
   (unless (subtypep mc-class 'short-method-combination)
     (method-combination-error
@@ -283,13 +286,14 @@ combination type."
      mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
-  (let ((new (make-instance mct-class
-               'source source-location
-               :direct-superclasses (list mc-class)
-               :documentation documentation
-               :type-name name
-               :operator operator
-               :identity-with-one-argument identity-with-one-argument)))
+  (let ((new (apply #'make-instance mct-class
+                    'source source-location
+                    :direct-superclasses (list mc-class)
+                    :documentation documentation
+                    :type-name name
+                    :operator operator
+                    :identity-with-one-argument identity-with-one-argument
+                    (when (consp mct-spec) (cdr mct-spec)))))
     (setf (slot-value new '%constructor)
           (lambda (options)
             (funcall #'make-instance
@@ -344,7 +348,7 @@ combination type."
         (args-option ())
         (gf-var nil)
         (mc-class 'long-method-combination)
-        (mct-class 'long-method-combination-type))
+        (mct-spec '(long-method-combination-type)))
     (unless method-group-specifiers-presentp
       (%program-error
        "~@<The long form of ~S requires a list of method group specifiers.~:@>"
@@ -365,24 +369,21 @@ combination type."
       (setq mc-class (cadr (pop body))))
     (when (and (consp (car body))
                (eq (caar body) :method-combination-type-class))
-      (unless (and (cdar body) (symbolp (cadar body)) (null (cddar body)))
-        (%program-error
-         "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
-         :method-combination-type-class 'define-method-combination))
-      (setq mct-class (cadr (pop body))))
+      (setq mct-spec (cdr (pop body))))
     (multiple-value-bind (documentation function)
         (make-long-method-combination-function
          type-name lambda-list method-group-specifiers args-option gf-var
          body)
       `(load-long-defcombin
         ',type-name ',documentation #',function ',lambda-list
-        ',args-option ',mc-class ',mct-class (sb-c:source-location)))))
+        ',args-option ',mc-class ',mct-spec (sb-c:source-location)))))
 
 (defun load-long-defcombin
     (name documentation function lambda-list args-lambda-list
-     mc-class mct-class
+     mc-class mct-spec
      source-location
-     &aux (mc-class (find-class mc-class)) (mct-class (find-class mct-class)))
+     &aux (mc-class (find-class mc-class))
+          (mct-class (find-class (car mct-spec))))
   (unless (subtypep mc-class 'long-method-combination)
     (method-combination-error
      "Invalid method combination class: ~A.~%~
@@ -398,14 +399,15 @@ combination type."
      mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
-  (let ((new (make-instance mct-class
-               'source source-location
-               :direct-superclasses (list mc-class)
-               :documentation documentation
-               :type-name name
-               :lambda-list lambda-list
-               :args-lambda-list args-lambda-list
-               :function function)))
+  (let ((new (apply #'make-instance mct-class
+                    'source source-location
+                    :direct-superclasses (list mc-class)
+                    :documentation documentation
+                    :type-name name
+                    :lambda-list lambda-list
+                    :args-lambda-list args-lambda-list
+                    :function function
+                    (cdr mct-spec))))
     (setf (slot-value new '%constructor)
           (lambda (options) (funcall #'make-instance new :options options)))
     (load-defcombin name new documentation)))
