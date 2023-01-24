@@ -724,14 +724,10 @@ combination type."
 ;; long syntax. But it clearly does not, because if you write (&WHOLE v) then
 ;; you get (LAMBDA (&WHOLE V ...) ...) which is illegal
 
-;; #### WARNING: I'm not sure if the handling of the :method-combination-class
-;; and :method-combination-type-class options below would be considered as
-;; standard-compliant or standard-breaking. There are places (like DEFGENERIC)
-;; where the standard explicitly allows implementations to extend an arguments
-;; list. Not here, but then again, it doesn't forbid it explicitly either. In
-;; any case, since this is just a macro, we can always provide another one,
-;; say, DEFINE-METHOD-COMBINATION-TYPE, which would be an even better name for
-;; it anyway.
+;; #### NOTE: according to Section 1.6 Language Extensions of the standard,
+;; extending DEFINE-METHOD-COMBINATION with the :method-combination-class and
+;; :method-combination-type-class options is conformant (it does not alter the
+;; behavior of conforming code, and it is not explicitly prohibited).
 
 (defmacro define-method-combination (&whole form name . args)
   (declare (ignore args))
