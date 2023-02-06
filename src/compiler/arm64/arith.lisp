@@ -1990,27 +1990,38 @@
                                            '(1))))
                           (hi (+ hi ,@(and excl-high
                                            '(-1)))))
-                      (multiple-value-bind (flo fhi)
+                      (multiple-value-bind (flo fhi one)
                           (if (sc-is x any-reg)
-                              (values (fixnumize lo) (fixnumize hi))
-                              (values lo hi))
+                              (values (fixnumize lo) (fixnumize hi) ,(fixnumize 1))
+                              (values lo hi 1))
                         (cond
                           ((and (sc-is x unsigned-reg)
                                 (< fhi 0))
                            (inst cmp null-tn 0))
-                          ((and (sc-is x unsigned-reg)
-                                (<= flo 0))
-                           (inst cmp x (add-sub-immediate fhi)))
-                          ((= lo 0)
+                          ((or (= lo 0)
+                               (and (sc-is x unsigned-reg)
+                                    (<= lo 0)))
+                           (when (add-sub-immediate-p (+ fhi one))
+                             (incf fhi one)
+                             (change-vop-flags vop '(:lo)))
                            (inst cmp x (add-sub-immediate fhi)))
                           ((= hi -1)
-                           (change-vop-flags vop '(:hs))
-                           (inst cmn x (add-sub-immediate (- flo))))
+                           (setf flo (- flo))
+                           (cond ((add-sub-immediate-p (+ flo one))
+                                  (incf flo one)
+                                  (change-vop-flags vop '(:hi)))
+                                 (t
+                                  (change-vop-flags vop '(:hs))))
+                           (inst cmn x (add-sub-immediate flo)))
                           (t
                            (if (plusp flo)
                                (inst sub temp x (add-sub-immediate flo))
                                (inst add temp x (add-sub-immediate (abs flo))))
-                           (inst cmp temp (add-sub-immediate (- fhi flo)))))))))
+                           (let ((cmp (- fhi flo)))
+                             (when (add-sub-immediate-p (+ cmp one))
+                               (incf cmp one)
+                               (change-vop-flags vop '(:lo)))
+                            (inst cmp temp (add-sub-immediate cmp)))))))))
 
                 (define-vop (,(symbolicate name '-integer/c))
                   (:translate ,name)
@@ -2031,14 +2042,16 @@
                   (:vop-var vop)
                   (:policy :fast-safe)
                   (:generator 5
-                    (aver (>= hi lo))
                     (let ((lo (fixnumize (+ lo ,@(and excl-low
                                                       `(1)))))
                           (hi (fixnumize (+ hi ,@(and excl-high
                                                       `(-1))))))
-                      (cond ((= lo 0)
-                             (inst tst x fixnum-tag-mask)
-                             (inst ccmp x (ccmp-immediate hi) :eq #b10))
+
+                      (cond ((> lo hi)
+                             (inst cmp null-tn 0))
+                            ((= lo 0)
+                                (inst tst x fixnum-tag-mask)
+                                (inst ccmp x (ccmp-immediate hi) :eq #b10))
                             ((= hi ,(fixnumize -1))
                              (change-vop-flags vop '(:hs))
                              (inst tst x fixnum-tag-mask)
@@ -2094,7 +2107,7 @@
                            (change-vop-flags vop '(,(if excl-low
                                                         :gt
                                                         :ge)))
-                           (if (minusp hi)
+                           (if (typep hi `(integer (,most-negative-fixnum) -1))
                                (inst cmn x (imm (- hi) nil))
                                (inst cmp x (imm hi nil)))
                            (inst ccmp x (imm lo) ,(if excl-high :lt :le) 1)))
@@ -2107,9 +2120,9 @@
                                    (csubtypep (tn-ref-type hi-ref)
                                               (specifier-type 'unsigned-byte)))
                               (change-vop-flags vop '(,(if excl-high :lo :ls)))
-                              (inst cmp x hi))
+                              (inst cmp x (imm hi nil)))
                              (t
-                              (if (minusp lo)
+                              (if (typep lo `(integer (,most-negative-fixnum) -1))
                                   (inst cmn x (imm (- lo) nil))
                                   (inst cmp x (imm lo nil)))
                               (inst ccmp x (imm hi) ,(if excl-low :gt :ge))))))
@@ -2122,6 +2135,7 @@
                          (x :scs (descriptor-reg))
                          (hi :scs (any-reg immediate)))
                   (:arg-types tagged-num (:or integer bignum) tagged-num)
+                  (:arg-refs lo-ref nil hi-ref)
                   (:conditional ,(if excl-high
                                      :lt
                                      :le))
@@ -2133,17 +2147,19 @@
                                    (fixnumize (tn-value x))
                                    x))
                              (ccmp (c cond &optional (flags 0))
-                               (if (typep c '(integer * -1))
+                               (if (typep c `(integer (,most-negative-fixnum) -1))
                                    (inst ccmn x (ccmp-immediate (- c)) cond flags)
                                    (inst ccmp x (ccmp-immediate c) cond flags))))
                       (inst tst x fixnum-tag-mask)
                       (cond ((and (sc-is lo immediate)
+                                  (csubtypep (tn-ref-type hi-ref)
+                                             (specifier-type 'unsigned-byte))
                                   (eql (tn-value lo)
                                        ,(if excl-low
                                             -1
                                             0)))
                              (change-vop-flags vop '(,(if excl-high :lo :ls)))
-                             (ccmp (imm hi) :eq 1))
+                             (ccmp (imm hi) :eq #b10))
                             (t
                              (ccmp (imm lo) :eq 1)
                              (ccmp (imm hi) ,(if excl-low

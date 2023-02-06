@@ -1427,18 +1427,9 @@
                   (when (eq (car *current-path*) 'original-source-start)
                     (setf (ctran-source-path (node-prev call)) *current-path*))
                   ;; Convert.
-                  (let* ((name (leaf-source-name leaf))
-                         (*inline-expansions*
+                  (let* ((*inline-expansions*
                            (register-inline-expansion leaf call))
-                         (res (ir1-convert-inline-expansion
-                               name
-                               (defined-fun-inline-expansion leaf)
-                               leaf
-                               inlinep
-                               (info :function :info name))))
-
-                    ;; Allow backward references to this function from following
-                    ;; forms.
+                         (res (ir1-convert-inline-expansion leaf inlinep)))
                     (setf (defined-fun-functional leaf) res)
                     (change-ref-leaf ref res)
                     (unless ir1-converting-not-optimizing-p
@@ -1627,8 +1618,7 @@
                           (remove transform (gethash node table) :key #'car)))
                 t)
                (:delayed
-                (remhash node table)
-                nil))))
+                t))))
           ((and flame
                 (valid-fun-use node
                                type
@@ -1773,7 +1763,7 @@
       (let* ((*transforming* (1+ *transforming*))
              (new-fun (ir1-convert-inline-lambda
                        res
-                       :debug-name (debug-name 'lambda-inlined source-name)))
+                       :debug-name (debug-name 'transform-for source-name)))
              (type (node-derived-type call))
              (ref (lvar-use (combination-fun call))))
         (change-ref-leaf ref new-fun)

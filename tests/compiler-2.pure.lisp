@@ -48,12 +48,9 @@
                    :allow-style-warnings t)
   ;; The sequence must contain a mixture of symbols and non-symbols
   ;; to call %FIND-POSITION. If only symbols, it makes no calls.
-  (let ((f (checked-compile '(lambda (x)
-                              (position x '(1 2 3 a b c 4 5 6 d e f g))))))
-    ;; test should be EQ, not EQL
-    (assert (or (find (symbol-function 'eq)
-                      (ctu:find-code-constants f :type 'sb-kernel:simple-fun))
-                (ctu:find-named-callees f :name 'eq))))
+  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g))))))
+    ;; Assert that the default :TEST of #'EQL was strength-reduced to #'EQ
+    (assert (equal calls '((sb-kernel:%find-position identity eq)))))
   (checked-compile-and-assert ()
       '(lambda (x)
         (position x '(a b c d e d c b a) :from-end t))
@@ -3920,6 +3917,44 @@
     ((1 0) nil)
     ((-1 10) nil)))
 
+(with-test (:name :range<-equal-bounds)
+  (checked-compile-and-assert
+      ()
+      `(lambda (l x h)
+         (sb-kernel:range< l x h))
+    ((0 0 0) nil)
+    ((0 0.5 0) nil)
+    ((0 -0.5 0) nil)
+    ((0 1/2 0) nil)
+    ((0 -1/2 0) nil))
+  (checked-compile-and-assert
+      ()
+      `(lambda (l x h)
+         (sb-kernel:range<<= l x h))
+    ((0 0 0) nil)
+    ((0 0.5 0) nil)
+    ((0 -0.5 0) nil)
+    ((0 1/2 0) nil)
+    ((0 -1/2 0) nil))
+  (checked-compile-and-assert
+      ()
+      `(lambda (l x h)
+         (sb-kernel:range<=< l x h))
+    ((0 0 0) nil)
+    ((0 0.5 0) nil)
+    ((0 -0.5 0) nil)
+    ((0 1/2 0) nil)
+    ((0 -1/2 0) nil))
+  (checked-compile-and-assert
+      ()
+      `(lambda (l x h)
+         (sb-kernel:range<= l x h))
+    ((0 0 0) t)
+    ((0 0.5 0) nil)
+    ((0 -0.5 0) nil)
+    ((0 1/2 0) nil)
+    ((0 -1/2 0) nil)))
+
 (with-test (:name :move-from-word/fixnum-ir2opt)
   (checked-compile-and-assert
    ()
@@ -3929,3 +3964,30 @@
         (values v5
                 (abs (shiftf v5 (+ v5 1))))))
    ((-10) (values -2 2))))
+
+(with-test (:name :values-list-type-check
+            :skipped-on (not (or :x86-64 :arm64)))
+  (assert (find-if (lambda (line)
+                     (search "BOGUS-ARG-TO-VALUES-LIST-ERROR" line :test #'equal))
+                   (ctu:disassembly-lines
+                    (checked-compile
+                     `(lambda (l)
+                        (values-list l))))))
+  (assert (not (find-if (lambda (line)
+                          (search "BOGUS-ARG-TO-VALUES-LIST-ERROR" line :test #'equal))
+                        (ctu:disassembly-lines
+                         (checked-compile
+                          `(lambda (l)
+                             (declare (optimize (safety 0)))
+                             (values-list l))))))))
+
+(with-test (:name :explicit-value-cell-top-level)
+  (ctu:file-compile
+   `((defvar *x*)
+     (let ((v 0))
+       (loop repeat 1
+             do
+             (setf *x* (lambda () (incf v)))))
+     (assert (eql (funcall *x*) 1))
+     (assert (eql (funcall *x*) 2)))
+   :load t))

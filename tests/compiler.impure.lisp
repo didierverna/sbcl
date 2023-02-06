@@ -1007,35 +1007,31 @@
 (defun foo-maybe-inline (x) (quux-marker x))
 
 (with-test (:name :nested-inline-calls)
-  (let ((fun (checked-compile `(lambda (x)
-                               (foo-inline (foo-inline (foo-inline x)))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-INLINE" fun)))
-    (assert (= 3 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+  (let ((fun '(lambda (x) (foo-inline (foo-inline (foo-inline x))))))
+    (assert (= 0 (ctu:count-full-calls 'foo-inline fun)))
+    (assert (= 3 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :nested-maybe-inline-calls)
-  (let ((fun (checked-compile
-              `(lambda (x)
+  (let ((fun `(lambda (x)
                  (declare (optimize (space 0)))
-                 (foo-maybe-inline (foo-maybe-inline (foo-maybe-inline x)))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
-    (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+                 (foo-maybe-inline (foo-maybe-inline (foo-maybe-inline x))))))
+    (assert (= 0 (ctu:count-full-calls 'foo-maybe-inline fun)))
+    (assert (= 1 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :inline-calls)
-  (let ((fun (checked-compile `(lambda (x)
-                                 (list (foo-inline x)
-                                       (foo-inline x)
-                                       (foo-inline x))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-INLINE" fun)))
-    (assert (= 3 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+  (let ((fun `(lambda (x)
+                (list (foo-inline x) (foo-inline x) (foo-inline x)))))
+    (assert (= 0 (ctu:count-full-calls 'foo-inline fun)))
+    (assert (= 3 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :maybe-inline-calls)
-  (let ((fun (checked-compile `(lambda (x)
-                                 (declare (optimize (space 0)))
-                                 (list (foo-maybe-inline x)
-                                       (foo-maybe-inline x)
-                                       (foo-maybe-inline x))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
-    (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+  (let ((fun `(lambda (x)
+                (declare (optimize (space 0)))
+                (list (foo-maybe-inline x)
+                      (foo-maybe-inline x)
+                      (foo-maybe-inline x)))))
+    (assert (= 0 (ctu:count-full-calls 'foo-maybe-inline fun)))
+    (assert (= 1 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :maybe-inline-let-calls)
   (checked-compile `(lambda (x)
@@ -3141,3 +3137,13 @@
                   (sb-int:info :function :type 'non-top-level-type-derive))
                  '(function () (values (integer 1 1) &optional))))
   (assert (eql (funcall 'non-top-level-type-derive) 1)))
+
+(with-test (:name :delete-optional-dispatch-xep)
+  (ctu:file-compile
+   "(defun delete-optional-dispatch-xep (&optional x)
+      (if (= x 0)
+          10
+          (multiple-value-call #'delete-optional-dispatch-xep (1- x))))"
+   :block-compile t ; so the self call is recognized
+   :load t)
+  (assert (= (funcall 'delete-optional-dispatch-xep 3) 10)))
