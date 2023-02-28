@@ -1638,7 +1638,7 @@ core and return a descriptor to it."
   (or (gethash package-name *cold-package-symbols*)
       (let* ((cold-package (allocate-struct-of-type 'package))
              (info (cons (cons nil nil) cold-package)))
-        (write-slots cold-package :%used-by-list *nil-descriptor*)
+        (write-slots cold-package :%used-by *nil-descriptor*)
         (setf (gethash package-name *cold-package-symbols*) info)
         (initialize-cold-package cold-package package-name)
         info)))
@@ -1937,7 +1937,7 @@ core and return a descriptor to it."
                         *static*))
   ;; static-call entrypoint vector must be immediately adjacent to *asm-routine-vector*
   (word-vector (make-list (length sb-vm:+static-fdefns+) :initial-element 0) *static*)
-  (setf *asm-routine-vector* (word-vector (make-list 70 :initial-element 0)
+  (setf *asm-routine-vector* (word-vector (make-list 256 :initial-element 0)
                                           *static*)))
 
   #-immobile-code
@@ -2942,6 +2942,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
           (unless (member (car item) ; these can't be called from compiled Lisp
                           '(sb-vm::fpr-save sb-vm::save-xmm sb-vm::save-ymm
                             sb-vm::fpr-restore sb-vm::restore-xmm sb-vm::restore-ymm))
+            (aver (< index (cold-vector-len *asm-routine-vector*)))
             (write-wordindexed/raw *asm-routine-vector*
                                    (+ sb-vm:vector-data-offset index) entrypoint)))
         (incf index)))))
@@ -4015,15 +4016,13 @@ III. initially undefined function references (alphabetically):
       (makunbound '*deferred-undefined-tramp-refs*)
 
       (when *cold-assembler-obj*
-        (write-wordindexed
-         *cold-assembler-obj* sb-vm:code-debug-info-slot
-         ;; code-debug-info stores the name->addr hashtable.
-         ;; Make sure readonly space doesn't point to dynamic space here.
-         (let ((z (make-fixnum-descriptor 0)))
-           (cold-cons z z (ecase (gspace-name
-                                  (descriptor-gspace *cold-assembler-obj*))
-                            ((:read-only :static) *static*)
-                            (:immobile-text *dynamic*)))))
+        ;; code-debug-info stores the name->addr hashtable.
+        ;; It's wrapped in a cons so that read-only space points to static-space
+        ;; and not to dynamic space. #-darwin-jit doesn't need this hack.
+        #+darwin-jit
+        (write-wordindexed *cold-assembler-obj* sb-vm:code-debug-info-slot
+                           (let ((z (make-fixnum-descriptor 0)))
+                             (cold-cons z z *static*)))
         (init-runtime-routines))
 
       ;; Initialize the *COLD-SYMBOLS* system with the information

@@ -328,31 +328,34 @@
                     (storew* header result-tn 0 other-pointer-lowtag t))))))))
 
 ;;;; CONS, ACONS, LIST and LIST*
-(macrolet ((store-slot (tn list &optional (slot cons-car-slot)
-                                          (lowtag list-pointer-lowtag))
+(macrolet ((pop-arg (ref)
+             `(prog1 (tn-ref-tn ,ref) (setf ,ref (tn-ref-across ,ref))))
+           (store-slot (arg list &optional (slot cons-car-slot)
+                                           (lowtag list-pointer-lowtag))
              ;; TODO: gencgc does not need EMIT-GC-STORE-BARRIER here,
              ;; but other other GC strategies might.
              `(let* (immediate-value
+                     (tn ,arg)
                      (reg
-                       (sc-case ,tn
+                       (sc-case tn
                          (constant
-                          (unless (and (constant-tn-p ,tn)
-                                       (eql prev-constant (tn-value ,tn)))
-                            (setf prev-constant (if (constant-tn-p ,tn)
-                                                    (tn-value ,tn)
+                          (unless (and (constant-tn-p tn)
+                                       (eql prev-constant (tn-value tn)))
+                            (setf prev-constant (if (constant-tn-p tn)
+                                                    (tn-value tn)
                                                     temp))
-                            (move temp ,tn))
+                            (move temp tn))
                           temp)
                          (immediate
-                          (if (eql prev-constant (setf immediate-value (tn-value ,tn)))
+                          (if (eql prev-constant (setf immediate-value (tn-value tn)))
                               temp
-                              (encode-value-if-immediate ,tn)))
+                              (encode-value-if-immediate tn)))
                          (control-stack
                           (setf prev-constant temp) ;; a non-eq initial value
-                          (move temp ,tn)
+                          (move temp tn)
                           temp)
                          (t
-                          ,tn))))
+                          tn))))
                 (when (eq (storew reg ,list ,slot ,lowtag temp)
                           temp)
                   (setf prev-constant immediate-value)))))
@@ -462,18 +465,15 @@
             (allocation +cons-primtype+ size list-pointer-lowtag res node temp thread-tn))
         (move ptr res)
         (dotimes (i (1- cons-cells))
-          (store-slot (tn-ref-tn things) ptr)
-          (setf things (tn-ref-across things))
+          (store-slot (pop-arg things) ptr)
           (inst add ptr (pad-data-block cons-size))
           (storew ptr ptr (- cons-cdr-slot cons-size) list-pointer-lowtag))
-        (store-slot (tn-ref-tn things) ptr cons-car-slot list-pointer-lowtag)
-        (cond (star
-               (setf things (tn-ref-across things))
-               (store-slot (tn-ref-tn things) ptr cons-cdr-slot list-pointer-lowtag))
-              (t
-               (storew nil-value ptr cons-cdr-slot list-pointer-lowtag)))
-        (aver (null (tn-ref-across things)))
-        (move result res)))))
+        (store-slot (pop-arg things) ptr cons-car-slot list-pointer-lowtag)
+        (if star
+            (store-slot (pop-arg things) ptr cons-cdr-slot list-pointer-lowtag)
+            (storew nil-value ptr cons-cdr-slot list-pointer-lowtag))))
+    (aver (null things))
+    (move result res)))
 )
 
 ;;;; special-purpose inline allocators
@@ -854,47 +854,43 @@
     (storew (make-fixup 'undefined-tramp :assembly-routine)
             result fdefn-raw-addr-slot other-pointer-lowtag)))
 
-(macrolet
-    ((frob (name labelp)
-       `(define-vop (,name)
-          ,@(unless labelp
-              '((:args (function :to :save :scs (descriptor-reg)))))
-          (:info ,@(when labelp '(label)) length stack-allocate-p)
-          (:temporary (:sc any-reg) temp)
-          #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
-          (:results (result :scs (descriptor-reg)))
-          (:node-var node)
-          (:generator 10
-            (let* ((words (+ length closure-info-offset)) ; including header
-                   (bytes (pad-data-block words))
-                   (header (logior (ash (1- words) n-widetag-bits) closure-widetag)))
-              (unless stack-allocate-p
-                (instrument-alloc closure-widetag bytes node (list result temp) thread-tn))
-              (pseudo-atomic (:elide-if stack-allocate-p :thread-tn thread-tn)
-                (if stack-allocate-p
-                    (stack-allocation bytes fun-pointer-lowtag result)
-                    (allocation nil bytes fun-pointer-lowtag result node temp thread-tn))
-                (storew* #-immobile-space header ; write the widetag and size
-                         #+immobile-space        ; ... plus the layout pointer
-                         (let ((layout #-sb-thread (static-symbol-value-ea 'function-layout)
-                                       #+sb-thread (thread-slot-ea thread-function-layout-slot)))
-                           (cond ((typep header '(unsigned-byte 16))
-                                  (inst mov temp layout)
-                                  ;; emit a 2-byte constant, the low 4 of TEMP were zeroed
-                                  (inst mov :word temp header))
-                                 (t
-                                  (inst mov temp header)
-                                  (inst or temp layout)))
-                           temp)
-                         result 0 fun-pointer-lowtag (not stack-allocate-p)))
-              ;; Finished with the pseudo-atomic instructions
-              ;; TODO: gencgc does not need EMIT-GC-STORE-BARRIER here, but other other GC strategies might.
-              (inst lea temp ,(if labelp
-                                  `(rip-relative-ea label (ash simple-fun-insts-offset word-shift))
-                                  `(object-slot-ea function simple-fun-insts-offset fun-pointer-lowtag)))
-              (storew temp result closure-fun-slot fun-pointer-lowtag))))))
-  (frob make-closure nil)
-  (frob make-closure-from-label t))
+(define-vop (make-closure)
+  (:info label length stack-allocate-p)
+  (:temporary (:sc any-reg) temp)
+  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
+  (:results (result :scs (descriptor-reg)))
+  (:node-var node)
+  (:generator 10
+    (let* ((words (+ length closure-info-offset)) ; including header
+           (bytes (pad-data-block words))
+           (header (logior (ash (1- words) n-widetag-bits) closure-widetag)))
+      (unless stack-allocate-p
+        (instrument-alloc closure-widetag bytes node (list result temp) thread-tn))
+      (pseudo-atomic (:elide-if stack-allocate-p :thread-tn thread-tn)
+        (if stack-allocate-p
+            (stack-allocation bytes fun-pointer-lowtag result)
+            (allocation nil bytes fun-pointer-lowtag result node temp thread-tn))
+        (storew* #-immobile-space header ; write the widetag and size
+                 #+immobile-space        ; ... plus the layout pointer
+                 (let ((layout #-sb-thread (static-symbol-value-ea 'function-layout)
+                               #+sb-thread (thread-slot-ea thread-function-layout-slot)))
+                   (cond ((typep header '(unsigned-byte 16))
+                          (inst mov temp layout)
+                          ;; emit a 2-byte constant, the low 4 of TEMP were zeroed
+                          (inst mov :word temp header))
+                         (t
+                          (inst mov temp header)
+                          (inst or temp layout)))
+                   temp)
+                 result 0 fun-pointer-lowtag (not stack-allocate-p)))
+      ;; Finished with the pseudo-atomic instructions
+      ;; TODO: gencgc does not need EMIT-GC-STORE-BARRIER here, but other other GC strategies might.
+      (inst lea temp (rip-relative-ea label (ash simple-fun-insts-offset word-shift)))
+      (storew temp result closure-fun-slot fun-pointer-lowtag)
+      #+metaspace
+      (let ((origin (sb-assem::asmstream-data-origin-label sb-assem:*asmstream*)))
+        (inst lea temp (rip-relative-ea origin :code))
+        (storew temp result closure-code-slot fun-pointer-lowtag)))))
 
 ;;; The compiler likes to be able to directly make value cells.
 (define-vop (make-value-cell)

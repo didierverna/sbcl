@@ -1042,7 +1042,7 @@
   #'equalp)
 
 ;;; Pack the aspects of a fixup into an integer.
-;;; DATA is for asm routine fixups. The routine can be represented in 7 bits,
+;;; DATA is for asm routine fixups. The routine can be represented in 8 bits,
 ;;; so the fixup can be reduced to one word instead of an integer and a symbol.
 (declaim (inline !pack-fixup-info))
 (defun !pack-fixup-info (offset kind flavor data)
@@ -1053,18 +1053,18 @@
           (ash (the (mod 16) (or (position flavor +fixup-flavors+)
                                  (error "Bad fixup flavor ~s" flavor)))
                3)
-          ;; 7 bits
-          (ash (the (mod 128) data) 7)
+          ;; 8 bits
+          (ash (the (mod 256) data) 7)
           ;; whatever it needs
-          (ash offset 14)))
+          (ash offset 15)))
 
 ;;; Unpack an integer from DUMP-FIXUPs. Shared by genesis and target fasloader
 (declaim (inline !unpack-fixup-info))
 (defun !unpack-fixup-info (packed-info) ; Return (VALUES offset kind flavor data)
-  (values (ash packed-info -14)
+  (values (ash packed-info -15)
           (aref +fixup-kinds+ (ldb (byte 3 0) packed-info))
           (aref +fixup-flavors+ (ldb (byte 4 3) packed-info))
-          (ldb (byte 7 7) packed-info)))
+          (ldb (byte 8 7) packed-info)))
 
 #+(or arm arm64 riscv sparc) ; these don't have any retained packed fixups (yet)
 (defun sb-c::pack-retained-fixups (fixup-notes)
@@ -1092,7 +1092,7 @@
                 (when (member flavor '(:assembly-routine :assembly-routine*))
                   (setq named nil)
                   (the (integer 1 *) ; data can't be 0
-                       (cddr (gethash name (%code-debug-info *assembler-routines*)))))
+                       (cddr (gethash name (%asm-routine-table *assembler-routines*)))))
                 0))
            (info
             (!pack-fixup-info (fixup-note-position note) (fixup-note-kind note)

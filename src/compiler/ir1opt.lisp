@@ -348,12 +348,9 @@
           (when (and (ref-p node)
                      (lambda-var-p (ref-leaf node)))
             (let ((type (single-value-type int)))
-              (when (and (and (boundp '*component-being-compiled*)
-                              (eq (node-component node) *component-being-compiled*))
-                         (member-type-p type)
+              (when (and (member-type-p type)
                          (eql (member-type-size type) 1)
                          (not (preserve-single-use-debug-var-p node (ref-leaf node))))
-
                 (change-ref-leaf node (find-constant
                                        (first (member-type-members type)))))))
           (reoptimize-lvar lvar)))))
@@ -854,13 +851,13 @@
                                               (pushnew node (lvar-dependent-nodes lvar)
                                                        :test #'eq))
                                          nil))))
-             (let* ((lvar (lambda-var-ref-lvar ref))
+             (let* ((initial-value (let-var-initial-value var))
                     (lambda (lambda-var-home var))
                     (good-lambda-shape (= (length (lambda-vars lambda)) 1)))
-               (when (and lvar
-                          (listp (lvar-uses lvar)))
-                 (do-uses (use lvar)
-                   (when (and (immediately-used-p lvar use)
+               (when (and (null (lambda-var-sets var))
+                          (listp (lvar-uses initial-value)))
+                 (do-uses (use initial-value)
+                   (when (and (immediately-used-p initial-value use)
                               (type= (single-value-type (node-derived-type use))
                                      (specifier-type 'null))
                               (eq (block-last (node-block use)) use)
@@ -1646,17 +1643,11 @@
 ;;;
 ;;; DELAY-IR1-TRANSFORM is used to throw out of an IR1 transform, and
 ;;; delay the transform on the node until later. REASONS specifies
-;;; when the transform will be later retried. The :OPTIMIZE reason
-;;; causes the transform to be delayed until after the current IR1
-;;; optimization pass. The :CONSTRAINT reason causes the transform to
-;;; be delayed until after constraint propagation.
-;;;
-;;; FIXME: Now (0.6.11.44) that there are 4 variants of this (GIVE-UP,
-;;; ABORT, DELAY/:OPTIMIZE, DELAY/:CONSTRAINT) and we're starting to
-;;; do CASE operations on the various REASON values, it might be a
-;;; good idea to go OO, representing the reasons by objects, using
-;;; CLOS methods on the objects instead of CASE, and (possibly) using
-;;; SIGNAL instead of THROW.
+;;; when the transform will be later retried. The :IR1-PHASES reason
+;;; causes the transform to be delayed until after the current
+;;; IR1-OPTIMIZE-PHASE-1 optimization pass. The :CONSTRAINT reason
+;;; causes the transform to be delayed until after constraint
+;;; propagation.
 (defun give-up-ir1-transform (&rest args)
   (throw 'give-up-ir1-transform (values :failure args)))
 (defun abort-ir1-transform (&rest args)

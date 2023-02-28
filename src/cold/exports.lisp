@@ -1353,7 +1353,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "LVAR-VALUE"
            "MACRO-POLICY-DECLS"
            "MAKE-ALIAS-TN" "MAKE-CATCH-BLOCK"
-           "MAKE-CLOSURE" #+(or x86-64 arm64) "MAKE-CLOSURE-FROM-LABEL" "MAKE-CONSTANT-TN"
+           "MAKE-CLOSURE" "MAKE-CONSTANT-TN"
            "MAKE-FIXUP-NOTE"
            "MAKE-LOAD-TIME-CONSTANT-TN" "MAKE-N-TNS" "MAKE-NORMAL-TN"
            "MAKE-RANDOM-TN"
@@ -2143,7 +2143,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "ANSI-STREAM-IN-BUFFER" "ANSI-STREAM-IN-INDEX"
            "ANSI-STREAM-MISC"
            "ANSI-STREAM-N-BIN"
-           "ANSI-STREAM-OUT" "ANSI-STREAM-SOUT"
+           "ANSI-STREAM-COUT" "ANSI-STREAM-SOUT"
            "COMPLEX-VECTOR"
            "LIST-TO-VECTOR*"
            "LOGICAL-HOST" "LOGICAL-HOST-DESIGNATOR"
@@ -3609,7 +3609,7 @@ package is deprecated in favour of SB-MOP.")
   (:use "CL" "SB-EXT" "SB-INT")
   (:documentation "internal: 1-2-Brother tree")
   (:shadow "DELETE")
-  (:export "INSERT" "DELETE"))
+  (:export "INSERT" "DELETE" "FIND<=" "FIND>=" "FIND="))
 
 (defpackage* "SB-LOCKLESS"
   (:documentation "internal: lockfree lists")
