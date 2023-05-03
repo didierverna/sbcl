@@ -242,33 +242,25 @@
             :load-if (not (location= x y))))
   (:results (y :scs (any-reg descriptor-reg)
                :load-if (not (location= x y))))
+  (:result-refs result-ref)
   (:result-types tagged-num)
   (:note "fixnum tagging")
   (:generator 1
-    (cond ((and (sc-is x signed-reg unsigned-reg)
-                (not (location= x y)))
-           (if (= n-fixnum-tag-bits 1)
-               (inst lea y (ea x x))
-               (inst lea y (ea nil x (ash 1 n-fixnum-tag-bits)))))
-          (t
-           ;; Uses: If x is a reg 2 + 3; if x = y uses only 3 bytes
-           (move y x)
-           (inst shl y n-fixnum-tag-bits)))))
+    (let ((opsize (if (and (eq n-fixnum-tag-bits 1)
+                           (csubtypep (tn-ref-type result-ref)
+                                      (specifier-type '(unsigned-byte 31))))
+                      :dword :qword)))
+      (cond ((and (sc-is x signed-reg unsigned-reg)
+                  (not (location= x y)))
+             (if (= n-fixnum-tag-bits 1)
+                 (inst lea opsize y (ea x x))
+                 (inst lea y (ea nil x (ash 1 n-fixnum-tag-bits)))))
+            (t
+             ;; Uses: If x is a reg 2 + 3; if x = y uses only 3 bytes
+             (move y x opsize)
+             (inst shl opsize y n-fixnum-tag-bits))))))
 (define-move-vop move-from-word/fixnum :move
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
-
-(eval-when (:compile-toplevel :execute)
-  ;; This is like a macro, but not a macro, because define-vop is weird.
-  (defun bignum-from-reg (tn signedp)
-    (flet ((make-vector ()
-             (map 'vector
-                  (lambda (x)
-                    ;; At present R11 can not occur here,
-                    ;; but let's be future-proof and allow for it.
-                    (unless (member x '(rsp rbp) :test 'string=)
-                      (symbolicate "ALLOC-" signedp "-BIGNUM-IN-" x)))
-                  +qword-register-names+)))
-      `(aref ,(make-vector) (tn-offset ,tn)))))
 
 ;;; Convert an untagged signed word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly
@@ -294,7 +286,7 @@
             (inst imul y x #.(ash 1 n-fixnum-tag-bits))
             (inst jmp :no DONE)
             (inst mov y x)))
-     (invoke-asm-routine 'call #.(bignum-from-reg 'y "SIGNED") vop)
+     (signed=>bignum-in-reg vop y)
      DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
@@ -348,7 +340,7 @@
     ;; support- speculatively restore the fixnum value, test previous flags and jump,
     ;; which would eliminate the 'jmp done' that jumps over the following SHR.
     (inst jmp :z fixnum)
-    (invoke-asm-routine 'call #.(bignum-from-reg 'res "UNSIGNED") vop)
+    (unsigned=>bignum-in-reg vop res)
     (inst jmp done)
     FIXNUM
     (inst shr res 1)

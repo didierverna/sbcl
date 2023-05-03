@@ -194,8 +194,8 @@
   ;; the optimizer for this node type doesn't care, it can elect not
   ;; to clear this flag.
   (reoptimize t :type boolean)
-  ;; if the LVAR value is DYNAMIC-EXTENT, CLEANUP protecting it.
-  (dynamic-extent nil :type (or null cleanup))
+  ;; if the LVAR value is DYNAMIC-EXTENT, some information.
+  (dynamic-extent nil :type (or null dx-info))
   ;; something or other that the back end annotates this lvar with
   (info nil)
   ;; Nodes to reoptimize together with the lvar
@@ -203,6 +203,25 @@
   (annotations nil)
   (dependent-annotations nil))
 (!set-load-form-method lvar (:xc :target) :ignore-it)
+
+;;; A DX-INFO structure is used to accumulate information about a
+;;; dynamic extent declaration.
+(defstruct (dx-info (:copier nil))
+  ;; The kind of dynamic extent this is.
+  (kind (missing-arg) :type (member enclose dynamic-extent truly-dynamic-extent))
+  ;; The value recognized to be declared dynamic extent.
+  (value (missing-arg) :type lvar)
+  ;; The stack-allocatable values in the transitive closure of the
+  ;; relation determined by the "otherwise inaccessible part"
+  ;; criterion. This is filled in by environment analysis.
+  (subparts nil :type list)
+  ;; The CLEANUP associated with this dynamic extent.
+  (cleanup (missing-arg) :type cleanup))
+
+(defprinter (dx-info :identity t)
+  kind
+  value
+  subparts)
 
 ;;; These are used for annotating a LVAR with information that can't
 ;;; be expressed using types or if the CAST semantics are undesirable
@@ -348,7 +367,7 @@
 
 (defun %with-ir1-environment-from-node (node fun)
   (declare (type node node) (type function fun))
-  #-sb-xc-host (declare (dynamic-extent fun)) ; "unable"
+  (declare (dynamic-extent fun))
   (let ((*current-component* (node-component node))
         (*lexenv* (node-lexenv node))
         (*current-path* (node-source-path node)))
@@ -695,13 +714,9 @@
   ;; structures whose NLX-INFO-CLEANUP is this cleanup. This is filled
   ;; in by environment analysis.
   ;;
-  ;; For :DYNAMIC-EXTENT: a list of all DX LVARs, preserved by this
-  ;; cleanup. This is filled when the cleanup is created (now by
-  ;; locall call analysis) and is rechecked by environment
-  ;; analysis. (For closures this is a list of the LVAR of the enclose
-  ;; after environment analysis.)
-  (nlx-info nil :type list)
-  (dx-kind nil))
+  ;; For :DYNAMIC-EXTENT: a list of all DX-INFOs, preserved by this
+  ;; cleanup.
+  (nlx-info nil :type list))
 (defprinter (cleanup :identity t)
   kind
   mess-up
@@ -856,16 +871,10 @@
   ;; This may be non-nil when REFS and SETS are null, since code can be deleted.
   (ever-used nil :type (member nil set t))
   ;; is it declared dynamic-extent, or truly-dynamic-extent?
-  (extent nil :type (member nil truly-dynamic-extent dynamic-extent indefinite-extent
-                            dynamic-extent-no-note))
+  (dynamic-extent nil :type (member nil truly-dynamic-extent dynamic-extent))
   ;; some kind of info used by the back end
   (info nil))
 (!set-load-form-method leaf (:xc :target) :ignore-it)
-
-(defun leaf-dynamic-extent (leaf)
-  (let ((extent (leaf-extent leaf)))
-    (unless (member extent '(nil indefinite-extent))
-      extent)))
 
 ;;; LEAF name operations
 (defun leaf-has-source-name-p (leaf)
@@ -1144,9 +1153,6 @@
       ;; it looks as though it's never interesting to get debug names
       ;; from them, so it's moot. -- WHN)
       (leaf-source-name leaf)))
-(defun leaf-%debug-name (leaf)
-  (when (functional-p leaf)
-    (functional-%debug-name leaf)))
 
 ;;; Is FUNCTIONAL LET-converted? (where we're indifferent to whether
 ;;; it returns one value or multiple values)
@@ -1218,15 +1224,8 @@
   ;; depends on in such a way that DFO shouldn't put them in separate
   ;; components.
   (calls-or-closes (make-sset) :type (or null sset))
-  ;; the TAIL-SET that this LAMBDA is in. This is null during creation.
-  ;;
-  ;; In CMU CL, and old SBCL, this was also NILed out when LET
-  ;; conversion happened. That caused some problems, so as of
-  ;; sbcl-0.pre7.37.flaky5.2 when I was trying to get the compiler to
-  ;; emit :EXTERNAL functions directly, and so now the value
-  ;; is no longer NILed out in LET conversion, but instead copied
-  ;; (so that any further optimizations on the rest of the tail
-  ;; set won't modify the value) if necessary.
+  ;; the TAIL-SET that this LAMBDA is in. This is null during creation
+  ;; and in let lambdas.
   (tail-set nil :type (or tail-set null))
   ;; the structure which represents the phsical environment that this
   ;; function's variables are allocated in. This is filled in by
@@ -1471,9 +1470,7 @@
                 (:copier nil))
   ;; The leaf referenced.
   (leaf nil :type leaf)
-  ;; CONSTANT nodes are always anonymous, since we wish to coalesce named and
-  ;; unnamed constants that are equivalent, we need to keep track of the
-  ;; reference name for XREF.
+  ;; KLUDGE: This is supposed to help with keyword debug messages somehow.
   (%source-name (missing-arg) :type symbol :read-only t)
   ;; Constraints that cannot be expressed as NODE-DERIVED-TYPE
   (constraints nil))
@@ -1628,10 +1625,10 @@
   ;; assertion is satisfied:
   ;;
   ;; NIL
-  ;;    No type check is necessary (VALUE type is a subtype of the TYPE-TO-CHECK.)
+  ;;    No type check is necessary (proven type of VALUE is a subtype of the TYPE-TO-CHECK.)
   ;;
   ;; :EXTERNAL
-  ;;    Type check will be performed by NODE-DEST.
+  ;;    A type check will be performed by NODE-DEST.
   ;;
   ;; T
   ;;    A type check is needed.
@@ -1720,8 +1717,11 @@
 ;;; would be emitted, if necessary.
 (defstruct (enclose (:include valued-node) ; this node uses a dummy lvar for dx analysis
                     (:copier nil))
-  ;; the list of functionals that this ENCLOSE node allocates.
-  (funs nil :type list))
+  ;; The list of functionals that this ENCLOSE node allocates.
+  (funs nil :type list)
+  ;; The cleanup for this enclose if any of its functionals are
+  ;; declared dynamic extent.
+  (cleanup nil :type (or null cleanup)))
 (defprinter (enclose :identity t)
   funs)
 

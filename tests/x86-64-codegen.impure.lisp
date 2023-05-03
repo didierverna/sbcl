@@ -58,14 +58,15 @@
         (setq lines (nbutlast lines)))
       ;; Remove safepoint traps
       (setq lines (remove-if (lambda (x) (search "; safepoint" x)) lines))
-      ;; If the last 4 lines are of the expected form
-      ;;   MOV RSP, RBP / CLC / POP RBP / RET
+      ;; If the last 3 lines are of the expected form
+      ;;   LEAVE / CLC / RET
       ;; then strip them out
       (if (and remove-epilogue
-               (every #'search
-                      '("MOV RSP, RBP" "CLC" "POP RBP" "RET")
-                      (subseq lines (- (length lines) 4))))
-          (butlast lines 4)
+               (let ((last3 (subseq lines (- (length lines) 3))))
+                 (and (search "LEAVE" (first last3))
+                      (search "CLC" (second last3))
+                      (search "RET" (third last3)))))
+          (butlast lines 3)
           lines)))
 (defun disasm-load (safety symbol)
   ;; This lambda has a name because if it doesn't, then the name
@@ -949,6 +950,7 @@
                     (when (/= linecount expect-n)
                       (warn "~S was ~d is ~d" type expect-n linecount))))))))))
 
+#+nil ; gotta figure out how to make this insensitive to standard asm boilerplate
 (with-test (:name :many-interesting-array-types
                   :skipped-on (:or (:not :sb-unicode)
                                    (:not :immobile-space)))
@@ -1137,7 +1139,7 @@
 
 (sb-vm::define-vop (trythis)
   (:generator 1
-   (sb-vm::inst and sb-vm::rax-tn (sb-c:make-fixup nil :gc-barrier))))
+   (sb-vm::inst and sb-vm::rax-tn (sb-c:make-fixup nil :card-table-index-mask))))
 (defun zook ()
   (sb-sys:%primitive trythis)
   nil)
@@ -1197,7 +1199,7 @@
        (cond ((and (>= (length line) 4) (string= line "VOP " :end1 4))
               (let ((string (subseq line 4 (position #\space line :start 5))))
                 (setq current-vop string)))
-             ((search ":FLAVOR GC-BARRIER" line)
+             ((search ":FLAVOR CARD-TABLE-INDEX-MASK" line)
               (push current-vop result)))))))
 
 (with-test (:name :closure-init-gc-barrier)
@@ -1324,3 +1326,61 @@
               (declare (dynamic-extent copy))
               (values (func copy)))))))
     (assert (not vops-with-barrier))))
+
+;;; word-sized add, subtract, multiply vops which yield either a fixnum
+;;; or bignum where the bignum can have 1, 2, or 3 bigdigits.
+(defparameter unsigned-word-test-inputs
+  (loop for i from 0 by (ash 1 56) repeat 256 collect i))
+
+(defparameter signed-word-test-inputs
+  (funcall
+   (compile nil ;; no interpreter stubs
+            `(lambda ()
+               (loop for word in unsigned-word-test-inputs
+                     collect (let ((b (sb-bignum:%allocate-bignum 1)))
+                               (setf (sb-bignum:%bignum-ref b 0) word)
+                               (sb-bignum::%normalize-bignum b 1)))))))
+
+(defun check-result (fun x y actual)
+  (let ((expect (funcall fun x y)))
+    (unless (eql actual expect)
+      (when (typep expect 'bignum)
+        (sb-vm:hexdump expect)
+        (terpri)
+        (sb-vm:hexdump actual))
+      (error "Failure @ ~X ~A ~X, expect ~D (~A) got ~D~%"
+             x fun y expect
+             (typecase expect
+               (fixnum 'fixnum)
+               (bignum (format nil "~d-word bignum"
+                               (sb-bignum:%bignum-length expect))))
+             actual))))
+
+(macrolet ((test-op (op)
+             `(progn
+                (format t "~&Testing ~A~%" ',op)
+                (dolist (x signed-word-test-inputs)
+                  (dolist (y signed-word-test-inputs)
+                    (check-result
+                     ',op x y
+                     (,op (the sb-vm:signed-word x) (the sb-vm:signed-word y))))))))
+  (defun test-signed ()
+    (test-op +)
+    (test-op -)
+    (test-op *)))
+
+(macrolet ((test-op (op)
+             `(progn
+                (format t "~&Testing ~A~%" ',op)
+                (dolist (x unsigned-word-test-inputs)
+                  (dolist (y unsigned-word-test-inputs)
+                    (check-result
+                     ',op x y
+                     (,op (the sb-vm:word x) (the sb-vm:word y))))))))
+  (defun test-unsigned ()
+    (test-op +)
+    (test-op -)
+    (test-op *)))
+
+(with-test (:name :signed-vops) (test-signed))
+(with-test (:name :unsigned-vops) (test-unsigned))

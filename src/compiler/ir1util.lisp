@@ -201,16 +201,6 @@
                    (eq (block-start succ)
                        (node-prev dest))))))))
 
-;;; Returns the defined (usually untrusted) type of the combination,
-;;; or NIL if we couldn't figure it out.
-(defun combination-defined-type (combination)
-  (let ((use (principal-lvar-use (basic-combination-fun combination))))
-    (or (when (ref-p use)
-          (let ((type (leaf-defined-type (ref-leaf use))))
-            (when (fun-type-p type)
-              (fun-type-returns type))))
-        *wild-type*)))
-
 ;;; Return true if LVAR destination is executed after node with only
 ;;; uninteresting nodes intervening.
 ;;;
@@ -357,12 +347,12 @@
   (values))
 
 (defun propagate-lvar-dx (new old)
-  (let ((cleanup (lvar-dynamic-extent old)))
-    (when cleanup
+  (let ((dx-info (lvar-dynamic-extent old)))
+    (when dx-info
       (setf (lvar-dynamic-extent old) nil)
       (unless (lvar-dynamic-extent new)
-        (setf (lvar-dynamic-extent new) cleanup)
-        (setf (cleanup-nlx-info cleanup) (subst new old (cleanup-nlx-info cleanup)))))))
+        (setf (lvar-dynamic-extent new) dx-info)
+        (setf (dx-info-value dx-info) new)))))
 
 (defun lexenv-contains-lambda (lambda parent-lexenv)
   (loop for lexenv = (lambda-lexenv lambda)
@@ -379,16 +369,29 @@
 ;;; (dx-let ((x (let ((m (make-array)))
 ;;;               (fill m)
 ;;;               m))))
-(defun propagate-ref-dx (new-ref old-lvar)
-  (let ((dx (lvar-dynamic-extent old-lvar))
-        (new-lambda-var (ref-leaf new-ref)))
-    (when (and dx
-               (lambda-var-p new-lambda-var)
-               (eq (functional-kind (lambda-var-home new-lambda-var)) :let)
-               ;; Make sure the let is inside the dx let
-               (lexenv-contains-lambda (lambda-var-home new-lambda-var)
-                                       (node-lexenv (cleanup-mess-up dx))))
-      (propagate-lvar-dx (let-var-initial-value new-lambda-var) old-lvar)
+(defun propagate-ref-dx (new-ref old-lvar var)
+  (let ((dx-info (lvar-dynamic-extent old-lvar))
+        (leaf (ref-leaf new-ref)))
+    (when dx-info
+      (let ((cleanup (dx-info-cleanup dx-info)))
+        (typecase leaf
+          (lambda-var
+           (when (and (eq (functional-kind (lambda-var-home leaf)) :let)
+                      ;; Make sure the let is inside the dx let
+                      (lexenv-contains-lambda (lambda-var-home leaf)
+                                              (node-lexenv (cleanup-mess-up cleanup))))
+             (propagate-lvar-dx (let-var-initial-value leaf) old-lvar)))
+          (clambda
+           (when (and (null (rest (leaf-refs leaf)))
+                      (lexenv-contains-lambda leaf
+                                              (node-lexenv (cleanup-mess-up cleanup))))
+             (let ((fun (functional-entry-fun leaf)))
+               (setf (enclose-cleanup (functional-enclose fun)) cleanup)
+               (setf (leaf-dynamic-extent fun) (leaf-dynamic-extent var))
+               (let ((dx-info (lvar-dynamic-extent old-lvar)))
+                 (setf (lvar-dynamic-extent old-lvar) nil)
+                 (setf (cleanup-nlx-info cleanup)
+                       (remove dx-info (cleanup-nlx-info cleanup)))))))))
       t)))
 
 (defun node-dominates-p (node1 node2)
@@ -516,13 +519,34 @@
 
         ;; Replace PLACEHOLDER with the LVAR.
         (let* ((refs (leaf-refs placeholder))
-               (node (first refs))
-               (victim (node-lvar node)))
-          (aver (null (rest refs))) ; PLACEHOLDER must be referenced exactly once.
-          (substitute-lvar filtered-lvar lvar)
-          (substitute-lvar lvar victim)
-          (flush-dest victim))
+               (node (first refs)))
+          (cond (refs
+                 (let ((victim (node-lvar node)))
+                  (aver (null (rest refs))) ; PLACEHOLDER must be referenced exactly once.
+                  (substitute-lvar filtered-lvar lvar)
+                  (substitute-lvar lvar victim)
+                  (flush-dest victim)))
+                (t
+                 (flush-dest lvar))))
 
+        ;; The form may have introduced new local calls, for example,
+        ;; from LET bindings, so invoke local call analysis.
+        (locall-analyze-component *current-component*))))
+  (values))
+
+(defun insert-code (before form)
+  (let ((ctran (node-prev before)))
+    (with-ir1-environment-from-node before
+      (ensure-block-start ctran)
+      (let* ((old-block (ctran-block ctran))
+             (new-start (make-ctran))
+             (filtered-lvar (make-lvar))
+             (new-block (ctran-starts-block new-start)))
+        ;; Splice in the new block before DEST, giving the new block
+        ;; all of DEST's predecessors.
+        (dolist (block (block-pred old-block))
+          (change-block-successor block old-block new-block))
+        (ir1-convert new-start ctran filtered-lvar form)
         ;; The form may have introduced new local calls, for example,
         ;; from LET bindings, so invoke local call analysis.
         (locall-analyze-component *current-component*))))
@@ -588,9 +612,6 @@
        (lambda-home fun))
     (when (eq (lambda-home fun) fun)
       (return fun))))
-
-(defun lambda-parent (lambda)
-  (lexenv-lambda (lambda-lexenv lambda)))
 
 (defun node-component (node)
   (declare (type node node))
@@ -740,102 +761,66 @@
 
 ;;;; DYNAMIC-EXTENT related
 
-(defun lambda-var-original-name (leaf)
-  (let ((home (lambda-var-home leaf)))
-    (if (eq :external (functional-kind home))
-        (let* ((entry (functional-entry-fun home))
-               (p (1- (or (position leaf (lambda-vars home))
-                          (bug "can't find leaf")))))
-          (leaf-debug-name
-           (if (optional-dispatch-p entry)
-               (elt (optional-dispatch-arglist entry) p)
-               (elt (lambda-vars entry) p))))
-        (leaf-debug-name leaf))))
-
-(defun note-no-stack-allocation (lvar &key flush)
-  (do-uses (use (principal-lvar lvar))
-    (dolist (use (ensure-list (if (cast-p use)
-                                  (principal-lvar-use (cast-value use))
-                                  use)))
-      (unless (or
-               (eq (cleanup-dx-kind  (lvar-dynamic-extent lvar))
-                   'dynamic-extent-no-note)
-               ;; If we're flushing, don't complain if we can flush the combination.
-               (and flush
-                    (or
-                     (node-to-be-deleted-p use)
-                     (and (combination-p use)
-                          (flushable-combination-p use))))
-               (and (ref-p use)
-                    (let ((leaf (ref-leaf use)) )
-                      (or
-                       ;; Don't complain about not being able to stack allocate constants.
-                       (constant-p leaf)
-                       ;; Don't report those with homes in :OPTIONAL -- we'd get doubled
-                       ;; reports that way.
-                       ;; Also don't report if the home is :EXTERNAL. This allows declaring
-                       ;; funargs as dynamic-extent which can inform compilation of callers
-                       ;; to this lambda that they can DXify the arg.
-                       (and (lambda-var-p leaf)
-                            (member (lambda-kind (lambda-var-home (ref-leaf use)))
-                                    '(:optional :external)))
-                       (or
-                        ;; Don't complain if the referent is #'SOMEFUN, avoiding a note for
-                        ;;  (DEFUN FOO (X &KEY (TEST #'IDENTITY)) ...)
-                        ;; where TEST is declared DX, and one possible use of this LVAR is
-                        ;; to the supplied arg, and other is essentially constant-like.
-                        (and (global-var-p leaf)
-                             (eq (global-var-kind leaf) :global-function))
-                        ;; Ignore top level closures
-                        (and (functional-p leaf)
-                             (functional-enclose leaf)
-                             (eq (functional-kind (node-home-lambda (functional-enclose leaf)))
-                                 :toplevel))))))
-               ;; It's supposed to be slow, so who cares it can't
-               ;; stack allocate something.
-               (policy use (= speed 0)))
-        ;; FIXME: For the first leg (lambda-bind (lambda-var-home ...))
-        ;; would be a far better description, but since we use
-        ;; *COMPILER-ERROR-CONTEXT* for muffling we can't -- as that node
-        ;; can have different handled conditions.
-        (let ((*compiler-error-context* use))
-          (if (and (ref-p use) (lambda-var-p (ref-leaf use)))
-              (compiler-notify "~@<could~2:I not stack allocate ~S in: ~S~:@>"
-                               (lambda-var-original-name (ref-leaf use))
-                               (find-original-source (node-source-path use)))
-              (compiler-notify "~@<could~2:I not stack allocate: ~S~:@>"
-                               (find-original-source (node-source-path use)))))))))
+;;; Insert code to establish a dynamic extent cleanup around CALL,
+;;; returning the cleanup.
+(defun insert-dynamic-extent-cleanup (call)
+  (let* ((entry (with-ir1-environment-from-node call
+                  (make-entry)))
+         (cleanup (make-cleanup :kind :dynamic-extent
+                                :mess-up entry)))
+    (setf (entry-cleanup entry) cleanup)
+    (insert-node-before call entry)
+    (setf (node-lexenv call)
+          (make-lexenv :default (node-lexenv call)
+                       :cleanup cleanup))
+    (setf (ctran-next (node-prev call)) nil)
+    (let ((ctran (make-ctran)))
+      (with-ir1-environment-from-node call
+        (ir1-convert (node-prev call) ctran nil '(%cleanup-point))
+        (link-node-to-previous-ctran call ctran)))
+    ;; Make CALL end its block, so that we have a place to
+    ;; insert cleanup code.
+    (node-ends-block call)
+    (push entry (lambda-entries (node-home-lambda entry)))
+    cleanup))
 
 (defun use-good-for-dx-p (use cleanup dx)
-  (and (not (node-to-be-deleted-p use))
-       (typecase use
-         (combination
-          (and (eq (combination-kind use) :known)
-               (let ((info (combination-fun-info use)))
-                 (or (awhen (fun-info-stack-allocate-result info)
-                       (funcall it use dx))
-                     (awhen (fun-info-result-arg info)
-                       (lvar-good-for-dx-p (nth it (combination-args use))
-                                           cleanup dx))))))
-         (cast
-          (and (not (cast-type-check use))
-               (lvar-good-for-dx-p (cast-value use) cleanup dx)))
-         (ref
-          (let ((var (ref-leaf use)))
-            ;; LET lambda var, no SETS, not explicitly indefinite-extent.
-            (when (and (lambda-var-p var)
-                       (eq (functional-kind (lambda-var-home var)) :let)
-                       (not (lambda-var-sets var))
-                       (neq (lambda-var-extent var) 'indefinite-extent)
-                       (lexenv-contains-lambda (lambda-var-home var)
-                                               (node-lexenv (cleanup-mess-up cleanup)))
-                       ;; Check the other refs are GOOD-FOR-DX-P.
-                       (dolist (ref (lambda-var-refs var) t)
-                         (unless (eq use ref)
-                           (when (not (ref-good-for-dx-p ref))
-                             (return nil)))))
-              (lvar-good-for-dx-p
-               (let-var-initial-value var) cleanup dx)))))))
+  (typecase use
+    (combination
+     (and (eq (combination-kind use) :known)
+          (let ((info (combination-fun-info use)))
+            (or (awhen (fun-info-stack-allocate-result info)
+                  (funcall it use dx))
+                (awhen (fun-info-result-arg info)
+                  (lvar-good-for-dx-p (nth it (combination-args use))
+                                      cleanup dx))))))
+    (cast
+     (and (not (cast-type-check use))
+          (lvar-good-for-dx-p (cast-value use) cleanup dx)))
+    (ref
+     (let ((leaf (ref-leaf use)))
+       (typecase leaf
+         (lambda-var
+          ;; LET lambda var with no SETS.
+          (when (and (eq (functional-kind (lambda-var-home leaf)) :let)
+                     (not (lambda-var-sets leaf))
+                     (lexenv-contains-lambda (lambda-var-home leaf)
+                                             (node-lexenv (cleanup-mess-up cleanup)))
+                     ;; Check the other refs are good.
+                     (dolist (ref (leaf-refs leaf) t)
+                       (unless (eq use ref)
+                         (when (not (ref-good-for-dx-p ref))
+                           (return nil)))))
+            (lvar-good-for-dx-p
+             (let-var-initial-value leaf) cleanup dx)))
+         (clambda
+          (aver (eq (functional-kind leaf) :external))
+          (when (and (null (rest (leaf-refs leaf)))
+                     (environment-closure (get-lambda-environment leaf))
+                     (lexenv-contains-lambda leaf
+                                             (node-lexenv (cleanup-mess-up cleanup))))
+            (aver (eq use (first (leaf-refs leaf))))
+            t)))))))
 
 (defun lvar-good-for-dx-p (lvar cleanup dx)
   (aver (lvar-uses lvar))
@@ -1614,8 +1599,6 @@
 (defun flush-dest (lvar)
   (declare (type (or lvar null) lvar))
   (unless (null lvar)
-    (when (lvar-dynamic-extent lvar)
-      (note-no-stack-allocation lvar :flush t))
     (setf (lvar-dest lvar) nil)
     (do-uses (use lvar)
       (flush-node use))
@@ -2883,6 +2866,18 @@ is :ANY, the function name is not checked."
                     leaf)
                    (when constants
                      (values :calls constants))))))))))
+
+(defun lambda-var-original-name (leaf)
+  (let ((home (lambda-var-home leaf)))
+    (if (eq :external (functional-kind home))
+        (let* ((entry (functional-entry-fun home))
+               (p (1- (or (position leaf (lambda-vars home))
+                          (bug "can't find leaf")))))
+          (leaf-debug-name
+           (if (optional-dispatch-p entry)
+               (elt (optional-dispatch-arglist entry) p)
+               (elt (lambda-vars entry) p))))
+        (leaf-debug-name leaf))))
 
 (defun process-lvar-modified-annotation (lvar annotation)
   (loop for annot in (lvar-annotations lvar)

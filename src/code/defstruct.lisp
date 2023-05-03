@@ -1022,7 +1022,9 @@ unless :NAMED is also specified.")))
                       1)))
              (setf index (dd-length defstruct))
              (incf (dd-length defstruct) n-words))))
-
+    (when (eq ctype *empty-type*)
+      (with-current-source-form (spec)
+       (style-warn "The type of the slot ~s is the empty type NIL" name)))
     ;; Check for existence of any BOA constructor that leaves the
     ;; slot with an unspecified value, as when it's initialized
     ;; by an &AUX binding with no value (CLHS 3.4.6)
@@ -1472,7 +1474,7 @@ unless :NAMED is also specified.")))
                            accessor-name
                            (dsd-name dsd))))))))
 
-    (awhen (remove-if-not #'sb-impl::emitted-full-call-count fnames)
+    (awhen (remove-if-not #'sb-c::emitted-full-call-count fnames)
       (sb-c:compiler-style-warn
        'sb-c:inlining-dependency-failure
        ;; This message omits the http://en.wikipedia.org/wiki/Serial_comma
@@ -1623,19 +1625,27 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;;                                      logical    arithmetic
 ;;;                                      bitmap     value
 ;;; Funcallable object:
-;;;   Non-compact header:                #b...1100        -4
+;;;   Executable w/ standard header:     #b.101000       -24
 ;;;       word0:     header
 ;;;       word1: (*) entry address
-;;;       word2: (u) layout
-;;;       word3: (t) implementation-fun
-;;;       word4: (t) tagged slots ...
-;;;   Compact header:                    #b...1000        -7
+;;;       word2: (u) machine instructions
+;;;       word3: (u) machine instructions
+;;;       word4: (t) implementation-fun
+;;;       word5: (u) layout
+;;;       word6: (t) tagged slots ...
+;;;   Executable w/ compact header:      #b...1000        -8
 ;;;       word0:     header/layout
 ;;;       word1: (*) entry address
 ;;;       word2: (u) machine instructions
 ;;;       word3: (u) machine instructions
 ;;;       word4: (t) implementation-fun
 ;;;       word5: (t) tagged slots ...
+;;;   Non-executable:                    #b...1100        -4
+;;;       word0:     header
+;;;       word1: (*) entry address
+;;;       word2: (u) layout
+;;;       word3: (t) implementation-fun
+;;;       word4: (t) tagged slots ...
 ;;; (*) entry address can be treated as either tagged or raw.
 ;;;     For some architectures it has a lowtag, but points to
 ;;;     read-only space. For others it is a fixnum.
@@ -2256,7 +2266,7 @@ or they must be declared locally notinline at each call site.~@:>"
                                                     x))
                                        slot-names) &aux (object ,allocate))
                  ,@set-layout
-                 #+x86-64
+                 #+executable-funinstances
                  ,@(when (and (eq dd-type 'funcallable-structure)
                               ;; fmt-control is not an executable function
                               (neq class-name 'sb-format::fmt-control))

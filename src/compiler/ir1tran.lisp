@@ -317,12 +317,7 @@
                    `(macro . (the ,type ,expansion))))
                 (:constant
                  (let ((value (symbol-value name)))
-                   ;; Objects that are freely coalescible become
-                   ;; anonymous since we aren't interested in
-                   ;; accessing them through their name.
-                   (if (sb-xc:typep value '(or number character symbol))
-                       (find-constant value)
-                       (make-constant value (ctype-of value) name))))
+                   (make-constant value (ctype-of value) name)))
                 (t
                  (make-global-var :kind kind
                                   :%source-name name
@@ -1127,8 +1122,7 @@
 
 (declaim (start-block process-decls make-new-inlinep
                       find-in-bindings
-                      process-muffle-decls
-                      %processing-decls))
+                      process-muffle-decls))
 
 ;;; Given a list of LAMBDA-VARs and a variable name, return the
 ;;; LAMBDA-VAR for that name, or NIL if it isn't found. We return the
@@ -1480,10 +1474,10 @@ the stack without triggering overflow protection.")
 (defun process-extent-decl (names vars fvars kind)
   (let ((extent
           (ecase kind
-            ((dynamic-extent dynamic-extent-no-note)
+            ((dynamic-extent)
              (when *stack-allocate-dynamic-extent*
                kind))
-            ((indefinite-extent truly-dynamic-extent)
+            ((truly-dynamic-extent)
              kind))))
     (if extent
         (dolist (name names)
@@ -1499,9 +1493,10 @@ the stack without triggering overflow protection.")
                   (cond
                     ((and (typep var 'global-var) (eq (global-var-kind var) :unknown)))
                     (bound-var
-                     (if (and (leaf-extent var) (neq extent (leaf-extent var)))
+                     (if (and (leaf-dynamic-extent var)
+                              (neq extent (leaf-dynamic-extent var)))
                          (warn "Multiple incompatible extent declarations for ~S?" name)
-                         (setf (leaf-extent var) extent)))
+                         (setf (leaf-dynamic-extent var) extent)))
                     (t (compiler-notify "Ignoring free ~S declaration: ~S" kind name))))
                  (cons
                   (compiler-error "~S on symbol-macro: ~S" kind name))
@@ -1510,8 +1505,7 @@ the stack without triggering overflow protection.")
             ((and (consp name)
                   (eq (car name) 'function)
                   (null (cddr name))
-                  (valid-function-name-p (cadr name))
-                  (neq extent 'indefinite-extent))
+                  (valid-function-name-p (cadr name)))
              (let* ((fname (cadr name))
                     (bound-fun (find fname fvars
                                      :key (lambda (x)
@@ -1522,7 +1516,7 @@ the stack without triggering overflow protection.")
                (etypecase fun
                  (leaf
                   (if bound-fun
-                      (setf (leaf-extent bound-fun) extent)
+                      (setf (leaf-dynamic-extent bound-fun) extent)
                       (compiler-notify
                        "Ignoring free DYNAMIC-EXTENT declaration: ~S" name)))
                  (cons
@@ -1591,7 +1585,7 @@ the stack without triggering overflow protection.")
          :default res
          :handled-conditions (process-unmuffle-conditions-decl
                               spec (lexenv-handled-conditions res))))
-       ((dynamic-extent truly-dynamic-extent indefinite-extent dynamic-extent-no-note)
+       ((dynamic-extent truly-dynamic-extent)
         (process-extent-decl (cdr spec) vars fvars (first spec))
         res)
        ((disable-package-locks enable-package-locks)
@@ -1735,34 +1729,6 @@ the stack without triggering overflow protection.")
             lambda-list explicit-check source-form
             (when local-optimize
               (process-optimize-decl local-optimize (lexenv-policy lexenv))))))
-
-(defun %processing-decls (decls vars fvars ctran lvar binding-form-p fun)
-  (multiple-value-bind (*lexenv* result-type post-binding-lexenv)
-      (process-decls decls vars fvars :binding-form-p binding-form-p)
-    (cond ((eq result-type *wild-type*)
-           (funcall fun ctran lvar post-binding-lexenv))
-          (t
-           (let ((value-ctran (make-ctran))
-                 (value-lvar (make-lvar)))
-             (multiple-value-prog1
-                 (funcall fun value-ctran value-lvar post-binding-lexenv)
-               (let ((cast (make-cast value-lvar result-type
-                                      (lexenv-policy *lexenv*))))
-                 (link-node-to-previous-ctran cast value-ctran)
-                 (setf (lvar-dest value-lvar) cast)
-                 (use-continuation cast ctran lvar))))))))
-
-(defmacro processing-decls ((decls vars fvars ctran lvar
-                                   &optional post-binding-lexenv)
-                            &body forms)
-  (declare (symbol ctran lvar))
-  (let ((post-binding-lexenv-p (not (null post-binding-lexenv)))
-        (post-binding-lexenv (or post-binding-lexenv (gensym "LEXENV"))))
-    `(%processing-decls ,decls ,vars ,fvars ,ctran ,lvar
-                        ,post-binding-lexenv-p
-                        (lambda (,ctran ,lvar ,post-binding-lexenv)
-                          (declare (ignorable ,post-binding-lexenv))
-                          ,@forms))))
 
 ;;; Return the SPECVAR for NAME to use when we see a local SPECIAL
 ;;; declaration. If there is a global variable of that name, then

@@ -84,18 +84,16 @@
   (inst mov rdx nil-value)
   (inst mov rdi rdx)
   (inst mov rsi rdx)
-  (inst mov rsp-tn rbp-tn)
   (inst stc)
-  (inst pop rbp-tn)
+  (inst leave)
   (inst ret)
 
   ;; Note: we can get this, because the return-multiple vop doesn't
   ;; check for this case when size > speed.
   ONE-VALUE
   (loadw rdx rsi -1)
-  (inst mov rsp-tn rbp-tn)
   (inst clc)
-  (inst pop rbp-tn)
+  (inst leave)
   (inst ret)
 
   TWO-VALUES
@@ -103,9 +101,8 @@
   (loadw rdx rsi -1)
   (loadw rdi rsi -2)
   (inst mov rsi nil-value)
-  (inst mov rsp-tn rbp-tn)
   (inst stc)
-  (inst pop rbp-tn)
+  (inst leave)
   (inst ret)
 
   THREE-VALUES
@@ -113,9 +110,8 @@
   (loadw rdx rsi -1)
   (loadw rdi rsi -2)
   (loadw rsi rsi -3)
-  (inst mov rsp-tn rbp-tn)
   (inst stc)
-  (inst pop rbp-tn)
+  (inst leave)
   (inst ret))
 
 ;;;; TAIL-CALL-VARIABLE
@@ -131,7 +127,7 @@
 ;;; we actually called. We also have to compute RCX from the difference
 ;;; between RSI and the stack top.
 #-sb-assembling ; avoid "Redefinition" warning (this file is processed twice)
-(defun !prepare-for-tail-call-variable (fun temp nargs rdx rdi rsi
+(defun prepare-for-tail-call-variable (fun temp nargs rdx rdi rsi
                                         r8 r9 r10
                                         &optional jump-to-the-end)
   (assemble ()
@@ -202,7 +198,7 @@
      (:temp r8 unsigned-reg r8-offset)
      (:temp r9 unsigned-reg r9-offset)
      (:temp r10 unsigned-reg r10-offset))
-  (!prepare-for-tail-call-variable fun temp nargs rdx rdi rsi r8 r9 r10)
+  (prepare-for-tail-call-variable fun temp nargs rdx rdi rsi r8 r9 r10)
 
   (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
 
@@ -219,11 +215,11 @@
      (:temp r8 unsigned-reg r8-offset)
      (:temp r9 unsigned-reg r9-offset)
      (:temp r10 unsigned-reg r10-offset))
-  (!prepare-for-tail-call-variable fun temp nargs rdx rdi rsi r8 r9 r10 t)
+  (prepare-for-tail-call-variable fun temp nargs rdx rdi rsi r8 r9 r10 t)
 
   (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
   (inst test :byte rbx-tn lowtag-mask)
-  (inst jmp :nz (entry-point-label 'call-symbol))
+  (inst jmp :nz (make-fixup 'call-symbol :assembly-routine))
   (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
 
 #+sb-assembling
@@ -245,18 +241,22 @@
   (inst mov fun fdefn)
   (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) fdefn))
   UNDEFINED
-  (inst jmp (entry-point-label 'undefined-tramp))
+  (inst jmp (make-fixup 'undefined-tramp :assembly-routine))
   NOT-CALLABLE
   (inst cmp fun nil-value) ;; NIL doesn't have SYMBOL-WIDETAG
   (inst jmp :e undefined)
 
   (inst pop (ea n-word-bytes rbp-tn))
-  (emit-error-break nil error-trap (error-number-or-lose 'sb-kernel::object-not-callable-error)
-                    (list fun)))
+  (cerror-call nil 'sb-kernel::object-not-callable-error fun)
+  (inst push (ea n-word-bytes rbp-tn))
+  (%lea-for-lowtag-test fdefn fun fun-pointer-lowtag)
+  (inst test :byte rbx-tn lowtag-mask)
+  (inst jmp :nz (make-fixup 'call-symbol :assembly-routine))
+  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
 
 
 (define-assembly-routine (throw
-                          (:return-style :raw))
+                          (:return-style :full-call-no-return))
                          ((:arg target (descriptor-reg any-reg) rdx-offset)
                           (:arg start any-reg rbx-offset)
                           (:arg count any-reg rcx-offset)
@@ -266,7 +266,6 @@
   (declare (ignore start count bsp-temp))
 
   (load-tl-symbol-value catch *current-catch-block*)
-
   LOOP
 
   (let ((error (gen-label)))
@@ -284,17 +283,11 @@
     (inst jmp :z error))
 
   (inst cmp target (object-slot-ea catch catch-block-tag-slot 0))
-  (inst jmp :e EXIT)
+  ;; Here RAX points to catch block containing symbol pointed to by RDX.
+  (inst jmp :e (make-fixup 'unwind :assembly-routine))
 
   (loadw catch catch catch-block-previous-catch-slot)
-  (inst jmp LOOP)
-
-  EXIT
-
-  ;; Here RAX points to catch block containing symbol pointed to by RDX.
-  ;; An extra RET gets stuffed after the JMP, but oh well. You can't just change
-  ;; the :return-style to :none because that also affects the call sequence.
-  (inst jmp (entry-point-label 'unwind)))
+  (inst jmp LOOP))
 
 ;;; Simply return and enter the loop in UNWIND instead of calling
 ;;; UNWIND directly
@@ -374,68 +367,6 @@
   ;; nlx-entry expects start in RBX and count in RCX
   (inst jmp (ea (* unwind-block-entry-pc-slot n-word-bytes) block)))
 
-#+sb-assembling
-(defun ensure-thread-base-tn-loaded ()
-  #-sb-thread
-  (let ((fixup (make-fixup "all_threads" :foreign-dataref)))
-    ;; Load THREAD-BASE-TN from the all_threads. Does not need to be spilled
-    ;; to stack, because we do do not give the register allocator access to it.
-    ;; And call_into_lisp saves it as per convention, not that it matters,
-    ;; because there's no way to get back into C code anyhow.
-    #-immobile-space (inst mov thread-tn (ea fixup))
-    #+immobile-space (inst mov thread-tn (rip-relative-ea fixup))
-    (inst mov thread-tn (ea thread-tn))))
-
-;;; Perform a store to code, updating the GC card mark bit.
-;;; This has two additional complications beyond the ordinary
-;;; generational barrier:
-;;; 1. immobile code uses its own card table which maps linearly
-;;;    with the page index, unlike the dynamic space card table
-;;;    that has a different way of computing a card address.
-;;; 2. code objects are so seldom written that it behooves us to
-;;;    track within each object whether it has been written,
-;;;    thereby avoiding scanning of unwritten objects.
-;;;    This is especially important for immobile space where
-;;;    it is likely that new code will be co-located on a page
-;;;    with old code due to the non-moving allocator.
-#+sb-assembling
-(define-assembly-routine (code-header-set (:return-style :none)) ()
-  ;; stack: ret-pc, object, index, value-to-store
-  (symbol-macrolet ((object (ea 8 rsp-tn))
-                    (word-index (ea 16 rsp-tn))
-                    (newval (ea 24 rsp-tn))
-                    ;; these are declared as vop temporaries
-                    (rax rax-tn)
-                    (rdx rdx-tn)
-                    (rdi rdi-tn))
-  (ensure-thread-base-tn-loaded)
-  (pseudo-atomic ()
-    (assemble ()
-      #+immobile-space
-      (progn
-        (inst mov rax object)
-        (inst sub rax (thread-slot-ea thread-text-space-addr-slot))
-        (inst shr rax (1- (integer-length immobile-card-bytes)))
-        (inst cmp rax (thread-slot-ea thread-text-card-count-slot))
-        (inst jmp :ae try-dynamic-space)
-        (inst mov rdi (thread-slot-ea thread-text-card-marks-slot))
-        (inst bts :dword :lock (ea rdi-tn) rax)
-        (inst jmp store))
-      TRY-DYNAMIC-SPACE
-      (inst mov rax object)
-      (inst shr rax gencgc-card-shift)
-      (inst and :dword rax card-index-mask)
-      (inst mov :byte (ea gc-card-table-reg-tn rax) 0)
-      STORE
-      (inst mov rdi object)
-      (inst mov rdx word-index)
-      (inst mov rax newval)
-      ;; set 'written' flag in the code header
-      (inst or :byte :lock (ea (- 3 other-pointer-lowtag) rdi) #x40)
-      ;; store newval into object
-      (inst mov (ea (- other-pointer-lowtag) rdi rdx n-word-bytes) rax))))
-  (inst ret 24)) ; remove 3 stack args
-
 ;;; These are trampolines, but they benefit from not being in the 'tramps' file
 ;;; because they'll automatically get a vop and an assembly routine this way,
 ;;; where tramps only get the assembly routine.
@@ -446,7 +377,7 @@
     ((:arg x (descriptor-reg) rdx-offset)
      (:res r (descriptor-reg) rdx-offset))
   (progn x r)
-  (with-registers-preserved (lisp :except rdx-tn)
+  (with-registers-preserved (lisp :except rdx)
     (call-static-fun 'update-object-layout 1)))
 
 (define-assembly-routine (sb-impl::install-hash-table-lock
@@ -456,20 +387,92 @@
     ((:arg x (descriptor-reg) rdx-offset)
      (:res r (descriptor-reg) rdx-offset))
   (progn x r)
-  (with-registers-preserved (lisp :except rdx-tn)
+  (with-registers-preserved (lisp :except rdx)
     (call-static-fun 'sb-impl::install-hash-table-lock 1)))
 
-;;; From a perspective of reducing code bloat, this asm routine does not merit
-;;; being one at all. A vop would suffice, because it's a single-use vop.
-;;; However the WITH-REGISTERS-PRESERVED macro seems to think that it is utilized
-;;; only by asm code in *ASSEMBLER-ROUTINES*. I had trouble with it otherwise.
-(define-assembly-routine (alloc-code (:return-style :raw))
-    ((:arg c-arg1 (signed-reg) rdi-offset)
-     (:arg c-arg2 (signed-reg) rsi-offset)
-     (:res res (descriptor-reg) rdx-offset))
-  (progn c-arg1 c-arg2) ; "use" the args
-  ;; Don't preserve the register which holds the lisp return value
-  (with-registers-preserved (c :except rdx-tn)
-    (pseudo-atomic ()
-      (inst call (make-fixup "alloc_code_object" :foreign)))
-    (move res rax-tn)))
+(define-assembly-routine
+    (return-values-list (:return-style :none))
+    ((:arg list descriptor-reg rax-offset)
+
+     (:temp rbx unsigned-reg rbx-offset)
+     (:temp rdx unsigned-reg rdx-offset)
+     (:temp rdi unsigned-reg rdi-offset)
+     (:temp rsi unsigned-reg rsi-offset)
+     (:temp count unsigned-reg rcx-offset)
+     (:temp null unsigned-reg r8-offset)
+     (:temp temp unsigned-reg r9-offset)
+     (:temp return unsigned-reg r10-offset))
+  (flet ((check (label)
+           (assemble ()
+             (%test-lowtag list temp skip nil list-pointer-lowtag)
+             (cerror-call nil 'bogus-arg-to-values-list-error list)
+             (inst jmp label)
+             skip)))
+    (assemble ()
+      (inst mov null nil-value)
+      (%test-lowtag list temp ZERO-VALUES-ERROR t list-pointer-lowtag)
+      (inst cmp list null)
+      (inst jmp :e ZERO-VALUES)
+
+      (loadw rdx list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null)
+      (inst jmp :ne CONTINUE)
+      ONE-VALUE
+      (inst clc)
+      (inst leave)
+      (inst ret)
+
+      CONTINUE
+      (check ONE-VALUE)
+
+      (inst mov count (fixnumize 2))
+      (loadw rdi list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null)
+      (inst jmp :e TWO-VALUES)
+      (check TWO-VALUES)
+
+      (inst mov count (fixnumize 3))
+      (loadw rsi list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null)
+      (inst jmp :e THREE-VALUES)
+      (check THREE-VALUES)
+
+      ;; As per the calling convention RBX is expected to point at the SP
+      ;; before the stack frame.
+      (inst lea rbx (ea (* sp->fp-offset n-word-bytes) rbp-tn))
+
+      (inst mov return (ea (frame-byte-offset return-pc-save-offset) rbp-tn))
+      (inst lea rsp-tn (ea (frame-byte-offset sp->fp-offset) rbp-tn))
+      (inst mov rbp-tn (ea (frame-byte-offset ocfp-save-offset) rbp-tn))
+
+      LOOP
+      (inst add count (fixnumize 1))
+      (pushw list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (check DONE)
+      (inst cmp list nil-value)
+      (inst jmp :ne LOOP)
+
+      DONE
+      (inst stc)
+      (inst push return)
+      (inst ret)
+
+      ZERO-VALUES-ERROR
+      (cerror-call nil 'bogus-arg-to-values-list-error list)
+      ZERO-VALUES
+      (zeroize count)
+      (inst mov rdx null)
+      (inst mov rdi null)
+
+      TWO-VALUES
+      (inst mov rsi null)
+
+      THREE-VALUES
+      (inst lea rbx (ea (* sp->fp-offset n-word-bytes) rbp-tn))
+      (inst stc)
+      (inst leave)
+      (inst ret))))

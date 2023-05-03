@@ -440,7 +440,7 @@ scav_fun_pointer(lispobj *where, lispobj object)
             /* funcallable-instance might have all descriptor slots
              * except for the trampoline, which points to an asm routine.
              * This is not true for self-contained trampoline GFs though. */
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#ifdef LISP_FEATURE_EXECUTABLE_FUNINSTANCES
             page_type = PAGE_TYPE_CODE, region = code_region;
 #else
             struct layout* layout = (void*)native_pointer(funinstance_layout(FUNCTION(object)));
@@ -460,7 +460,7 @@ scav_fun_pointer(lispobj *where, lispobj object)
         }
         copy = gc_copy_object(object, 1+SHORT_BOXED_NWORDS(*fun), region, page_type);
         gc_assert(copy != object);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#ifdef LISP_FEATURE_EXECUTABLE_FUNINSTANCES
         if (widetag == FUNCALLABLE_INSTANCE_WIDETAG) {
             struct funcallable_instance* old = (void*)native_pointer(object);
             struct funcallable_instance* new = (void*)native_pointer(copy);
@@ -955,18 +955,22 @@ scav_funinstance(lispobj *where, lispobj header)
     struct layout * layout = LAYOUT(layoutptr);
     scav1(&layout->friend, layout->friend);
 #else
+    // This handles compact or non-compact layouts with indifference.
     lispobj old = layoutptr;
     scav1(&layoutptr, layoutptr);
     if (layoutptr != old) funinstance_layout(where) = layoutptr;
 #endif
     struct funcallable_instance* fin = (void*)where;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    // payload: entry addr, 2 raw words, implementation function
-    scavenge(&fin->function, nslots-3);
+#ifdef LISP_FEATURE_EXECUTABLE_FUNINSTANCES
+    lispobj* firstword = &fin->function;
 #else
-    // payload: trampoline entry addr, layout, implementation function, ...
-    scavenge(&fin->function, nslots-2);
+    lispobj* firstword = &fin->layout;
 #endif
+    // This will potentially see the layout "again" if it appears as an
+    // ordinary descriptor slot. Thankfully it's not a problem for gencgc
+    // to process a slot twice.
+    lispobj* lastword = where + (nslots+1); // exclusive upper bound
+    scavenge(firstword, lastword - firstword);
     return 1 + (nslots | 1);
 }
 
@@ -1500,6 +1504,20 @@ static inline boolean stable_eql_hash_p(lispobj obj)
    (!hashvec ? rehash || !eql_hashing || !stable_eql_hash_p(newkey) : \
     hashvec[hv_index] == MAGIC_HASH_VECTOR_VALUE))
 
+
+/* The standard pointer tagging scheme admits an optimization that cuts the number
+ * of instructions down when testing for either 'a' or 'b' (or both) being a tagged
+ * pointer, because the bitwise OR of two pointers is considered a pointer.
+ * This trick is inadmissible for the PPC64 lowtag arrangement.
+ *
+ * NOTE: this is allowed to return a false positive. e.g. take the fixnum 1
+ * (internally #b10) and single-float-widetag = 0x19. (Assume 64-bit words)
+ * The bitwise OR is (#b11001 | #b10) = #b11011 which looks like a pointer */
+#ifdef LISP_FEATURE_PPC64
+#define at_least_one_pointer_p(a,b) (is_lisp_pointer(a) || is_lisp_pointer(b))
+#else
+#define at_least_one_pointer_p(a,b) (is_lisp_pointer(a|b))
+#endif
 
 /* Scavenge the "real" entries in the hash-table kv vector. The vector element
  * at index 0 bounds the scan. The element at length-1 (the hash table itself)

@@ -22,7 +22,8 @@
 #include "genesis/primitive-objects.h"
 #include "genesis/hash-table.h"
 #include "genesis/package.h"
-#include "brothertree.h"
+#include "genesis/split-ordered-list.h"
+#include "genesis/brothertree.h"
 #include "forwarding-ptr.h"
 
 lispobj *
@@ -224,11 +225,11 @@ uword_t brothertree_find_eql(uword_t key, lispobj tree)
             tree = ((struct unary_node*)INSTANCE(tree))->child;
         } else {
             struct binary_node* node = (void*)INSTANCE(tree);
-            if (node->key == key) return tree;
+            if (node->uw_key == key) return tree;
             lispobj l = NIL, r = NIL;
             // unless a fringe node, read the left and right pointers
-            if (!fringe_node_p(node)) l = node->left, r = node->right;
-            if (key < node->key) tree = l; else tree = r;
+            if (!fringe_node_p(node)) l = node->_left, r = node->_right;
+            if (key < node->uw_key) tree = l; else tree = r;
         }
     }
     return 0;
@@ -244,11 +245,11 @@ uword_t brothertree_find_lesseql(uword_t key, lispobj tree)
             tree = ((struct unary_node*)INSTANCE(tree))->child;
         } else {
             struct binary_node* node = (void*)INSTANCE(tree);
-            if (node->key == key) return tree;
+            if (node->uw_key == key) return tree;
             lispobj l = NIL, r = NIL;
             // unless a fringe node, read the left and right pointers
-            if (!fringe_node_p(node)) l = node->left, r = node->right;
-            if (key < node->key) tree = l; else { best = tree; tree = r; }
+            if (!fringe_node_p(node)) l = node->_left, r = node->_right;
+            if (key < node->uw_key) tree = l; else { best = tree; tree = r; }
         }
     }
     return best;
@@ -264,11 +265,11 @@ uword_t brothertree_find_greatereql(uword_t key, lispobj tree)
             tree = ((struct unary_node*)INSTANCE(tree))->child;
         } else {
             struct binary_node* node = (void*)INSTANCE(tree);
-            if (node->key == key) return tree;
+            if (node->uw_key == key) return tree;
             lispobj l = NIL, r = NIL;
             // unless a fringe node, read the left and right pointers
-            if (!fringe_node_p(node)) l = node->left, r = node->right;
-            if (key > node->key) tree = r; else { best = tree; tree = l; }
+            if (!fringe_node_p(node)) l = node->_left, r = node->_right;
+            if (key > node->uw_key) tree = r; else { best = tree; tree = l; }
         }
     }
     return best;
@@ -322,3 +323,41 @@ int bsearch_greatereql_uint32(uint32_t item, uint32_t* array, int nelements)
     return -1;
 }
 #endif
+
+/* Find in an address-based split-ordered list
+ * Unlike the lisp algorithm, this does not "assist" a pending deletion
+ * by completing it with compare-and-swap - this loop simply ignores
+ * any deleted nodes that haven't been snipped out yet. */
+struct split_ordered_list_node*
+split_ordered_list_find(struct split_ordered_list* solist,
+                        lispobj key)
+{
+    struct cons* bins_and_shift = CONS(solist->bins);
+    struct vector* bins = VECTOR(bins_and_shift->car);
+    int shift = fixnum_value(bins_and_shift->cdr);
+    // see MULTIPLICATIVE-HASH in src/code/solist.lisp
+#ifdef LISP_FEATURE_64_BIT
+    lispobj prod = 11400714819323198485UL * key;
+#else
+    lispobj prod = 2654435769U * key;
+#endif
+    lispobj full_hash = (prod >> (1+N_FIXNUM_TAG_BITS)) | 1;
+    int bin_index = full_hash >> shift;
+    lispobj nodeptr = bins->data[bin_index];
+    while ((nodeptr & WIDETAG_MASK) == UNBOUND_MARKER_WIDETAG) {
+        nodeptr = bins->data[--bin_index];
+    }
+    struct split_ordered_list_node* node = (void*)native_pointer(nodeptr);
+    lispobj hash_as_fixnum = make_fixnum(full_hash);
+    while (1) {
+        if (node->node_hash == hash_as_fixnum) { // possible hit
+            if (node->so_key == key && // looking good
+                lowtag_of(node->_node_next) != 0) { // node is not deleted, great
+                return node;
+            }
+        }
+        if (node->node_hash > hash_as_fixnum ||
+            node->_node_next == LFLIST_TAIL_ATOM) return NULL;
+        node = (void*)native_pointer(node->_node_next);
+    }
+}

@@ -131,6 +131,7 @@ run in any thread.")
          nil)
         (t
          (flet ((perform-gc ()
+                  (declare (sb-c::tlab :system)) ; for *gc-epoch*
                   ;; Called from WITHOUT-GCING and WITHOUT-INTERRUPTS
                   ;; after the world has been stopped, but it's an
                   ;; awkwardly long piece of code to nest so deeply.
@@ -221,7 +222,8 @@ run in any thread.")
   ;; which is an arbitrary one. If those actions aquire any locks, or are sensitive
   ;; to the state of *ALLOW-WITH-INTERRUPTS*, any deadlocks of what-have-you
   ;; are user error. Hooks need to be sufficiently uncomplicated as to be harmless.
-  (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))
+  (sb-vm:without-arena "post-gc"
+    (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))
 
 #-sb-thread
 (defun post-gc ()
@@ -396,7 +398,7 @@ statistics are appended to it."
     (array generation #.(1+ sb-vm:+pseudo-static-generation+)))
 
 ;;; Why is PAGE-INDEX-T in SB-KERNEL but PAGE and the page table are in SB-VM?
-(define-alien-type (struct sb-vm::page)
+(define-alien-type nil
     (struct sb-vm::page
             ;; To cut down the size of the page table, the scan_start_offset
             ;; - a/k/a "start" - is measured in 4-byte integers regardless

@@ -6,6 +6,10 @@
 (defvar *compile-files-p* nil)
 (load (merge-pathnames "src/cold/warm.lisp" *load-pathname*))
 
+(with-open-file (stream "output/asm-routines.txt" :direction :output
+                        :if-does-not-exist :create :if-exists :supersede)
+  (sb-c:dis sb-fasl:*assembler-routines* stream))
+
 ;; sb-xref-for-internals is actively harmful to tree-shaking.
 ;; Remove some symbols to make the hide-packages test pass.
 #+sb-xref-for-internals
@@ -235,7 +239,8 @@
        :all)
       (when wps
         (dolist (wp wps)
-          (format t "Found string ~S~%" (weak-pointer-value wp)))
+          (sb-int:binding* ((v (weak-pointer-value wp) :exit-if-null))
+            (format t "Found string ~S~%" v)))
         (warn "Potential problem with format-control strings.
 Please check that all strings which were not recognizable to the compiler
 (as the first argument to WARN, etc.) are wrapped in SB-FORMAT:TOKENS"))

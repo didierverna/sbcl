@@ -1297,7 +1297,7 @@ core and return a descriptor to it."
 
 (defvar *vacuous-slot-table*)
 (defvar *cold-layout-gspace* (or #+metaspace '*read-only*
-                                 #+immobile-space '*immobile-fixedobj*
+                                 #+compact-instance-header '*immobile-fixedobj*
                                  '*dynamic*))
 (declaim (ftype (function (symbol layout-depthoid integer index integer descriptor)
                           descriptor)
@@ -1877,7 +1877,8 @@ core and return a descriptor to it."
   ;; but tagged with INSTANCE-POINTER-LOWTAG.
   (setq *lflist-tail-atom*
         (if core-file-name
-            (allocate-struct-of-type 'sb-lockless::list-node *static*)
+            (write-slots (allocate-struct-of-type 'sb-lockless::list-node *static*)
+                         :%node-next nil)
             (let ((words (+ 1 #-compact-instance-header 1)))
               (allocate-struct words (make-fixnum-descriptor 0) *static*))))
 
@@ -1901,10 +1902,7 @@ core and return a descriptor to it."
                          sb-vm:symbol-value-slot
                          (ash (cold-layout-descriptor-bits 'function) 32))
 
-  #+metaspace
-  (cold-set '**primitive-object-layouts**
-            (allocate-vector sb-vm:simple-vector-widetag 256 256 *read-only*))
-  #+(and immobile-space (not metaspace))
+  #+compact-instance-header
   (cold-set '**primitive-object-layouts**
             (let ((filler
                    (make-random-descriptor
@@ -2939,9 +2937,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
         (let ((entrypoint (lookup-assembler-reference (car item))))
           (write-wordindexed/raw asm-code (+ base index 1) entrypoint)
           #+immobile-space
-          (unless (member (car item) ; these can't be called from compiled Lisp
-                          '(sb-vm::fpr-save sb-vm::save-xmm sb-vm::save-ymm
-                            sb-vm::fpr-restore sb-vm::restore-xmm sb-vm::restore-ymm))
+          (progn
             (aver (< index (cold-vector-len *asm-routine-vector*)))
             (write-wordindexed/raw *asm-routine-vector*
                                    (+ sb-vm:vector-data-offset index) entrypoint)))
@@ -2953,6 +2949,10 @@ Legal values for OFFSET are -4, -8, -12, ..."
   (pop-stack)
   (pop-stack)
   (pop-stack)
+  (values))
+
+(define-cold-fop (fop-note-full-calls)
+  (sb-c::accumulate-full-calls (host-object-from-core (pop-stack)))
   (values))
 
 ;;; Target variant of this is defined in 'target-load'
@@ -2968,7 +2968,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
     (when (>= index end) (return))
     (binding* (((offset kind flavor)
                 (!unpack-fixup-info (descriptor-integer (svref fixups (incf index)))))
-               (name (cond ((member flavor '(:code-object :gc-barrier)) nil)
+               (name (cond ((member flavor '(:code-object :card-table-index-mask)) nil)
                            (t (svref fixups (incf index)))))
                (string
                 (when (and (descriptor-p name)
@@ -2991,7 +2991,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
               (cold-layout-id (gethash (descriptor-bits (->layout name))
                                        *cold-layout-by-addr*)))
              ;; The machine-dependent code decides how to patch in 'nbits'
-             #+gencgc (:gc-barrier sb-vm::gencgc-card-table-index-nbits)
+             #+gencgc (:card-table-index-mask sb-vm::gencgc-card-table-index-nbits)
              (:immobile-symbol
               ;; an interned symbol is represented by its host symbol,
               ;; but an uninterned symbol is a descriptor.
@@ -3466,38 +3466,45 @@ lispobj symbol_package(struct symbol*);~%" (genesis-header-prefix))
       (output-c)
       (format t "~%#endif /* __ASSEMBLER__ */~%"))))
 
-(defun write-structure-object (dd *standard-output* &optional structname)
-  (flet ((cstring (designator) (c-name (string-downcase designator))))
-    (format t "#ifndef __ASSEMBLER__~2%")
-    (format t "#include ~S~%" (lispobj-dot-h))
-    (format t "struct ~A {~%" (or structname (cstring (dd-name dd))))
-    (format t "    lispobj header; // = word_0_~%")
-    ;; "self layout" slots are named '_layout' instead of 'layout' so that
-    ;; classoid's expressly declared layout isn't renamed as a special-case.
-    #-compact-instance-header (format t "    lispobj _layout;~%")
-    ;; Output exactly the number of Lisp words consumed by the structure,
-    ;; no more, no less. C code can always compute the padded length from
-    ;; the precise length, but the other way doesn't work.
-    (let ((names
-           (coerce (loop for i from sb-vm:instance-data-start below (dd-length dd)
-                         collect (list (format nil "word_~D_" (1+ i))))
-                   'vector)))
-      (dolist (slot (dd-slots dd))
-        (let ((cell (aref names (- (dsd-index slot) sb-vm:instance-data-start)))
-              (name (cstring (dsd-name slot))))
-          (case (dsd-raw-type slot)
-            ((t) (rplaca cell name))
-            ;; remind C programmers which slots are untagged
-            (sb-vm:signed-word (rplaca cell (format nil "sw_~a" name)))
-            (sb-vm:word (rplaca cell (format nil "uw_~a" name)))
-            (t (rplacd cell name)))))
-      (loop for slot across names
-            do (format t "    lispobj ~A;~@[ // ~A~]~%"
-                       ;; reserved word
-                       (if (string= (car slot) "default") "_default" (car slot))
-                       (cdr slot))))
-    (format t "};~%")
-    (format t "~%#endif /* __ASSEMBLER__ */~2%")))
+(defun write-structure-object (dd *standard-output* &optional structure-tag)
+  (labels
+      ((cstring (designator) (c-name (string-downcase designator)))
+       (output (dd structure-tag)
+         (format t "struct ~A {~%" structure-tag)
+         (format t "    lispobj header; // = word_0_~%")
+         ;; "self layout" slots are named '_layout' instead of 'layout' so that
+         ;; classoid's expressly declared layout isn't renamed as a special-case.
+         #-compact-instance-header (format t "    lispobj _layout;~%")
+         ;; Output exactly the number of Lisp words consumed by the structure,
+         ;; no more, no less. C code can always compute the padded length from
+         ;; the precise length, but the other way doesn't work.
+         (let ((names
+                (coerce (loop for i from sb-vm:instance-data-start below (dd-length dd)
+                              collect (list (format nil "word_~D_" (1+ i))))
+                        'vector)))
+           (dolist (slot (dd-slots dd))
+             (let ((cell (aref names (- (dsd-index slot) sb-vm:instance-data-start)))
+                   (name (cstring (dsd-name slot))))
+               (case (dsd-raw-type slot)
+                 ((t) (rplaca cell name))
+                 ;; remind C programmers which slots are untagged
+                 (sb-vm:signed-word (rplaca cell (format nil "sw_~a" name)))
+                 (sb-vm:word (rplaca cell (format nil "uw_~a" name)))
+                 (t (rplacd cell name)))))
+           (loop for slot across names
+                 do (format t "    lispobj ~A;~@[ // ~A~]~%"
+                            ;; reserved word
+                            (if (string= (car slot) "default") "_default" (car slot))
+                            (cdr slot))))
+         (format t "};~%")))
+  (format t "#ifndef __ASSEMBLER__~2%")
+  (format t "#include ~S~%" (lispobj-dot-h))
+  (output dd (or structure-tag (cstring (dd-name dd))))
+  (when (eq (dd-name dd) 'sb-lockless::split-ordered-list)
+    (terpri)
+    (output (wrapper-info (find-layout 'sb-lockless::so-data-node))
+            "split_ordered_list_node"))
+  (format t "~%#endif /* __ASSEMBLER__ */~2%")))
 
 (defun write-thread-init (stream)
   (dolist (binding sb-vm::per-thread-c-interface-symbols)
@@ -3529,7 +3536,7 @@ lispobj symbol_package(struct symbol*);~%" (genesis-header-prefix))
       (format stream "#define ~A_tlsindex 0x~X~%"
               c-symbol (ensure-symbol-tls-index symbol))))
   ;; This #define is relative to the start of the fixedobj space to allow heap relocation.
-  #+(or immobile-space metaspace)
+  #+compact-instance-header
   (format stream "~@{#define LAYOUT_OF_~A (lispobj)(~A_SPACE_START+0x~x)~%~}"
           "FUNCTION"
           #+metaspace "READ_ONLY" #-metaspace "FIXEDOBJ"
@@ -4196,6 +4203,12 @@ III. initially undefined function references (alphabetically):
         (out-to "hash-table"
           (write-structure-object (wrapper-info (find-layout 'sb-impl::general-hash-table))
                                   stream "hash_table"))
+        (out-to "brothertree"
+          (write-structure-object (wrapper-info (find-layout 'sb-brothertree::unary-node))
+                                  stream "unary_node")
+          (write-structure-object (wrapper-info (find-layout 'sb-brothertree::binary-node))
+                                  stream "binary_node")
+          (format stream "extern uword_t brothertree_find_lesseql(uword_t key, lispobj tree);~%"))
         (dolist (class '(defstruct-description defstruct-slot-description
                          package
                          ;; FIXME: probably these should be external?

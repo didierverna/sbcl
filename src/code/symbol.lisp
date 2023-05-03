@@ -239,6 +239,7 @@ distinct from the global value. Can also be SETF."
 (defun %ensure-plist-holder (symbol info)
   ;; Invoked only when SYMBOL is known to be a symbol.
   (declare (optimize (safety 0)))
+  (declare (sb-c::tlab :system)) ; holder must be in the heap
   (if (consp info) ; it's fine to call this with a cell already installed
       info ; all done
       (let (newcell)
@@ -383,8 +384,14 @@ distinct from the global value. Can also be SETF."
     (logior-array-flags name sb-vm:+vector-shareable+)) ; Set "logically read-only" bit
   (let ((symbol
          (truly-the symbol
-          #+immobile-symbols (sb-vm::make-immobile-symbol name)
+          ;; If no immobile-space, easy: all symbols go in dynamic-space
           #-immobile-space (sb-vm::%%make-symbol name)
+          ;; If #+immobile-symbols, then uninterned symbols go in dynamic space, but
+          ;; interned symbols go in immobile space. Good luck IMPORTing an uninterned symbol-
+          ;; it'll work at least superficially, but if used as a code constant, the symbol's
+          ;; address may violate the assumption that it's an imm32 operand.
+          #+immobile-symbols
+          (if (eql kind 0) (sb-vm::%%make-symbol name) (sb-vm::make-immobile-symbol name))
           #+(and immobile-space (not immobile-symbols))
           (if (or (eql kind 1) ; keyword
                   (and (eql kind 2) ; random interned symbol
@@ -393,7 +400,9 @@ distinct from the global value. Can also be SETF."
                        (char= (char name (1- (length name))) #\*)))
               (sb-vm::make-immobile-symbol name)
               (sb-vm::%%make-symbol name)))))
-    (%set-symbol-package symbol nil)
+    ;; Compact-symbol (which is equivalent to #+64-bit) has the package already NIL
+    ;; because the PACKAGE-ID-BITS field defaults to 0.
+    #-compact-symbol (%set-symbol-package symbol nil)
     symbol))
 
 (defun get (symbol indicator &optional (default nil))
@@ -415,6 +424,7 @@ distinct from the global value. Can also be SETF."
 (defun %put (symbol indicator value)
   "The VALUE is added as a property of SYMBOL under the specified INDICATOR.
   Returns VALUE."
+  (declare (sb-c::tlab :system))
   (do ((pl (symbol-plist symbol) (cddr pl)))
       ((endp pl)
        (setf (symbol-plist symbol)
@@ -461,6 +471,7 @@ distinct from the global value. Can also be SETF."
           ((eq (car plist) indicator)
            (return (cadr plist))))))
 
+;;; Note: this will cons in an arena if you're using one.
 (defun %putf (place property new-value)
   (declare (type list place))
   (do ((plist place (cddr plist)))
@@ -491,12 +502,14 @@ distinct from the global value. Can also be SETF."
   nor fbound and has no properties, else it has a copy of SYMBOL's
   function, value and property list."
   (declare (type symbol symbol))
+  (declare (sb-c::tlab :system)) ; heap-cons the property list if copying it
   (setq new-symbol (make-symbol (symbol-name symbol)))
   (when copy-props
     (%set-symbol-value new-symbol
                        (%primitive sb-c:fast-symbol-value symbol))
-    (setf (symbol-plist new-symbol)
-          (copy-list (symbol-plist symbol)))
+    (locally (declare (optimize speed)) ; will inline COPY-LIST
+      (setf (symbol-plist new-symbol)
+            (copy-list (symbol-plist symbol))))
     (when (fboundp symbol)
       (setf (symbol-function new-symbol) (symbol-function symbol))))
   new-symbol)

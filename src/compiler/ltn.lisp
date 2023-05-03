@@ -100,6 +100,14 @@
   (declare (type lvar lvar))
   (ir2-lvar-primitive-type (lvar-info lvar)))
 
+;;; Return true if a constant LEAF is of a type which we can legally
+;;; directly reference in code. Named constants with arbitrary pointer
+;;; values cannot, since we must preserve EQLness.
+(defun legal-immediate-constant-p (leaf)
+  (declare (type constant leaf))
+  (or (not (leaf-has-source-name-p leaf))
+      (sb-xc:typep (constant-value leaf) '(or symbol number character))))
+
 ;;; If LVAR is used only by a REF to a leaf that can be delayed, then
 ;;; return the leaf, otherwise return NIL.
 (defun lvar-delayed-leaf (lvar)
@@ -615,7 +623,7 @@
 ;;; before we run out of restrictions, then we only succeed if the
 ;;; leftover restrictions are *. If we run out of restrictions before
 ;;; we run out of result types, then we always win.
-(defun template-results-ok (template result-type)
+(defun template-results-ok (template result-type &optional single-value-p)
   (declare (type template template)
            (type ctype result-type))
   (when (template-more-results-type template)
@@ -623,19 +631,28 @@
   (let ((types (template-result-types template)))
     (cond
      ((values-type-p result-type)
-      (do ((ltypes (append (args-type-required result-type)
-                           (args-type-optional result-type))
-                   (rest ltypes))
-           (types types (rest types)))
-          ((null ltypes)
-           (dolist (type types t)
-             (unless (eq type '*)
-               (return nil))))
-        (when (null types) (return t))
-        (let ((type (first types)))
-          (unless (operand-restriction-ok type
-                                          (primitive-type (first ltypes)))
-            (return nil)))))
+      (if (and single-value-p
+               (let ((optional (vop-info-optional-results template)))
+                 (and optional
+                      (not (eql (car optional) 0))
+                      (= (length optional)
+                         (1- (length types))))))
+          (operand-restriction-ok (car types)
+                                  (primitive-type (or (car (args-type-required result-type))
+                                                      (car (args-type-optional result-type)))))
+          (do ((ltypes (append (args-type-required result-type)
+                               (args-type-optional result-type))
+                       (rest ltypes))
+               (types types (rest types)))
+              ((null ltypes)
+               (dolist (type types t)
+                 (unless (eq type '*)
+                   (return nil))))
+            (when (null types) (return t))
+            (let ((type (first types)))
+              (unless (operand-restriction-ok type
+                                              (primitive-type (first ltypes)))
+                (return nil))))))
      (types
       (operand-restriction-ok (first types) (primitive-type result-type)))
      (t t))))
@@ -675,7 +692,7 @@
                           (immediately-used-p (if-test dest) call))
                      (values t nil)
                      (values nil :conditional)))))
-          ((template-results-ok template dtype)
+          ((template-results-ok template dtype (lvar-single-value-p (node-lvar call)))
            (values t nil))
           (t
            (values nil :result-types)))))

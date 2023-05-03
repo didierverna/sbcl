@@ -56,6 +56,17 @@
          (entry-info-closure-tn (lambda-info thing))))
       (bug "~@<~2I~_~S ~_not found in ~_~S~:>" thing env)))
 
+;;; If LEAF already has a constant TN, return that, otherwise make a
+;;; TN for it.
+(defun constant-tn (leaf)
+  (declare (type constant leaf))
+  ;; Anonymize the constant for things we never want to dump by name
+  ;; (freely coalescible objects) now so that we don't get duplicate
+  ;; constants in the compiled component.
+  (make-constant-tn (if (legal-immediate-constant-p leaf)
+                        (find-constant (constant-value leaf))
+                        leaf)))
+
 ;;; Return a TN that represents the value of LEAF, or NIL if LEAF
 ;;; isn't directly represented by a TN. ENV is the environment that
 ;;; the reference is done in.
@@ -65,14 +76,14 @@
     (lambda-var
      (unless (lambda-var-indirect leaf)
        (find-in-environment leaf env)))
-    (constant (make-constant-tn leaf))
+    (constant (constant-tn leaf))
     (t nil)))
 
 ;;; This is used to conveniently get a handle on a constant TN during
 ;;; IR2 conversion. It returns a constant TN representing the Lisp
 ;;; object VALUE.
 (defun emit-constant (value)
-  (make-constant-tn (find-constant value)))
+  (constant-tn (find-constant value)))
 
 ;;; Convert a REF node. The reference must not be delayed.
 (defun ir2-convert-ref (node block)
@@ -99,7 +110,7 @@
                   (vop ancestor-frame-ref node block tn (leaf-info leaf) res))))
            (t (emit-move node block tn res)))))
       (constant
-       (move-lvar-result node block (list (make-constant-tn leaf)) lvar)
+       (move-lvar-result node block (list (constant-tn leaf)) lvar)
        (return-from ir2-convert-ref))
       (functional
        (ir2-convert-closure node block leaf res))
@@ -213,9 +224,7 @@
            (type tn res))
   (aver (not (eql (functional-kind functional) :deleted)))
   (unless (leaf-info functional)
-    (setf (leaf-info functional)
-          (make-entry-info :name
-                           (functional-debug-name functional))))
+    (setf (leaf-info functional) (make-entry-info)))
   (let ((closure (etypecase functional
                    (clambda
                     (assertions-on-ir2-converted-clambda functional)
@@ -291,18 +300,20 @@
                   (loop for what in closure and n from 0 do
                     (if (lambda-p what)
                         (unless (eq (functional-kind what) :deleted)
-                          (delayed (list tn (find-in-environment what env) n)))
+                          (delayed (list tn (find-in-environment what env) n
+                                         leaf-dx-p)))
                         (unless (and (lambda-var-p what)
                                      (null (leaf-refs what)))
                           (let ((initial-value (closure-initial-value what env nil)))
                             (if initial-value
-                                (vop closure-init node ir2-block tn initial-value n)
+                                (vop closure-init node ir2-block tn initial-value n
+                                     leaf-dx-p)
                                 ;; An initial-value of NIL means to
                                 ;; stash the frame pointer... which
                                 ;; requires a different VOP.
                                 (vop closure-init-from-fp node ir2-block tn n))))))))))))
-      (loop for (tn what n) in (delayed)
-            do (vop closure-init node ir2-block tn what n))))
+      (loop for (tn what n leaf-dx-p) in (delayed)
+            do (vop closure-init node ir2-block tn what n leaf-dx-p))))
   (values))
 
 ;;; Convert a SET node. If the NODE's LVAR is annotated, then we also
@@ -1310,27 +1321,19 @@
       (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
                                   (fun-lexically-notinline-p fname))))
              (inlineable-bit (if inlineable-p 1 0))
-             (cell (info :function :emitted-full-calls fname)))
+             (cell (get-emitted-full-calls fname)))
         (if (not cell)
             ;; The low bit indicates whether any not-NOTINLINE call was seen.
             ;; The next-lowest bit is magic. Refer to %COMPILER-DEFMACRO
             ;; and WARN-IF-INLINE-FAILED/CALL for the pertinent logic.
-            (setf cell (list (logior 4 inlineable-bit))
-                  (info :function :emitted-full-calls fname) cell)
-            (incf (car cell) (+ 4 (if (oddp (car cell)) 0 inlineable-bit))))
+            (setf cell (logior 4 inlineable-bit))
+            (incf cell (+ 4 (if (oddp cell) 0 inlineable-bit))))
+        (setf (get-emitted-full-calls fname) cell)
         ;; If the full call was wanted, don't record anything.
         ;; (This was originally for debugging SBCL self-compilation)
         (when inlineable-p
           (unless *failure-p*
-            (warn-if-inline-failed/call fname (node-lexenv node) cell))
-          (case *track-full-called-fnames*
-            (:detailed
-             (when (boundp '*compile-file-pathname*)
-               (pushnew *compile-file-pathname* (cdr cell)
-                        :test #'equal)))
-            (:very-detailed
-             (pushnew (component-name *component-being-compiled*)
-                      (cdr cell) :test #'equalp))))))
+            (warn-if-inline-failed/call fname (node-lexenv node) cell)))))
 
     ;; Special mode, usually only for the cross-compiler
     ;; and only with the feature enabled.

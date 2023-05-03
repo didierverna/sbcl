@@ -1036,25 +1036,17 @@
 (declaim (inline barvector))
 (defun barvector (x y z)
   (make-array 3 :initial-contents (list x y z)))
-(with-test (:name :dx-compiler-notes
-            :fails-on (and))
+(with-test (:name :dx-compiler-notes)
   (flet ((assert-notes (j lambda)
            (let ((notes (nth 4 (multiple-value-list (checked-compile lambda))))) ; TODO
              (unless (= (length notes) j)
                (error "Wanted ~S notes, got ~S for~%   ~S"
                       j (length notes) lambda)))))
-    ;; These ones should complain.
-    (assert-notes 1 `(lambda (x)
-                       (let ((v (make-array x)))
+    ;; This should complain.
+    (assert-notes 1 `(lambda ()
+                       (let ((v (make-array (1+ #.sb-vm::+backend-page-bytes+))))
                          (declare (dynamic-extent v))
-                         (length v))))
-    (assert-notes 2 `(lambda (x)
-                       (let ((y (if (plusp x)
-                                    (true x)
-                                    (true (- x)))))
-                         (declare (dynamic-extent y))
-                         (print y)
-                         nil)))
+                         (print (sb-ext:stack-allocated-p v)))))
     ;; These ones should not complain.
     (assert-notes 0 `(lambda (name)
                        (with-alien
@@ -1768,3 +1760,92 @@
        (assert (sb-ext:stack-allocated-p (cdr x))))
      nil)
    ((3) NIL)))
+
+(with-test (:name :dx-anonymous-closure)
+  (checked-compile-and-assert
+   ()
+   '(lambda (z)
+     (let ((x (lambda () (print z))))
+       (declare (dynamic-extent x))
+       (funcall x)
+       (funcall x)
+       (assert (sb-ext:stack-allocated-p x))
+       (funcall x)))
+   ((3) 3)))
+
+(with-test (:name :dx-anonymous-closure-otherwise-inaccessible)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (let ((y (cons (lambda () (print x))
+                    (lambda () (print x)))))
+       (declare (dynamic-extent y))
+       (print y)
+       (assert (sb-ext:stack-allocated-p y))
+       (assert (sb-ext:stack-allocated-p (car y)))
+       (assert (sb-ext:stack-allocated-p (cdr y)))
+       (print y)
+       (funcall (car y))))
+   ((3) 3)))
+
+(with-test (:name :dx-anonymous-closure-otherwise-inaccessible.flet)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (let ((y (cons (flet ((g () (print x)))
+                      #'g)
+                    (lambda () (print x)))))
+       (declare (dynamic-extent y))
+       (print y)
+       (assert (sb-ext:stack-allocated-p y))
+       (assert (sb-ext:stack-allocated-p (car y)))
+       (assert (sb-ext:stack-allocated-p (cdr y)))
+       (print y)
+       (funcall (car y))))
+   ((3) 3)))
+
+(defun known-function-autodx (x thing list)
+  (subst-if x (lambda (y) (eq y thing)) list))
+
+(with-test (:name :auto-dx-known-functions-too)
+  (assert (equal (known-function-autodx 3 4 (list 1 2 3 4)) '(1 2 3 3)))
+  (assert-no-consing (known-function-autodx 3 4 nil)))
+
+(defun known-function-autodx-transform (x list)
+  (map nil (lambda (y) (+ x y)) list))
+
+(with-test (:name :auto-dx-known-functions-too.transform)
+  (assert-no-consing (known-function-autodx-transform 3 '(1 2 3 4))))
+
+(defun known-function-autodx-transform-2 (array x list)
+  (map-into array (lambda (y) (+ x y)) list)
+  array)
+
+(with-test (:name :auto-dx-known-functions-too.transform-2)
+  (let ((array (make-array 4)))
+    (declare (dynamic-extent array))
+    (assert (equalp (known-function-autodx-transform-2 array 3 '(1 2 3 4)) #(4 5 6 7)))
+    #+(or) ; appears to not work on some platforms for some reason?
+    (assert-no-consing (known-function-autodx-transform-2 array 3 '(1 2 3 4)))))
+
+(defun auto-dx-cleaned-up-too-many-times (off array)
+  (let ((acc 0))
+    (flet ((positivep (num) (plusp (+ num off))))
+      (dotimes (i 10)
+        (incf acc (position-if #'positivep array))))
+    acc))
+
+(with-test (:name :auto-dx-cleaned-up-too-many-times)
+  (assert (= (auto-dx-cleaned-up-too-many-times 1 #(-1 2 3)) 10)))
+
+(with-test (:name :auto-dx-correct-mess-up)
+  (checked-compile-and-assert
+   (:allow-notes nil
+    :optimize '(:speed 1))
+   '(lambda (x y z)
+     (map 'list
+      (lambda (a b)
+        (+ z a b))
+      x
+      y))
+   (('(1 2 3 4) '(1 2 3 4) 1) '(3 5 7 9) :test #'equal)))

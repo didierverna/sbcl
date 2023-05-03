@@ -14,6 +14,7 @@
 #include "genesis/arena.h"
 #include "genesis/gc-tables.h"
 #include "thread.h"
+#include "graphvisit.h"
 
 extern void acquire_gc_page_table_lock(), release_gc_page_table_lock();
 extern lispobj * component_ptr_from_pc(char *pc);
@@ -104,6 +105,11 @@ static inline void* arena_mutex(struct arena* a) {
 void arena_release_memblks(lispobj arena_taggedptr)
 {
     struct arena* arena = (void*)native_pointer(arena_taggedptr);
+    // Avoid a race with GC in scavenge_arenas(). We're messing up the chain
+    // of blocks and can't have anything else looking at them.
+    __attribute__((unused)) lispobj old_hidden
+      = __sync_val_compare_and_swap(&arena->hidden, NIL, LISP_T);
+    gc_assert(old_hidden == NIL);
     ARENA_MUTEX_ACQUIRE(arena);
     struct arena_memblk* first = (void*)arena->uw_first_block;
     struct arena_memblk* block = first->next;
@@ -116,8 +122,16 @@ void arena_release_memblks(lispobj arena_taggedptr)
     char* mem_base = (char*)first + sizeof (struct arena_memblk);
     first->freeptr = PTR_ALIGN_UP(mem_base, CHUNK_ALIGN);
     first->next = NULL;
-    arena->uw_extension_count = 0;
+    // Release huge-object blocks
+    block = (void*)arena->uw_huge_objects;
+    while (block) {
+        struct arena_memblk* next = block->next;
+        free(block);
+        block = next;
+    }
+    arena->uw_huge_objects = 0;
     arena->uw_length = arena->uw_original_size;
+    arena->hidden = NIL;
     ARENA_MUTEX_RELEASE(arena);
 }
 
@@ -150,6 +164,15 @@ void AMD64_SYSV_ABI sbcl_delete_arena(lispobj arena_taggedptr)
     ARENA_DISPOSE_MEMORY(arena, arena->uw_original_size);
 }
 
+static page_index_t close_heap_region(struct alloc_region* r, int page_type) {
+    page_index_t result = -1;
+    if (r->start_addr) {
+        result = find_page_index(r->start_addr);
+        gc_close_region(r, page_type);
+    }
+    return result;
+}
+
 void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
                      __attribute__((unused)) lispobj* ra) // return address
 {
@@ -166,7 +189,8 @@ void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
     struct extra_thread_data *extra_data = thread_extra_data(th);
     if (arena) { // switching from the dynamic space to an arena
         if (th->arena)
-            lose("arena error: can't switch from %p to %p", (void*)th->arena, arena);
+            lose("arena error: can't switch from %p to %p", (void*)th->arena,
+                 (void*)arena_taggedptr);
         // Page table lock guards the arena chain, as well as the page table
         acquire_gc_page_table_lock();
         // See if this arena has ever been switched to,
@@ -176,8 +200,10 @@ void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
             arena_chain = arena_taggedptr;
         }
         // Close only the non-system regions
-        if (th->mixed_tlab.start_addr) gc_close_region(&th->mixed_tlab, PAGE_TYPE_MIXED);
-        if (th->cons_tlab.start_addr) gc_close_region(&th->cons_tlab, PAGE_TYPE_CONS);
+        thread_extra_data(th)->mixed_page_hint =
+            close_heap_region(&th->mixed_tlab, PAGE_TYPE_MIXED);
+        thread_extra_data(th)->cons_page_hint =
+            close_heap_region(&th->cons_tlab, PAGE_TYPE_CONS);
         release_gc_page_table_lock();
 #if 0 // this causes a data race, the very thing it's trying to avoid
         int arena_index = fixnum_value(arena->index);
@@ -236,28 +262,63 @@ static void* memblk_claim_subrange(struct arena* a, struct arena_memblk* mem,
             if (mem != actual_current_block) { // oops - looking at the wrong memblk
                 mem = actual_current_block;
                 // fall into the mutex release and restart below
-            }  else {
-                // really add an extension block
-                if (a->uw_extension_count == a->uw_max_extensions) { // can't extend further
+            } else { // potentially extend
+                // An object occupying 1/512th or more of an extension is separately allocated.
+                int oversized = nbytes > (sword_t)(a->uw_growth_amount >> 9);
+                long request = oversized ? nbytes : (sword_t)a->uw_growth_amount;
+                if (a->uw_length + request > a->uw_size_limit) { // limit reached
                     ARENA_MUTEX_RELEASE(a);
-                    lose("Fatal: arena memory exhausted");
+                    lose("Fatal: won't add arena %s block. Length=%lx request=%lx max=%lx",
+                         oversized ? "huge-object" : "extension",
+                         a->uw_length, request, a->uw_size_limit);
                 }
-                char* new_mem = ARENA_GET_OS_MEMORY(a->uw_growth_amount);
+                // For a huge object, ensure that there will be adequate space after aligning
+                // the bounds. Don't worry about it for a regular extension block though
+                // because there's no chance that the current request won't fit.
+                // Moreover, use malloc() for oversized objects instead of the macro
+                // because we don't actually remember the originally requested size
+                // to pass to ARENA_DISPOSE_MEMORY in arena_release_memblks
+                long actual_request;
+                char* new_mem;
+                if (oversized) {
+                    actual_request = request + 3*CHUNK_ALIGN;
+                    new_mem = malloc(actual_request);
+                } else {
+                    actual_request = request;
+                    new_mem = ARENA_GET_OS_MEMORY(actual_request);
+                }
                 if (new_mem == 0) {
                     ARENA_MUTEX_RELEASE(a);
                     lose("Fatal: arena memory exhausted and could not obtain more memory");
                 }
                 struct arena_memblk* extension= (void*)new_mem;
                 char* mem_base = new_mem + sizeof (struct arena_memblk);
+                // Alignment serves the needs of hide/unhide because mprotect()
+                // operates only on boundaries as dictated by the OS and/or CPU.
                 char* aligned_mem_base = PTR_ALIGN_UP(mem_base, CHUNK_ALIGN);
                 extension->freeptr = aligned_mem_base;
-                char* limit = new_mem + a->uw_growth_amount;
+                char* limit = new_mem + actual_request;
                 char* aligned_limit = PTR_ALIGN_DOWN(limit, CHUNK_ALIGN);
                 extension->limit = aligned_limit;
                 extension->next = NULL;
                 extension->padding = 0;
-                a->uw_length += a->uw_growth_amount; // tally up the total length
-                a->uw_extension_count++;
+                // tally up the total length
+                // For huge objects, count only the directly requested space,
+                // not the "bookends" (alignment chunks)
+                a->uw_length += request;
+                if (oversized) {
+                    long usable_space = aligned_limit - aligned_mem_base;
+                    // This should assert() because it's very bad, but assertions can be
+                    // disabled, so explicitly lose() if it happens.
+                    if (nbytes > usable_space) lose("alignment glitch");
+                    extension->next = (void*)a->uw_huge_objects;
+                    a->uw_huge_objects = (uword_t)extension;
+                    // A huge object needs to be zero-filled. It probably was, because it
+                    // probably just got mmapped() but there's no way to know.
+                    memset(aligned_mem_base, 0, nbytes);
+                    ARENA_MUTEX_RELEASE(a);
+                    return aligned_mem_base;
+                }
                 mem->next = extension;
                 // Other threads can start using the new block already
                 a->uw_current_block = (lispobj)extension;
@@ -297,11 +358,16 @@ lispobj* handle_arena_alloc(struct thread* th, struct alloc_region* region,
      *  1. amount remaining in the TLAB is not significant. Just toss it out.
      *     Refill the TLAB with the default quantum plus the user's actual request.
      *     Then carve out the new object from the beginning of the TLAB.
+     *     Exception: if 'nbytes' exceeds 64KiB then always treat it as case 2.
+     *     This avoids an anomaly in the situation where 'nbytes' so large that it
+     *     can not be obtained from the current arena block, but instead uses malloc()
+     *     directly. In such case, attempting to refill the TLAB from the same
+     *     block is futile.
      *
      *  2. amount remaining in the TLAB is worth keeping.
      *     Don't refill the TLAB; just make the new object as a discrete claim.
      */
-    if (avail < min_keep) { // case 1
+    if (avail < min_keep && nbytes <= 65536) { // case 1
         struct arena* in_use_arena = (void*)native_pointer(th->arena);
         __sync_fetch_and_add(&in_use_arena->uw_bytes_wasted, avail);
         long total_request = nbytes + 8192;
@@ -352,8 +418,9 @@ void gc_scavenge_arenas()
                 do {
                     // The block is its own lower bound for scavenge.
                     // Its first 4 words look like fixnums, so no need to skip 'em.
-                    fprintf(stderr, "Arena @ %p: scavenging %p..%p\n",
-                            a, block, block->freeptr);
+                    if (gencgc_verbose)
+                        fprintf(stderr, "Arena @ %p: scavenging %p..%p\n",
+                                a, block, block->freeptr);
                     heap_scavenge((lispobj*)block, (lispobj*)block->freeptr);
                 } while ((block = block->next) != NULL);
             }
@@ -466,14 +533,18 @@ int find_dynspace_to_arena_ptrs(lispobj arena, lispobj result_buffer)
         /* This produces false positives, don't return potential pointers, but instead print them.
          * Using the output, you can try to probe the suspect memory with SB-VM:HEXDUMP */
         if (th == get_sb_vm_thread()) {
-          scan_thread_control_stack(&arena, // = the approximate stack pointer
-                                    th->control_stack_end,
-                                    th->lisp_thread);
+            scan_thread_control_stack(&arena, // = the approximate stack pointer
+                                      th->control_stack_end,
+                                      th->lisp_thread);
         } else {
-          int ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX, th));
-          if (ici != 1) lose("can't find interrupt context");
-          lispobj sp = *os_context_register_addr(nth_interrupt_context(0, th), reg_SP);
-          scan_thread_control_stack((lispobj*)sp, th->control_stack_end, th->lisp_thread);
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+            lispobj *sp = os_get_csp(th);
+#else
+            int ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX, th));
+            if (ici != 1) lose("can't find interrupt context");
+            lispobj sp = *os_context_register_addr(nth_interrupt_context(0, th), reg_SP);
+#endif
+            scan_thread_control_stack((lispobj*)sp, th->control_stack_end, th->lisp_thread);
         }
 #endif
         scan_thread_words((lispobj*)th->binding_stack_start,
@@ -539,6 +610,7 @@ void arena_mprotect(lispobj arena, int option)
         // the block itself is not within [base,limit] and so can be read even if prot==PROT_NONE
         blk = blk->next;
     } while (blk);
+    // TODO: mprotect huge-object blocks
 #endif
 }
 
@@ -602,6 +674,27 @@ int diagnose_arena_fault(os_context_t* context, char *addr)
     fprintf(stderr, "access of object @ %p\n", (void*)obj);
     fflush(stderr);
     lisp_memory_fault_error(context, addr);
-    return 1;
 #endif
+    return 1;
+}
+
+struct visitor {
+    lispobj arena;
+    long nwords;
+};
+
+static void visit(lispobj obj, void* arg) {
+    struct visitor* v = arg;
+    if (find_containing_arena(obj) == v->arena) v->nwords += object_size(native_pointer(obj));
+}
+size_t count_arena_live_bytes(lispobj arena) {
+    struct hopscotch_table h;
+    struct visitor v;
+    v.arena = arena;
+    v.nwords = 0;
+    struct grvisit_context* c =
+        visit_heap_from_static_roots(&h, visit, &v);
+    hopscotch_destroy(&h);
+    free(c);
+    return v.nwords * N_WORD_BYTES;
 }

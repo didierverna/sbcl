@@ -67,7 +67,7 @@
     (apply #'compiler-mumble foo)))
 
 
-(deftype object () '(or fasl-output core-object null))
+(deftype object () '(or fasl-output #-sb-xc-host core-object null))
 
 (defvar *compile-object* nil)
 (declaim (type object *compile-object*))
@@ -548,6 +548,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 (progn
   (defun component-mem-space (component)
     (or (component-%mem-space component)
+        #-sb-xc-host
         (setf (component-%mem-space component)
               (if (fasl-output-p *compile-object*)
                   (and (eq *compile-file-to-memory-space* :immobile)
@@ -560,10 +561,10 @@ necessary, since type inference may take arbitrarily long to converge.")
   (defun code-immobile-p (thing)
     #+sb-xc-host (declare (ignore thing)) #+sb-xc-host t
     #-sb-xc-host
-    (let ((component (typecase thing
+    (let ((component (etypecase thing
                        (vop  (node-component (vop-node thing)))
                        (node (node-component thing))
-                       (t    thing))))
+                       (component thing))))
       (eq (component-mem-space component) :immobile))))
 
 (defun %compile-component (component)
@@ -581,11 +582,6 @@ necessary, since type inference may take arbitrarily long to converge.")
   (when (or (ir2-component-values-receivers (component-info component))
             (component-dx-lvars component))
     (maybe-mumble "Stack ")
-    ;; STACK only uses dominance information for DX LVAR back
-    ;; propagation (see BACK-PROPAGATE-ONE-DX-LVAR).
-    (when (component-dx-lvars component)
-      (clear-dominators component)
-      (find-dominators component))
     (stack-analyze component)
     ;; Assign BLOCK-NUMBER for any cleanup blocks introduced by
     ;; stack analysis. There shouldn't be any unreachable code after
@@ -1519,6 +1515,7 @@ necessary, since type inference may take arbitrarily long to converge.")
   (let ((object *compile-object*))
     (etypecase object
       (fasl-output (fasl-dump-toplevel-lambda-call tll object))
+      #-sb-xc-host
       (core-object (core-call-toplevel-lambda      tll object))
       (null))))
 
@@ -1709,7 +1706,7 @@ necessary, since type inference may take arbitrarily long to converge.")
         (sb-impl::*eval-tlf-index* nil)
         (sb-impl::*eval-source-context* nil))
     (handler-case
-        (handler-bind (((satisfies handle-condition-p) #'handle-condition-handler))
+        (handler-bind (((satisfies handle-condition-p) 'handle-condition-handler))
           (with-compilation-values
             (with-compilation-unit ()
               (fasl-dump-partial-source-info info *compile-object*)
@@ -1731,6 +1728,9 @@ necessary, since type inference may take arbitrarily long to converge.")
                       #-sb-xc-host
                       (core-object (fix-core-source-info info object))
                       (null)))))
+              ;; FIXME: dump/restore "linkage" information, produce deferred warnings
+              ;; (sb-fasl::dump-emitted-full-calls (emitted-full-calls *compilation*)
+              ;;                                  *compile-object*)
               (let ((code-coverage-records
                       (code-coverage-records (coverage-metadata *compilation*))))
                   (unless (zerop (hash-table-count code-coverage-records))
@@ -1809,20 +1809,15 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defglobal *compile-elapsed-time* 0) ; nanoseconds
 (defglobal *compile-file-elapsed-time* 0) ; nanoseconds
 (defun get-thread-virtual-time ()
-  #+(and linux (not sb-xc-host))
-  (multiple-value-bind (sec nsec)
-      (sb-unix::clock-gettime sb-unix:clock-thread-cputime-id)
-    (cons sec nsec))
-  #-(and linux (not sb-xc-host))
-  '(0 . 0))
+  #+(and linux (not sb-xc-host)) (sb-unix:clock-gettime sb-unix:clock-thread-cputime-id)
+  #-(and linux (not sb-xc-host)) (values 0 0))
 
-(defun accumulate-compiler-time (symbol start)
-  (declare (ignorable symbol start))
+(defun accumulate-compiler-time (symbol start-sec start-nsec)
+  (declare (ignorable symbol start-sec start-nsec))
   #+(and linux (not sb-xc-host))
-  (destructuring-bind (sec-after . nsec-after) (get-thread-virtual-time)
-    (destructuring-bind (sec-before . nsec-before) start
-      (let* ((sec-diff (- sec-after sec-before))
-             (nsec-diff (- nsec-after nsec-before))
+  (multiple-value-bind (stop-sec stop-nsec) (get-thread-virtual-time)
+      (let* ((sec-diff (- stop-sec start-sec))
+             (nsec-diff (- stop-nsec start-nsec))
              (total-nsec-diff (+ (* sec-diff (* 1000 1000 1000))
                                  nsec-diff))
              (old (symbol-global-value symbol)))
@@ -1835,7 +1830,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                                   (cas (symbol-value symbol) old new)
                                   #+x86-64
                                   (%cas-symbol-global-value symbol old new)))
-                (return))))))))
+                (return)))))))
 
 ;;; Open some files and call SUB-COMPILE-FILE. If something unwinds
 ;;; out of the compile, then abort the writing of the output file, so
@@ -1905,14 +1900,15 @@ returning its filename.
   :EMIT-CFASL
      (Experimental). If true, outputs the toplevel compile-time effects
      of this file into a separate .cfasl file."
-  (let* ((output-file-pathname nil)
+  (binding*
+        ((output-file-pathname nil)
          (fasl-output nil)
          (cfasl-pathname nil)
          (cfasl-output nil)
          (abort-p t)
          (warnings-p nil)
          (failure-p t) ; T in case error keeps this from being set later
-         (clock-start (get-thread-virtual-time))
+         ((start-sec start-nsec) (get-thread-virtual-time))
          (input-pathname (verify-source-file input-file))
          (source-info
           (make-file-source-info input-pathname external-format
@@ -1972,7 +1968,7 @@ returning its filename.
       (when (and trace-file (not (streamp trace-file)))
         (close *compiler-trace-output*)))
 
-    (accumulate-compiler-time '*compile-file-elapsed-time* clock-start)
+    (accumulate-compiler-time '*compile-file-elapsed-time* start-sec start-nsec)
 
     ;; CLHS says that the first value is NIL if the "file could not
     ;; be created". We interpret this to mean "a valid fasl could not

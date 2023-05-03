@@ -55,7 +55,9 @@
   "Default number of bytes per buffer.")
 
 (defun alloc-buffer (&optional (size +bytes-per-buffer+))
-  (declare (sb-c::tlab :system) (inline !make-buffer))
+  (declare (sb-c::tlab :system)
+           (inline allocate-system-memory) ; so the SAP gets heap-consed
+           (inline !make-buffer))
   ;; Don't want to allocate & unwind before the finalizer is in place.
   (without-interrupts
     (let* ((sap (allocate-system-memory size))
@@ -485,8 +487,7 @@
     (t 'simple-stream-error)))
 
 ;;; common idioms for reporting low-level stream and file problems
-(defun simple-stream-perror (format-control stream &optional errno &rest format-arguments)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper simple-stream-perror (format-control stream &optional errno &rest format-arguments)
   (error (stream-errno-to-condition errno)
          :stream stream
          :format-control "~@<~?~@[: ~2I~_~A~]~:>"
@@ -494,8 +495,7 @@
                                  (list* stream format-arguments)
                                  (when errno (strerror errno)))))
 
-(defun file-perror (pathname errno &optional datum &rest arguments)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper file-perror (pathname errno &optional datum &rest arguments)
   (let ((message (when errno (strerror errno))))
     (multiple-value-bind (condition-type arguments)
         (typecase datum
@@ -507,8 +507,7 @@
       (apply #'error condition-type :pathname pathname :message message
              arguments))))
 
-(defun c-string-encoding-error (external-format code)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper c-string-encoding-error (external-format code)
   (error 'c-string-encoding-error
          :external-format external-format
          :code code))
@@ -519,8 +518,7 @@
                 (%byte-blt ,sap ,offset .buffer. 0 ,count)
                 .buffer.)))
 
-(defun c-string-decoding-error (external-format sap offset count)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper c-string-decoding-error (external-format sap offset count)
   (error 'c-string-decoding-error
          :external-format external-format
          :octets (sap-ref-octets sap offset count)))

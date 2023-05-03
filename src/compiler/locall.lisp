@@ -41,72 +41,47 @@
 ;;; lvars.
 (defun propagate-to-args (call fun)
   (declare (type combination call) (type clambda fun))
-  (loop with policy = (lexenv-policy (node-lexenv call))
-        for args on (basic-combination-args call)
-        for var in (lambda-vars fun)
-        for name = (or (and (lambda-var-arg-info var )
-                            (arg-info-key (lambda-var-arg-info var )))
-                       (lambda-var-%source-name var))
-        do (assert-lvar-type (car args) (leaf-type var) policy
-                             (if (eq (functional-kind fun) :optional)
-                                 (make-local-call-context fun name)
-                                 name))
-           (unless (leaf-refs var)
-             (flush-dest (car args))
-             (setf (car args) nil)))
+  (do ((args (basic-combination-args call) (cdr args))
+       (vars (lambda-vars fun) (cdr vars))
+       (policy (lexenv-policy (node-lexenv call))))
+      ((null args))
+    (let* ((var (car vars))
+           (name (or (and (lambda-var-arg-info var)
+                          (arg-info-key (lambda-var-arg-info var)))
+                     (lambda-var-%source-name var))))
+      (assert-lvar-type (car args) (leaf-type var) policy
+                        (if (eq (functional-kind fun) :optional)
+                            (make-local-call-context fun name)
+                            name))
+      (unless (leaf-refs var)
+        (flush-dest (car args))
+        (setf (car args) nil))))
+
   (values))
 
-;;; Given a local call CALL to FUN, find the associated argument LVARs
-;;; of CALL corresponding to declared dynamic extent LAMBDA-VARs and
-;;; mark them as dynamic extent, setting up the cleanup corresponding
-;;; to the dynamic extent as well. We mark them now so that
-;;; optimizations optimizing away LVARs have the chance to propagate
-;;; the dynamic extent information. Environment analysis is
-;;; responsible for actually deciding if the lvars can be
-;;; dynamic-extent allocated, dealing with transitively marking the
+;;; Given a local call CALL to FUN, mark the associated args of CALL
+;;; corresponding to declared dynamic extent LAMBDA-VARs as dynamic
+;;; extent, setting up the corresponding cleanup. We do this now so
+;;; that the cleanup has the right scope. Environment analysis is
+;;; responsible for actually deciding if the arguments can be
+;;; dynamic-extent allocated, and deals with transitively marking the
 ;;; otherwise-inaccessible parts of these values as dynamic extent as
-;;; well. This is because environment analysis happens after qll major
-;;; changes to the dataflow in IR1 have been done and it is clear
-;;; whether an LVAR is actually used by a combination which can
-;;; dynamic-extent allocate.
-(defun recognize-potentially-dynamic-extent-lvars (call fun)
+;;; well. We do this because environment analysis happens after all
+;;; major changes to the dataflow in IR1 have been done and it is
+;;; clear whether a combination can actually stack allocate it's value.
+(defun mark-dynamic-extent-args (call fun)
   (declare (type combination call) (type clambda fun))
-  ;; The block may end up being deleted due to cast optimization
-  ;; caused by USE-GOOD-FOR-DX-P
-  (unless (node-to-be-deleted-p call)
-    (let* (no-notes
-           (dx-lvars
-             (loop for arg in (basic-combination-args call)
-                   for var in (lambda-vars fun)
-                   for dx = (leaf-dynamic-extent var)
-                   when (and dx arg (not (lvar-dynamic-extent arg)))
-                   collect (cons dx arg)
-                   do
-                   (when (eq dx 'dynamic-extent-no-note)
-                     (setf no-notes dx)))))
-      (when dx-lvars
-        (let* ((entry (with-ir1-environment-from-node call
-                        (make-entry)))
-               (cleanup (make-cleanup :kind :dynamic-extent
-                                      :mess-up entry
-                                      :nlx-info dx-lvars
-                                      :dx-kind no-notes)))
-          (setf (entry-cleanup entry) cleanup)
-          (insert-node-before call entry)
-          (setf (node-lexenv call)
-                (make-lexenv :default (node-lexenv call)
-                             :cleanup cleanup))
-          (setf (ctran-next (node-prev call)) nil)
-          (let ((ctran (make-ctran)))
-            (with-ir1-environment-from-node call
-              (ir1-convert (node-prev call) ctran nil '(%cleanup-point))
-              (link-node-to-previous-ctran call ctran)))
-          ;; Make CALL end its block, so that we have a place to
-          ;; insert cleanup code.
-          (node-ends-block call)
-          (push entry (lambda-entries (node-home-lambda entry)))
-          (dolist (cell dx-lvars)
-            (setf (lvar-dynamic-extent (cdr cell)) cleanup))))))
+  (let (cleanup)
+    (loop for arg in (basic-combination-args call)
+          for var in (lambda-vars fun)
+          do (let ((dx-kind (leaf-dynamic-extent var)))
+               (when (and arg dx-kind (not (lvar-dynamic-extent arg)))
+                 (unless cleanup
+                   (setq cleanup (insert-dynamic-extent-cleanup call)))
+                 (let ((dx-info (make-dx-info :kind dx-kind :value arg
+                                              :cleanup cleanup)))
+                   (setf (lvar-dynamic-extent arg) dx-info)
+                   (push dx-info (cleanup-nlx-info cleanup)))))))
   (values))
 
 ;;; This function handles merging the tail sets if CALL is potentially
@@ -155,7 +130,7 @@
   (propagate-to-args call fun)
   (setf (basic-combination-kind call) :local)
   (sset-adjoin fun (lambda-calls-or-closes (node-home-lambda call)))
-  (recognize-potentially-dynamic-extent-lvars call fun)
+  (mark-dynamic-extent-args call fun)
   (merge-tail-sets call fun)
   (change-ref-leaf ref fun)
   (values))
@@ -706,15 +681,14 @@
 ;;; function that rearranges the arguments and calls the entry point.
 ;;; We analyze the new function and the entry point immediately so
 ;;; that everything gets converted during the single pass.
-(defun convert-hairy-fun-entry (ref call entry vars ignores args indef)
+(defun convert-hairy-fun-entry (ref call entry vars ignores args)
   (declare (list vars ignores args) (type ref ref) (type combination call)
            (type clambda entry))
   (let ((new-fun
          (with-ir1-environment-from-node call
            (ir1-convert-lambda
             `(lambda ,vars
-               (declare (ignorable ,@ignores)
-                        (indefinite-extent ,@indef))
+               (declare (ignorable ,@ignores))
                (%funcall ,entry ,@args))
             :debug-name (debug-name 'hairy-function-entry
                                     (lvar-fun-debug-name
@@ -877,9 +851,7 @@
 
         (convert-hairy-fun-entry ref call (optional-dispatch-main-entry fun)
                                  (append temps more-temps)
-                                 (ignores) (call-args)
-                                 (when (optional-rest-p fun)
-                                   more-temps)))))
+                                 (ignores) (call-args)))))
 
   (values))
 
@@ -928,57 +900,10 @@
         (block-succ call-block)
       (unlink-blocks call-block next-block)
       (link-blocks call-block bind-block)
+      (unless (eq (car (ctran-source-path (node-prev call))) 'original-source-path)
+        (setf (ctran-source-path (block-start bind-block))
+              (ctran-source-path (node-prev call))))
       next-block)))
-
-;;; Remove CLAMBDA from the tail set of anything it used to be in the
-;;; same set as; but leave CLAMBDA with a valid tail set value of
-;;; its own, for the benefit of code which might try to pull
-;;; something out of it (e.g. return type).
-(defun depart-from-tail-set (clambda)
-  ;; Until sbcl-0.pre7.37.flaky5.2, we did
-  ;;   (LET ((TAILS (LAMBDA-TAIL-SET CLAMBDA)))
-  ;;     (SETF (TAIL-SET-FUNS TAILS)
-  ;;           (DELETE CLAMBDA (TAIL-SET-FUNS TAILS))))
-  ;;   (SETF (LAMBDA-TAIL-SET CLAMBDA) NIL)
-  ;; here. Apparently the idea behind the (SETF .. NIL) was that since
-  ;; TAIL-SET-FUNS no longer thinks we're in the tail set, it's
-  ;; inconsistent, and perhaps unsafe, for us to think we're in the
-  ;; tail set. Unfortunately..
-  ;;
-  ;; The (SETF .. NIL) caused problems in sbcl-0.pre7.37.flaky5.2 when
-  ;; I was trying to get Python to emit :EXTERNAL LAMBDAs directly
-  ;; (instead of only being able to emit funny little :TOPLEVEL stubs
-  ;; which you called in order to get the address of an external LAMBDA):
-  ;; the external function was defined in terms of internal function,
-  ;; which was LET-converted, and then things blew up downstream when
-  ;; FINALIZE-XEP-DEFINITION tried to find out its DEFINED-TYPE from
-  ;; the now-NILed-out TAIL-SET. So..
-  ;;
-  ;; To deal with this problem, we no longer NIL out
-  ;; (LAMBDA-TAIL-SET CLAMBDA) here. Instead:
-  ;;   * If we're the only function in TAIL-SET-FUNS, it should
-  ;;     be safe to leave ourself linked to it, and it to you.
-  ;;   * If there are other functions in TAIL-SET-FUNS, then we're
-  ;;     afraid of future optimizations on those functions causing
-  ;;     the TAIL-SET object no longer to be valid to describe our
-  ;;     return value. Thus, we delete ourselves from that object;
-  ;;     but we save a newly-allocated tail-set, derived from the old
-  ;;     one, for ourselves, for the use of later code (e.g.
-  ;;     FINALIZE-XEP-DEFINITION) which might want to
-  ;;     know about our return type.
-  (let* ((old-tail-set (lambda-tail-set clambda))
-         (old-tail-set-funs (tail-set-funs old-tail-set)))
-    (unless (= 1 (length old-tail-set-funs))
-      (setf (tail-set-funs old-tail-set)
-            (delete clambda old-tail-set-funs))
-      (let ((new-tail-set (copy-tail-set old-tail-set)))
-        (setf (lambda-tail-set clambda) new-tail-set
-              (tail-set-funs new-tail-set) (list clambda)))))
-  ;; The documentation on TAIL-SET-INFO doesn't tell whether it could
-  ;; remain valid in this case, so we nuke it on the theory that
-  ;; missing information tends to be less dangerous than incorrect
-  ;; information.
-  (setf (tail-set-info (lambda-tail-set clambda)) nil))
 
 ;;; Handle the environment semantics of LET conversion. We add CLAMBDA
 ;;; and its LETs to LETs for the CALL's home function. We merge the
@@ -998,9 +923,9 @@
           (delete clambda (component-lambdas component)))
     (setf (component-reanalyze component) t))
   (setf (lambda-call-lexenv clambda) (node-lexenv call))
-
-  (depart-from-tail-set clambda)
-
+  (let ((tails (lambda-tail-set clambda)))
+    (setf (tail-set-funs tails)
+          (delete clambda (tail-set-funs tails))))
   (let* ((home (node-home-lambda call))
          (home-env (lambda-environment home))
          (env (lambda-environment clambda)))
@@ -1273,6 +1198,7 @@
                          (leaf-type var))
               (let ((use-component (node-component use)))
                 (propagate-lvar-annotations-to-refs arg var)
+                (propagate-ref-dx use arg var)
                 (update-lvar-dependencies leaf arg)
                 (substitute-leaf-if
                  (lambda (ref)

@@ -618,11 +618,13 @@
                      (if (template-conditional-p info) 0 (length rtypes))
                      (template-more-results-type info) "results")
       (check-tn-refs (vop-temps vop) vop t 0 t "temps")
-      (unless (= (+ (length (vop-codegen-info vop))
-                    (if (typep (template-result-types info) '(cons (eql :conditional)))
-                        -1
-                        0))
-                 (template-info-arg-count info))
+      (unless (or (= (+ (length (vop-codegen-info vop))
+                        (if (typep (template-result-types info) '(cons (eql :conditional)))
+                            -1
+                            0))
+                     (template-info-arg-count info))
+                  ;; Allow these 2 allocator vops to take an undeclared info arg
+                  (member (vop-info-name info) '(sb-vm::fixed-alloc sb-vm::var-alloc)))
         (barf "wrong number of codegen info args in ~S" vop))))
   (values))
 
@@ -1037,17 +1039,8 @@
            (let ((cleanup (entry-cleanup node)))
              (case (cleanup-kind cleanup)
                ((:dynamic-extent)
-                (format t "entry DX~{ v~D~}"
-                        (mapcar (lambda (lvar-or-cell)
-                                  (typecase lvar-or-cell
-                                    (cons
-                                     (cons (car lvar-or-cell)
-                                           (cont-num (cdr lvar-or-cell))))
-                                    (enclose
-                                     lvar-or-cell)
-                                    (t
-                                     (cont-num lvar-or-cell))))
-                                (cleanup-nlx-info cleanup))))
+                (format t "entry DX~{ ~D~}"
+                        (cleanup-nlx-info cleanup)))
                (t
                 (format t "entry ~S" (entry-exits node))))))
           (exit
@@ -1072,15 +1065,17 @@
            (write-string "enclose ")
            (dolist (leaf (enclose-funs node))
              (print-leaf leaf)
-             (write-char #\space)
-             (let* ((entry-fun (functional-entry-fun leaf))
-                    (env (and entry-fun (lambda-environment entry-fun))))
-               (when env
-                 (write-string "{env:")
-                 (dolist (leaf (environment-closure env))
-                   (write-char #\space)
-                   (print-leaf leaf))
-                 (write-string "}")))
+             (when (lambda-p leaf)
+               (write-char #\space)
+               (let ((env (lambda-environment leaf)))
+                 (when env
+                   (write-string "{env:")
+                   (dolist (thing (environment-closure env))
+                     (write-char #\space)
+                     (etypecase thing
+                       (leaf (print-leaf thing))
+                       (nlx-info (princ thing))))
+                   (write-string "}"))))
              (write-char #\space))))
         (when (and *debug-print-types*
                    (valued-node-p node))

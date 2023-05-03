@@ -437,6 +437,7 @@ of :INHERITED :EXTERNAL :INTERNAL."
 ;;; using a division by the table size minus two.
 (defun make-symbol-hashset (size &optional (load-factor 3/4))
   (declare (sb-c::tlab :system)
+           (inline make-symtbl-magic) ; to allow system-TLAB allocation
            (inline %make-symbol-hashset))
   (flet ((choose-good-size (size)
            (loop for n of-type fixnum
@@ -453,10 +454,9 @@ of :INHERITED :EXTERNAL :INTERNAL."
                (size (truncate (* n load-factor)))
                (reciprocals
                 (if (= n 3) ; minimal table
-                    (make-symtbl-magic 0 0 0 0)
+                    (make-symtbl-magic 0 0 0 0) ; <-- should be LTV but can't be.
+                                                ; (package-cold-init called before LTV fixups)
                     (make-symtbl-magic h1-mask h1-c h2-mask 0))))
-      ;; Store optimized remainder parameters unles either reciprocal
-      ;; (for H1 or H2) can't work using the fast REM algorithm in 32 bits.
       (%make-symbol-hashset (cons reciprocals (make-array n :initial-element 0))
                             size))))
 
@@ -1280,6 +1280,20 @@ Experimental: interface subject to change."
 
 ;;; Delete SYMBOL from TABLE, storing -1 in its place. SYMBOL must exist.
 ;;;
+;;; NOTE: It's possible that NUKE-SYMBOL should never 0-fill the old symbol-hashset if downsizing.
+;;; CLHS nowhere implies that altering accessability of a symbol already _present_ in a package
+;;; counts as INTERNing. Iterating over directly present symbols of a package permits UNINTERN on
+;;; the current symbol, which might rehash the storage vector, creating a new one. To allow it,
+;;; UNINTERN does not 0-fill the old vector, so any observers of that vector still see all symbols
+;;; beyond the cursor. But what if the operation is EXPORT or UNEXPORT? This moves the symbol from
+;;; one table to the other for that same package. EXPORT would remove from internals and move to
+;;; externals. If the internals can down-size and 0-fill (as we do), then symbols beyond the cursor
+;;; are missed. The argument in favaor of allowing EXPORT would seem to be that EXPORT is not
+;;; technically INTERNing in this case. But the argument _against_ allowing EXPORT or UNEXPORT
+;;; is that there is one and only one exception specifically called out as permissible, namely:
+;;;  "the current symbol may be uninterned from the package being traversed."
+;;; If it were _also_ intended to be permissible to EXPORT or UNEXPORT, would it not have said
+;;; that it is permissible to change accessibility ? I'm not sure.
 (defun nuke-symbol (table symbol splat)
   (let* ((string (symbol-name symbol))
          (length (length string))
@@ -1834,10 +1848,22 @@ it is not already present."
   "Add all the PACKAGES-TO-USE to the use list for PACKAGE so that the
 external symbols of the used packages are accessible as internal symbols in
 PACKAGE."
-  (with-package-graph ()
-    (let ((packages (package-listify packages-to-use))
-          (package (find-undeleted-package-or-lose package)))
-
+  ;; These don't have to be continuable errors.
+  ;; Don't signal them while holding the graph lock
+  ;; (Note that we resolve the names outside of any lock.
+  ;; If user code further affects the name -> package mapping while concurrently
+  ;; doing a USE-PACKAGE, that not our problem)
+  (let ((package
+         (let ((pkg (find-undeleted-package-or-lose package)))
+           ;; "package [...] cannot be the KEYWORD package."
+           (when (eq pkg *keyword-package*)
+             (error "~S can't use packages" pkg))
+           pkg))
+        (packages (package-listify packages-to-use)))
+    ;; "packages-to-use ... The KEYWORD package may not be supplied."
+    (when (memq *keyword-package* packages)
+      (error "Can not USE-PACKAGE ~S" *keyword-package*))
+    (with-package-graph ()
       ;; Loop over each package, USE'ing one at a time...
       (with-single-package-locked-error ()
         (dolist (pkg packages)
@@ -2099,7 +2125,6 @@ PACKAGE."
 ;;; PACKAGE-DESIGNATOR is actually a deleted package, and in that case
 ;;; you generally do want to signal an error instead of proceeding.)
 (defun %find-package-or-lose (package-designator)
-  (declare (optimize allow-non-returning-tail-call))
   (let ((package-designator package-designator))
     (prog () retry
        (let ((result (find-package package-designator)))
@@ -2115,7 +2140,6 @@ PACKAGE."
 ;;; consequences of most operations on deleted packages are
 ;;; unspecified. We try to signal errors in such cases.
 (defun find-undeleted-package-or-lose (package-designator)
-  (declare (optimize allow-non-returning-tail-call))
   (let ((package-designator package-designator))
     (prog () retry
        (let ((maybe-result (%find-package-or-lose package-designator)))

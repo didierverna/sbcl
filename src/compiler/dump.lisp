@@ -38,9 +38,7 @@
   ;; used for everything else. We use a separate EQ table to avoid
   ;; performance pathologies with objects for which SIMILAR
   ;; degenerates to EQL. Everything entered in the SIMILAR table is
-  ;; also entered in the EQ table. The NAMED-CONSTANT is used for
-  ;; named constants whose references are dumped as load time values
-  ;; of SYMBOL-GLOBAL-VALUE.
+  ;; also entered in the EQ table.
   (similar-table (make-similarity-table) :type hash-table :read-only t)
   (eq-table (make-hash-table :test 'eq) :type hash-table :read-only t)
   ;; the INSTANCE table maps dumpable instances to unique IDs for calculating
@@ -1032,7 +1030,7 @@
 
 (defconstant-eqx +fixup-flavors+
   #(:assembly-routine :assembly-routine*
-    :gc-barrier :symbol-tls-index
+    :card-table-index-mask :symbol-tls-index
     :alien-code-linkage-index :alien-data-linkage-index
     :foreign :foreign-dataref
     :code-object
@@ -1086,7 +1084,7 @@
     (let* ((fixup (fixup-note-fixup note))
            (name (fixup-name fixup))
            (flavor (fixup-flavor fixup))
-           (named (not (member flavor '(:code-object :gc-barrier))))
+           (named (not (member flavor '(:code-object :card-table-index-mask))))
            (data
             (or #-sb-xc-host ; ASM routine indices aren't known to the cross-compiler
                 (when (member flavor '(:assembly-routine :assembly-routine*))
@@ -1099,7 +1097,7 @@
                               flavor data))
            (operand
             (ecase flavor
-              ((:code-object :gc-barrier) (the null name))
+              ((:code-object :card-table-index-mask) (the null name))
               (:layout
                (if (symbolp name)
                    name
@@ -1243,6 +1241,9 @@
     ;; So these go on the stack last, i.e. nearest the top.
     ;; Reversing sorts the entry points in ascending address order
     ;; except possibly when there are multiple entry points to one routine
+    (unless (= (length (remove-duplicates (mapcar 'car routines)))
+               (length routines))
+      (error "Duplicated asm routine name"))
     (dolist (routine (reverse routines))
       (dump-object (car routine) file)
       (dump-integer (+ (label-position (cadr routine)) (caddr routine))
@@ -1476,3 +1477,21 @@
   (dump-object namestring file)
   (dump-object cc file)
   (dump-fop 'fop-record-code-coverage file))
+
+(defun dump-emitted-full-calls (hash-table fasl)
+  (let ((list (%hash-table-alist hash-table)))
+    #+sb-xc-host ; enforce host-insensitive reproducible ordering
+    (labels ((symbol< (a b)
+               (cond ((string< a b) t)
+                     ((string= a b)
+                      ;; this does find a few pairs of lookalikes
+                      (string< (cl:package-name (sb-xc:symbol-package a))
+                               (cl:package-name (sb-xc:symbol-package b))))))
+             (fname< (a b)
+               (cond ((and (atom a) (atom b)) (symbol< a b))
+                     ((atom a) t) ; symbol < list
+                     ((atom b) nil) ; opposite
+                     ((symbol< (cadr a) (cadr b))))))
+      (setq list (sort list #'fname< :key #'car)))
+    (dump-object list fasl)
+    (dump-fop 'fop-note-full-calls fasl)))

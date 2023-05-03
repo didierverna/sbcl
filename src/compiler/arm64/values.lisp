@@ -109,7 +109,7 @@
 ;;; unknown values continuations.
 (define-vop (values-list)
   (:args (arg :scs (descriptor-reg) :target list))
-  (:arg-types list)
+  (:arg-refs arg-ref)
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
@@ -124,14 +124,17 @@
 
     (unless (eq (tn-kind start) :unused)
       (move start csp-tn))
+    (when (and (policy node (> safety 0))
+               (not (csubtypep (tn-ref-type arg-ref) (specifier-type 'list))))
+      (inst b type-check))
 
     LOOP
     (inst cmp list null-tn)
     (loadw temp list cons-car-slot list-pointer-lowtag)
     (inst b :eq DONE)
     (loadw list list cons-cdr-slot list-pointer-lowtag)
-    (inst add csp-tn csp-tn n-word-bytes)
-    (storew temp csp-tn -1)
+    (inst str temp (@ csp-tn n-word-bytes :post-index))
+    TYPE-CHECK
     (cond ((policy node (> safety 0))
            (test-type list ndescr LOOP nil (list-pointer-lowtag))
            (cerror-call vop 'bogus-arg-to-values-list-error list))

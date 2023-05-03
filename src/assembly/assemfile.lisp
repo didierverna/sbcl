@@ -32,6 +32,7 @@
          (asmstream (make-asmstream))
          (*asmstream* asmstream)
          (sb-vm::*adjustable-vectors* nil))
+    (declare (special sb-vm::*adjustable-vectors*))
     (unwind-protect
         (let ((sb-xc:*features* (cons :sb-assembling sb-xc:*features*))
               (*readtable* sb-cold:*xc-readtable*))
@@ -123,18 +124,23 @@
     for export in exports
     collect `(push ,(expand-one-export-spec export) *entry-points*)))
 
-;;; Create a placeholder that will later resolve to the label of an entry point.
-;;; This is because we don't know all the names of routines until seeing them.
-;;; This is an alternative to using a fixup. It may generate shorter code.
-(defun sb-vm::entry-point-label (name) `(sb-assem::entry ,name))
-
 (defun resolve-ep-labels (section)
   (do ((statement (stmt-next (section-start section)) (stmt-next statement)))
       ((null statement))
-    (binding* ((patch (member-if (lambda (x) (typep x '(cons (eql sb-assem::entry))))
-                                 (stmt-operands statement))
-                      :exit-if-null)
-               (ep (assoc (cadar patch) *entry-points*)))
+    ;; We also output some raw words using fixups; I'm not sure if they should be
+    ;; changed to labels. For now, restrict to control transfers.
+    (binding* ((patch
+                (when (member (stmt-mnemonic statement)
+                              '("B" "BEQ" "JMP" "CALL") ; KLUDGE
+                              :test 'string=)
+                  (member-if (lambda (x)
+                               (and (typep x 'fixup)
+                                    (eq (fixup-flavor x) :assembly-routine)
+                                    (eql (fixup-offset x) 0)))
+                             (stmt-operands statement)))
+                :exit-if-null)
+               (ep (assoc (fixup-name (car patch)) *entry-points*)))
+      ;; oy. what is (third ep) ? An offset?
       (aver (and ep (= (third ep) 0)))
       (rplaca patch (second ep)))))
 
@@ -192,7 +198,8 @@
          (results (remove :res vars :key #'reg-spec-kind :test #'neq))
          (return-style (or (cadr (assoc :return-style options)) :raw))
          (cost (or (cadr (assoc :cost options)) 247))
-         (vop (make-symbol "VOP")))
+         (vop (or (cadr (assoc :vop-var options))
+                  (make-symbol "VOP"))))
     ;; :full-call-no-return entails the call site behavior for :full-call
     ;; without automatic insertion of the return sequence. This avoids some confusion
     ;; on the part of the human reading the code, especially if the asm routine
@@ -239,10 +246,12 @@
          ;; any :SAVE-P specified in options supersedes one from call-temps.
          ;; It would be wiser to signal an error about duplicate options.
          ,@(remove-if (lambda (x)
-                        (member x '(:return-style :cost :call-temps)))
+                        (member x '(:return-style :cost :call-temps
+                                    :vop-var :vop-prefix)))
                       options
                       :key #'car)
          (:generator ,cost
+           ,@(cdr (assoc :vop-prefix options))
            ,@(mapcar (lambda (arg)
                        `(move ,(reg-spec-temp arg) ,(reg-spec-name arg)))
                      args)

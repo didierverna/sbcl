@@ -237,6 +237,9 @@ and no value was provided for it." name))))))))))
 (defun check-arg-type (lvar type n)
   (declare (type lvar lvar) (type ctype type) (type index n))
   (cond
+    ((eq (lvar-type lvar) *empty-type*)
+     (note-unwinnage "The ~:R argument never returns a value." n)
+     nil)
     ((not *ctype-test-fun*))
     ((not (constant-type-p type))
      (let* ((ctype (lvar-type lvar))
@@ -245,9 +248,6 @@ and no value was provided for it." name))))))))))
               (unless (type= ctype (specifier-type '(eql dummy)))
                 (note-lossage "The ~:R argument is a ~S, not a ~S."
                               n (type-specifier ctype) (type-specifier type)))
-              nil)
-             ((eq ctype *empty-type*)
-              (note-unwinnage "The ~:R argument never returns a value." n)
               nil)
              (t t))))
     ((not (constant-lvar-p lvar))
@@ -434,6 +434,9 @@ and no value was provided for it." name))))))))))
 ;;; CALL. If TYPE is supplied and not null, then we merge the
 ;;; information into the information already accumulated in TYPE.
 (defun note-fun-use (call &optional type)
+  (declare (inline make-approximate-key-info
+                   make-approximate-fun-type)
+           (sb-c::tlab :system))
   (declare (type combination call)
            (type (or approximate-fun-type null) type)
            #-sb-xc-host

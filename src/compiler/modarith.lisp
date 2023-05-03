@@ -352,6 +352,7 @@
              (cond
                ((eq signedp (cdr w)) (<= width (car w)))
                ((eq signedp nil) (< width (car w))))))
+      (declare (truly-dynamic-extent #'inexact-match))
       (let ((tgt (find-if #'inexact-match twidths)))
         (when tgt
           (return-from best-modular-version
@@ -467,13 +468,12 @@
                 (when (<= width ,width)
                   (cond ((or (and (constant-lvar-p count)
                                   (plusp (lvar-value count)))
-                             (csubtypep count-type
-                                        (specifier-type '(and unsigned-byte fixnum))))
+                             (csubtypep count-type (specifier-type 'word)))
                          (cut-to-width integer ,kind width ,signedp)
                          ',left-name)
                         #+(or arm64 x86-64)
                         ((and (not (constant-lvar-p count))
-                              (csubtypep count-type (specifier-type 'fixnum))
+                              (csubtypep count-type (specifier-type 'sb-vm:signed-word))
                               ;; Unknown sign
                               (not (csubtypep count-type (specifier-type '(integer * 0))))
                               (not (csubtypep count-type (specifier-type '(integer 0 *))))

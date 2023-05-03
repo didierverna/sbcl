@@ -73,21 +73,6 @@ static void xgetbv(unsigned *eax, unsigned *edx)
 
 #define VECTOR_FILL_T "VECTOR-FILL/T"
 
-void set_alloc_tramp_vectors(int ymm_enable)
-{
-    struct code* code = (struct code*)asm_routines_start;
-    lispobj* instructions = (lispobj*)code + code_header_words(code);
-    int index;
-    get_asm_routine_by_name("FPR-SAVE", &index);
-    if (index)
-        instructions[index] =
-            (lispobj)get_asm_routine_by_name(ymm_enable ? "SAVE-YMM" : "SAVE-XMM", 0);
-    get_asm_routine_by_name("FPR-RESTORE", &index);
-    if (index)
-        instructions[index] =
-            (lispobj)get_asm_routine_by_name(ymm_enable ? "RESTORE-YMM" : "RESTORE-XMM", 0);
-}
-
 // Poke in a byte that changes an opcode to enable faster vector fill.
 // Using fixed offsets and bytes is no worse than what we do elsewhere.
 void tune_asm_routines_for_microarch(void)
@@ -111,7 +96,6 @@ void tune_asm_routines_for_microarch(void)
             }
         }
     }
-    set_alloc_tramp_vectors(avx_supported);
     int our_cpu_feature_bits = 0;
     // avx2_supported gets copied into bit 1 of *CPU-FEATURE-BITS*
     if (avx2_supported) our_cpu_feature_bits |= 1;
@@ -138,7 +122,6 @@ void untune_asm_routines_for_microarch(void)
 {
     asm_routine_poke(VECTOR_FILL_T, 0x12, 0xEB); // Change JL to JMP
     SetSymbolValue(CPU_FEATURE_BITS, 0, 0);
-    set_alloc_tramp_vectors(0);
 }
 
 #ifndef _WIN64
@@ -158,6 +141,29 @@ arch_get_bad_addr(int __attribute__((unused)) sig,
  * (This depends both on architecture, which determines what we might
  * want to get to, and on OS, which determines how we get to it.)
  */
+
+// I don't have an easy way to test changes for these OSes, so just use this
+// context visitor based on the old slightly-less-efficient way of doing it.
+#if defined LISP_FEATURE_SUNOS || defined LISP_FEATURE_HAIKU
+void visit_context_registers(void (*proc)(os_context_register_t, int), os_context_t *context)
+{
+    proc(os_context_pc(context), 1);
+    proc(*os_context_register_addr(context, reg_RAX), 1);
+    proc(*os_context_register_addr(context, reg_RCX), 1);
+    proc(*os_context_register_addr(context, reg_RDX), 1);
+    proc(*os_context_register_addr(context, reg_RBX), 1);
+    proc(*os_context_register_addr(context, reg_RSI), 1);
+    proc(*os_context_register_addr(context, reg_RDI), 1);
+    proc(*os_context_register_addr(context, reg_R8 ), 1);
+    proc(*os_context_register_addr(context, reg_R9 ), 1);
+    proc(*os_context_register_addr(context, reg_R10), 1);
+    proc(*os_context_register_addr(context, reg_R11), 1);
+    proc(*os_context_register_addr(context, reg_R12), 1);
+    proc(*os_context_register_addr(context, reg_R13), 1);
+    proc(*os_context_register_addr(context, reg_R14), 1);
+    proc(*os_context_register_addr(context, reg_R15), 1);
+}
+#endif
 
 os_context_register_t *
 os_context_flags_addr(os_context_t *context)
@@ -649,26 +655,26 @@ lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
     return entrypoint_taggedptr((uword_t)fdefn->raw_addr);
 }
 
+#ifdef LISP_FEATURE_SB_THREAD
 #include "genesis/vector.h"
 #define LOCK_PREFIX 0xF0
 #undef SHOW_PC_RECORDING
 
-extern unsigned int alloc_profile_n_counters;
 extern unsigned int max_alloc_point_counters;
-#ifdef LISP_FEATURE_SB_THREAD
+
 #ifdef LISP_FEATURE_WIN32
 extern CRITICAL_SECTION alloc_profiler_lock;
 #else
 extern pthread_mutex_t alloc_profiler_lock;
 #endif
-#endif
 
-static unsigned int claim_index(int qty)
+
+static unsigned int claim_index(int qty) // qty is 1 or 2
 {
     static boolean warning_issued;
-    unsigned int index = alloc_profile_n_counters;
-    alloc_profile_n_counters += qty;
-    if (alloc_profile_n_counters <= max_alloc_point_counters)
+    unsigned int index = fixnum_value(SYMBOL(N_PROFILE_SITES)->value);
+    SYMBOL(N_PROFILE_SITES)->value += make_fixnum(qty);
+    if (fixnum_value(SYMBOL(N_PROFILE_SITES)->value) <= max_alloc_point_counters)
        return index;
     if (!warning_issued) {
        fprintf(stderr, "allocation profile buffer overflowed\n");
@@ -811,6 +817,7 @@ allocation_tracker_sized(uword_t* sp)
     int __attribute__((unused)) ret = mutex_release(&alloc_profiler_lock);
     gc_assert(ret);
 }
+#endif
 
 __attribute__((sysv_abi)) lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs) {
     extern lispobj call_into_lisp_(lispobj, lispobj *, int, struct thread *)

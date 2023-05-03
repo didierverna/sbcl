@@ -25,6 +25,12 @@
 (when (sb-sys:find-dynamic-foreign-symbol-address "show_gc_generation_throughput")
   (setf (extern-alien "show_gc_generation_throughput" int) 1))
 
+#+sbcl ; prevent "illegal to redefine standard type: RATIONAL" etc
+(when (member "SB-XC" (package-nicknames "CL") :test 'string=)
+  (sb-ext:unlock-package "CL")
+  (rename-package "CL" "COMMON-LISP" '("CL"))
+  (sb-ext:lock-package "CL"))
+
 (in-package "SB-COLD")
 
 (defun parse-make-host-parallelism (str)
@@ -284,8 +290,16 @@
                           sb-xc:*features*))
              (arch (target-platform-keyword)))
         ;; Win32 conditionally adds :sb-futex in grovel-features.sh
-        (when (target-featurep '(:and :sb-thread (:or :linux :freebsd)))
+        ;; Futexes aren't available in all macos versions, but they are available in all versions that support arm, so always enable them there
+        (when (target-featurep '(:and :sb-thread (:or :linux :freebsd :openbsd (:and :darwin :arm64))))
           (pushnew :sb-futex sb-xc:*features*))
+        ;; If may not be the best idea to put clock_gettime calls around every
+        ;; futex_wait if the OS/libc you're building for does not have a vdso entry point.
+        ;; So leave this out unless enabled explicitly and/or I gather more data on
+        ;; its performance impact.
+        #+nil
+        (when (target-featurep '(:and :sb-futex :x86-64 :linux))
+          (pushnew :futex-wait-metric sb-xc:*features*))
         (when (target-featurep :immobile-space)
           (when (member :sb-thread sb-xc:*features*)
             (pushnew :system-tlabs sb-xc:*features*))
@@ -304,6 +318,17 @@
           ;; Just print something and go on with life.
           (setq sb-xc:*features* (remove :int4-breakpoints sb-xc:*features*))
           (warn "Removed :INT4-BREAKPOINTS from target features"))
+        (when (target-featurep :x86-64)
+          (let ((int3-enable (target-featurep :int3-breakpoints))
+                (int4-enable (target-featurep :int4-breakpoints))
+                (ud2-enable (target-featurep :ud2-breakpoints)))
+            (when (or ud2-enable int4-enable)
+              (setq sb-xc:*features* (remove :int3-breakpoints sb-xc:*features*))
+              (when (and ud2-enable int4-enable)
+                (error "UD2-BREAKPOINTS and INT4-BREAKPOINTS are mutually exclusive choices")))
+            (unless (or int3-enable int4-enable ud2-enable)
+              ;; don't love the name, but couldn't think of a better one
+              (push :sw-int-avoidance sb-xc:*features*))))
         (when (or (target-featurep :arm64)
                   (and (target-featurep :x86-64)
                        (member :sse4 backend-subfeatures)))
@@ -365,10 +390,8 @@
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
          ("(and immobile-symbols (not immobile-space))"
           ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
-         ("(and system-tlabs (or (not sb-thread) (not immobile-space)))"
-          ;; I don't think it really reqires immobile-space but I haven't tried
-          ;; it and I don't care to support that.
-          ":SYSTEM-TLABS requires SB-THREAD and IMMOBILE-SPACE")
+         ("(and system-tlabs (not sb-thread))"
+          ":SYSTEM-TLABS requires SB-THREAD")
          ("(and sb-futex (not sb-thread))"
           "Can't enable SB-FUTEX on platforms lacking thread support")
          ;; There is still hope to make multithreading on DragonFly x86-64
