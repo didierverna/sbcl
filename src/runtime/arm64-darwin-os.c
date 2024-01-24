@@ -1,6 +1,6 @@
 #include "thread.h"
-#include "gc-internal.h"
-#include "gc-private.h"
+#include "gc.h"
+#include "code.h"
 void set_thread_stack(void *address) {
     /* KLUDGE: There is no interface to change the stack location of
        the initial thread, and without that backtrace(3) returns zero
@@ -20,9 +20,9 @@ void set_thread_stack(void *address) {
 }
 
 void jit_patch(lispobj* address, lispobj value) {
-    THREAD_JIT(0);
+    THREAD_JIT_WP(0);
     *address = value;
-    THREAD_JIT(1);
+    THREAD_JIT_WP(1);
 }
 
 void jit_copy_code_insts(lispobj dst, lispobj* src)
@@ -31,11 +31,11 @@ void jit_copy_code_insts(lispobj dst, lispobj* src)
     struct code* code = (struct code*)(dst-OTHER_POINTER_LOWTAG);
     int nwords = code_total_nwords(code);
     gc_assert(code_total_nwords((struct code*)aligned_src));
-    THREAD_JIT(0);
+    THREAD_JIT_WP(0);
     // Leave the header word alone
     memcpy(&code->boxed_size, aligned_src + 1, (nwords-1)<<WORD_SHIFT);
     for_each_simple_fun(i, fun, code, 1, { fun->self = fun_self_from_baseptr(fun); })
-    THREAD_JIT(1);
+    THREAD_JIT_WP(1);
     free(src);
     // FINISH-FIXUPS didn't call SB-VM:SANCTIFY-FOR-EXECUTION
     // because the copy of the code on which it operates was only temporary.
@@ -49,42 +49,40 @@ void jit_copy_code_constants(lispobj lispcode, lispobj constants)
     struct vector* v = VECTOR(constants);
     gc_assert(header_widetag(v->header) == SIMPLE_VECTOR_WIDETAG);
     gc_assert(find_page_index((void*)code) >= 0);
-    THREAD_JIT(0);
+
     sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIG_STOP_FOR_GC);
-    thread_sigmask(SIG_BLOCK, &mask, 0);
+    block_blockable_signals(&mask);
+    THREAD_JIT_WP(0);
     gc_card_mark[addr_to_card_index(code)] = CARD_MARKED;
     SET_WRITTEN_FLAG((lispobj*)code);
     memcpy(&code->constants, v->data, vector_len(v) * N_WORD_BYTES);
-    thread_sigmask(SIG_UNBLOCK, &mask, 0);
-    THREAD_JIT(1);
+    THREAD_JIT_WP(1);
+    thread_sigmask(SIG_SETMASK, &mask, 0);
 }
 
 void jit_memcpy(void* dst, void* src, size_t n) {
-    THREAD_JIT(0);
+    THREAD_JIT_WP(0);
     memcpy(dst, src, n);
-    THREAD_JIT(1);
+    THREAD_JIT_WP(1);
 }
 
 void jit_patch_code(lispobj code, lispobj value, unsigned long index) {
-    /* It is critical that we NOT touch the mark table if the object is off-heap.
-     * With soft protection, it's doesn't matter - it's merely suboptimal - but arm64
-     * uses physical protection for now, and a page fault on a page that is erroneously
-     * marked (i.e. not write-protected, allegedly) would be an error.
-     * Disallow GC in between setting the WRITTEN flag and doing the assigmment */
+    /* It is better not to the touch a card mark if the object is off-heap,
+     * though it's not terribly important any more */
     if (find_page_index((void*)code) >= 0) {
-        THREAD_JIT(0);
         sigset_t mask;
-        sigemptyset(&mask);
-        sigaddset(&mask, SIG_STOP_FOR_GC);
-        thread_sigmask(SIG_BLOCK, &mask, 0);
+        // Disallow GC in between setting the WRITTEN flag and doing the assigmment
+        block_blockable_signals(&mask);
+        THREAD_JIT_WP(0);
+
         gc_card_mark[addr_to_card_index(code)] = CARD_MARKED;
         SET_WRITTEN_FLAG(native_pointer(code));
         native_pointer(code)[index] = value;
-        thread_sigmask(SIG_UNBLOCK, &mask, 0);
-        THREAD_JIT(1);
+
+        THREAD_JIT_WP(1);
+        thread_sigmask(SIG_SETMASK, &mask, 0);
     } else { // Off-heap code objects can't be executed (or GC'd)
+             // umm, so why do they exist? I wish I could remember...
         SET_WRITTEN_FLAG(native_pointer(code));
         native_pointer(code)[index] = value;
     }

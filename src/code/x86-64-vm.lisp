@@ -219,36 +219,23 @@
                            (logior (ash undefined-fdefn-header 16)
                                    fdefn-widetag))) ; word 0
 
-#+immobile-code
-(progn
-(defconstant trampoline-entry-offset n-word-bytes)
-(defun make-simplifying-trampoline (fun)
-  ;; 'alloc' is compiled after this file so we don't see the derived type.
-  ;; But slam found a conflict on recompile.
-  (let ((code (truly-the (values code-component (integer 0) &optional)
-                         (allocate-code-object :dynamic 3 24)))) ; KLUDGE
-    (setf (%code-debug-info code) fun)
-    (with-pinned-objects (code)
-      (let ((sap (sap+ (code-instructions code) trampoline-entry-offset))
-            (ea (+ (logandc2 (get-lisp-obj-address code) lowtag-mask)
-                   (ash code-debug-info-slot word-shift))))
-        (setf (sap-ref-32 sap 0) #x058B48 ; REX MOV [RIP-n]
-              (signed-sap-ref-32 sap 3) (- ea (+ (sap-int sap) 7)); disp
-              (sap-ref-32 sap 7) #xFD60FF))) ; JMP [RAX-3]
-    ;; Verify that the jump table size reads as  0.
-    (aver (zerop (code-jump-table-words code)))
-    ;; It is critical that there be a trailing 'uint16' of 0 in this object
-    ;; so that CODE-N-ENTRIES reports 0.  By luck, there is exactly enough
-    ;; room in the object to hold two 0 bytes. It would be easy enough to enlarge
-    ;; by 2 words if it became necessary. The assertions makes sure we stay ok.
-    (aver (zerop (code-n-entries code)))
-    code))
-
 (defun fdefn-has-static-callers (fdefn)
   (declare (type fdefn fdefn))
   (with-pinned-objects (fdefn)
     (logbitp 7 (sap-ref-8 (int-sap (get-lisp-obj-address fdefn))
                           (- 1 other-pointer-lowtag)))))
+
+(eval-when (:compile-toplevel)
+(define-vop (set-fdefn-has-static-callers)
+  (:args (fdefn :scs (descriptor-reg)))
+  (:generator 1
+    ;; atomic because the immobile gen# is in the same byte
+    (inst or :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x80)))
+(define-vop (unset-fdefn-has-static-callers)
+  (:args (fdefn :scs (descriptor-reg)))
+  (:generator 1
+    ;; atomic because the immobile gen# is in the same byte
+    (inst and :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f))))
 
 (defun set-fdefn-has-static-callers (fdefn newval)
   (declare (type fdefn fdefn) (type bit newval))
@@ -257,26 +244,31 @@
       (%primitive set-fdefn-has-static-callers fdefn))
   fdefn)
 
-(defun %set-fdefn-fun (fdefn fun)
-  (declare (type fdefn fdefn) (type function fun)
-           (values function))
-  (when (fdefn-has-static-callers fdefn)
-    (remove-static-links fdefn))
-  (let ((trampoline (when (closurep fun)
-                      (make-simplifying-trampoline fun)))) ; a newly made CODE object
-    (with-pinned-objects (fdefn trampoline fun)
-      (let* ((jmp-target
-              (if trampoline
-                  ;; Jump right to code-instructions + N. There's no simple-fun.
-                  (sap-int (sap+ (code-instructions trampoline)
-                                 trampoline-entry-offset))
-                  ;; CLOSURE-CALLEE accesses the self pointer of a funcallable
-                  ;; instance w/ builtin trampoline, or a simple-fun.
-                  ;; But the result is shifted by N-FIXNUM-TAG-BITS because
-                  ;; CELL-REF yields a descriptor-reg, not an unsigned-reg.
-                  (get-lisp-obj-address (%closure-callee fun)))))
-        (%primitive sb-vm::set-direct-callable-fdefn-fun fdefn fun jmp-target))))
-  fun)
+#+immobile-code
+(progn
+(sb-kernel:!defstruct-with-alternate-metaclass closure-trampoline
+  :slot-names ()
+  :constructor %alloc-closure-trampoline
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)
+
+(defun set-fdefn-fun (fun fdefn)
+  (declare (type fdefn fdefn) (type function fun))
+  (let ((jmp-target (if (closurep fun)
+                        (let ((instance (%alloc-closure-trampoline)))
+                          (setf (%funcallable-instance-fun instance) fun)
+                          instance)
+                        fun)))
+    (with-pinned-objects (jmp-target)
+      ;; CLOSURE-CALLEE accesses the self pointer of a funcallable
+      ;; instance w/ builtin trampoline, or a simple-fun.
+      ;; But the result is shifted by N-FIXNUM-TAG-BITS because
+      ;; CELL-REF yields a descriptor-reg, not an unsigned-reg.
+      (%primitive set-direct-callable-fdefn-fun fdefn fun
+                  (get-lisp-obj-address (%closure-callee jmp-target)))))
+  nil)
 
 ) ; end PROGN
 
@@ -296,12 +288,6 @@
          (make-lisp-obj (logior obj other-pointer-lowtag)))
         (#.funcallable-instance-widetag
          (make-lisp-obj (logior obj fun-pointer-lowtag)))))))
-
-;;; Compute the PC that FDEFN will jump to when called.
-#+immobile-code
-(defun fdefn-raw-addr (fdefn)
-  (sap-ref-word (int-sap (get-lisp-obj-address fdefn))
-                (- (ash fdefn-raw-addr-slot word-shift) other-pointer-lowtag)))
 
 ;;; Undo the effects of XEP-ALLOCATE-FRAME
 ;;; and point PC to FUNCTION
@@ -404,7 +390,7 @@
                        (fun (aref replacements fdefn-index)))
               (when (and fun (/= (bit ambiguous fdefn-index) 1))
                 ;; Set the statically-linked flag
-                (sb-vm::set-fdefn-has-static-callers fdefn 1)
+                (set-fdefn-has-static-callers fdefn 1)
                 (when (= (bit ambiguous fdefn-index) 1)
                   (push offset (aref stored-locs fdefn-index)))
                 ;; Change the machine instruction
@@ -463,7 +449,7 @@
 (defun fdefn-entry-address (fdefn)
   (let ((fdefn (if (fdefn-p fdefn) fdefn (find-or-create-fdefn fdefn))))
     (+ (get-lisp-obj-address fdefn)
-       (- 2 sb-vm:other-pointer-lowtag))))
+       (- 2 other-pointer-lowtag))))
 
 (defun validate-asm-routine-vector ()
   ;; If the jump table in static space does not match the jump table
@@ -486,7 +472,7 @@
     ;; from any address in dynamic space. The fdefns aren't actually in static space.
     (let ((vector (truly-the (simple-array word (*))
                              (%make-lisp-obj (static-call-entrypoint-vector)))))
-      (dotimes (i (length sb-vm:+static-fdefns+))
+      (dotimes (i (length +static-fdefns+))
         (setf (aref vector i)
               (let ((fun (%symbol-function (truly-the symbol (aref +static-fdefns+ i)))))
                 (sap-ref-word (int-sap (get-lisp-obj-address fun))

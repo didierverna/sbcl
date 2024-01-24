@@ -32,7 +32,7 @@
             (:conc-name hss-)
             (:copier nil)
             (:predicate nil))
-  (cells #() :type simple-vector :read-only t)
+  (cells #() :type (or simple-vector #-sb-xc-host weak-vector) :read-only t)
   ;; We always store a hash-vector even if inexact (see below)
   ;; so that we can avoid calling the comparator on definite mismatches.
   (hash-vector (make-array 0 :element-type '(unsigned-byte 16))
@@ -61,17 +61,48 @@
   #+hashset-metrics (count-finds 0 :type sb-vm:word)
   (mutex nil :type (or null #-sb-xc-host sb-thread:mutex)))
 
+(defmacro hs-cells-len (v)
+  #-weak-vector-readbarrier `(length ,v)
+  #+weak-vector-readbarrier
+  `(let ((v (truly-the (or simple-vector weak-vector) ,v)))
+     (if (simple-vector-p v) (length v) (weak-vector-len v))))
+
+(defun (setf hs-cell-ref) (newval cells index)
+  #-weak-vector-readbarrier (setf (svref cells index) newval)
+  ;; Even though this access could be punned (because the effective address
+  ;; of weak-pointer + displacement or vector + displacement is the same)
+  ;; that would be wrong because the store barriers are different.
+  #+weak-vector-readbarrier
+  (if (simple-vector-p cells)
+      (setf (svref cells index) newval)
+      (setf (weak-vector-ref cells index) newval)))
+
+(declaim (inline hs-cell-ref))
+(defun hs-cell-ref (v i)
+  #-weak-vector-readbarrier (svref v i)
+  ;; As above, there is a read barrier needed for access to weak objects
+  ;; but not for simple-vector. Would it be both correct and faster
+  ;; to always _assume_ the vector is weak? I don't think so.
+  #+weak-vector-readbarrier
+  (let ((v (truly-the (or simple-vector weak-vector) v)))
+     (if (simple-vector-p v) (svref v i) (weak-vector-ref v i))))
+
 ;;; The last few elements in the cell vector are metadata.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant hs-storage-trailer-cells 3))
 (defmacro hs-cells-capacity (v)
-  `(truly-the index (- (length ,v) ,hs-storage-trailer-cells)))
+  `(truly-the index (- (hs-cells-len ,v) ,hs-storage-trailer-cells)))
 (defmacro hs-cells-mask (v)
-  `(truly-the index (- (length ,v) ,(1+ hs-storage-trailer-cells))))
-(defmacro hs-cells-gc-epoch (v) `(aref ,v (- (length ,v) 3)))
+  `(truly-the index (- (hs-cells-len ,v) ,(1+ hs-storage-trailer-cells))))
+(defmacro hs-cells-gc-epoch (v)
+  `(hs-cell-ref ,v (- (hs-cells-len ,v) 3)))
 ;;; max probe sequence length for these cells
-(defmacro hs-cells-max-psl (v)  `(truly-the fixnum (aref ,v (- (length ,v) 2))))
-(defmacro hs-cells-n-avail (v)  `(truly-the fixnum (aref ,v (- (length ,v) 1))))
+;;; TODO: if #+weak-vector-readbarrier add an accessor which bypasses
+;;; the barrier given that the indexed element is a non-pointer.
+(defmacro hs-cells-max-psl (v)
+  `(truly-the fixnum (hs-cell-ref ,v (- (hs-cells-len ,v) 2))))
+(defmacro hs-cells-n-avail (v)
+  `(truly-the fixnum (hs-cell-ref ,v (- (hs-cells-len ,v) 1))))
 
 (defun hashset-cells-load-factor (cells)
   (let* ((cap (hs-cells-capacity cells))
@@ -85,15 +116,13 @@
   (declare (ignorable weakp))
   (declare (sb-c::tlab :system) (inline !make-hs-storage))
   (let* ((len (+ capacity hs-storage-trailer-cells))
-         (cells
-          #+sb-xc-host (make-array len :initial-element 0)
-          #-sb-xc-host
-          (let ((type (if weakp
-                          (logior (ash sb-vm:vector-weak-flag sb-vm:array-flags-position)
-                                  sb-vm:simple-vector-widetag)
-                          sb-vm:simple-vector-widetag)))
-            (sb-vm::splat (truly-the simple-vector (allocate-vector #+ubsan nil type len len))
-                          len 0)))
+         ;; This *MUST* use allocate-weak-vector and not MAKE-WEAK-VECTOR.
+         ;; The latter can not be open-coded and would allocate to an arena
+         ;; if so chosen by the the current thread, thereby ignoring
+         ;; the SB-C::TLAB declaration above. ALLOCATE-WEAK-VECTOR
+         ;; will respect the local declaration.
+         (cells (cond #-sb-xc-host (weakp (sb-c::allocate-weak-vector len))
+                      (t (make-array len :initial-element 0))))
          (psl-vector (make-array capacity :element-type '(unsigned-byte 8)
                                           :initial-element 0))
          (hash-vector (make-array capacity :element-type '(unsigned-byte 16))))
@@ -109,11 +138,13 @@
 
 (defun hashset-weakp (hashset)
   #+sb-xc-host (declare (ignore hashset))
-  #-sb-xc-host
-  (let* ((storage (hashset-storage hashset))
-         (cells (hss-cells storage)))
-    (not (zerop (get-header-data cells)))))
+  #-sb-xc-host (weak-vector-p (hss-cells (hashset-storage hashset))))
 
+;;; The hash-function provided to this constructor has to be reasonably strong.
+;;; You could probably get away with SXHASH for instance types since we have stable
+;;; addressed-based hashing on those. However, if the intent is to lookup keys
+;;; using a content-based hash, then it's not useful to rely on SXHASH. When in doubt
+;;; as to whether your hash is strong enough, call MURMUR3-FMIX-WORD somewhere in it.
 (defun make-hashset (estimated-count test-function hash-function &key weakness synchronized)
   (declare (boolean weakness synchronized))
   (let* ((capacity (power-of-two-ceiling (* estimated-count 2)))
@@ -198,7 +229,7 @@
       (loop
         (incf probe-sequence-pos)
         (let* ((location (logand (+ hash (triang probe-sequence-pos)) mask))
-               (probed-key (aref cells location))
+               (probed-key (hs-cell-ref cells location))
                ;; Get the position in its probe sequence of the key (if any)
                ;; in the slot we're considering taking.
                (probed-key-psp ; named 'recordposition' in the paper
@@ -211,7 +242,7 @@
             (let ((probed-key-hash (aref hash-vector location)))
               (setf (aref hash-vector location) (ldb (byte 16 0) hash)
                     (aref psl-vector location) probe-sequence-pos
-                    (aref cells location) key)
+                    (hs-cell-ref cells location) key)
               #+hashset-debug
               (when (> probe-sequence-pos max-psl)
                 (format *error-output* "hashset-insert(~x): max_psl was ~D is ~D, LF=~F~%"
@@ -239,14 +270,34 @@
          (values (if (plusp n-keys) (/ (float sum-psl) n-keys)) ; avg PSL
                  histo
                  (/ (float n-keys) (hs-cells-capacity cells)))) ; load factor
-      (let ((x (aref cells i)))
+      (let ((x (hs-cell-ref cells i)))
         (when (validp x)
           (let ((psl (aref psl-vector i)))
             (incf (aref histo (1- psl)))
             (incf sum-psl psl)
             (incf n-keys)))))))
 
+;;; Return count of occupied cells, NILs, 0s, and unbound markers.
+;;; [Sidebar: I may need to change the tombstone and/or unassigned value.
+;;; Currently these hashsets can't represent 0 or NIL as a key per se]
+(defun hs-cells-occupancy (cells limit)
+  (declare (type (or simple-vector #-sb-xc-host weak-vector) cells)
+           (index limit))
+  (let ((count-live 0)
+        (count-nil 0) ; GC smashes to NIL, so these are tombstones
+        (count-0 0) ; cells are 0-initialized, so this indicates never used
+        (count-ubm 0))
+    (declare (fixnum count-live count-0 count-NIL count-ubm))
+    (dotimes (i limit)
+      (let ((val (hs-cell-ref cells i)))
+        (cond ((eql val nil) (incf count-nil))
+              ((eql val 0) (incf count-0))
+              #-sb-xc-host ((unbound-marker-p val) (incf count-ubm))
+              (t (incf count-live)))))
+    (values count-live count-nil count-0 count-ubm)))
+
 (defun hashset-rehash (hashset count)
+  (declare (type (or index null) count))
   ;; (hashset-check-invariants hashset "begin rehash")
   (flet ((validp (x) (and (not (hs-chain-terminator-p x)) x)))
     (declare (inline validp))
@@ -254,7 +305,7 @@
            (old-cells (hss-cells old-storage))
            (old-capacity (hs-cells-capacity old-cells))
            (count (or count ; count is already known if just GC'ed
-                      (count-if #'validp old-cells :end old-capacity)))
+                      (hs-cells-occupancy old-cells old-capacity)))
            (new-capacity (max 64 (power-of-two-ceiling (* count 2))))
            (new-storage
             (allocate-hashset-storage new-capacity (hashset-weakp hashset))))
@@ -273,7 +324,7 @@
           ((< i 0)
            (decf (hs-cells-n-avail (hss-cells new-storage)) n-inserted))
         (declare (type index-or-minus-1 i) (fixnum n-inserted))
-        (let ((key (aref old-cells i)))
+        (let ((key (hs-cell-ref old-cells i)))
           (when (validp key)
             (incf n-inserted)
             ;; Test whether 16-bit hashes are good for the _new_ storage, not the old.
@@ -283,10 +334,11 @@
                                  (aref old-hash-vector i))))))
       ;; Assign the new vectors
       (setf (hashset-storage hashset) new-storage)
-      ;; Zap the old key vector
-      (fill old-cells 0)
-      ;; old vector becomes non-weak, eliminating some GC overhead
-      #-sb-xc-host (assign-vector-flags old-cells 0)
+      (when (simple-vector-p old-cells)
+        ;; Zap the old key vector
+        (fill old-cells 0)
+        ;; old vector becomes non-weak, eliminating some GC overhead
+        #-sb-xc-host (assign-vector-flags old-cells 0))
       ;; (hashset-check-invariants hashset "end rehash")
       new-storage)))
 
@@ -302,7 +354,7 @@
                    (n-live))
                ;; First decide if the table occupancy needs to be recomputed after GC
                (unless (eq (hs-cells-gc-epoch cells) current-epoch)
-                 (setf n-live (count-if #'validp cells :end capacity)
+                 (setf n-live (hs-cells-occupancy cells capacity)
                        (hs-cells-n-avail cells) (- capacity n-live)
                        (hs-cells-gc-epoch cells) current-epoch))
                ;; Next decide if rehash should occur (LF exceeds 75%)
@@ -352,8 +404,8 @@
     ;; (It's also not better for subsequent iterations, but it's good enough)
     (loop
       (let* ((next-index (logand (+ index iteration) mask))
-             (k1 (aref cells index))
-             (k2 (aref cells next-index))
+             (k1 (hs-cell-ref cells index))
+             (k2 (hs-cell-ref cells next-index))
              (h1 (aref hash-vector index))
              (h2 (aref hash-vector next-index)))
         (when (and (= (lowtag-of k2) lowtag) (= h2 clipped-hash) (funcall test k2 key))
@@ -388,12 +440,12 @@
          (iteration 1))
     (declare (fixnum iteration))
     (loop
-      (let ((probed-value (aref cells index)))
+      (let ((probed-value (hs-cell-ref cells index)))
         (when (hs-chain-terminator-p probed-value) ; end of probe sequence
           (return nil))
         (when (and probed-value (funcall test probed-value key))
           (hs-aver-probe-sequence-len storage index iteration)
-          (setf (aref cells index) nil) ; It's that simple
+          (setf (hs-cell-ref cells index) nil) ; It's that simple
           (return t))
         (if (>= iteration max-psl) (return nil))
         (setq index (logand (+ index iteration) mask))
@@ -420,9 +472,10 @@
   (macrolet ((dovect ()
                `(let ((vec (hss-cells (hashset-storage hashset))))
                   (do ((index 0 (1+ index))
-                       (length (- (length vec) hs-storage-trailer-cells)))
+                       ;; FIXME: isn't this just HS-CELLS-CAPACITY ?
+                       (length (- (hs-cells-len vec) hs-storage-trailer-cells)))
                       ((>= index length))
-                    (let ((elt (svref vec index)))
+                    (let ((elt (hs-cell-ref vec index)))
                       (unless (or (null elt) (eql elt 0))
                         (funcall function elt)))))))
     (if (hashset-mutex hashset)
@@ -430,8 +483,11 @@
         (dovect))))
 
 (defun hashset-count (hashset &aux (cells (hss-cells (hashset-storage hashset))))
-  (count-if (lambda (x) (and x (not (hs-chain-terminator-p x))))
-            cells :end (hs-cells-capacity cells)))
+  (let ((n 0))
+    (dotimes (i (hs-cells-capacity cells) n)
+      (let ((x (hs-cell-ref cells i)))
+        (when (and x (not (hs-chain-terminator-p x)))
+          (incf n))))))
 (defmethod print-object ((self robinhood-hashset) stream)
   (print-unreadable-object (self stream :type t :identity t)
     (let ((cells (hss-cells (hashset-storage self))))
@@ -484,19 +540,34 @@
                      ;; hash.impure.lisp)
                      #.(logandc1 1193941380939624010 most-positive-fixnum))
              most-positive-fixnum)))
+(defvar *sxhash-crosscheck* nil)
 )
 
 #+sb-xc-host
-(progn
-  (defvar *sxhash-crosscheck* nil)
-  (defun sb-xc:sxhash (obj)
-    (let ((answer
-           (etypecase obj ; croak on anything but these
-            (symbol (sb-impl::symbol-name-hash obj))
+(defun sb-xc:sxhash (obj)
+  (let ((answer
+         (etypecase obj ; croak on anything but these
+            (symbol (let ((s (string obj)))
+                      ;; !PACKAGE-COLD-INIT will cross-check this hash
+                      (return-from sb-xc:sxhash
+                        (calc-symbol-name-hash s (length s)))))
             (sb-xc:fixnum #.(sxhash-fixnum-xform 'obj))
+            ;; calc-member-type-hash seems to want to invoke sb-xc:sxhash on
+            ;; signed zeros. I'm not sure if the answer has to match SBCL's
+            ;; answer, but this makes it so it does.
             (single-float #.(sxhash-single-float-xform 'obj))
             (double-float #.(sxhash-double-float-xform 'obj)))))
-      ;; Symbol hashes are verified by CHECK-HASH-SLOT in !PACKAGE-COLD-INIT
-      (unless (symbolp obj)
-        (push (cons obj answer) *sxhash-crosscheck*))
-      answer)))
+    (push (cons obj answer) *sxhash-crosscheck*)
+    answer))
+
+#-sb-xc-host
+(progn
+(defun weak-hashset-linear-find/eq (key hashset)
+  (let ((cells (hss-cells hashset)))
+    (if (simple-vector-p cells)
+        (find key cells :test #'eq)
+        (weak-vector-find/eq key cells))))
+(defun weak-vector-find/eq (key vector)
+  (dotimes (i (weak-vector-len vector))
+    (when (eq (weak-vector-ref vector i) key)
+      (return key)))))

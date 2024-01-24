@@ -87,7 +87,7 @@
   (context (* os-context-t))
     (index int))
 
-(sb-c::when-vop-existsp  (:translate sb-c::unsigned+)
+(sb-c::when-vop-existsp  (:translate overflow+)
   (declaim (inline os-context-flags-addr))
   (define-alien-routine ("os_context_flags_addr" os-context-flags-addr)
       (* unsigned)
@@ -260,3 +260,13 @@
           (when (atom (setq obj (cdr obj))) (return))
           (pin obj)
           (setq addr (logandc2 (get-lisp-obj-address obj) lowtag-mask)))))))
+
+#-executable-funinstances
+(defun write-funinstance-prologue (object)
+  (let ((slot  (- (ash funcallable-instance-trampoline-slot word-shift)
+                  fun-pointer-lowtag)))
+    ;; The amount of processing formerly done by MAKE-FIXUP and resolving the fixup
+    ;; was at _least_ as much as this one hash-table lookup.
+    (with-pinned-objects (object)
+      (setf (sap-ref-word (int-sap (get-lisp-obj-address object)) slot)
+            (get-asm-routine 'funcallable-instance-tramp)))))

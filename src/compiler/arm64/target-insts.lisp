@@ -197,7 +197,7 @@
     (if (= (length value) 3)
         (destructuring-bind (size opc reg) value
           (cond ((zerop v)
-                 (when (= size #b10)
+                 (when (/= size #b11)
                    (princ "W" stream))
                  (princ (svref *register-names* reg) stream))
                 (t
@@ -417,11 +417,33 @@
                             (ash (cadr value) 2))
                     (ash value 2)))
          (address (+ value (dstate-cur-addr dstate))))
-    ;; LRA pointer
-    (if (= (logand address lowtag-mask) other-pointer-lowtag)
-        (- address (- other-pointer-lowtag n-word-bytes))
+    (maybe-note-assembler-routine address nil dstate)
+    ;; Reference to a function within this code object.
+    (or (and (= (logand address lowtag-mask) fun-pointer-lowtag)
+             (let* ((seg (dstate-segment dstate))
+                    (code (seg-code seg))
+                    (offset (+ (sb-disassem::seg-initial-offset seg)
+                               (dstate-cur-offs dstate)
+                               (- value fun-pointer-lowtag))))
+               (loop for n below (code-n-entries code)
+                     do (when (= (%code-fun-offset code n) offset)
+                          (let ((fun (%code-entry-point code n)))
+                            (note (lambda (stream) (prin1-quoted-short fun stream)) dstate))
+                          (return (- address fun-pointer-lowtag))))))
         address)))
 
+(defun annotate-add-sub-imm (value stream dstate)
+  (declare (ignore stream))
+  (destructuring-bind (register shift offset) value
+    (case register
+      (#.sb-vm::null-offset
+       (let ((inst (current-instruction dstate))
+             (offset (+ sb-vm:nil-value
+                        (if (= shift 1)
+                            (ash offset 12)
+                            offset))))
+         (when (zerop (ldb (byte 2 29) inst)) ;; ADD
+           (maybe-note-static-symbol offset dstate)))))))
 
 (defun annotate-ldr-str (register offset dstate)
   (case register

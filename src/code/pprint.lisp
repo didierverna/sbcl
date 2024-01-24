@@ -519,17 +519,20 @@
            (type newline until))
   (let* ((target (pretty-stream-target stream))
          (buffer (pretty-stream-buffer stream))
+         (buffer-significant-spaces (pretty-stream-buffer-significant-spaces stream))
          (kind (newline-kind until))
          (literal-p (eq kind :literal))
          (amount-to-consume (posn-index (newline-posn until) stream))
          (amount-to-print
           (if literal-p
               amount-to-consume
-              (let ((last-non-blank
-                     (position #\space buffer :end amount-to-consume
-                               :from-end t :test #'char/=)))
-                (if last-non-blank
-                    (1+ last-non-blank)
+              (let ((last-significant-char-pos
+                     (loop for pos downfrom (1- amount-to-consume) to 0
+                           if (or (char/= (char buffer pos) #\Space)
+                                  (member pos buffer-significant-spaces))
+                           do (return pos))))
+                (if last-significant-char-pos
+                    (1+ last-significant-char-pos)
                     0)))))
     (write-string buffer target :end amount-to-print)
     (let ((line-number (pretty-stream-line-number stream)))
@@ -574,6 +577,10 @@
                  :end1 prefix-len)
         (setf (pretty-stream-buffer-fill-pointer stream) new-fill-ptr)
         (incf (pretty-stream-buffer-offset stream) shift)
+        (when buffer-significant-spaces
+          (setf (pretty-stream-buffer-significant-spaces stream)
+                (remove-if #'minusp
+                           (mapcar (lambda (x) (- x shift)) buffer-significant-spaces))))
         (unless literal-p
           (setf (logical-block-section-column block) prefix-len)
           (setf (logical-block-section-start-line block) line-number))))))
@@ -772,7 +779,7 @@ line break."
   (or (and (eq (info :type :kind type-spec) :instance)
            (let ((layout (info :type :compiler-layout type-spec)))
              (and layout
-                  (let ((info (wrapper-info layout)))
+                  (let ((info (layout-info layout)))
                     (and info
                          (let ((pred (dd-predicate-name info)))
                            (and pred (fboundp pred)
@@ -1492,6 +1499,14 @@ line break."
   (with-pretty-stream (stream)
     (funcall fun stream object)))
 
+;;; Called to inform the pretty stream that a #\Space character just
+;;; written is significant even if it is at end-of-line.
+(defun note-significant-space (stream)
+  (declare (type stream stream))
+  (when (pretty-stream-p stream)
+    (push (1- (pretty-stream-buffer-fill-pointer stream))
+          (pretty-stream-buffer-significant-spaces stream))))
+
 ;;; Warm bootup is slightly less brittle if we can avoid first having to run
 ;;; the compiler to make the predicates for the initial PPD type specifiers.
 ;;; Factoring this out avoids retaining excess junk as part of the codeblob
@@ -1510,7 +1525,7 @@ line break."
            ;; adjust the computation of POSSIBLY-MATCHABLE in PPRINT-DISPATCH.
            ;; For identical priorities, we pick the first match, but that's technically
            ;; unspecified behavior because insertion isn't necessarily stable,
-           ;; thought it is in this implementation.
+           ;; though it is in this implementation.
            (entry '(and array (not (or string bit-vector))) 'pprint-array)
            (entry '(cons (and symbol (satisfies fboundp))) 'pprint-call-form)
            (entry 'cons 'pprint-fill 'consp)

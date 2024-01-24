@@ -224,9 +224,6 @@
 
 ;;;; fdefinition (FDEFN) objects
 
-(define-vop (fdefn-fun cell-ref)        ; /pfw - alpha
-  (:variant fdefn-fun-slot other-pointer-lowtag))
-
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
   (:policy :fast-safe)
@@ -242,11 +239,9 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) raw)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (inst mov raw (make-fixup 'closure-tramp :assembly-routine))
     (inst cmp (make-ea :byte :base function :disp (- fun-pointer-lowtag))
@@ -255,8 +250,7 @@
           (make-ea :dword :base function
                    :disp (- (* simple-fun-self-slot n-word-bytes) fun-pointer-lowtag)))
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-    (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (move result function)))
+    (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -420,9 +414,6 @@
 
 ;;;; value cell hackery
 
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
-
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))
 
@@ -482,20 +473,24 @@
     (inst mov table (make-ea :dword :disp (make-fixup "gc_card_mark" :foreign-dataref)))
     (inst mov table (make-ea :dword :base table))
     (pseudo-atomic ()
-      ;; Compute card mark index and touch the mark byte
-      (inst mov card object)
-      (inst shr card gencgc-card-shift)
-      (inst and card (make-fixup nil :card-table-index-mask))
-      (inst mov (make-ea :byte :base table :index card) 1) ; CARD_MARKED
-      ;; set 'written' flag in the code header
-      ;; this doesn't need to use :LOCK because the only other writer
-      ;; would be a GCing thread, but we're pseudo-atomic here.
-      ;; If two threads actually did write the byte, then they would write
-      ;; the same value, and that works fine.
-      (inst or (make-ea :byte :base object :disp (- 3 other-pointer-lowtag)) #x40)
-      ;; store
-      (inst mov (make-ea :dword :base object :index index :disp (- other-pointer-lowtag))
-            value))))
+      (let ((do-not-mark (gen-label)))
+        (inst cmp object static-space-end)
+        (inst jmp :b DO-NOT-MARK)
+        ;; Compute card mark index and touch the mark byte
+        (inst mov card object)
+        (inst shr card gencgc-card-shift)
+        (inst and card (make-fixup nil :card-table-index-mask))
+        (inst mov (make-ea :byte :base table :index card) 1) ; CARD_MARKED
+        (emit-label DO-NOT-MARK)
+        ;; set 'written' flag in the code header
+        ;; this doesn't need to use :LOCK because the only other writer
+        ;; would be a GCing thread, but we're pseudo-atomic here.
+        ;; If two threads actually did write the byte, then they would write
+        ;; the same value, and that works fine.
+        (inst or (make-ea :byte :base object :disp (- 3 other-pointer-lowtag)) #x40)
+        ;; store
+        (inst mov (make-ea :dword :base object :index index :disp (- other-pointer-lowtag))
+              value)))))
 
 ;;;; raw instance slot accessors
 

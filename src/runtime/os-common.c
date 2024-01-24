@@ -14,11 +14,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "globals.h"
 #include "runtime.h"
-#include "genesis/config.h"
-#include "genesis/constants.h"
 #include "genesis/cons.h"
 #include "genesis/vector.h"
 #include "genesis/symbol.h"
@@ -31,6 +29,9 @@
 #include "code.h"
 #if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
 # include <dlfcn.h>
+#endif
+#if defined LISP_FEATURE_UNIX && defined LISP_FEATURE_SOFT_CARD_MARKS
+#include "gc.h" // for find_page_index
 #endif
 
 /*
@@ -106,7 +107,7 @@ os_deallocate(os_vm_address_t addr, os_vm_size_t len)
 #ifdef LISP_FEATURE_WIN32
     gc_assert(VirtualFree(addr, 0, MEM_RELEASE));
 #else
-    if (munmap(addr, len) == -1) perror("munmap");
+    if (sbcl_munmap(addr, len) == -1) perror("munmap");
 #endif
 }
 #endif
@@ -117,31 +118,33 @@ os_get_errno(void)
     return errno;
 }
 
-#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX && !defined USE_DARWIN_GCD_SEMAPHORES
+void
+os_set_errno(int new_errno)
+{
+    errno = new_errno;
+}
+
+#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX && !defined USE_DARWIN_GCD_SEMAPHORES && !defined CANNOT_USE_POSIX_SEM_T
 void
 os_sem_init(os_sem_t *sem, unsigned int value)
 {
     if (-1==sem_init(sem, 0, value))
         lose("os_sem_init(%p, %u): %s", sem, value, strerror(errno));
-    FSHOW((stderr, "os_sem_init(%p, %u)\n", sem, value));
 }
 
 void
-os_sem_wait(os_sem_t *sem, char *what)
+os_sem_wait(os_sem_t *sem)
 {
-    FSHOW((stderr, "%s: os_sem_wait(%p) ...\n", what, sem));
     while (-1 == sem_wait(sem))
         if (EINTR!=errno)
-            lose("%s: os_sem_wait(%p): %s", what, sem, strerror(errno));
-    FSHOW((stderr, "%s: os_sem_wait(%p) => ok\n", what, sem));
+            lose("os_sem_wait(%p): %s", sem, strerror(errno));
 }
 
 void
-os_sem_post(sem_t *sem, char *what)
+os_sem_post(sem_t *sem)
 {
     if (-1 == sem_post(sem))
-        lose("%s: os_sem_post(%p): %s", what, sem, strerror(errno));
-    FSHOW((stderr, "%s: os_sem_post(%p)\n", what, sem));
+        lose("os_sem_post(%p): %s", sem, strerror(errno));
 }
 
 void
@@ -173,24 +176,38 @@ os_dlsym_default(char *name)
 #endif
 
 int alien_linkage_table_n_prelinked;
+extern lispobj* get_alien_linkage_table_initializer();
 void os_link_runtime()
 {
-    if (alien_linkage_table_n_prelinked)
-        return; // Linkage was already performed by coreparse
+    lispobj* table = get_alien_linkage_table_initializer();
+    if (table) {
+        // Prefill the alien linkage table so that shrinkwrapped executables which
+        // link in all their C library dependencies can avoid linking with -ldl
+        // but extern-alien still works for newly compiled code.
+        lispobj* ptr = table;
+        int n = alien_linkage_table_n_prelinked = *ptr++;
+        int index = 0;
+        for ( ; n-- ; index++ ) {
+            bool datap = *ptr == (lispobj)-1; // -1 can't be a function address
+            if (datap) ++ptr;
+            arch_write_linkage_table_entry(index, (void*)*ptr++, datap);
+        }
+        return;
+    }
 
     struct vector* symbols = VECTOR(SymbolValue(REQUIRED_FOREIGN_SYMBOLS,0));
-    alien_linkage_table_n_prelinked = vector_len(symbols);
-    int j;
-    for (j = 0 ; j < alien_linkage_table_n_prelinked ; ++j)
+    int n = alien_linkage_table_n_prelinked = vector_len(symbols);
+    int index;
+    for (index = 0 ; index < n ; ++index)
     {
-        lispobj item = symbols->data[j];
-        boolean datap = listp(item);
+        lispobj item = symbols->data[index];
+        bool datap = listp(item);
         lispobj symbol_name = datap ? CONS(item)->car : item;
-        char *namechars = (void*)(intptr_t)(VECTOR(symbol_name)->data);
+        char *namechars = vector_sap(symbol_name);
         void* result = os_dlsym_default(namechars);
 
         if (result) {
-            arch_write_linkage_table_entry(j, result, datap);
+            arch_write_linkage_table_entry(index, result, datap);
         } else { // startup might or might not work. ymmv
             fprintf(stderr, "Missing required foreign symbol '%s'\n", namechars);
         }
@@ -201,12 +218,11 @@ void os_unlink_runtime()
 {
 }
 
-boolean
-gc_managed_heap_space_p(lispobj addr)
+bool gc_managed_heap_space_p(lispobj addr)
 {
     if ((READ_ONLY_SPACE_START <= addr && addr < READ_ONLY_SPACE_END)
         || (STATIC_SPACE_START <= addr && addr < STATIC_SPACE_END)
-#if defined LISP_FEATURE_GENCGC
+#if defined LISP_FEATURE_GENERATIONAL
         || (DYNAMIC_SPACE_START <= addr &&
             addr < (DYNAMIC_SPACE_START + dynamic_space_size))
         || immobile_space_p(addr)
@@ -333,8 +349,19 @@ void* load_core_bytes_jit(int fd, os_vm_offset_t offset, os_vm_address_t addr, o
 
 #endif
 
-boolean
-gc_managed_addr_p(lispobj addr)
+bool is_in_stack_space(lispobj ptr)
+{
+    struct thread *th;
+    for_each_thread(th) {
+        if ((th->control_stack_start <= (lispobj *)ptr) &&
+            (th->control_stack_end >= (lispobj *)ptr)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+bool gc_managed_addr_p(lispobj addr)
 {
     struct thread *th;
 
@@ -377,17 +404,27 @@ char *copied_string(char *string)
     return strcpy(successful_malloc(1+strlen(string)), string);
 }
 
+lispobj* duplicate_codeblob_offheap(lispobj code)
+{
+    int nwords = code_total_nwords((struct code*)(code-OTHER_POINTER_LOWTAG));
+    lispobj* mem = malloc((nwords+1) * N_WORD_BYTES);
+    if ((uword_t)mem & LOWTAG_MASK) lose("this is unexpected\n");
+    // add 1 word if not dualword aligned
+    lispobj* copy = (lispobj*)((uword_t)mem + ((uword_t)mem & N_WORD_BYTES));
+    memcpy(copy, (char*)code-OTHER_POINTER_LOWTAG, nwords<<WORD_SHIFT);
+    return mem;
+}
+
 #ifdef LISP_FEATURE_UNIX
-#include "gc-internal.h"
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
-#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+#if defined LISP_FEATURE_SOFT_CARD_MARKS && !defined LISP_FEATURE_DARWIN_JIT
     // dynamic space should not have protections manipulated
     if (find_page_index(address) >= 0)
         lose("unexpected call to os_protect with software card marks");
 #endif
-    if (mprotect(address, length, prot) < 0) {
+    if (sbcl_mprotect(address, length, prot) < 0) {
 #ifdef LISP_FEATURE_LINUX
         if (errno == ENOMEM) {
             lose("An mprotect call failed with ENOMEM. This probably means that the maximum amount\n"
@@ -402,18 +439,9 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 }
 #endif
 
-lispobj* duplicate_codeblob_offheap(lispobj code)
-{
-    int nwords = code_total_nwords((struct code*)(code-OTHER_POINTER_LOWTAG));
-    lispobj* mem = malloc((nwords+1) * N_WORD_BYTES);
-    if ((uword_t)mem & LOWTAG_MASK) lose("this is unexpected\n");
-    // add 1 word if not dualword aligned
-    lispobj* copy = (lispobj*)((uword_t)mem + ((uword_t)mem & N_WORD_BYTES));
-    memcpy(copy, (char*)code-OTHER_POINTER_LOWTAG, nwords<<WORD_SHIFT);
-    return mem;
-}
-
-#if 0 // interceptors for debugging so I don't have to reinvent them every time
+#ifdef TRACE_MMAP_SYSCALLS
+FILE* mmgr_debug_logfile;
+// interceptors for debugging so I don't have to reinvent them every time
 static void decode_protbits(int prot, char result[4]) {
     result[0] = (prot & PROT_READ) ? 'r' : '-';
     result[1] = (prot & PROT_WRITE) ? 'w' : '-';
@@ -431,25 +459,109 @@ static void decode_flagbits(int flags, char result[40]) {
 #undef APPEND
     strcpy(p, "}");
 }
-void* sbcl_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+void* traced_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
     char decoded_prot[4], decoded_flags[40];
     decode_protbits(prot, decoded_prot);
     decode_flagbits(flags, decoded_flags);
     void* result = mmap(addr, length, prot, flags, fd, offset);
-    fprintf(stderr, "mmap(%p,%lx,%s,%s,%d,%llx)=%p\n", addr, length,
+    fprintf(mmgr_debug_logfile, "mmap(%p,%lx,%s,%s,%d,%llx)=%p\n", addr, length,
             decoded_prot, decoded_flags, fd, offset, result);
     return result;
 }
-int sbcl_munmap(void* addr, size_t length) {
+int traced_munmap(void* addr, size_t length) {
     int result = munmap(addr, length);
-    fprintf(stderr, "munmap(%p,%lx)=%d\n", addr, length, result);
+    fprintf(mmgr_debug_logfile, "munmap(%p,%lx)=%d\n", addr, length, result);
     return result;
 }
 int sbcl_mprotect(void* addr, size_t length, int prot) {
     char decoded_prot[4];
     decode_protbits(prot, decoded_prot);
     int result = mprotect(addr, length, prot);
-    fprintf(stderr, "mprotect(%p,%lx,%s)=%d\n", addr, length, decoded_prot, result);
+    fprintf(mmgr_debug_logfile, "mprotect(%p,%lx,%s)=%d\n", addr, length, decoded_prot, result);
     return result;
+}
+#endif
+
+#ifdef LISP_FEATURE_ELF
+#include <elf.h>
+
+static off_t lisp_rel_section_offset;
+static ssize_t lisp_rel_section_size;
+
+// Return the offset to a file section named 'lisp.core' if there is one
+off_t search_for_elf_core(int fd)
+{
+    Elf64_Ehdr ehdr;
+
+    if (lseek(fd, 0, SEEK_SET) != 0 ||
+        read(fd, &ehdr, sizeof ehdr) != sizeof ehdr) {
+        fprintf(stderr, "failed to read elf header\n");
+        return 0;
+    }
+    unsigned long result = 0;
+    char* shdrs = 0;
+    char * shstrtab_strbuf = 0;
+
+    // Slurp in all the section headers
+    int nbytes = ehdr.e_shentsize * ehdr.e_shnum;
+    if ((shdrs = malloc(nbytes)) == NULL ||
+        lseek(fd, ehdr.e_shoff, SEEK_SET) != (Elf64_Sxword)ehdr.e_shoff ||
+        read(fd, shdrs, nbytes) != nbytes)
+        goto done;
+    Elf64_Shdr* shdr = (Elf64_Shdr*)(shdrs + ehdr.e_shentsize * ehdr.e_shstrndx);
+    // Slurp the string table
+    if ((shstrtab_strbuf = malloc(shdr->sh_size)) == NULL ||
+        lseek(fd, shdr->sh_offset, SEEK_SET) != (Elf64_Sxword)shdr->sh_offset ||
+        read(fd, shstrtab_strbuf, shdr->sh_size) != (Elf64_Sxword)shdr->sh_size)
+        goto done;
+    // Scan the section header string table to locate both the 'lisp.core' and
+    // 'lisp.rel' sections. There might not be a lisp.rel section, but don't stop
+    // looking after seeing just one. The order is unspecified.
+    int i;
+    for(i=1;i<ehdr.e_shnum;++i) { // skip section 0 which is the null section
+        Elf64_Shdr* h = (Elf64_Shdr*)(shdrs + ehdr.e_shentsize * i);
+        if  (!strcmp(&shstrtab_strbuf[h->sh_name], "lisp.core")) {
+            gc_assert(!result); // there can be only 1
+            result = h->sh_offset;
+            if (lisp_rel_section_offset) break; // stop when both sections seen
+        } else if (!strcmp(&shstrtab_strbuf[h->sh_name], "lisp.rel")) {
+            gc_assert(!lisp_rel_section_offset); // there can be only 1
+            lisp_rel_section_offset = h->sh_offset;
+            lisp_rel_section_size = h->sh_size;
+            if (result) break; // stop when both sections seen
+        }
+    }
+done:
+    if (shstrtab_strbuf) free(shstrtab_strbuf);
+    if (shdrs) free(shdrs);
+    return result;
+}
+
+int apply_pie_relocs(long code_space_translation,
+                     long dynamic_space_translation,
+                     int fd)
+{
+    // If dynamic space was relocated, let coreparse fix everything by itself.
+    // The entire heap must be walked anyway to fix intra-dynamic-space pointers.
+    if (dynamic_space_translation != 0 || lisp_rel_section_size == 0)
+        return 0;
+    // Otherwise, we're going to make it appear that code space was supposed
+    // to have been mapped where it actually was.
+    int n_relocs = lisp_rel_section_size / sizeof (long);
+    unsigned long **ptrs = malloc(n_relocs * sizeof (long));
+    if (!ptrs) return 0;
+    int success = 0;
+    if (lseek(fd, lisp_rel_section_offset, SEEK_SET) == lisp_rel_section_offset &&
+        read(fd, ptrs, lisp_rel_section_size) == lisp_rel_section_size) {
+        int i;
+        // element 0 of the array is not used
+        for (i = 1; i<n_relocs; ++i) {
+            unsigned long *vaddr = ptrs[i];
+            *vaddr += code_space_translation;
+        }
+        success = 1;
+    }
+    free(ptrs);
+    return success;
 }
 #endif

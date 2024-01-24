@@ -34,6 +34,18 @@
     (define-compiler-macro switch-to-arena (a)
       `(sb-sys:%primitive sb-vm::switch-to-arena ,a))))
 
+(defmacro with-pseudo-atomic-foreign-calls (&body body)
+  ;; Used judiciously, this can prevent some deadlocks.
+  ;; It's possible that git rev 7143001bbe7d50c6 was an attempt to solve a
+  ;; similar issue, but either its author had an incomplete understanding - GC can't
+  ;; actually deadlock now - or else things were very different from what they are.
+  ;; In any case, we desire a way to say that certain foreign calls are
+  ;; uninterruptible, but this technique has less overhead than WITHOUT-GCING
+  ;; which is to be eschewed as no such thing exists in most collectors.
+  ;; If using safepoints, then this reduces to PROGN.
+  `(symbol-macrolet (#-sb-safepoint (sb-vm::.pseudo-atomic-call-out. t))
+     ,@body))
+
 ;;;; other miscellaneous stuff
 
 ;;; This returns a form that returns a dual-word aligned number of bytes when
@@ -255,4 +267,12 @@
           (lambda (node block)
             (ir2-convert-casser node block name offset lowtag)))))
 
-;;; Modular functions
+(defglobal *backend-cond-scs* nil)
+
+(defmacro define-cond-sc (name sc &body test)
+  `(setf (getf *backend-cond-scs* ',name)
+         (cons ',sc (defun ,(symbolicate 'make- name '-test) (load-scs)
+                      (lambda (tn)
+                        (if (progn ,@test)
+                            t
+                            load-scs))))))

@@ -13,7 +13,7 @@ CFLAGS += -g -Wall -fdollars-in-identifiers
 
 OS_SRC = bsd-os.c arm64-bsd-os.c darwin-os.c arm64-darwin-os.c
 
-OS_LIBS = -lSystem -lc -ldl
+OS_LIBS = -lc -ldl
 ifdef LISP_FEATURE_SB_THREAD
   OS_LIBS += -lpthread
 endif
@@ -28,13 +28,17 @@ endif
 ASSEM_SRC = arm64-assem.S
 ARCH_SRC = arm64-arch.c
 
-LINKFLAGS += -dynamic -twolevel_namespace -bind_at_load
+LINKFLAGS += -dynamic -twolevel_namespace
 
 CFLAGS += -fno-omit-frame-pointer
 DISABLE_PIE=no
 
 ifdef LISP_FEATURE_IMMOBILE_SPACE
   GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c
+else ifdef LISP_FEATURE_MARK_REGION_GC
+# The parallelized mark-region collector can perform a full GC,
+# but can't use fullcgc to perform heap->arena pointer detection.
+  GC_SRC = fullcgc.c pmrgc.c traceroot.c mark-region.c incremental-compact.c gc-thread-pool.c
 else
   GC_SRC = fullcgc.c gencgc.c traceroot.c
 endif

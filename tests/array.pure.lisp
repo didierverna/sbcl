@@ -422,7 +422,10 @@
                   :skipped-on :ubsan)
   ;; 1-bit fixnum tags make array limits overflow the word length
   ;; when converted to bytes
-  (when (= sb-vm:n-fixnum-tag-bits 1)
+  (when (and (= sb-vm:n-fixnum-tag-bits 1)
+             (<= (- most-positive-fixnum
+                    array-total-size-limit)
+                 2))
     (multiple-value-bind (fun failure-p warnings)
         (checked-compile
          '(lambda ()
@@ -722,3 +725,74 @@
                                                        x))
                                              (length x)))))
                  `(values (integer 11 12) &optional))))
+
+(with-test (:name :aref-dimension-checking)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x)
+         (aref x 0))
+    ((#2A((1 2) (3 4))) (condition 'type-error))))
+
+(with-test (:name :aref-constant-type-derive)
+  (flet ((test (form type)
+           (assert
+            (type-specifiers-equal
+             (caddr
+              (sb-kernel:%simple-fun-type
+               (checked-compile
+                `(lambda (a)
+                   ,form))))
+             `(values ,type &optional)))))
+    (test `(aref #(1 2 3) a)
+          '(integer 1 3))
+    (test `(svref #(1 2 3.0) a)
+          '(or (integer 1 2) single-float))
+    (test `(aref ,(make-array 3 :fill-pointer 2 :initial-contents #(1 2 3.0)) a)
+          '(or (integer 1 2) single-float))))
+
+(with-test (:name :make-array-initial-contents-zero-dimensions)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (d)
+         (make-array d :initial-contents 1))
+    ((nil) #0a1 :test #'equalp)))
+
+(with-test (:name :negative-fill-pointer)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (a f)
+      (setf (fill-pointer a) f))
+   (((make-array 0 :fill-pointer 0) -1) (condition 'type-error))))
+
+(with-test (:name :large-index
+            :skipped-on (not :64-bit))
+  (checked-compile
+   `(lambda ()
+      (make-array
+       (1+ (ash 1 32))
+       :element-type 'base-char
+       :initial-element #\a)))
+  (checked-compile
+   `(lambda (x a)
+      (setf (sbit x (ash 1 34)) a)))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910)))
+        (declare (dynamic-extent s))
+        (funcall fn s)))))
+
+(with-test (:name :hairy-aref-check-bounds)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare ((vector t) x))
+                        (aref x 0))
+                     nil))
+             0)))
+
+(with-test (:name :setf-aref-simple-vector-from-new-value)
+  (assert (not
+           (ctu:ir1-named-calls
+            `(lambda (x)
+               (declare ((simple-array * (*)) x))
+               (setf (aref x 0) 'm))))))

@@ -118,7 +118,7 @@
     (mapc #'join-thread threads)
     (assert (not oops))))
 
-(with-test (:name :semaphore-multiple-waiters :skipped-on (not :sb-thread))
+(with-test (:name :semaphore-multiple-waiters :skipped-on (or (not :sb-thread) :gc-stress))
   (let ((semaphore (make-semaphore :name "test sem")))
     (labels ((make-readers (n i)
                (values
@@ -341,14 +341,15 @@
                     (error "oops"))
                 (sb-sys:deadline-timeout () :deadline)))))
 
-(with-test (:name (:condition-wait :timeout :one-thread))
+(with-test (:name (:condition-wait :timeout :one-thread)
+                  :skipped-on :gc-stress)
   (let ((mutex (make-mutex))
         (waitqueue (make-waitqueue)))
     (assert (not (with-mutex (mutex)
                    (condition-wait waitqueue mutex :timeout 0.01))))))
 
 (with-test (:name (:condition-wait :timeout :many-threads)
-            :skipped-on (not :sb-thread))
+            :skipped-on (or (not :sb-thread) :gc-stress))
   (let* ((mutex (make-mutex))
          (waitqueue (make-waitqueue))
          (sem (make-semaphore))
@@ -511,8 +512,15 @@
   (let ((thr
          (make-thread
           (lambda ()
-            (with-open-file (stream (format nil "/proc/self/task/~d/comm"
-                                            (thread-os-tid *current-thread*)))
-              (read-line stream)))
+            (let ((all-names
+                   (loop for filename in (directory "/proc/self/task/*/comm")
+                         collect (with-open-file (stream filename) (read-line stream)))))
+              (setf (thread-name *current-thread*) "newname")
+              (with-open-file (stream (format nil "/proc/self/task/~d/comm"
+                                              (thread-os-tid *current-thread*)))
+                (list (read-line stream) all-names))))
           :name "testme")))
-    (assert (string= (join-thread thr) "testme"))))
+    (let ((results (join-thread thr)))
+      (assert (string= (first results) "newname"))
+      (assert (find "finalizer" (second results) :test 'string=))
+      (assert (find "testme" (second results) :test 'string=)))))

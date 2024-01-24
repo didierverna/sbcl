@@ -25,9 +25,6 @@
 
 (defvar *check-consistency* nil)
 
-;;; Set to NIL to disable loop analysis for register allocation.
-(defvar *loop-analyze* t)
-
 (defvar *compile-verbose* t
   "The default for the :VERBOSE argument to COMPILE-FILE.")
 (defvar *compile-print* nil
@@ -409,7 +406,8 @@ necessary, since type inference may take arbitrarily long to converge.")
   (event ir1-optimize-until-done)
   (let ((count 0)
         (cleared-reanalyze nil)
-        (fastp nil))
+        (fastp nil)
+        reoptimized)
     (loop
       (when (component-reanalyze component)
         (setf count 0
@@ -419,6 +417,7 @@ necessary, since type inference may take arbitrarily long to converge.")
       (setf (component-reoptimize component) nil)
       (ir1-optimize component fastp)
       (cond ((component-reoptimize component)
+             (setf reoptimized t)
              (incf count)
              (when (and (>= count *max-optimize-iterations*)
                         (not (component-reanalyze component))
@@ -434,8 +433,8 @@ necessary, since type inference may take arbitrarily long to converge.")
       (maybe-mumble (if fastp "-" ".")))
     (when cleared-reanalyze
       (setf (component-reanalyze component) t))
-    (maybe-mumble " "))
-  (values))
+    (maybe-mumble " ")
+    reoptimized))
 
 (defparameter *constraint-propagate* t)
 
@@ -448,34 +447,34 @@ necessary, since type inference may take arbitrarily long to converge.")
   (when (component-reanalyze component)
     (maybe-mumble "DFO")
     (loop
-      (find-dfo component)
+     (find-dfo component)
       (unless (component-reanalyze component)
         (maybe-mumble " ")
         (return))
-      (maybe-mumble ".")))
-  (values))
+      (maybe-mumble "."))
+    t))
 
 (defparameter *reoptimize-limit* 10)
 
 (defun ir1-optimize-phase-1 (component)
   (let ((loop-count 0)
-        (constraint-propagate *constraint-propagate*))
+        (constraint-propagate *constraint-propagate*)
+        reoptimized)
     (tagbody
      again
        (loop
-        (ir1-optimize-until-done component)
+        (setf reoptimized (ir1-optimize-until-done component))
         (cond ((or (component-new-functionals component)
                    (component-reanalyze-functionals component))
                (maybe-mumble "Locall ")
                (locall-analyze-component component))
               ((and (>= loop-count 1)
-                    (not (or (component-reoptimize component)
-                             (component-reanalyze component))))
+                    (not (component-reanalyze component))
+                    (not reoptimized))
                ;; Constraint propagation did something but that
                ;; information didn't lead to any new optimizations.
                ;; Don't run constraint-propagate again.
                (return)))
-        (eliminate-dead-code component)
         (dfo-as-needed component)
         (when constraint-propagate
           (maybe-mumble "Constraint ")
@@ -538,6 +537,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 (declaim (type (member :immobile :dynamic :auto) *compile-to-memory-space*)
          (type (member :immobile :dynamic) *compile-file-to-memory-space*))
 (defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
+(export '*compile-file-to-memory-space*) ; silly user code looks at, even if no immobile-space
 (defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
 
 #-immobile-code
@@ -580,7 +580,7 @@ necessary, since type inference may take arbitrarily long to converge.")
   (report-code-deletion)
 
   (when (or (ir2-component-values-receivers (component-info component))
-            (component-dx-lvars component))
+            (ir2-component-stack-allocates-p (component-info component)))
     (maybe-mumble "Stack ")
     (stack-analyze component)
     ;; Assign BLOCK-NUMBER for any cleanup blocks introduced by
@@ -701,22 +701,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defvar *compile-component-hook* nil)
 
 (defun compile-component (component)
-
-  ;; miscellaneous sanity checks
-  ;;
-  ;; FIXME: These are basically pretty wimpy compared to the checks done
-  ;; by the old CHECK-IR1-CONSISTENCY code. It would be really nice to
-  ;; make those internal consistency checks work again and use them.
   (aver-live-component component)
-  (do-blocks (block component)
-    (aver (eql (block-component block) component)))
-  (dolist (lambda (component-lambdas component))
-    ;; sanity check to prevent weirdness from propagating insidiously as
-    ;; far from its root cause as it did in bug 138: Make sure that
-    ;; thing-to-COMPONENT links are consistent.
-    (aver (eql (lambda-component lambda) component))
-    (aver (eql (node-component (lambda-bind lambda)) component)))
-
   (let* ((*component-being-compiled* component))
 
     (when *compile-progress*
@@ -731,20 +716,20 @@ necessary, since type inference may take arbitrarily long to converge.")
 
     (ir1-phases component)
 
-    ;; This should happen at some point before ENVIRONMENT-ANALYZE,
-    ;; and after RECORD-COMPONENT-XREFS.  Beyond that, I haven't
-    ;; really thought things through.  -- AJB, 2014-Jun-08
-    (eliminate-dead-code component)
+    ;; KLUDGE: We should instead set COMPONENT-REOPTIMIZE to T
+    ;; whenever a REF gets deleted so that DFO-AS-NEEDED kicks in only
+    ;; when needed, and we don't need this call to do a final
+    ;; unreachable entry point scan.
+    (find-dfo component)
 
-    (when *loop-analyze*
-      (dfo-as-needed component)
-      (maybe-mumble "Dom ")
-      (find-dominators component)
-      (maybe-mumble "Loop ")
-      (loop-analyze component))
+    (dfo-as-needed component)
+    (maybe-mumble "Dom ")
+    (find-dominators component)
+    (maybe-mumble "Loop ")
+    (loop-analyze component)
 
     #|
-    (when (and *loop-analyze* *compiler-trace-output*)
+    (when *compiler-trace-output*
       (labels ((print-blocks (block)
                  (format *compiler-trace-output* "    ~A~%" block)
                  (when (block-loop-next block)
@@ -827,11 +812,11 @@ necessary, since type inference may take arbitrarily long to converge.")
     (let ((ir1-namespace *ir1-namespace*))
       (clrhash (free-funs ir1-namespace))
       (clrhash (free-vars ir1-namespace))
-      ;; FIXME: It would make sense to clear these tables as well, but
-      ;; ARM64 relies on the constant for NIL to stay around in order to
-      ;; assign a wired TN to it, so we let people share it. Investigate a
-      ;; proper fix.
-      #+(or)
+      ;; FIXME: It would make sense to clear these tables on arm64 as
+      ;; well, but it relies on the constant for NIL to stay around in
+      ;; order to assign a wired TN to it. A possible fix is to give
+      ;; arm64 NULL-SC like on other platforms.
+      #-arm64
       (progn
         (clrhash (eql-constants ir1-namespace))
         (clrhash (similar-constants ir1-namespace))))))
@@ -968,8 +953,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;; a subtype of not-so-aptly-named INPUT-ERROR-IN-COMPILE-FILE.
 (defun %do-forms-from-info (function info condition-name)
   (declare (function function))
-  ; FIXME: why "could not stack-allocate" in a few call sites?
-  ; (declare (dynamic-extent function))
+  (declare (dynamic-extent function))
   (let* ((file-info (source-info-file-info info))
          (stream (get-source-stream info))
          (pos (file-position stream))
@@ -1162,24 +1146,6 @@ necessary, since type inference may take arbitrarily long to converge.")
                         situations)
           (intersection '(:load-toplevel load) situations)
           (intersection '(:execute eval) situations)))
-
-
-;;; utilities for extracting COMPONENTs of FUNCTIONALs
-(defun functional-components (f)
-  (declare (type functional f))
-  (etypecase f
-    (clambda (list (lambda-component f)))
-    (optional-dispatch (let ((result nil))
-                         (flet ((maybe-frob (maybe-clambda)
-                                  (when (and maybe-clambda
-                                             (promise-ready-p maybe-clambda))
-                                    (pushnew (lambda-component
-                                              (force maybe-clambda))
-                                             result))))
-                           (map nil #'maybe-frob (optional-dispatch-entry-points f))
-                           (maybe-frob (optional-dispatch-more-entry f))
-                           (maybe-frob (optional-dispatch-main-entry f)))
-                         result))))
 
 ;;; Print some noise about FORM if *COMPILE-PRINT* is true.
 (defun note-top-level-form (form)
@@ -1602,8 +1568,6 @@ necessary, since type inference may take arbitrarily long to converge.")
           (compile-load-time-value-lambda lambdas)
           (compile-toplevel-lambdas lambdas top-level-closure)))
 
-    (dolist (component components)
-      (clear-ir1-info component))
     (clear-ir1-namespace))
   (values))
 
@@ -1647,8 +1611,8 @@ necessary, since type inference may take arbitrarily long to converge.")
 
   (defun handle-condition-handler (condition)
     (let ((muffles (get-handled-conditions)))
-      (aver muffles) ; FIXME: looks redundant with "fell through"
-      (dolist (muffle muffles (bug "fell through"))
+      (aver muffles) ; FIXME: looks redundant with UNREACHABLE
+      (dolist (muffle muffles (sb-impl::unreachable))
         (destructuring-bind (type . restart-name) muffle
           (when (handle-p condition type)
             (awhen (find-restart restart-name condition)

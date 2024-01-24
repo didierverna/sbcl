@@ -47,14 +47,6 @@
   ;; better not to add a new lazy stable hash slot to instances as a
   ;; side-effect of compiling.
   (instance-id-table (make-hash-table :test 'eq) :type hash-table :read-only t)
-  ;; the CONS table is an additional EQ table, used for storing CDRs
-  ;; of dumped lists which will not have their own direct identity as
-  ;; a dumped constant, but which might nevertheless be EQ to some
-  ;; other dumped object (and require that EQness to be preserved).
-  ;; The hash table entry, if present, is a reference to its parent
-  ;; list object (which will have a direct entity as a dumped
-  ;; constant) along with an index of how many CDRs to take.
-  (cons-table (make-hash-table :test 'eq) :type hash-table :read-only t)
   ;; Hashtable mapping a string to a list of fop-table indices of
   ;; symbols whose name is that string. For any name as compared
   ;; by STRING= there can be a symbol whose name is a base string
@@ -322,13 +314,24 @@
     (dump-fop 'fop-move-to-table fasl-output)
     (incf (fasl-output-table-free fasl-output))))
 
+(defun cdr-similarity-p (index fasl-output)
+  (when (consp index)
+    (destructuring-bind (list . nthcdr) index
+      (let ((index (gethash list (fasl-output-eq-table fasl-output))))
+        (when (fixnump index)
+          (dump-push index fasl-output)
+          (dump-fop 'fop-nthcdr fasl-output nthcdr)
+          t)))))
+
 ;;; If X is in File's SIMILAR-TABLE, then push the object and return T,
 ;;; otherwise NIL.
 (defun similar-check-table (x fasl-output)
   (declare (type fasl-output fasl-output))
-  (awhen (get-similar x (fasl-output-similar-table fasl-output))
-    (dump-push it fasl-output)
-    t))
+  (let ((index (get-similar x (fasl-output-similar-table fasl-output))))
+    (cond ((fixnump index)
+           (dump-push index fasl-output)
+           t)
+          ((cdr-similarity-p index fasl-output)))))
 
 ;;; These functions are called after dumping an object to save the
 ;;; object in the table. The object (also passed in as X) must already
@@ -444,8 +447,9 @@
 ;;; When we go to dump the object, we enter it in the CIRCULARITY-TABLE.
 (defun dump-non-immediate-object (x file)
   (let ((index (gethash x (fasl-output-eq-table file))))
-    (cond (index
+    (cond ((fixnump index)
            (dump-push index file))
+          ((cdr-similarity-p index file))
           (t
            (typecase x
              (symbol (dump-symbol x file))
@@ -456,8 +460,8 @@
                     ((not (similar-check-table x file))
                      (dump-list x file t)
                      (similar-save-object x file))))
-             (wrapper
-              (dump-wrapper x file)
+             (layout
+              (dump-layout x file)
               (eq-save-object x file))
              #+sb-xc-host
              (ctype
@@ -586,7 +590,6 @@
 ;;; We peek at the object type so that we only pay the circular
 ;;; detection overhead on types of objects that might be circular.
 (defun dump-object (x file)
-  #+(and metaspace sb-xc-host) (when (cl:typep x 'sb-vm:layout) (error "can't dump sb-vm:layout"))
   (if (compound-object-p x)
       (let ((*circularities-detected* ())
             (circ (fasl-output-circularity-table file)))
@@ -780,28 +783,25 @@
 
         ;; if this CONS is EQ to some other object we have already
         ;; dumped, dump a reference to that instead.
-        (let ((index (gethash l (fasl-output-eq-table file))))
-          (when index
-            (dump-push index file)
-            (terminate-dotted-list n file)
-            (return)))
+        (let* ((table (if coalesce
+                          (fasl-output-similar-table file)
+                          (fasl-output-eq-table file)))
+               (index (gethash l table)))
+          (cond ((fixnump index)
+                 (dump-push index file)
+                 (terminate-dotted-list n file)
+                 (return))
+                ((cdr-similarity-p index file)
+                 (when (> n 0)
+                   (terminate-dotted-list n file))
+                 (return)))
 
-        ;; if this CONS is EQ to the Ith CDR of some other list we have
-        ;; already dumped, dump a reference to that instead.
-        (let ((list+i (gethash l (fasl-output-cons-table file))))
-          (when list+i
-            (destructuring-bind (list i) list+i
-              (aver (consp list))
-              (let ((index (gethash list (fasl-output-eq-table file))))
-                (dump-push index file)
-                (dump-fop 'fop-nthcdr file i)
-                (when (> n 0)
-                  (terminate-dotted-list n file))
-                (return)))))
-
-        ;; put an entry for this cons into the fasl output cons table,
-        ;; for the benefit of dumping later constants
-        (setf (gethash l (fasl-output-cons-table file)) (list list n))
+          ;; put an entry for this cons into the fasl output cons table,
+          ;; for the benefit of dumping later constants
+          (let ((index (cons list n)))
+            (setf (gethash l (fasl-output-eq-table file)) index)
+            (when coalesce
+              (setf (gethash l (fasl-output-similar-table file)) index))))
 
         (setf (gethash l circ) list)
 
@@ -820,8 +820,9 @@
                  ;; This is the same as DUMP-NON-IMMEDIATE-OBJECT but
                  ;; without calling COALESCE-TREE-P again.
                  (let ((index (gethash obj (fasl-output-eq-table file))))
-                   (cond (index
+                   (cond ((fixnump index)
                           (dump-push index file))
+                         ((cdr-similarity-p index file))
                          ((not coalesce)
                           (dump-list obj file)
                           (eq-save-object obj file))
@@ -888,7 +889,12 @@
       ;; the host upgraded to T but whose expressed type was not T.
       (sb-xc:simple-vector
        (dump-simple-vector simple-version file)
-       (eq-save-object x file))
+       (eq-save-object x file)
+       (unless (eq x simple-version)
+         ;; In case it has circularities that need to be patched
+         ;; later.
+         (setf (gethash simple-version (fasl-output-eq-table file))
+               (gethash x (fasl-output-eq-table file)))))
       (t
        (unless (similar-check-table x file)
          (dump-specialized-vector simple-version file)
@@ -1026,7 +1032,7 @@
   (values))
 
 (eval-when (:compile-toplevel)
-  (assert (<= (length +fixup-kinds+) 8))) ; fixup-kind fits in 3 bits
+  (assert (<= (length +fixup-kinds+) 16))) ; fixup-kind fits in 4 bits
 
 (defconstant-eqx +fixup-flavors+
   #(:assembly-routine :assembly-routine*
@@ -1044,30 +1050,33 @@
 ;;; so the fixup can be reduced to one word instead of an integer and a symbol.
 (declaim (inline !pack-fixup-info))
 (defun !pack-fixup-info (offset kind flavor data)
-  (logior ;; 3 bits
-          (the (mod 8) (or (position kind +fixup-kinds+)
+  (logior ;; 4 bits
+          (the (mod 16) (or (position kind +fixup-kinds+)
                            (error "Bad fixup kind ~s" kind)))
           ;; 4 bits
           (ash (the (mod 16) (or (position flavor +fixup-flavors+)
                                  (error "Bad fixup flavor ~s" flavor)))
-               3)
+               4)
           ;; 8 bits
-          (ash (the (mod 256) data) 7)
+          (ash (the (mod 256) data) 8)
           ;; whatever it needs
-          (ash offset 15)))
+          (ash offset 16)))
 
 ;;; Unpack an integer from DUMP-FIXUPs. Shared by genesis and target fasloader
 (declaim (inline !unpack-fixup-info))
 (defun !unpack-fixup-info (packed-info) ; Return (VALUES offset kind flavor data)
-  (values (ash packed-info -15)
-          (aref +fixup-kinds+ (ldb (byte 3 0) packed-info))
-          (aref +fixup-flavors+ (ldb (byte 4 3) packed-info))
-          (ldb (byte 8 7) packed-info)))
+  (values (ash packed-info -16)
+          (aref +fixup-kinds+ (ldb (byte 4 0) packed-info))
+          (aref +fixup-flavors+ (ldb (byte 4 4) packed-info))
+          (ldb (byte 8 8) packed-info)))
 
-#+(or arm arm64 riscv sparc) ; these don't have any retained packed fixups (yet)
-(defun sb-c::pack-retained-fixups (fixup-notes)
-  (declare (ignore fixup-notes))
-  0) ; as if from PACK-CODE-FIXUP-LOCS
+#-(or x86 x86-64) ; these two architectures provide an overriding definition
+(defun pack-fixups-for-reapplication (fixup-notes)
+  (let (result)
+    (dolist (note fixup-notes (sb-c:pack-code-fixup-locs nil nil result))
+      (let ((fixup (fixup-note-fixup note)))
+        (when (eq (fixup-flavor fixup) :card-table-index-mask)
+          (push (fixup-note-position note) result))))))
 
 ;;; Dump all the fixups.
 ;;;  - foreign (C) symbols: named by a string
@@ -1078,7 +1087,7 @@
   ;; "retained" fixups are those whose offset in the code needs to be
   ;; remembered for subsequent reapplication by the garbage collector,
   ;; or in some cases, on core startup.
-  (dump-object (sb-c::pack-retained-fixups fixup-notes) fasl-output)
+  (dump-object (pack-fixups-for-reapplication fixup-notes) fasl-output)
   (dump-object alloc-points fasl-output)
   (dolist (note fixup-notes nelements)
     (let* ((fixup (fixup-note-fixup note))
@@ -1101,12 +1110,8 @@
               (:layout
                (if (symbolp name)
                    name
-                   (wrapper-classoid-name
-                    (cond #+metaspace
-                          ((sb-kernel::layout-p name) (layout-friend name))
-                          (t name)))))
-              (:layout-id
-               (the wrapper name))
+                   (layout-classoid-name name)))
+              (:layout-id (the layout name))
               ((:assembly-routine :assembly-routine*
                :symbol-tls-index
                ;; Only #+immobile-space can use the following two flavors.
@@ -1396,12 +1401,12 @@
            struct))
   (note-potential-circularity struct file)
   (do* ((length (%instance-length struct))
-        (wrapper (%instance-wrapper struct))
-        (bitmap (wrapper-bitmap wrapper))
+        (layout (%instance-layout struct))
+        (bitmap (layout-bitmap layout))
         (circ (fasl-output-circularity-table file))
         (index sb-vm:instance-data-start (1+ index)))
       ((>= index length)
-       (dump-non-immediate-object wrapper file)
+       (dump-non-immediate-object layout file)
        (dump-fop 'fop-struct file length))
     (let* ((obj (if (logbitp index bitmap)
                     (%instance-ref struct index)
@@ -1418,14 +1423,14 @@
                              (t obj))
                        file))))
 
-(defun dump-wrapper (obj file &aux (flags (wrapper-flags obj)))
-  (when (wrapper-invalid obj)
+(defun dump-layout (obj file)
+  (when (layout-invalid obj)
     (compiler-error "attempt to dump reference to obsolete class: ~S"
-                    (wrapper-classoid obj)))
+                    (layout-classoid obj)))
   ;; STANDARD-OBJECT could in theory be dumpable, but nothing else,
   ;; because all its subclasses can evolve to have new layouts.
-  (aver (not (logtest flags +pcl-object-layout-flag+)))
-  (let ((name (wrapper-classoid-name obj)))
+  (aver (not (logtest (layout-flags obj) +pcl-object-layout-flag+)))
+  (let ((name (layout-classoid-name obj)))
     ;; Q: Shouldn't we aver that NAME is the proper name for its classoid?
     (unless name
       (compiler-error "dumping anonymous layout: ~S" obj))
@@ -1435,14 +1440,14 @@
     #-sb-xc-host
     (let ((fop (known-layout-fop name)))
       (when fop
-        (return-from dump-wrapper (dump-byte fop file))))
+        (return-from dump-layout (dump-byte fop file))))
     (dump-object name file))
-  (sub-dump-object (wrapper-bitmap obj) file)
-  (sub-dump-object (wrapper-inherits obj) file)
+  (sub-dump-object (layout-bitmap obj) file)
+  (sub-dump-object (layout-inherits obj) file)
   (dump-fop 'fop-layout file
-            (1+ (wrapper-depthoid obj)) ; non-stack args can't be negative
-            (logand flags sb-kernel::layout-flags-mask)
-            (wrapper-length obj)))
+            (1+ (layout-depthoid obj)) ; non-stack args can't be negative
+            (logand (layout-flags obj) sb-kernel::layout-flags-mask)
+            (layout-length obj)))
 
 ;;;; dumping instances which just save their slots
 

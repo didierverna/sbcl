@@ -12,6 +12,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+#+mark-region-gc (invoke-restart 'run-tests::skip-file)
 (cl:in-package :cl-user)
 
 ;;; Regression due to 1f892df9600eb986038526c3ec738809b15a3f75
@@ -22,10 +23,12 @@
                                              #-x86-64 undefined-function))
 
 ;;; ROOM should run without signalling an error. (bug 247)
-(let ((*standard-output* (make-broadcast-stream)))
-  (room)
-  (room t)
-  (room nil))
+(with-test (:name :room
+                  :broken-on (and :immobile-space :gc-stress))
+ (let ((*standard-output* (make-broadcast-stream)))
+   (room)
+   (room t)
+   (room nil)))
 
 ;;; COPY-SYMBOL should work without signalling an error, even if the
 ;;; symbol is unbound.

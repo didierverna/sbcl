@@ -14,7 +14,7 @@
          (aref ,byte-to-code-table byte))
        (defun ,code-byte-name (code)
          (declare (optimize speed #.*safety-0*)
-                  (type char-code code))
+                  (%char-code code))
          (if (> code 255)
              nil
              (aref ,code-to-byte-table code))))))
@@ -37,38 +37,12 @@
    #x5c #xf7 #x53 #x54 #x55 #x56 #x57 #x58 #x59 #x5a #xb2 #xd4 #xd6 #xd2 #xd3 #xd5
    #x30 #x31 #x32 #x33 #x34 #x35 #x36 #x37 #x38 #x39 #xb3 #xdb #xdc #xd9 #xda #x9f))
 
-(declaim (inline get-ebcdic-us-bytes))
-(defun get-ebcdic-us-bytes (string pos)
-  (declare (optimize speed #.*safety-0*)
-           (type simple-string string)
-           (type array-range pos))
-  (get-latin-bytes #'code->ebcdic-us-mapper :ebcdic-us string pos))
+(define-unibyte-to-octets-functions :ebcdic-us get-ebcdic-us-bytes string->ebcdic-us code->ebcdic-us-mapper)
 
-(defun string->ebcdic-us (string sstart send null-padding)
-    (declare (optimize speed #.*safety-0*)
-             (type simple-string string)
-             (type array-range sstart send))
-  (values (string->latin% string sstart send #'get-ebcdic-us-bytes null-padding)))
+(define-unibyte-to-string-functions :ebcdic-us ebcdic-us->string ebcdic-us->code-mapper)
 
-(defmacro define-ebcdic-us->string* (accessor type)
-  (declare (ignore type))
-  (let ((name (make-od-name 'ebcdic-us->string* accessor)))
-    `(progn
-       (defun ,name (string sstart send array astart aend)
-         (,(make-od-name 'latin->string* accessor) string sstart send array astart aend #'ebcdic-us->code-mapper)))))
-(instantiate-octets-definition define-ebcdic-us->string*)
-
-(defmacro define-ebcdic-us->string (accessor type)
-  (declare (ignore type))
-  `(defun ,(make-od-name 'ebcdic-us->string accessor) (array astart aend)
-     (,(make-od-name 'latin->string accessor) array astart aend #'ebcdic-us->code-mapper)))
-(instantiate-octets-definition define-ebcdic-us->string)
-
-(define-unibyte-external-format :ebcdic-us (:cp037 :|cp037| :ibm-037 :ibm037)
-  (let ((ebcdic-us-byte (code->ebcdic-us-mapper bits)))
-    (if ebcdic-us-byte
-        (setf (sap-ref-8 sap tail) ebcdic-us-byte)
-        (external-format-encoding-error stream bits)))
-  (code-char (ebcdic-us->code-mapper byte))
-  ebcdic-us->string-aref
-  string->ebcdic-us)
+(define-unibyte-external-format-with-newline-variants :ebcdic-us (:cp037 :|cp037| :ibm-037 :ibm037)
+  (ebcdic-us->code-mapper code->ebcdic-us-mapper)
+  (ebcdic-us->string-aref string->ebcdic-us)
+  (ebcdic-us->string/cr-aref string->ebcdic-us/cr)
+  (ebcdic-us->string/crlf-aref string->ebcdic-us/crlf))

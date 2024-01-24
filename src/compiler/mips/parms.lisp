@@ -15,13 +15,12 @@
 
 (defconstant +backend-fasl-file-implementation+ :mips)
 
-  ;; The o32 ABI specifies 4k-64k as page size. We have to pick the
-  ;; maximum since mprotect() works only with page granularity.
-(defconstant +backend-page-bytes+ 65536)
-(defconstant gencgc-page-bytes 8192)
+;; backend-page-size is the granularity at which we try to map/unmap.
+;; linux says getpagesize() is 4k so any multiple thereof is fine.
+(defconstant +backend-page-bytes+ 16384)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 (defconstant cards-per-page 8)
 (defconstant gencgc-alloc-granularity 0)
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;;; Machine Architecture parameters:
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -56,11 +55,11 @@
 
 #+linux
 (progn
-  (!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
+  (gc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
   (defconstant alien-linkage-table-entry-size 4)
   (defconstant alien-linkage-table-growth-direction :down)
-  (setq *linkage-space-predefined-entries* '(("call_into_c" nil)))
+  (setq *alien-linkage-table-predefined-entries* '(("call_into_c" nil)))
 
   ;; C stack grows downward from 0x80000000
   )

@@ -11,31 +11,22 @@
  * files for more information.
  */
 
-/*
- * FIXME:
- *   Some of the code in here is deeply broken, depending on guessing
- *   already out-of-date values instead of getting them from sbcl.h.
- */
-
 #include <stdio.h>
 #include <string.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "print.h"
 #include "runtime.h"
 #include "code.h"
-#include "gc-internal.h"
-#include "gc-private.h"
+#include "gc.h"
 #include "genesis/gc-tables.h"
-#include "thread.h"              /* genesis/primitive-objects.h needs this */
+#include "thread.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <setjmp.h>
 
-struct dyndebug_config dyndebug_config = {
-    QSHOW == 2,
-};
+struct dyndebug_config dyndebug_config;
 
 void
 dyndebug_init()
@@ -54,7 +45,6 @@ dyndebug_init()
     char *names[DYNDEBUG_NFLAGS];
     int *ptrs[DYNDEBUG_NFLAGS];
 
-    dyndebug_init1(fshow,          "FSHOW");
     dyndebug_init1(gencgc_verbose, "GENCGC_VERBOSE");
     dyndebug_init1(safepoints,     "SAFEPOINTS");
     dyndebug_init1(seh,            "SEH");
@@ -107,7 +97,7 @@ dyndebug_init()
             }
         }
     }
-#if defined(LISP_FEATURE_GENCGC)
+#if defined(LISP_FEATURE_GENERATIONAL)
     if (dyndebug_config.dyndebug_gencgc_verbose) {
         gencgc_verbose = 1;
     }
@@ -117,12 +107,8 @@ dyndebug_init()
 #undef DYNDEBUG_NFLAGS
 }
 
-#include "monitor.h"
 #include "vars.h"
 #include "os.h"
-#ifdef LISP_FEATURE_GENCGC
-#include "gencgc-alloc-region.h" /* genesis/thread.h needs this */
-#endif
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
 #include "genesis/static-symbols.h"
@@ -131,7 +117,7 @@ dyndebug_init()
 static int max_lines = 20, cur_lines = 0;
 static int max_depth = 5, brief_depth = 2, cur_depth = 0;
 static int max_length = 5;
-static boolean dont_descend = 0, skip_newline = 0;
+static bool dont_descend = 0, skip_newline = 0;
 static int cur_clock = 0;
 
 static void print_obj(char *prefix, lispobj obj);
@@ -151,7 +137,7 @@ static void indent(int in)
 }
 
 static jmp_buf ldb_print_nlx;
-static boolean continue_p(boolean newline)
+static bool continue_p(bool newline)
 {
     char buffer[256];
 
@@ -364,21 +350,13 @@ static void brief_struct(lispobj obj)
     }
 }
 
-#include "genesis/layout.h"
 #include "genesis/defstruct-description.h"
-#include "genesis/defstruct-slot-description.h"
-static boolean tagged_slot_p(struct layout *layout, int slot_index)
+static bool tagged_slot_p(struct layout *layout, int slot_index)
 {
     // Since we're doing this scan, we could return the name
     // and exact raw type.
-#ifdef LISP_FEATURE_METASPACE
-    struct wrapper *wrapper = (void*)(layout->friend-INSTANCE_POINTER_LOWTAG);
-    if (instancep(wrapper->_info)) {
-        struct defstruct_description* dd = (void*)(wrapper->_info-INSTANCE_POINTER_LOWTAG);
-#else
     if (instancep(layout->_info)) {
         struct defstruct_description* dd = (void*)(layout->_info-INSTANCE_POINTER_LOWTAG);
-#endif
         lispobj slots = dd->slots;
         for ( ; slots != NIL ; slots = CONS(slots)->cdr ) {
             struct defstruct_slot_description* dsd =
@@ -387,7 +365,15 @@ static boolean tagged_slot_p(struct layout *layout, int slot_index)
                 return (fixnum_value(dsd->bits) & DSD_RAW_TYPE_MASK) == 0;
         }
     }
-    return 0;
+    /* Revision 2b783b49 said to prefer LAYOUT-INFO vs BITMAP because the bitmap
+     * can indicate a 0 bit ("raw") for any slot that _may_ be ignored by GC, such as
+     * slots constrained to FIXNUM. Unfortunately that misses that CONDITION instances
+     * have trailing variable-length tagged data. In practice an instance may have raw
+     * words only if it has a DD, which most CONDITION subtypes do not. Therefore this
+     * could almost always return 1. But layout-of-layout is an important use of trailing
+     * raw slots. Attempting to print random words as tagged could be disastrous.
+     * Therefore, test the bitmap if the above loop failed to find slot_index. */
+    return bitmap_logbitp(slot_index, get_layout_bitmap(layout));
 }
 
 static void print_struct(lispobj obj)
@@ -511,20 +497,18 @@ lispobj symbol_function(struct symbol* symbol)
 
 static void print_fun_or_otherptr(lispobj obj)
 {
-    lispobj *ptr;
-    unsigned long header;
-    int count, type, index;
+    int index;
     char buffer[16];
 
-    ptr = native_pointer(obj);
+    lispobj *ptr = native_pointer(obj);
     if (ptr == NULL) {
         printf(" (NULL Pointer)");
         return;
     }
 
-    header = *ptr++;
-    count = HeaderValue(header);
-    type = header_widetag(header);
+    int count = object_size(ptr)-1;
+    uword_t header = *ptr++;
+    int type = header_widetag(header);
 
     print_obj("header: ", header);
     if (!other_immediate_lowtag_p(header)) {
@@ -553,7 +537,7 @@ static void print_fun_or_otherptr(lispobj obj)
         print_slots(ratio_slots, count, ptr);
         break;
 
-    case COMPLEX_WIDETAG:
+    case COMPLEX_RATIONAL_WIDETAG:
         print_slots(complex_slots, count, ptr);
         break;
 
@@ -574,7 +558,7 @@ static void print_fun_or_otherptr(lispobj obj)
 #ifdef LISP_FEATURE_COMPACT_SYMBOL
         // print_obj doesn't understand raw words, so make it a fixnum
         int pkgid = symbol_package_id(sym) << N_FIXNUM_TAG_BITS;
-        print_obj("package_id: ", pkgid);
+        print_obj("pkgid: ", pkgid);
 #endif
         break;
 
@@ -758,7 +742,7 @@ static void print_obj(char *prefix, lispobj obj)
     int type = lowtag_of(obj);
     struct var *var = lookup_by_obj(obj);
     char buffer[256];
-    boolean verbose = cur_depth < brief_depth;
+    bool verbose = cur_depth < brief_depth;
 
     if (!continue_p(verbose))
         return;
@@ -844,7 +828,6 @@ void brief_print(lispobj obj)
 // and return a Lisp string, are designed to be foolproof during GC,
 // hence all the forwarding checks.
 
-#include "forwarding-ptr.h"
 struct vector * symbol_name(struct symbol* sym)
 {
   if (forwarding_pointer_p((lispobj*)sym))
@@ -852,29 +835,21 @@ struct vector * symbol_name(struct symbol* sym)
   lispobj name = sym->name;
   if (lowtag_of(name) != OTHER_POINTER_LOWTAG) return NULL;
   lispobj string = decode_symbol_name(name);
-  return VECTOR(follow_maybe_fp(string));
+  return VECTOR(follow_fp(string)); // can't have a nameless symbol
 }
 struct vector * classoid_name(lispobj * classoid)
 {
   if (forwarding_pointer_p(classoid))
       classoid = native_pointer(forwarding_pointer_value(classoid));
   // Classoids are named by symbols even though a CLASS name is arbitrary (theoretically)
-  lispobj sym = classoid[CLASSOID_NAME_WORDINDEX];
+  lispobj sym = ((struct classoid*)classoid)->name;
   return lowtag_of(sym) != OTHER_POINTER_LOWTAG ? NULL : symbol_name(SYMBOL(sym));
 }
 struct vector * layout_classoid_name(lispobj * layout)
 {
-#ifdef LISP_FEATURE_METASPACE
-  // layout can't be forwarded, but wrapper could be
-  lispobj* wrapper = native_pointer(((struct layout*)layout)->friend);
-  if (forwarding_pointer_p(wrapper))
-      wrapper = native_pointer(forwarding_pointer_value(wrapper));
-  lispobj classoid = ((struct wrapper*)wrapper)->classoid;
-#else
   if (forwarding_pointer_p(layout))
       layout = native_pointer(forwarding_pointer_value(layout));
   lispobj classoid = ((struct layout*)layout)->classoid;
-#endif
   return instancep(classoid) ? classoid_name(native_pointer(classoid)) : NULL;
 }
 struct vector * instance_classoid_name(lispobj * instance)

@@ -40,9 +40,10 @@
   ;; hashes.
   (let ((win 0) (n-trials 10) (prev (sb-int:address-based-counter-val)))
     (dotimes (i n-trials)
-      (declare (notinline cons sb-sys:int-sap)) ; it's flushable, but don't flush it
-      #+use-cons-region (sb-sys:int-sap #xf00fa) ; 2 words in mixed-region
-      #-use-cons-region (cons 1 2)
+      (locally
+          (declare (notinline cons sb-sys:int-sap)) ; it's flushable, but don't flush it
+        #+use-cons-region (sb-sys:int-sap #xf00fa) ; 2 words in mixed-region
+        #-use-cons-region (cons 1 2))
       (let ((ptr (sb-int:address-based-counter-val)))
         (when (= ptr (1+ prev))
           (incf win))
@@ -190,8 +191,8 @@
     (dotimes (i 10)
       (setf (gethash (cons 'foo (gensym)) tbl) 1))
     (gc)
-    ;; The need-to-rehash bit is set
-    (assert (eql 1 (svref (sb-impl::hash-table-pairs tbl) 1)))
+    ;; Set the need-to-rehash bit
+    (setf (svref (sb-impl::hash-table-pairs tbl) 1) 1)
     (clrhash tbl)
     ;; The need-to-rehash bit is not set
     (assert (eql 0 (svref (sb-impl::hash-table-pairs tbl) 1)))))
@@ -267,7 +268,8 @@
 ;;; which has two different freelists - one of cells that REMHASH has made available
 ;;; and one of cells that GC has marked as empty. Since we no longer inhibit GC
 ;;; during table operations, we need to give GC a list of its own to manipulate.
-(with-test (:name (hash-table :gc-smashed-cell-list))
+(with-test (:name (hash-table :gc-smashed-cell-list)
+                  :broken-on :mark-region-gc)
   (flet ((f ()
            (dotimes (i 20000) (setf (gethash i *tbl*) (- i)))
            (setf (gethash (cons 1 2) *tbl*) 'foolz)
@@ -360,7 +362,7 @@
 ;;; This affected the performance of TYPECASE.
 (with-test (:name :sxhash-on-layout)
   (dolist (x '(pathname cons array))
-    (let ((l (sb-kernel:wrapper-friend (sb-kernel:find-layout x))))
+    (let ((l (sb-kernel:find-layout x)))
       (assert (= (sxhash l) (sb-kernel:layout-clos-hash l))))))
 
 (with-test (:name :equalp-table-fixnum-equal-to-float)
@@ -474,9 +476,9 @@
 ;;; such that LOGANDing any number of nonzero hashes is nonzero.
 (with-test (:name :layout-hashes-constant-1-bit)
   (let ((combined most-positive-fixnum))
-    (maphash (lambda (classoid wrapper)
+    (maphash (lambda (classoid layout)
                (declare (ignore classoid))
-               (let ((hash (sb-kernel:wrapper-clos-hash wrapper)))
+               (let ((hash (sb-kernel:layout-clos-hash layout)))
                  (setq combined (logand combined hash))))
              (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't)))
     (assert (/= 0 combined))))
@@ -498,7 +500,7 @@
     (loop repeat (the fixnum n-iter)
           do
        (let* ((n (random limit random-state))
-              (lisp-hash (sb-impl:murmur-fmix-word-for-unit-test n))
+              (lisp-hash (sb-impl::murmur3-fmix-word n))
               (c-hash (c-murmur-fmix n)))
          (assert (= lisp-hash c-hash))))))
 (compile 'murmur-compare)

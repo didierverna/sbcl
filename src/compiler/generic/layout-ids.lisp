@@ -21,10 +21,27 @@
 
 ;;; [Some manual editing here was necessary due to not having all the packages
 ;;; in all build configurations.]
+;;; Also note that some types are here to force consistent assignment of
+;;; a layout ID between both genesis passes. In particular, without HASHSET
+;;; we'd get the rarely-seen header diff failure:
+;;;   //testing for consistency of first and second GENESIS passes
+;;;   diff -r src/runtime/genesis/instance.h output/genesis-2/instance.h
+;;;   62,63c62,63
+;;;   < #define HASHSET_LAYOUT_ID 135
+;;;   < #define HASHSET_STORAGE_LAYOUT_ID 136
+;;;   ---
+;;;   > #define HASHSET_LAYOUT_ID 283
+;;;   > #define HASHSET_STORAGE_LAYOUT_ID 284
+;;;
 (defparameter *popular-structure-types* (mapcar 'list '(
 SB-KERNEL:CTYPE
 HASH-TABLE
+PACKAGE
+SB-IMPL::ROBINHOOD-HASHSET
+SB-IMPL::ROBINHOOD-HASHSET-STORAGE
 SB-IMPL::GENERAL-HASH-TABLE
+SB-LOCKLESS::LINKED-LIST
+SB-LOCKLESS::FINALIZER-NODE
 SB-C::NODE
 SB-C::GLOBAL-CONFLICTS
 SB-C::GLOBAL-VAR
@@ -125,7 +142,6 @@ SB-C::LVAR-PROPER-SEQUENCE-ANNOTATION
 SB-DI:CODE-LOCATION
 SB-KERNEL:STRUCTURE-CLASSOID
 SB-C::LVAR-FUNCTION-DESIGNATOR-ANNOTATION
-SB-LOCKLESS::LINKED-LIST
 SB-C::LVAR-MODIFIED-ANNOTATION
 SB-DI::BOGUS-DEBUG-FUN
 #+sb-simd-pack SB-KERNEL:SIMD-PACK-TYPE
@@ -197,7 +213,6 @@ SB-DI::BREAKPOINT-DATA
 SB-PRETTY::PPRINT-DISPATCH-ENTRY
 SB-IMPL::EXTERNAL-FORMAT
 SB-PCL::METHOD-COMBINATION-INFO
-SB-KERNEL::LIST-NODE
 SB-ALIEN-INTERNALS:ALIEN-ENUM-TYPE
 #+sb-fasteval SB-INTERPRETER::SYMBOL-MACRO-SCOPE
 SB-INT:DEPRECATION-INFO
@@ -219,10 +234,12 @@ SB-C::DXABLE-ARGS
   #-(or arm mips) 'signed-byte)
 
 ;;; There are a few wired IDs:
+;;; (I doubt that these numbers need to be hand-chosen now. It should be enough
+;;; to list them in compiler/generic/layout-ids)
 ;;;   0 = T
 ;;;   1 = STRUCTURE-OBJECT
-;;;   2 = WRAPPER if #+metaspace, unused if #-metaspace
-;;;   3 = SB-VM:LAYOUT if #+metaspace, WRAPPER if #-metaspace
+;;;   2 = unused : FIXME
+;;;   3 = LAYOUT
 ;;;   4 = SB-LOCKLESS::LIST-NODE
 ;;;   5 = SB-BROTHERTREE::UNARY-NODE
 (ecase layout-id-type
@@ -253,13 +270,10 @@ SB-C::DXABLE-ARGS
 (defvar *condition-layout-uniqueid-counter* -128) ; decremented before use
 
 (defun choose-layout-id (name conditionp)
-  ;; If you change these, then also change src/runtime/gc-private.h
-  ;; The ID of T is irrelevant since we'll never try to compare to it.
   (case name
     ((t) 0)
     (structure-object 1)
-    #+metaspace (wrapper 2)
-    (#+metaspace sb-vm:layout #-metaspace wrapper 3)
+    (layout 3)
     (sb-lockless::list-node 4)
     (sb-brothertree::unary-node 5)
     (t (or (cdr (assq name sb-kernel::*popular-structure-types*))

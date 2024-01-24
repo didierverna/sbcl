@@ -1,4 +1,4 @@
-;;;; arithmetic tests with side effects
+;;;; arithmetic tests without side effects
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -169,4 +169,256 @@
    (ppc-ldb-1 (lambda (x)
                 (push x acc)))
    (assert (equal acc '(#xff #xff #xff #xff)))))
-
+
+(with-test (:name :ldb-word-cast)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x y)
+         (truly-the fixnum (ldb (byte x y) 100)))
+    ((100 0) 100)))
+
+(with-test (:name :logbitp-negative-error)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x y)
+         (logbitp x y))
+    ((-1 0) (condition 'type-error))
+    ((-2 (1+ most-positive-fixnum)) (condition 'type-error))
+    (((1- most-negative-fixnum) 1) (condition 'type-error))))
+
+(with-test (:name :*-overflow-ratio)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (a)
+         (the fixnum (* 8 a)))
+    ((1/8) 1)))
+
+#+64-bit
+(with-test (:name :bignum-float)
+  (checked-compile-and-assert
+      ()
+      `(lambda (d)
+         (sb-sys:without-gcing
+           (let ((res (sb-bignum:%allocate-bignum 2)))
+             (setf (sb-bignum:%bignum-ref res 1) 529
+                   (sb-bignum:%bignum-ref res 0) 9223372036854775807)
+             (sb-bignum:%bignum-set-length res 1)
+             (unwind-protect
+                  (< res d)
+               (sb-bignum:%bignum-set-length res 2)))))
+    ((-9.223372036854776d18) nil)
+    ((9.223372036854776d18) t)))
+
+(with-test (:name :overflow-transform-nil)
+  (checked-compile-and-assert
+      (:allow-warnings t)
+      `(lambda (v)
+         (let ((i 0))
+           (flet ((f (i)
+                    (the fixnum i)
+                    (svref v (+ i 26387449082611642302))))
+             (f i)
+             (incf i)
+             (f i)
+             (incf i)))))
+  (checked-compile-and-assert
+      (:allow-style-warnings t)
+      `(lambda (s e)
+         (subseq s 0 (when e
+                       (- (length s) 12129535698721845515))))))
+
+(with-test (:name :integer-length-union-derivation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (b)
+         (integer-length
+          (if (>= b 0)
+              b
+              -2)))
+    ((-1) 1)
+    ((0) 0)
+    ((15) 4)))
+
+(with-test (:name :isqrt-union)
+  (assert-type
+   (lambda (x)
+     (declare ((or (integer 1 5) (integer 9 10)) x))
+     (isqrt x))
+   (integer 1 3)))
+
+(with-test (:name :integer-length-union)
+  (assert-type
+   (lambda (x)
+     (declare ((or (integer 1 5) (integer 9 10)) x))
+     (integer-length x))
+   (integer 1 4)))
+
+(with-test (:name :rem-transform-erase-types)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((integer * 0) a))
+      (zerop (rem a 2)))
+   ((-1) nil)
+   ((-2) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((member 7 -9) a))
+      (zerop (rem a 8)))
+   ((7) nil)
+   ((-9) nil)))
+
+(with-test (:name :unexpected-immediates-in-vops)
+  (checked-compile
+   `(lambda (n)
+      (declare (fixnum n))
+      (loop for i below 2
+            do (print (logbitp i n))
+               (the (satisfies minusp) i))))
+  (checked-compile
+   `(lambda ()
+      (loop for i below 2
+            do (print (lognot i))
+               (the (satisfies minusp) i))))
+  (checked-compile
+   `(lambda ()
+      (loop for i below 2
+            do (print (- i))
+               (the (satisfies minusp) i))))
+  (checked-compile
+   `(lambda ()
+      (loop for i below 2
+            do (print (* i 3))
+               (the (satisfies minusp) i))))
+  (checked-compile
+   `(lambda ()
+      (loop for i below 2
+            do (print (* i 3))
+               (the (satisfies minusp) i))))
+  (checked-compile
+   `(lambda ()
+      (loop for i of-type fixnum below 2
+            do (print (logand most-positive-word (* i 4)))
+               (the (satisfies minusp) i)))))
+
+(with-test (:name :/-by-integer-type)
+  (assert-type
+   (lambda (x y)
+     (declare ((integer 1 9) x)
+              (integer y))
+     (/ x y))
+   (or (rational -9 (0)) (rational (0) 9)))
+  (assert-type
+   (lambda (x y)
+     (declare ((integer 1 9) x)
+              ((integer 0) y))
+     (/ x y))
+   (rational (0) 9))
+  (assert-type
+   (lambda (x y)
+     (declare ((rational 0 9) x)
+              ((integer 0) y))
+     (/ x y))
+   (rational 0 9)))
+
+(with-test (:name :truncate-unused-q)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare (fixnum a))
+      (rem a 4))
+   ((3) 3)
+   ((-3) -3)
+   ((4) 0)
+   ((-4) 0)))
+
+(with-test (:name :*-by-integer-type)
+  (assert-type
+   (lambda (x)
+     (declare (integer x))
+     (* x 5))
+   (or (integer 5) (integer * -5) (integer 0 0))))
+
+(with-test (:name :truncate-transform-unused-result)
+  (assert-type
+   (lambda (c)
+     (declare ((integer -1000 0) c)
+              (optimize speed))
+     (values
+      (truncate (truncate (rem c -89) -16) 20)))
+   (or (integer 0 0))))
+
+(with-test (:name :rem^2)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare (fixnum a))
+      (rem a 2))
+   ((-2) 0)
+   ((-3) -1)
+   ((2) 0)
+   ((3) 1)))
+
+(with-test (:name :deposit-field-derive-type)
+  (assert-type
+   (lambda (s)
+     (declare ((member 8 10) s))
+     (deposit-field -21031455 (byte s 9) 1565832649825))
+   (or (integer 1565832320097 1565832320097) (integer 1565832713313 1565832713313))))
+
+(with-test (:name :logior-negative-bound)
+  (checked-compile-and-assert
+   ()
+   `(lambda (b c)
+      (declare ((integer 7703 1903468060) c))
+      (logandc1 (/ (logorc2 c b) -1) c))
+   ((-1 7703) 7702)))
+
+(with-test (:name :set-numeric-contagion)
+  (assert-type
+   (lambda (n)
+     (loop for i below n
+           sum (coerce n 'single-float)))
+   (or (integer 0 0) single-float)))
+
+(with-test (:name :overflow-transform-order)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (a m)
+         (declare (fixnum a))
+         (let ((j (* 44 a)))
+           (when m
+             (the fixnum j))))
+    ((most-positive-fixnum nil) nil)
+    ((most-positive-fixnum t) (condition 'type-error))))
+
+(with-test (:name :logtest-memref-boxed)
+  (checked-compile-and-assert
+      ()
+      `(lambda (b)
+         (declare (sb-vm:word b))
+         (when (oddp b)
+           (lambda (m)
+             (when m
+               (setf b 1))
+             b)))
+    (((expt 2 (1- sb-vm:n-word-bits))) nil)
+    (((1+ (expt 2 (1- sb-vm:n-word-bits)))) t :test (lambda (x y)
+                                                      y
+                                                      (functionp (car x))))))
+
+(with-test (:name :range-unsigned)
+  (assert-type
+   (lambda (d)
+     (declare (type (integer 1 109) d))
+     (typep (- d) '(integer -47727025476642942 -2593702250735)))
+   null))
+
+(with-test (:name :signed-byte-8-p-unsigned)
+  (checked-compile
+   `(lambda (a)
+      (declare (type (simple-array sb-vm:word (*)) a)
+               (optimize speed))
+      (the (signed-byte 8) (aref a 0)))
+   :allow-notes nil))

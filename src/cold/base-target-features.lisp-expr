@@ -109,12 +109,6 @@
  ;; original CMU CL code.)
  ; :sb-show-assem
 
- ;; Compile the C runtime with support for low-level debugging output
- ;; through FSHOW.  If enabled, this feature allows
- ;; users to turn on such debugging output using environment variables at
- ;; run-time.
- ; :sb-qshow
-
  ;; Enable code for collecting statistics on usage of various operations,
  ;; useful for performance tuning of the SBCL system itself. This code
  ;; is probably pretty stale (having not been tested since the fork from
@@ -276,6 +270,14 @@
  ;; want to disable it, if you need to pass file descriptors to
  ;; foreign code that uses a 32-bit off_t.
  ; :largefile
+
+ ;; This feature allows static space to be relocatable on start-up.
+ ; :relocatable-static-space
+
+ ;; This feature allows Lisp spaces to be randomly allocated anywhere
+ ;; in virtual address space, i.e. the behavior of passing mmap an
+ ;; address of zero. Requires all spaces to be relocatable on start-up.
+ ; :aslr
 
  ;; SBCL has optional support for zstd-based compressed core files.  Enable
  ;; this feature to compile it in.  Obviously, doing so adds a dependency

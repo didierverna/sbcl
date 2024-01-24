@@ -5,12 +5,7 @@
  * The functions in this file are typically called directly from Lisp.
  * Thus, when their signature changes, they don't need updates in a .h
  * file somewhere, but they do need updates in the Lisp code. FIXME:
- * It would be nice to enforce this at compile time. It mighn't even
- * be all that hard: make the cross-compiler versions of DEFINE-ALIEN-FOO
- * macros accumulate strings in a list which then gets written out at
- * the end of sbcl2.h at the end of cross-compilation, then rerun
- * 'make' in src/runtime/ using the new sbcl2.h as sbcl.h (and make
- * sure that all the files in src/runtime/ include sbcl.h). */
+ * It would be nice to enforce this at compile time. */
 
 /*
  * This software is part of the SBCL system. See the README file for
@@ -23,7 +18,7 @@
  * files for more information.
  */
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #include <sys/types.h>
 #include <dirent.h>
@@ -60,7 +55,12 @@
    Unix header, according to Perry E. Metzger, in a message on
    sbcl-devel dated 2004-03-29, this is the POSIXly-correct way of
    using environ: by an explicit declaration.  -- CSR, 2004-03-30 */
+#if defined __W32API_USE_DLLIMPORT__
+// Assume that if that DLLIMPORT preprocessor symbol is defined, then 'environ' is too.
+// It gets defined as '_environ' which in turn is defined as (* __p__environ())
+#else
 extern char **environ;
+#endif
 
 /*
  * stuff needed by CL:DIRECTORY and other Lisp directory operations
@@ -524,12 +524,6 @@ int s_issock(mode_t mode)
 #endif /* !LISP_FEATURE_WIN32 */
 
 #ifdef LISP_FEATURE_UNIX
-#ifdef LISP_FEATURE_DARWIN
-/* nanosleep() is not re-entrant on some versions of Darwin and is
- * reimplemented using the underlying syscalls.
- */
-int sb_nanosleep(time_t sec, int nsec);
-#else
 void sb_nanosleep(time_t sec, int nsec)
 {
     struct timespec rqtp = {sec, nsec};
@@ -537,36 +531,8 @@ void sb_nanosleep(time_t sec, int nsec)
 
     while(nanosleep(&rqtp, &rmtp) && errno == EINTR) {
         rqtp = rmtp;
-        /* The old lisp version stated
-           ;; KLUDGE: On Darwin, if an interrupt cases nanosleep to
-           ;; take longer than the requested time, the call will
-           ;; return with EINT and (unsigned)-1 seconds in the
-           ;; remainder timespec, which would cause us to enter
-           ;; nanosleep again for ~136 years. So, we check that the
-           ;; remainder time is actually decreasing.
-           ;;
-           ;; It would be neat to do this bit of defensive
-           ;; programming on all platforms, but unfortunately on
-           ;; Linux, REM can be a little higher than REQ if the
-           ;; nanosleep() call is interrupted quickly enough,
-           ;; probably due to the request being rounded up to the
-           ;; nearest HZ. This would cause the sleep to return way
-           ;; too early.
-           #+darwin
-           (let ((rem-sec (slot rem 'tv-sec))
-           (rem-nsec (slot rem 'tv-nsec)))
-           (when (or (> secs rem-sec)
-           (and (= secs rem-sec) (>= nsecs rem-nsec)))
-           ;; Update for next round.
-           (setf secs  rem-sec
-           nsecs rem-nsec)
-           t)
-
-           but the Darwin variant is implemented elsewhere
-        */
     }
 }
-#endif
 
 void sb_nanosleep_double(double seconds) {
     /* Some (which?) platforms, apparently, can't sleep more than 100

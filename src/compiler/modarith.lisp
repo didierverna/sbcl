@@ -352,7 +352,7 @@
              (cond
                ((eq signedp (cdr w)) (<= width (car w)))
                ((eq signedp nil) (< width (car w))))))
-      (declare (truly-dynamic-extent #'inexact-match))
+      (declare (dynamic-extent #'inexact-match))
       (let ((tgt (find-if #'inexact-match twidths)))
         (when tgt
           (return-from best-modular-version
@@ -392,6 +392,8 @@
                 nil) ; After fixing above, replace with T, meaning
                                         ; "don't reoptimize this (LOGAND) node any more".
               )))))))
+
+(setf (fun-info-optimizer (fun-info-or-lose 'logandc2)) #'logand-optimizer-optimizer)
 
 (defoptimizer (mask-signed-field optimizer) ((width x) node)
   (let ((result-type (single-value-type (node-derived-type node))))

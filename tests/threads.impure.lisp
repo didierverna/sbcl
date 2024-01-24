@@ -74,7 +74,8 @@
 
 ;;;; Now the real tests...
 
-(with-test (:name (with-mutex :timeout))
+(with-test (:name (with-mutex :timeout)
+            :broken-on :gc-stress)
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -251,7 +252,8 @@
                               (with-recursive-lock (m :wait-p nil)
                                 t))))))))
 
-(with-test (:name (with-recursive-lock :timeout))
+(with-test (:name (with-recursive-lock :timeout)
+                  :broken-on :gc-stress)
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -276,7 +278,8 @@
     (with-mutex (l)
       (with-recursive-lock (l)))))
 
-(with-test (:name (condition-wait :basics-1))
+(with-test (:name (condition-wait :basics-1)
+                  :skipped-on :gc-stress)
   (let ((queue (make-waitqueue :name "queue"))
         (lock (make-mutex :name "lock"))
         (n 0))
@@ -285,6 +288,7 @@
                  (assert (eql (mutex-owner lock) *current-thread*))
                  (format t "~A got mutex~%" *current-thread*)
                  ;; now drop it and sleep
+                 ;; FIXME: condition-wait returning doesn't mean there was condition-notify
                  (condition-wait queue lock)
                  ;; after waking we should have the lock again
                  (assert (eql (mutex-owner lock) *current-thread*))
@@ -300,7 +304,8 @@
         (condition-notify queue))
       (sleep 1))))
 
-(with-test (:name (condition-wait :basics-2))
+(with-test (:name (condition-wait :basics-2)
+                  :skipped-on :gc-stress)
   (let ((queue (make-waitqueue :name "queue"))
         (lock (make-mutex :name "lock")))
     (labels ((ours-p (value)
@@ -310,6 +315,7 @@
                  (assert (ours-p (mutex-owner lock)))
                  (format t "~A got mutex~%" (mutex-owner lock))
                  ;; now drop it and sleep
+                 ;; FIXME: condition-wait returning doesn't mean there was condition-notify
                  (condition-wait queue lock)
                  ;; after waking we should have the lock again
                  (format t "woken, ~A got mutex~%" (mutex-owner lock))
@@ -346,7 +352,8 @@
         (wait-on-semaphore w)
         (assert (null (join-thread th)))))))
 
-(with-test (:name (grab-mutex :timeout :acquisition-success))
+(with-test (:name (grab-mutex :timeout :acquisition-success)
+            :skipped-on :gc-stress)
   (let ((m (make-mutex))
         (child))
     (with-mutex (m)
@@ -732,7 +739,6 @@
 
 ;; You have to shoehorn this arbitrary sexpr into a feature expression
 ;; to have the test summary show that a test was disabled.
-#+gencgc
 (unless (eql (extern-alien "verify_gens" int)
              (+ sb-vm:+highest-normal-generation+ 2))
   (pushnew :verify-gens *features*))

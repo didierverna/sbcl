@@ -1,5 +1,4 @@
-#+(or (not system-tlabs) (not compact-instance-header) interpreter)
-(invoke-restart 'run-tests::skip-file)
+#+(or (not system-tlabs) interpreter) (invoke-restart 'run-tests::skip-file)
 
 (in-package sb-vm)
 
@@ -28,6 +27,16 @@
     (assert (null (c-find-heap->arena)))
     (destroy-arena a)))
 
+(test-util:with-test (:name :no-arena-symbol-name)
+  (let* ((a (new-arena 1048576))
+         (symbol
+          (sb-vm:with-arena (a)
+            (let ((string (format nil "test~D" (random 10))))
+              (make-symbol string)))))
+    (assert (heap-allocated-p symbol))
+    (assert (heap-allocated-p (symbol-name symbol)))
+    (destroy-arena a)))
+
 (test-util:with-test (:name :no-arena-symbol-property)
   (let* ((a (new-arena 1048576))
          (copy-of-foo
@@ -37,6 +46,40 @@
     (test-util:opaque-identity copy-of-foo)
     (assert (not (c-find-heap->arena)))
     (destroy-arena a)))
+
+(test-util:with-test (:name :interrupt-thread-on-arena)
+  (let* ((a (new-arena 1048576))
+         (sem (sb-thread:make-semaphore))
+         (junk))
+    (sb-vm:with-arena (a)
+      (sb-thread:interrupt-thread
+       sb-thread:*current-thread*
+       (lambda ()
+         (setf junk (cons 'foo 'bar))
+         (sb-thread:signal-semaphore sem))))
+    (sb-thread:wait-on-semaphore sem)
+    (sb-vm:destroy-arena a)
+    (assert (heap-allocated-p junk))))
+
+(defun find-some-pkg () (find-package "NOSUCHPKG"))
+
+(test-util:with-test (:name :find-package-1-element-cache)
+  (let* ((cache (let ((code (fun-code-header #'find-some-pkg)))
+                  (loop for i from code-constants-offset
+                        below (code-header-words code)
+                        when (and (typep (code-header-ref code i) '(cons string))
+                                  (string= (car (code-header-ref code i))
+                                           "NOSUCHPKG"))
+                        return (code-header-ref code i))))
+         (elements (cdr cache)))
+    (assert (or (equalp (cdr cache) #(NIL NIL NIL))
+                (search "#<weak array [3]" (write-to-string (cdr cache)))))
+    (let* ((a (new-arena 1048576))
+           (pkg (with-arena (a) (find-some-pkg))))
+      (assert (not pkg)) ; no package was found of course
+      (assert (neq (cdr cache) elements)) ; the cache got affected
+      (assert (not (c-find-heap->arena)))
+      (destroy-arena a))))
 
 #+nil
 (test-util:with-test (:name :arena-alloc-waste-reduction)
@@ -120,6 +163,24 @@
               (error "~S has ~S" symbol line)))))))
   (let ((finder-result (c-find-heap->arena)))
     (assert (null finder-result))))
+
+(defun decode-all-debug-data ()
+  (dolist (code (sb-vm:list-allocated-objects :all :type sb-vm:code-header-widetag))
+    (let ((info (sb-kernel:%code-debug-info code)))
+      (when (typep info 'sb-c::compiled-debug-info)
+        (do ((cdf (sb-c::compiled-debug-info-fun-map info)
+                  (sb-c::compiled-debug-fun-next cdf)))
+            ((null cdf))
+          (test-util:opaque-identity
+           (sb-di::debug-fun-lambda-list
+            (sb-di::make-compiled-debug-fun cdf code))))))))
+
+(test-util:with-test (:name :debug-data-force-to-heap)
+  (let ((a (sb-vm:new-arena (* 1024 1024 1024))))
+    (sb-vm:with-arena (a)
+      (decode-all-debug-data))
+    (assert (null (sb-vm:c-find-heap->arena a)))
+    (sb-vm:destroy-arena a)))
 
 (defun test-with-open-file ()
   ;; Force allocation of a new BUFFER containing a new SAP,
@@ -490,6 +551,7 @@
 ;;; unhidden and potentially rewound. So any use of it is like a use-after-free bug,
 ;;; except that the memory is still there so we can figure out what went wrong
 ;;; with user code. This might pass on #+-linux but has not been tested.
+(setf (extern-alien "lose_on_corruption_p" int) 0)
 (test-util:with-test (:name :arena-use-after-free :skipped-on (:not :linux))
   ;; scary messages scare me
   (format t "::: NOTE: Expect a \"CORRUPTION WARNING\" from this test~%")
@@ -498,17 +560,18 @@
     (block foo
       (handler-bind
           ((sb-sys:memory-fault-error
-            (lambda (c)
-              (format t "~&Uh oh spaghetti-o: tried to read @ ~x~%"
-                      (sb-sys:system-condition-address c))
-              (setq caught t)
-              (return-from foo))))
+             (lambda (c)
+               (format t "~&Uh oh spaghetti-o: tried to read @ ~x~%"
+                       (sb-sys:system-condition-address c))
+               (setq caught t)
+               (return-from foo))))
         (aref *vect* 3)))
     (assert caught))
   ;; Assert that it becomes usable again
   (unhide-arena *another-arena*)
   (rewind-arena *another-arena*)
   (dotimes (i 10) (f *another-arena* 1000)))
+(setf (extern-alien "lose_on_corruption_p" int) 1)
 
 ;; #+sb-devel preserves some symbols that the test doesn't care about
 ;; as the associated function will never be called.

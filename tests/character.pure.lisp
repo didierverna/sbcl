@@ -62,7 +62,7 @@
                  (digit-char -1)
                  (digit-char 4 1)
                  (digit-char 4 37)
-                 (sb-int:two-arg-char-equal 10 10)))
+                 (char-equal 10 10)))
    (assert-error (apply (car form) (mapcar 'eval (cdr form))) type-error)))
 
 ;; All of the inequality predicates when called out-of-line
@@ -205,3 +205,9 @@
                                    (char-downcase char-b))
                 do (assert (eql (funcall fun char-a char-b)
                                 equal))))))
+(with-test (:name :code-char-type-unions)
+  (assert-type
+   (lambda (b)
+     (declare ((or (eql 5) (eql 10)) b))
+     (typep (code-char b) 'base-char))
+   (member t)))

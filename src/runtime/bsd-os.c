@@ -25,8 +25,7 @@
 #include <utime.h>
 #include <assert.h>
 #include <errno.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -42,7 +41,8 @@
 #include <signal.h>
 /* #include <sys/sysinfo.h> */
 #include "validate.h"
-#include "gc-internal.h"
+#include "gc.h"
+#include "sys_mmap.inc"
 
 
 
@@ -132,25 +132,27 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
     int protection;
     int flags = 0;
 
-#if defined(LISP_FEATURE_OPENBSD) && defined(MAP_STACK)
-        /* OpenBSD requires MAP_STACK for pages used as stack.
-         * Note that FreeBSD has a MAP_STACK with different behavior. */
-    if (space_id == THREAD_STRUCT_CORE_SPACE_ID) flags = MAP_STACK;
-#endif
-
     // FIXME: This probaby needs to use MAP_TRYFIXED
     if (attributes & IS_GUARD_PAGE)
         protection = OS_VM_PROT_NONE;
     else
-#ifndef LISP_FEATURE_DARWIN_JIT
+#if defined(LISP_FEATURE_OPENBSD) && defined(MAP_STACK)
+    /* OpenBSD requires MAP_STACK for pages used as stack (and RW protection).
+     * Note that FreeBSD has a MAP_STACK with different behavior. */
+    if (space_id == THREAD_STRUCT_CORE_SPACE_ID) {
+        protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
+        flags |= MAP_STACK;
+    } else {
         protection = OS_VM_PROT_ALL;
-#else
+    }
+
+#elif defined(LISP_FEATURE_DARWIN_JIT)
     if (jit) {
         if (jit == 2)
             protection = OS_VM_PROT_ALL;
         else
             protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
-        flags = MAP_JIT;
+        flags |= MAP_JIT;
     }
     else if (executable) {
         protection = OS_VM_PROT_READ | OS_VM_PROT_EXECUTE;
@@ -158,6 +160,9 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
     else {
         protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
     }
+
+#else
+        protection = OS_VM_PROT_ALL;
 #endif
 
     attributes &= ~IS_GUARD_PAGE;
@@ -190,7 +195,7 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
        Except for MAP_FIXED mappings, the system will never replace existing mappings. */
 
     // ALLOCATE_LOW seems never to get what we want
-    if (!(attributes & MOVABLE) || (attributes & ALLOCATE_LOW)) flags = MAP_FIXED;
+    if (!(attributes & MOVABLE) || (attributes & ALLOCATE_LOW)) flags |= MAP_FIXED;
 #endif
 
 #ifdef MAP_EXCL // not defined in OpenBSD, NetBSD, DragonFlyBSD
@@ -226,7 +231,7 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
 #endif
     {
         os_vm_address_t requested = addr;
-        addr = mmap(addr, len, protection, flags, -1, 0);
+        addr = sbcl_mmap(addr, len, protection, flags, -1, 0);
         if (requested && requested != addr && !(attributes & MOVABLE)) {
             return 0;
         }
@@ -251,8 +256,6 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
  * any OS-dependent special low-level handling for signals
  */
 
-#if defined LISP_FEATURE_GENCGC
-
 /*
  * The GENCGC needs to be hooked into whatever signal is raised for
  * page fault on this OS.
@@ -267,13 +270,13 @@ memory_fault_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     os_restore_tls_segment_register(context);
 #endif
 
-    FSHOW((stderr, "Memory fault at: %p, PC: %p\n", fault_addr, OS_CONTEXT_PC(context)));
-
 #ifdef LISP_FEATURE_SB_SAFEPOINT
     if (handle_safepoint_violation(context, fault_addr)) return;
 #endif
 
+#ifdef LISP_FEATURE_GENCGC
     if (gencgc_handle_wp_violation(context, fault_addr)) return;
+#endif
 
     if (!handle_guard_page_triggered(context,fault_addr))
             lisp_memory_fault_error(context, fault_addr);
@@ -283,11 +286,7 @@ void
 os_install_interrupt_handlers(void)
 {
     if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
-    ll_install_handler(SIG_MEMORY_FAULT,
-#if defined(LISP_FEATURE_FREEBSD) && !defined(__GLIBC__)
-                                                 (__siginfohandler_t *)
-#endif
-                                                 memory_fault_handler);
+    ll_install_handler(SIG_MEMORY_FAULT, memory_fault_handler);
 
 #ifdef LISP_FEATURE_DARWIN
     /* Unmapped pages get this and not SIGBUS. */
@@ -296,28 +295,6 @@ os_install_interrupt_handlers(void)
 
     }
 }
-
-#else /* Currently PPC/Darwin/Cheney only */
-
-static void
-sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
-{
-    os_vm_address_t addr;
-
-    addr = arch_get_bad_addr(signal, info, context);
-    if (cheneygc_handle_wp_violation(context, addr)) return;
-
-    if (!handle_guard_page_triggered(context, addr))
-            interrupt_handle_now(signal, info, context);
-}
-
-void
-os_install_interrupt_handlers(void)
-{
-    ll_install_handler(SIG_MEMORY_FAULT, sigsegv_handler);
-}
-
-#endif /* defined GENCGC */
 
 #ifdef __NetBSD__
 static void netbsd_init()

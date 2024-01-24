@@ -13,29 +13,28 @@
 
 #include <stdio.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "validate.h"
 #include "os.h"
 #include "arch.h"
 #include "lispregs.h"
-#include "signal.h"
-#include "alloc.h"
+#include <signal.h>
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
-#include "unaligned.h"
+#include "align.h"
 #include "search.h"
 #include "var-io.h"
 
+#include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
-#include "forwarding-ptr.h"
 #include "core.h"
-#include "gc-private.h"
+#include "gc.h"
 
 #define INT3_INST 0xCC
 #define INTO_INST 0xCE
@@ -145,23 +144,24 @@ arch_get_bad_addr(int __attribute__((unused)) sig,
 // I don't have an easy way to test changes for these OSes, so just use this
 // context visitor based on the old slightly-less-efficient way of doing it.
 #if defined LISP_FEATURE_SUNOS || defined LISP_FEATURE_HAIKU
-void visit_context_registers(void (*proc)(os_context_register_t, int), os_context_t *context)
+void visit_context_registers(void (*proc)(os_context_register_t, void*),
+                             os_context_t *context, void* arg)
 {
-    proc(os_context_pc(context), 1);
-    proc(*os_context_register_addr(context, reg_RAX), 1);
-    proc(*os_context_register_addr(context, reg_RCX), 1);
-    proc(*os_context_register_addr(context, reg_RDX), 1);
-    proc(*os_context_register_addr(context, reg_RBX), 1);
-    proc(*os_context_register_addr(context, reg_RSI), 1);
-    proc(*os_context_register_addr(context, reg_RDI), 1);
-    proc(*os_context_register_addr(context, reg_R8 ), 1);
-    proc(*os_context_register_addr(context, reg_R9 ), 1);
-    proc(*os_context_register_addr(context, reg_R10), 1);
-    proc(*os_context_register_addr(context, reg_R11), 1);
-    proc(*os_context_register_addr(context, reg_R12), 1);
-    proc(*os_context_register_addr(context, reg_R13), 1);
-    proc(*os_context_register_addr(context, reg_R14), 1);
-    proc(*os_context_register_addr(context, reg_R15), 1);
+    proc(os_context_pc(context), arg);
+    proc(*os_context_register_addr(context, reg_RAX), arg);
+    proc(*os_context_register_addr(context, reg_RCX), arg);
+    proc(*os_context_register_addr(context, reg_RDX), arg);
+    proc(*os_context_register_addr(context, reg_RBX), arg);
+    proc(*os_context_register_addr(context, reg_RSI), arg);
+    proc(*os_context_register_addr(context, reg_RDI), arg);
+    proc(*os_context_register_addr(context, reg_R8 ), arg);
+    proc(*os_context_register_addr(context, reg_R9 ), arg);
+    proc(*os_context_register_addr(context, reg_R10), arg);
+    proc(*os_context_register_addr(context, reg_R11), arg);
+    proc(*os_context_register_addr(context, reg_R12), arg);
+    proc(*os_context_register_addr(context, reg_R13), arg);
+    proc(*os_context_register_addr(context, reg_R14), arg);
+    proc(*os_context_register_addr(context, reg_R15), arg);
 }
 #endif
 
@@ -237,8 +237,6 @@ void arch_skip_instruction(os_context_t *context)
             break;
         }
 
-    FSHOW((stderr,
-           "/[arch_skip_inst resuming at %x]\n", OS_CONTEXT_PC(context)));
 }
 
 unsigned char *
@@ -247,23 +245,15 @@ arch_internal_error_arguments(os_context_t *context)
     return 1 + (unsigned char *)OS_CONTEXT_PC(context);
 }
 
-boolean
-arch_pseudo_atomic_atomic(os_context_t __attribute__((unused)) *context)
-{
-    return get_pseudo_atomic_atomic(get_sb_vm_thread());
+bool arch_pseudo_atomic_atomic(struct thread *thread) {
+    return get_pseudo_atomic_atomic(thread);
 }
 
-void
-arch_set_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
-{
-    struct thread *thread = get_sb_vm_thread();
+void arch_set_pseudo_atomic_interrupted(struct thread *thread) {
     set_pseudo_atomic_interrupted(thread);
 }
 
-void
-arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
-{
-    struct thread *thread = get_sb_vm_thread();
+void arch_clear_pseudo_atomic_interrupted(struct thread *thread) {
     clear_pseudo_atomic_interrupted(thread);
 }
 
@@ -274,7 +264,7 @@ arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *conte
 unsigned int
 arch_install_breakpoint(void *pc)
 {
-    unsigned int result = *(unsigned int*)pc;
+    unsigned int result = UNALIGNED_LOAD32(pc);
 #ifdef LISP_FEATURE_INT4_BREAKPOINTS
     *(char*)pc = INTO_INST;
 #else
@@ -427,7 +417,7 @@ sigill_handler(int __attribute__((unused)) signal,
                siginfo_t __attribute__((unused)) *siginfo,
                os_context_t *context) {
     unsigned char* pc = (void*)OS_CONTEXT_PC(context);
-    if (*(unsigned short *)pc == UD2_INST) {
+    if (UNALIGNED_LOAD16(pc) == UD2_INST) {
         OS_CONTEXT_PC(context) += 2;
         return sigtrap_handler(signal, siginfo, context);
     }
@@ -590,57 +580,25 @@ arch_set_fp_modes(unsigned int mxcsr)
     asm ("ldmxcsr %0" : : "m" (temp));
 }
 
-static __attribute__((unused)) boolean codeblob_p(lispobj ptr) {
-    return lowtag_of(ptr) == OTHER_POINTER_LOWTAG &&
-           widetag_of((lispobj*)(ptr-OTHER_POINTER_LOWTAG)) == CODE_HEADER_WIDETAG;
-}
-
 /* Return the tagged pointer for which 'entrypoint' is the starting address.
- * This will be one of the following:
- * 1. a fun-pointer which is either
- *   - a simple-fun header located 2 words before the entrypoint.
- *     N.B.: This returns the SIMPLE-FUN, and _not_ its containing codeblob.
- *   - a funcallable-instance with an embedded trampoline that make it
- *     equivalent to a simple-fun
- * 2. a code-component with no simple-fun within it, that makes closures
- *    callable like simple-funs. The code header is at entrypoint minus 4 words.
- *
- * By first reading at (entrypoint - 2*N_WORD_BYTES) this does the right thing
- * when 'entrypoint' is actually type 2, because the word accessed will not be
- * an object header or forwarding marker (it will be whatever %CODE-DEBUG-INFO is).
- * Whereis if this were type 1, but we read at (entrypoint - 4*N_WORD_BYTES) first,
- * then we could perceive random uninitialized bytes of the preceding object.
+ * This result will have SIMPLE_FUN_WIDETAG or FUNCALLABLE_INSTANCE_WIDETAG.
+ * If the thing has been forwarded, we do NOT return the newspace copy.
  */
 lispobj entrypoint_taggedptr(uword_t entrypoint) {
     if (!entrypoint || points_to_asm_code_p(entrypoint)) return 0;
-    // First try
     lispobj* phdr = (lispobj*)(entrypoint - 2*N_WORD_BYTES);
     if (forwarding_pointer_p(phdr)) {
-        gc_dcheck(lowtag_of(forwarding_pointer_value(phdr)) == FUN_POINTER_LOWTAG);
-        return make_lispobj(phdr, FUN_POINTER_LOWTAG);
+        gc_assert(lowtag_of(forwarding_pointer_value(phdr)) == FUN_POINTER_LOWTAG);
+        // We can't assert on the widetag if forwarded, because defragmentation
+        // puts the new logical object at some totally different physical address.
+        // This function doesn't know if defrag is occurring.
+    } else {
+        __attribute__((unused)) unsigned char widetag = widetag_of(phdr);
+        gc_assert(widetag == SIMPLE_FUN_WIDETAG || widetag == FUNCALLABLE_INSTANCE_WIDETAG);
     }
-    int widetag = widetag_of(phdr);
-    if (widetag == FUNCALLABLE_INSTANCE_WIDETAG || widetag == SIMPLE_FUN_WIDETAG) {
-        return make_lispobj(phdr, FUN_POINTER_LOWTAG);
-    }
-    // Second try
-    phdr = (lispobj*)(entrypoint - 4*N_WORD_BYTES);
-    /* It is nearly impossible for forwarding to arise, by this reasoning:
-     * Case A: if some thread references the codeblob that wraps a closure,
-     *  then the codeblob is pinned; hence not forwarded.
-     * Case B: if not executing (or otherwise referenced from stack/registers),
-     *  there can exist no other tagged reference to the codeblob.
-     * Aside from the FDEFN that owns it, the only other untagged reference would
-     * be from the search tree, which isn't scavenged. (The entire tree dies after GC.)
-     * It's conceivable the debugger could store a tagged pointer to this entrypoint
-     * in something, but I tried to make it do so, and couldn't. I was, however, able
-     * to artificially cause forwarding by putting closure trampolines in symbols */
-    if (forwarding_pointer_p(phdr))
-        gc_dcheck(codeblob_p(forwarding_pointer_value(phdr)));
-    else
-        gc_dcheck(widetag_of(phdr) == CODE_HEADER_WIDETAG);
-    return make_lispobj(phdr, OTHER_POINTER_LOWTAG);
+    return make_lispobj(phdr, FUN_POINTER_LOWTAG);
 }
+
 /* Return the lisp object that fdefn's raw_addr slot jumps to.
  * In the event that the referenced object was forwarded, this returns the un-forwarded
  * object (the forwarded value is used to assert some invariants though).
@@ -671,7 +629,7 @@ extern pthread_mutex_t alloc_profiler_lock;
 
 static unsigned int claim_index(int qty) // qty is 1 or 2
 {
-    static boolean warning_issued;
+    static bool warning_issued;
     unsigned int index = fixnum_value(SYMBOL(N_PROFILE_SITES)->value);
     SYMBOL(N_PROFILE_SITES)->value += make_fixnum(qty);
     if (fixnum_value(SYMBOL(N_PROFILE_SITES)->value) <= max_alloc_point_counters)
@@ -683,7 +641,7 @@ static unsigned int claim_index(int qty) // qty is 1 or 2
     return 0; // use the overflow bin(s)
 }
 
-static boolean NO_SANITIZE_MEMORY
+static bool NO_SANITIZE_MEMORY
 instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 {
     int __attribute__((unused)) ret = mutex_acquire(&alloc_profiler_lock);
@@ -711,7 +669,7 @@ instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 
 // logical index 'index' in the metadata array stores the code component
 // and pc-offset relative to the component base address
-static void record_pc(char* pc, unsigned int index, boolean sizedp)
+static void record_pc(char* pc, unsigned int index, bool sizedp)
 {
     lispobj *code = component_ptr_from_pc(pc);
     if (!code) {
@@ -753,8 +711,7 @@ static void record_pc(char* pc, unsigned int index, boolean sizedp)
     }
 }
 
-void AMD64_SYSV_ABI
-allocation_tracker_counted(uword_t* sp)
+void allocation_tracker_counted(uword_t* sp)
 {
     uword_t *pc, word_at_pc;
     if (instrumentp(sp, &pc, &word_at_pc)) {
@@ -785,8 +742,7 @@ allocation_tracker_counted(uword_t* sp)
     gc_assert(ret);
 }
 
-void AMD64_SYSV_ABI
-allocation_tracker_sized(uword_t* sp)
+void allocation_tracker_sized(uword_t* sp)
 {
     uword_t *pc, word_at_pc;
     if (instrumentp(sp, &pc, &word_at_pc)) {

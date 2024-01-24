@@ -52,11 +52,11 @@
                                 :lowtag other-pointer-lowtag
                                 :widetag ratio-widetag
                                 :alloc-trans %make-ratio)
-  (numerator :type integer
+  (numerator :type (and integer (not (eql 0)))
              :ref-known (flushable movable)
              :ref-trans %numerator
              :init :arg)
-  (denominator :type (integer 1)
+  (denominator :type (integer 2)
                :ref-known (flushable movable)
                :ref-trans %denominator
                :init :arg))
@@ -77,9 +77,11 @@
   #+sparc (filler)
   (value :c-type "long double" :length #+x86 3 #+sparc 4))
 
+;;; FIXME: the primitive-type should probably be named COMPLEX-RATIONAL
+;;; but that was more invasive than renaming just the widetag
 (define-primitive-object (complex :type complex
                                   :lowtag other-pointer-lowtag
-                                  :widetag complex-widetag
+                                  :widetag complex-rational-widetag
                                   :alloc-trans %make-complex)
   (real :type real
         :ref-known (flushable movable)
@@ -159,7 +161,6 @@ Code header representation:
 For both:
   code-size = total words * n-word-bytes - boxed bytes
   text-size = code-size - simple-fun table size - padding bytes
-  bit 31 of word 0 = fullcgc mark bit
   bit 30           = touched since last GC bit
   The boxed byte count is stored "raw" (i.e. it's not a tagged value,
   but it has fixnum nature)
@@ -190,6 +191,20 @@ during backtrace.
   (boxed-size :type fixnum ; see above figure
               :ref-known (flushable movable)
               :ref-trans %code-boxed-size)
+  ;;
+  ;; Caution! the first few slots have a slight amount of order-sensitivity.
+  ;; When saving a core we try to defer the scavenge of FIXUPS and DEBUG-INFO
+  ;; so that they reside relatively near the end of the consumed space.
+  ;; This is similar to what 'purify.c' would do.  It's tricky to express a range
+  ;; without either hardwiring the indices or else assuming that you know the order
+  ;; in which they appear, as in "&obj->firstslot" up to "&obj->lastslot".
+  ;; See in particular how scav_code_blob() and delay_code_metadata_scavenge()
+  ;; conspire to skip over 2 slots and then come back to visit them later.
+  ;;
+  ;; Not all architectures use fixups. The slot is always present for consistency.
+  ;; The corresponding SETF function is defined using code-header-set
+  ;; on the slot index.
+  (fixups :type t :ref-known (flushable) :ref-trans %code-fixups)
   ;; This slot usually holds an instance of SB-C::COMPILED-DEBUG-FUN
   ;; but the debugger can replace it with a cons of that and something else.
   ;; It could also be the symbol :BPT-LRA, or, as a special case
@@ -201,17 +216,12 @@ during backtrace.
   (debug-info :type t
               :ref-known (flushable)
               :ref-trans %code-debug-info)
-  ;; Not all architectures use fixups. The slot is always present for consistency.
-  ;; The corresponding SETF function is defined using code-header-set
-  ;; on the slot index.
-  (fixups :type t :ref-known (flushable) :ref-trans %code-fixups)
   (constants :rest-p t))
 
 (define-primitive-object (fdefn :type fdefn
                                 :lowtag other-pointer-lowtag
                                 :widetag fdefn-widetag)
-  (name :ref-trans fdefn-name
-        :set-trans %set-fdefn-name :set-known ())
+  (name :ref-trans fdefn-name)
   (fun :type (or function null) :ref-trans fdefn-fun)
   ;; raw-addr is used differently by the various backends:
   ;; - Sparc, ARM, and RISC-V store the same object as 'fun'
@@ -225,6 +235,14 @@ during backtrace.
   ;;   a self-contained trampoline, or closure or funcallable-instance
   ;;   wrapped in a simplifying trampoline.
   (raw-addr :c-type "char *"))
+
+;;; Reader for FDEFN-RAW-ADDR. The usual IR2 converter would return
+;;; descriptor-reg and so its result would need shifting by n-fixnum-tag-bits.
+#-sb-xc-host
+(defun fdefn-raw-addr (fdefn)
+  (with-pinned-objects (fdefn)
+    (sap-ref-word (int-sap (get-lisp-obj-address fdefn))
+                  (- (ash fdefn-raw-addr-slot word-shift) other-pointer-lowtag))))
 
 ;;; a simple function (as opposed to hairier things like closures
 ;;; which are also subtypes of Common Lisp's FUNCTION type)
@@ -265,13 +283,8 @@ during backtrace.
                                   :alloc-trans %alloc-closure)
   (fun :init :arg :ref-trans #+(or x86 x86-64 arm64) %closure-callee
                              #-(or x86 x86-64 arm64) %closure-fun)
-  ;; 'fun' is an interior pointer to code, but we also need the base pointer
-  ;; for MPS. I'm trying to figure out how to avoid this word of overhead,
-  ;; but it works for the time being.
-  #+metaspace (code :ref-known (flushable) :ref-trans %closure-code)
   (info :rest-p t))
 
-#+executable-funinstances
 (define-primitive-object (funcallable-instance
                           :lowtag fun-pointer-lowtag
                           :widetag funcallable-instance-widetag
@@ -285,24 +298,13 @@ during backtrace.
   ;; were the LAYOUT to intrude between the instructions and the FUNCTION,
   ;; then the instruction bytes would depend on whether #+compact-instance-header
   ;; is enabled, which is an extra and unnecessary complication.
-  (instword1)
-  (instword2)
+  #+executable-funinstances (instword1)
+  #+executable-funinstances (instword2)
   (function :type function
             :ref-known (flushable) :ref-trans %funcallable-instance-fun
             :set-known () :set-trans (setf %funcallable-instance-fun))
   #-compact-instance-header
   (layout :set-trans %set-fun-layout :ref-trans %fun-layout)
-  (info :rest-p t))
-#-executable-funinstances
-(define-primitive-object (funcallable-instance
-                          :lowtag fun-pointer-lowtag
-                          :widetag funcallable-instance-widetag
-                          :alloc-trans %make-funcallable-instance)
-  (trampoline :init :funcallable-instance-tramp)
-  (layout :set-trans %set-fun-layout :ref-trans %fun-layout)
-  (function :type function
-            :ref-known (flushable) :ref-trans %funcallable-instance-fun
-            :set-known () :set-trans (setf %funcallable-instance-fun))
   (info :rest-p t))
 
 (define-primitive-object (value-cell :lowtag other-pointer-lowtag
@@ -388,7 +390,10 @@ during backtrace.
   ;; regardless of whether the object being tested is known to be a symbol.
   ;; Accessing the hash requires masking off bits to yield a fixnum result,
   ;; all the more so if the object is any random type.
+  #-relocatable-static-space
   (hash :set-trans %set-symbol-hash)
+  #+relocatable-static-space
+  unused
   (value :init :unbound
          :set-trans %set-symbol-global-value
          :set-known ())
@@ -416,6 +421,8 @@ during backtrace.
         :type (or instance list)
         :init :null)
   (name :init :arg #-compact-symbol :ref-trans #-compact-symbol symbol-name)
+  #+relocatable-static-space
+  (hash :set-trans %set-symbol-hash)
   #-compact-symbol
   (package-id :type index ; actually 16 bits. (Could go in the header)
               :ref-trans symbol-package-id
@@ -487,6 +494,8 @@ during backtrace.
            msan-xor-constant
            ;; The following slot's existence must NOT be conditional on #+msan
            msan-param-tls) ; = &__msan_param_tls
+       #+permgen
+       ,@'(function-layout)
        #+immobile-space
        ,@'(function-layout
            text-space-addr
@@ -503,7 +512,16 @@ during backtrace.
   (assign-header-slot-indices))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-(defconstant histogram-small-bins 32)) ; for consing size histogram
+  ;; allocator histogram capacity
+  (defconstant n-histogram-bins-small 32)
+  (defconstant n-histogram-bins-large 32))
+;;; the #+allocation-size-histogram has an exact count of objects allocated
+;;; for all sizes up to (* cons-size n-word-bytes n-histogram-bins-small).
+;;; Larger allocations are grouped by the binary log of the size.
+;;; It seems that 99.5% of all allocations are less than the small bucket limit,
+;;; making the histogram exact except for the tail.
+(defconstant first-large-histogram-bin-log2size
+  (integer-length (* n-histogram-bins-small cons-size n-word-bytes)))
 
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
@@ -590,8 +608,11 @@ during backtrace.
   ;; handling, we need to know if the machine context is in Lisp code
   ;; or not.  On non-threaded targets, this is a global variable in
   ;; the runtime, but it's clearly a per-thread value.
-  #+(and sb-thread (not arm64))
-  (foreign-function-call-active :c-type "boolean")
+  ;; This is a true/false flag. Since there are about 47 different competing
+  ;; definitions of the C type "boolean", just use "lispobj" for its known size.
+  ;; The name is visually distinct from the global flag of similar purpose
+  ;; so that 'grep' can find the one you want more easily.
+  #+(and sb-thread (not arm64)) (ffcall-active-p)
   ;; Same as above for the location of the current control stack frame.
   #+(and sb-thread (not (or x86 x86-64)))
   (control-frame-pointer :c-type "lispobj *")
@@ -600,7 +621,7 @@ during backtrace.
   ;; print an approximation of the CSP as needed.
   #+sb-thread
   (control-stack-pointer :c-type "lispobj *")
-  #+ppc64 (card-table)
+  (card-table)
 
   ;; A few extra thread-local allocation buffers for special purposes
   ;; #-sb-thread probably won't use these, to be determined...
@@ -614,8 +635,11 @@ during backtrace.
   (et-allocator-mutex-acq) ; elapsed times
   (et-find-freeish-page)
   (et-bzeroing)
-  (obj-size-histo :c-type "size_histogram"
-                  :length #.(+ histogram-small-bins n-word-bits))
+  (allocator-histogram :c-type "size_histogram"
+                       ;; small bins store just a count
+                       ;; large bins store a count and size
+                       :length #.(+ (* 2 n-histogram-bins-large)
+                                    n-histogram-bins-small))
 
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
@@ -668,25 +692,26 @@ during backtrace.
 
 ) ; end PROGN
 
+;;; The offset of NIL in static space, including the tag.
+(defconstant nil-value-offset
+  (+ ;; Make space for the different regions, if they exist.
+     ;; If you change this, then also change zero_all_free_ranges() in
+     ;; gencgc.
+     #+(and gencgc (not sb-thread) (not 64-bit))
+     (* 10 n-word-bytes)
+     ;; This offset of #x100 has to do with some edge cases where a vop
+     ;; might treat UNBOUND-MARKER as a pointer. So it has an address
+     ;; that is somewhere near NIL which makes it sort of "work"
+     ;; to dereference it. See git rev f1a956a6a771 for more info.
+     #+64-bit #x100
+     ;; magic padding because of NIL's symbol/cons-like duality
+     (* 2 n-word-bytes)
+     list-pointer-lowtag))
+
 ;;; The definitions below want to use ALIGN-UP, which is not defined
 ;;; in time to put these in early-objdef, but it turns out that we don't
 ;;; need them there.
-(defconstant nil-value
-    (+ static-space-start
-       ;; mixed_region precedes NIL
-       ;; 10 is the number of words to reserve at the beginning of static space
-       ;; prior to the words of NIL.
-       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis,
-       ;; and zero_all_free_ranges() in gencgc.
-       #+(and gencgc (not sb-thread) (not 64-bit)) (ash 10 word-shift)
-       ;; This offset of #x100 has to do with some edge cases where a vop
-       ;; might treat UNBOUND-MARKER as a pointer. So it has an address
-       ;; that is somewhere near NIL which makes it sort of "work"
-       ;; to dereference it. See git rev f1a956a6a771 for more info.
-       #+64-bit #x100
-       ;; magic padding because of NIL's symbol/cons-like duality
-       (* 2 n-word-bytes)
-       list-pointer-lowtag))
+(#-relocatable-static-space defconstant #+relocatable-static-space define-symbol-macro nil-value (+ static-space-start nil-value-offset))
 
 #+sb-xc-host (defun get-nil-taggedptr () nil-value)
 
@@ -715,8 +740,8 @@ during backtrace.
 ;;; nil-as-a-list. So subtract the lowtag and then go back one more word.
 ;;; This address is NOT double-lispword-aligned, but the scavenge method
 ;;; does not assert that.
-(defconstant nil-symbol-slots-start
-  (- nil-value list-pointer-lowtag n-word-bytes))
+(defconstant nil-symbol-slots-offset
+  (- nil-value-offset list-pointer-lowtag n-word-bytes))
 
 ;;; NIL as a symbol contains the usual number of words for a symbol,
 ;;; aligned to a double-lispword. This will NOT end at a double-lispword boundary.
@@ -727,8 +752,9 @@ during backtrace.
 ;;; count because of the assertion in heap_scavenge that the scan ends as expected,
 ;;; and scavenge methods must return an even number because nothing can be smaller
 ;;; than 1 cons cell or not a multiple thereof.
-(defconstant nil-symbol-slots-end
-  (+ nil-symbol-slots-start (ash (align-up symbol-size 2) word-shift)))
+(defconstant nil-symbol-slots-end-offset
+  (+ nil-symbol-slots-offset
+     (ash (align-up symbol-size 2) word-shift)))
 
 ;;; This constant is the number of words to report that NIL consumes
 ;;; when Lisp asks for its primitive-object-size. So we say that it consumes
@@ -739,10 +765,11 @@ during backtrace.
 ;;; Basically skip over MIXED-REGION (if it's in static space) and NIL.
 ;;; Or: go to NIL's header word, subtract 1 word, and add in the physical
 ;;; size of NIL in bytes that we report for primitive-object-size.
-(defconstant static-space-objects-start
-  (+ nil-symbol-slots-start (ash (1- sizeof-nil-in-words) word-shift)))
+(defconstant static-space-objects-offset
+  (+ nil-symbol-slots-offset
+     (ash (1- sizeof-nil-in-words) word-shift)))
 
-(defconstant lockfree-list-tail-value
-  (+ static-space-objects-start
+(defconstant lockfree-list-tail-value-offset
+  (+ static-space-objects-offset
      (* (length +static-symbols+) (ash (align-up symbol-size 2) word-shift))
      instance-pointer-lowtag))

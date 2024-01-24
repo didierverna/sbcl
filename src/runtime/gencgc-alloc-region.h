@@ -1,12 +1,6 @@
 #ifndef _GENCGC_ALLOC_REGION_H_
 #define _GENCGC_ALLOC_REGION_H_
 
-#include "gc.h"
-
-#ifndef LISP_FEATURE_GENCGC
-#error "gencgc-alloc-region.h included, but LISP_FEATURE_GENCGC not defined"
-#endif
-
 /* Abstract out the data for an allocation region allowing a single
  * routine to be used for allocation and closing. */
 /* Caution: if you change this, you may have to change compiler/generic/objdef
@@ -21,14 +15,27 @@ struct alloc_region {
     void  *start_addr;
 };
 
+static inline void gc_set_region_empty(struct alloc_region *region)
+{
+    /* Free-pointer has to be not equal to 0 because it's undefined behavior
+     * to add any value whatsoever to the null pointer.
+     * Annoying, isn't it.  http://c-faq.com/null/machexamp.html */
+    region->free_pointer = region->end_addr = (void*)0x1000;
+    /* Start 0 is the indicator of closed-ness. */
+    region->start_addr = 0;
+}
+
+static inline void gc_init_region(struct alloc_region *region)
+{
+    // A distinction without a difference (it used to do one more assignment)
+    gc_set_region_empty(region);
+}
+
 typedef struct {
     struct alloc_region cons;
     struct alloc_region mixed;
     uword_t token;
 } arena_state;
-
-// Macro to statically initialize instead of using set_region_empty()
-#define ALLOC_REGION_INITIALIZER {(void*)0x1000, (void*)1000, 0}
 
 // One region for each of page type.
 // These indices have no correlation to PAGE_TYPE constants.
@@ -49,7 +56,14 @@ extern struct alloc_region  gc_alloc_region[6];
                |(uintptr_t)gc_alloc_region[4].start_addr \
                |(uintptr_t)gc_alloc_region[5].start_addr))
 
-extern generation_index_t from_space, new_space;
 extern int gencgc_alloc_profiler;
+#ifdef LISP_FEATURE_SB_THREAD
+# define THREAD_ALLOC_REGION(threadvar,slot) &threadvar-> slot ##_tlab
+#else
+# define THREAD_ALLOC_REGION(threadvar,slot) main_thread_ ##slot ##_region
+#define main_thread_mixed_region (struct alloc_region*)(STATIC_SPACE_START + MIXED_REGION_OFFSET)
+#define main_thread_cons_region (struct alloc_region*)(STATIC_SPACE_START + CONS_REGION_OFFSET)
+#define main_thread_boxed_region (struct alloc_region*)(STATIC_SPACE_START + BOXED_REGION_OFFSET)
+#endif
 
 #endif /*  _GENCGC_ALLOC_REGION_H_ */

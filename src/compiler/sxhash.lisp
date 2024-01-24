@@ -131,35 +131,8 @@
 
 (deftransform sxhash ((x) (double-float)) '#.(sb-impl::sxhash-double-float-xform 'x))
 
-(deftransform sxhash ((x) (symbol))
-  ;; All interned symbols have a precomputed hash.
-  ;; The types for which interned-ness can be conveyed via type constraints
-  ;; are KEYWORD and MEMBER. Despite the existence of UNINTERN, the optimization
-  ;; here is admissible. If the user uninterns a symbol, the hash is still there.
-  ;; TBH I think we should just precompute the hash of all symbols.
-  (cond ((or (csubtypep (lvar-type x) (specifier-type 'keyword))
-             (and (member-type-p (lvar-type x))
-                  (progn
-                    ;; can't be a subtype of SYMBOL with fp-zeroes in it
-                    (aver (null (sb-kernel::member-type-fp-zeroes (lvar-type x))))
-                    (xset-every #'cl:symbol-package
-                                (sb-kernel::member-type-xset (lvar-type x))))))
-         `(symbol-hash x)) ; Never need to lazily compute and memoize
-        ((gethash 'ensure-symbol-hash *backend-parsed-vops*)
-         ;; A vop might emit slightly better code than the expression below
-         `(ensure-symbol-hash x))
-        (t
-         ;; Cache the value of the symbol's sxhash in the symbol-hash
-         ;; slot.
-         '(let ((result (symbol-hash x)))
-            ;; 0 marks uninitialized slot. We can't use negative
-            ;; values for the uninitialized slots since NIL might be
-            ;; located so high in memory on some platforms that its
-            ;; SYMBOL-HASH (which contains NIL itself) is a negative
-            ;; fixnum.
-            (if (= 0 result)
-                (ensure-symbol-hash x)
-                result)))))
+;; All symbols have a precomputed hash.
+(deftransform sxhash ((x) (symbol)) `(symbol-hash x))
 
 (deftransform symbol-hash* ((object predicate) (symbol null) * :important nil)
   `(symbol-hash* object 'symbolp)) ; annotate that object satisfies SYMBOLP
@@ -168,3 +141,49 @@
                              (constant-arg (member nil symbolp)))
                             * :important nil)
   `(symbol-hash* object 'non-null-symbol-p)) ; etc
+
+;;; To use this macro during cross-compilation we will have to emulate
+;;; generate_perfhash_sexpr using a file, similar to xfloat-math.
+(defun make-perfect-hash-lambda (array)
+  (declare (type (simple-array (unsigned-byte 32) (*)) array))
+  (let* ((string
+          #+sb-xc-host (sb-cold::emulate-generate-perfect-hash-sexpr array)
+          #-sb-xc-host
+          (sb-unix::newcharstar-string
+           (sb-sys:with-pinned-objects (array)
+             (alien-funcall (extern-alien
+                             "generate_perfhash_sexpr"
+                             (function (* char) system-area-pointer int))
+                            (sb-sys:vector-sap array) (length array)))))
+         (expr #+sb-xc-host ; don't rebind anything except *PACKAGE*
+               ;; especially as we need to keep our #\A charmacro
+               (let ((*package* #.(find-package "SB-C"))) (read-from-string string))
+               #-sb-xc-host
+               (with-standard-io-syntax
+                 (let ((*package* #.(find-package "SB-C")))
+                   (read-from-string string)))))
+    (labels ((containsp (e op)
+               (if (consp e)
+                   (or (containsp (car e) op) (containsp (cdr e) op))
+                   (eq e op))))
+      `(lambda (val)
+         (declare (optimize (safety 0) (debug 0) (sb-c:store-source-form 0)))
+         (declare (type (unsigned-byte 32) val))
+         ;; Remove the macros that aren't used, it helps with visual inspection
+         ;; of the result. However, one macro can't call another since CONTAINSP
+         ;; doesn't understand macros.
+         (macrolet ,(remove-if-not
+                     (lambda (m) (containsp expr (car m)))
+                     '((& (a b) `(logand ,a ,b)) ; purposely look more C-like
+                       (^ (a b) `(logxor ,a ,b)) ;  (for debugging)
+                       (u32+ (a b) `(logand (+ ,a ,b) #xFFFFFFFF))
+                       (^= (a b) `(setq ,a (logxor ,a ,b)))
+                       (+= (a b) `(setq ,a (logand (+ ,a ,b) #xFFFFFFFF)))
+                       (<< (n c) `(logand (ash ,n ,c) #xFFFFFFFF))
+                       (>> (n c) `(ash ,n (- ,c)))))
+           ;; We generate _really_ crappy code for 32-bit math on 64-bit machines.
+           ;; I think the steps are sufficiently trivial that a single vop could choose
+           ;; how to translate the arbitrary s-expression
+           ,@expr)))))
+(intern "TAB")
+(intern "SCRAMBLE")

@@ -73,19 +73,18 @@
              :format-control
              "Not enough room left in static code space to allocate vector.")))
 
+(define-alien-variable ("text_space_highwatermark" *text-space-free-pointer*)
+  system-area-pointer)
 #+immobile-space
 (progn
 
 (define-alien-variable text-space-size (unsigned 32))
 (define-alien-variable ("FIXEDOBJ_SPACE_START" fixedobj-space-start) unsigned-long)
-(define-alien-variable ("text_space_highwatermark" *text-space-free-pointer*)
-  system-area-pointer)
 (define-alien-variable ("fixedobj_free_pointer" *fixedobj-space-free-pointer*)
   system-area-pointer)
 
-(eval-when (:compile-toplevel) ; FIXME: these assertions look irrelevant now
-  (assert (eql code-boxed-size-slot 1))
-  (assert (eql code-debug-info-slot 2)))
+(eval-when (:compile-toplevel)
+  (aver (eql code-boxed-size-slot 1)))
 
 ;;; Size-class segregation (implying which page we try to allocate to)
 ;;; is done from lisp now, not C. There are 3 objects types we'll see,
@@ -117,7 +116,7 @@
 
 (defun make-immobile-symbol (name)
   (let ((symbol (truly-the symbol
-                 (or (%primitive !fast-alloc-immobile-symbol)
+                 (or #+x86-64 (%primitive !fast-alloc-immobile-symbol)
                      (alloc-immobile-fixedobj
                       symbol-size
                       (logior (ash (1- symbol-size) n-widetag-bits) symbol-widetag))))))

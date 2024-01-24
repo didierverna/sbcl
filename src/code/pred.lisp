@@ -114,7 +114,6 @@
   (def-type-predicate-wrapper rationalp)
   (def-type-predicate-wrapper ratiop)
   (def-type-predicate-wrapper realp)
-  (def-type-predicate-wrapper short-float-p)
   (def-type-predicate-wrapper single-float-p)
   #+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
   #+sb-simd-pack-256 (def-type-predicate-wrapper simd-pack-256-p)
@@ -214,19 +213,11 @@
      (type-specifier (ctype-of object)))
     (simple-fun 'compiled-function)
     (t
-     #+metaspace ; WRAPPER-OF can't be called on layoutless objects.
-     (unless (logtest (get-lisp-obj-address (%instanceoid-layout object))
-                      sb-vm:widetag-mask)
-       ;; [fun-]instances momentarily have no layout in any code interrupted
-       ;; just after allocating and before assigning slots.
-       ;; OUTPUT-UGLY-OBJECT has a similar precaution as this.
-       (return-from type-of (if (functionp object) 'funcallable-instance 'instance)))
-     (let ((wrapper (wrapper-of object)))
-       #-metaspace ; already checked for a good layout if metaspace
-       (when (= (get-lisp-obj-address wrapper) 0)
+     (let ((layout (layout-of object)))
+       (when (= (get-lisp-obj-address layout) 0)
          (return-from type-of
            (if (functionp object) 'funcallable-instance 'instance)))
-       (let* ((classoid (wrapper-classoid wrapper))
+       (let* ((classoid (layout-classoid layout))
               (name (classoid-name classoid)))
          ;; FIXME: should the first test be (not (or (%instancep) (%funcallable-instance-p)))?
          ;; God forbid anyone makes anonymous classes of generic functions.
@@ -247,24 +238,9 @@
 (defun eq (obj1 obj2)
   "Return T if OBJ1 and OBJ2 are the same object, otherwise NIL."
   (eq obj1 obj2))
-;;; and this too, but it's only needed for backends on which
-;;; IR1 might potentially transform EQL into %EQL/INTEGER.
-#+integer-eql-vop
-(defun %eql/integer (obj1 obj2)
-  ;; This is just for constant folding, there's no real need to transform
-  ;; into the %EQL/INTEGER VOP. But it's confusing if it becomes identical to
-  ;; EQL, and then due to ICF we find that #'EQL => #<FUNCTION %EQL/INTEGER>.
-  ;; Type declarations don't suffice because we don't know which arg is an integer
-  ;; (if not both). We could ensure selection of the vop by using %PRIMITIVE.
-  ;; Anyway it suffices to disable type checking and pretend its the always
-  ;; the first arg that's an integer, but that won't work on the host because
-  ;; it might enforce the type since we can't portably unenforce after declaring.
-  (declare (optimize (sb-c::type-check 0)))
-  (eql (the integer obj1) obj2))
 
 (declaim (inline %eql))
 (defun %eql (obj1 obj2)
-  "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   #+x86-64 (eql obj1 obj2) ; vop fully implements all cases of EQL
   #-x86-64 ; else this is the only full implementation of EQL
   (or (eq obj1 obj2)
@@ -286,8 +262,10 @@
              #+long-float
              (long-float eql)
              (bignum
-              #-integer-eql-vop (lambda (x y) (zerop (bignum-compare x y)))
-              #+integer-eql-vop eql) ; will become %eql/integer
+              #.(sb-c::if-vop-existsp (:named sb-vm::%eql/integer)
+                  'eql
+                  '(lambda (x y)
+                    (zerop (bignum-compare x y)))))
              (ratio
               (lambda (x y)
                 (and (eql (numerator x) (numerator y))
@@ -306,6 +284,7 @@
                      (eql (imagpart x) (imagpart y))))))))))
 
 (defun eql (x y)
+  "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   ;; On x86-64, EQL is just an interpreter stub for a vop.
   ;; For others it's a call to the implementation of generic EQL.
   (#+x86-64 eql #-x86-64 %eql x y))
@@ -519,8 +498,7 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                 (and (logtest (logior +structure-layout-flag+ +pathname-layout-flag+)
                               (layout-flags layout))
                      (eq (%instance-layout y) layout)
-                     (funcall (wrapper-equalp-impl (layout-friend layout))
-                              x y)))))
+                     (funcall (layout-equalp-impl layout) x y)))))
         ((arrayp x)
          (and (arrayp y)
               ;; string-equal is nearly 2x the speed of array-equalp for comparing strings

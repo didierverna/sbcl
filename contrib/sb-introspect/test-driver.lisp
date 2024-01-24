@@ -356,13 +356,14 @@
 (setq sb-ext:*evaluator-mode* :compile)
 (sb-ext:defglobal *large-obj* nil)
 
-#+(and gencgc (or riscv x86 x86-64 ppc) (not win32) (not ubsan))
+#+(and generational (or riscv x86 x86-64 ppc) (not win32) (not ubsan))
 (progn
   (setq *print-array* nil)
   (setq *large-obj* (make-array (* sb-vm:gencgc-page-bytes 4)
                                 :element-type '(unsigned-byte 8)))
   (sb-ext:gc :gen 1) ; Array won't move to a large unboxed page until GC'd
-  (deftest allocation-information.5
+  (test-util:with-test (:name allocation-information.5
+                        :skipped-on :mark-region-gc) ; doesn't move to an unboxed page
           (tai *large-obj* :heap
                `(:space :dynamic :generation 1 :boxed nil :pinned nil :large t)
                :ignore (list :page :write-protected))
@@ -409,7 +410,7 @@
       object)))
 (compile 'alloc-large-code)
 
-#+gencgc
+#+generational
 (deftest allocation-information.6
     ;; Remember, all tests run after all toplevel forms have executed,
     ;; so if this were (DEFGLOBAL *LARGE-CODE* ... ) or something,
@@ -430,7 +431,8 @@
 (defun get-small-bignum-allocation-information ()
   (setq *small-bignum* (+ (+ *b* (ash 1 100)) *negb*))
   (nth-value 1 (allocation-information *small-bignum*)))
-#+gencgc
+
+#-(or mark-region-gc gc-stress)
 (deftest allocation-information.7
     (locally
       (declare (notinline format))

@@ -13,37 +13,36 @@
  * files for more information.
  */
 
-#include "sbcl.h"
+#include <stdbool.h>
+#include "genesis/sbcl.h"
 #include "gc.h"
-#include "gc-internal.h"
-#include "gc-private.h"
 #include "genesis/vector.h"
 #include "genesis/gc-tables.h"
-// FIXME: cheneygc needs layout.h but gencgc doesn't,
-// which means it's leaking in from somewhere else. Yuck.
-#include "genesis/layout.h"
-#include "gc-internal.h"
+#include "genesis/instance.h"
+#include "genesis/symbol.h"
 #include "immobile-space.h"
 #include "hopscotch.h"
 #include "code.h"
+#include "genesis/static-symbols.h"
+#include "validate.h"
 
-static boolean gcable_pointer_p(lispobj pointer)
+static bool gcable_pointer_p(lispobj pointer)
 {
 #ifdef LISP_FEATURE_CHENEYGC
    return pointer >= (lispobj)current_dynamic_space
        && pointer < (lispobj)get_alloc_pointer();
 #endif
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
    return find_page_index((void*)pointer) >= 0 || immobile_space_p(pointer);
 #endif
 }
 
-static boolean coalescible_number_p(lispobj* where)
+static bool coalescible_number_p(lispobj* where)
 {
     int widetag = widetag_of(where);
     return widetag == BIGNUM_WIDETAG
         // Ratios and complex integers containing pointers to bignums don't work.
-        || ((widetag == RATIO_WIDETAG || widetag == COMPLEX_WIDETAG)
+        || ((widetag == RATIO_WIDETAG || widetag == COMPLEX_RATIONAL_WIDETAG)
             && fixnump(where[1]) && fixnump(where[2]))
 #ifndef LISP_FEATURE_64_BIT
         || widetag == SINGLE_FLOAT_WIDETAG
@@ -56,7 +55,7 @@ static boolean coalescible_number_p(lispobj* where)
 /// Return true of fixnums, bignums, strings, symbols.
 /// Strings are considered eql-comparable,
 /// because they're coalesced before comparing.
-static boolean eql_comparable_p(lispobj obj)
+static bool eql_comparable_p(lispobj obj)
 {
     if (fixnump(obj) || obj == NIL) return 1;
     if (lowtag_of(obj) != OTHER_POINTER_LOWTAG) return 0;
@@ -69,7 +68,7 @@ static boolean eql_comparable_p(lispobj obj)
         || widetag == SIMPLE_BASE_STRING_WIDETAG;
 }
 
-static boolean vector_isevery(boolean (*pred)(lispobj), struct vector* v)
+static bool vector_isevery(bool (*pred)(lispobj), struct vector* v)
 {
     int i;
     for (i = vector_len(v)-1; i >= 0; --i)
@@ -155,18 +154,25 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
     struct hopscotch_table* ht = (struct hopscotch_table*)arg;
     sword_t nwords, i;
 
-    for ( ; where < limit ; where += nwords ) {
+    where = next_object(where, 0, limit);
+    while (where) {
         lispobj word = *where;
         if (is_header(word)) {
             int widetag = header_widetag(word);
             nwords = sizetab[widetag](where);
-            if (leaf_obj_widetag_p(widetag)) continue; // Ignore this object.
+            lispobj *next = next_object(where, nwords, limit);
+            if (leaf_obj_widetag_p(widetag)) {
+              // Ignore this object.
+              where = next;
+              continue;
+            }
             sword_t coalesce_nwords = nwords;
             if (instanceoid_widetag_p(widetag)) {
                 lispobj layout = layout_of(where);
                 struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
                 for (i=0; i<(nwords-1); ++i)
                     if (bitmap_logbitp(i, bitmap)) coalesce_obj(where+1+i, ht);
+                where = next;
                 continue;
             }
             switch (widetag) {
@@ -176,6 +182,7 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
                 lispobj name = decode_symbol_name(symbol->name);
                 coalesce_obj(&name, ht);
                 set_symbol_name(symbol, name);
+                where = next;
                 continue;
             }
             case CODE_HEADER_WIDETAG:
@@ -184,10 +191,12 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
             }
             for(i=1; i<coalesce_nwords; ++i)
                 coalesce_obj(where+i, ht);
+            where = next;
         } else {
             nwords = 2;
             coalesce_obj(where+0, ht);
             coalesce_obj(where+1, ht);
+            where = next_object(where, 2, limit);
         }
     }
     return 0;
@@ -206,12 +215,13 @@ void coalesce_similar_objects()
     lispobj* the_symbol_nil = (lispobj*)(NIL - LIST_POINTER_LOWTAG - N_WORD_BYTES);
     coalesce_range(the_symbol_nil, ALIGN_UP(SYMBOL_SIZE,2) + the_symbol_nil, arg);
     coalesce_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, arg);
+    coalesce_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer, arg);
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     coalesce_range((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, arg);
     coalesce_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, arg);
 #endif
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
     walk_generation(coalesce_range, -1, arg);
 #else
     coalesce_range(current_dynamic_space, get_alloc_pointer(), arg);

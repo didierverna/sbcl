@@ -167,7 +167,7 @@
          (index
           (position "OBJECT-NOT-TYPE-ERROR" lines :test 'search)))
     (let ((line (nth (+ index 2) lines)))
-      (assert (search "; #<SB-KERNEL:WRAPPER " line))
+      (assert (search "; #<SB-KERNEL:LAYOUT " line))
       (assert (search " SB-ASSEM:LABEL" line)))))
 
 #+immobile-code ; uses SB-C::*COMPILE-TO-MEMORY-SPACE*
@@ -675,15 +675,15 @@
   ;; component.
   (let ((names
           (mapcar (lambda (x)
-                    (sb-kernel:classoid-name (sb-kernel:wrapper-classoid x)))
-                  (ctu:find-code-constants #'sb-kernel:%%typep :type 'sb-kernel:wrapper))))
+                    (sb-kernel:classoid-name (sb-kernel:layout-classoid x)))
+                  (ctu:find-code-constants #'sb-kernel:%%typep :type 'sb-kernel:layout))))
     (assert (null (set-difference names
                                   '(sb-kernel:ctype
                                     sb-kernel:unknown-type
                                     sb-kernel:fun-designator-type
                                     sb-c::abstract-lexenv
                                     sb-kernel::classoid-cell
-                                    sb-kernel:wrapper
+                                    sb-kernel:layout
                                     sb-kernel:classoid
                                     sb-kernel:built-in-classoid
                                     #-immobile-space null))))))
@@ -702,30 +702,13 @@
      (loop for line in (split-string (with-output-to-string (string)
                                        (disassemble f :stream string))
                                      #\newline)
-             thereis (and (search "WRAPPER for" line)
+             thereis (and (search "LAYOUT for" line)
                           (search "CMP DWORD PTR" line)))))
 
 (with-test (:name :thread-local-unbound)
   (declare (optimize safety))
   (let ((c (nth-value 1 (ignore-errors sb-c::*compilation*))))
     (assert (eq (cell-error-name c) 'sb-c::*compilation*))))
-
-#+immobile-code
-(with-test (:name :debug-fun-from-pc-more-robust)
-  ;; This test verifies that debug-fun-from-pc does not croak when the PC points
-  ;; within a trampoline allocated to wrap a closure in a simple-funifying wrapper
-  ;; for installation into a global symbol.
-  (let ((closure (funcall (compile nil '(lambda (x)  (lambda () x))) 0))
-        (symbol (gensym)))
-    (assert (sb-kernel:closurep closure))
-    (setf (fdefinition symbol) closure)
-    (let ((trampoline
-            (sb-di::code-header-from-pc
-             (sb-sys:int-sap (sb-vm::fdefn-raw-addr
-                              (sb-int:find-fdefn symbol))))))
-      (assert (zerop (sb-kernel:code-n-entries trampoline)))
-      (assert (typep (sb-di::debug-fun-from-pc trampoline 8)
-                     'sb-di::bogus-debug-fun)))))
 
 (defstruct foo (s 0 :type (or null string)))
 (with-test (:name :reduce-stringp-to-not-null)
@@ -1157,7 +1140,8 @@
 ;;; one per item. It is still suboptimal in that it can not discern
 ;;; between initializing and updating, so it always uses a :QWORD move
 ;;; despite the prezeroed pages.
-(with-test (:name :init-vector-mov-to-mem)
+(with-test (:name :init-vector-mov-to-mem
+            :skipped-on :debug-gc-barriers)
   (let* ((lines (disassembly-lines
                  '(lambda () (vector #\x 1 2 3))))
          (magic-value
@@ -1224,17 +1208,16 @@
              (let ((neg (- val))) (make-point neg))))))
     (assert (equal vops-with-barrier '("SET-SLOT")))))
 
-(with-test (:name :system-tlabs)
-  (when (find-symbol "SYS-ALLOC-TRAMP" "SB-VM")
-    (assert (loop for line in (disassembly-lines 'sb-impl:test-make-packed-info)
-                  thereis (search "SYS-ALLOC-TRAMP" line)))
-    (assert (loop for line in (disassembly-lines 'sb-impl:test-copy-packed-info)
-                  thereis (search "SYS-ALLOC-TRAMP" line)))
-    (let ((f (compile nil '(lambda (x)
-                            (declare (sb-c::tlab :system))
-                            (sb-pcl::%copy-cache x)))))
-      (assert (loop for line in (disassembly-lines f)
-                    thereis (search "SYS-ALLOC-TRAMP" line))))))
+(with-test (:name :system-tlabs :skipped-on (not :system-tlabs))
+  (assert (loop for line in (disassembly-lines 'sb-impl:test-make-packed-info)
+                thereis (search "SYS-ALLOC-TRAMP" line)))
+  (assert (loop for line in (disassembly-lines 'sb-impl:test-copy-packed-info)
+                thereis (search "SYS-ALLOC-TRAMP" line)))
+  (let ((f (compile nil '(lambda (x)
+                          (declare (sb-c::tlab :system))
+                          (sb-pcl::%copy-cache x)))))
+    (assert (loop for line in (disassembly-lines f)
+                  thereis (search "SYS-ALLOC-TRAMP" line)))))
 
 (defun find-in-disassembly (string lambda-expression)
   (let ((disassembly
@@ -1299,10 +1282,10 @@
   ;; This is a trivial test of the control case for :stack-instance-set
   (let ((vops-with-barrier
          (find-gc-barriers
-          '(lambda ()
+          '(lambda (x)
             (declare (inline make-wordpair))
             (let ((pair (make-wordpair :a 'foo)))
-              (setf (wordpair-b pair) "hi")
+              (setf (wordpair-b pair) (car x))
               (values (func pair)))))))
     (assert (equal vops-with-barrier '("INSTANCE-INDEX-SET")))))
 
@@ -1384,3 +1367,23 @@
 
 (with-test (:name :signed-vops) (test-signed))
 (with-test (:name :unsigned-vops) (test-unsigned))
+
+(with-test (:name :old-slot-set-no-barrier)
+  (let ((vops-with-barrier
+          (find-gc-barriers
+           '(lambda (y)
+             (let ((x (cons 0 0)))
+               (setf (car x) y)
+               x)))))
+    (assert (not vops-with-barrier))))
+
+(with-test (:name :smaller-than-qword-cons-slot-init
+                  :skipped-on (:not :mark-region-gc))
+  (let ((lines (disassembly-lines
+                (compile nil '(lambda (a) (list 1 a #\a))))))
+    (assert (loop for line in lines
+                  thereis (search "MOV BYTE PTR" line))) ; constant 1
+    (assert (loop for line in lines
+                  thereis (search "MOV WORD PTR" line))) ; constant #\a
+    (assert (loop for line in lines
+                  thereis (search "MOV DWORD PTR" line))))) ; constant NIL

@@ -100,7 +100,8 @@
   ;; Arguments are can be passed unboxed, no type checking on entry is
   ;; performed, and the number of arguments passed in registers can be
   ;; greater than the standard number. Only fixed arguments can be used.
-  fixed-args)
+  fixed-args
+  unboxed-return)
 
 (defstruct (fun-info (:copier nil)
                      #-sb-xc-host (:pure t))
@@ -151,6 +152,10 @@
   ;; each constraint flips the meaning of the constraint if it is
   ;; non-NIL.
   (constraint-propagate nil :type (or function null))
+  ;; Propagating stuff back to the arguments based on the constraints on
+  ;; the result of this combination.
+  (constraint-propagate-back nil :type (or function null))
+  (constraint-propagate-result nil :type (or function null))
   ;; If true, the function can add flow-sensitive type information
   ;; depending on the truthiness of its return value.  Returns two
   ;; values, a LVAR and a CTYPE. The LVAR is of that CTYPE iff the
@@ -171,7 +176,10 @@
   (result-arg nil :type (or index null))
   ;; Customizing behavior of ASSERT-CALL-TYPE
   (call-type-deriver nil :type (or function null))
-  annotation)
+  annotation
+  ;; For functions with unboxed args/returns
+  (folder nil :type (or function null))
+  (externally-checkable-type nil :type (or function null)))
 
 (defprinter (fun-info)
   (attributes :test (not (zerop attributes))

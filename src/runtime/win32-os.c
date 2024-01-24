@@ -32,7 +32,7 @@
 #include <sys/param.h>
 #include <sys/file.h>
 #include <io.h>
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -40,7 +40,6 @@
 #include "interr.h"
 #include "lispregs.h"
 #include "runtime.h"
-#include "alloc.h"
 #include "genesis/primitive-objects.h"
 #include "dynbind.h"
 
@@ -58,15 +57,13 @@
 #include "validate.h"
 #include "thread.h"
 #include "align.h"
-#include "unaligned.h"
 
 #include "gc.h"
-#include "gc-private.h"
-#include "gencgc-internal.h"
 #include <wincrypt.h>
 #include <stdarg.h>
 #include <string.h>
 #include "print.h"
+#include <shlobj.h>
 
 /* missing definitions for modern mingws */
 #ifndef EH_UNWINDING
@@ -117,8 +114,10 @@ static void set_seh_frame(void *frame)
 
 void alloc_gc_page()
 {
+#ifndef LISP_FEATURE_64_BIT // 64-bit uses the page below the card mark table
     gc_assert(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                            MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
+#endif
 }
 
 /* Permit loads from GC_SAFEPOINT_PAGE_ADDR (NB page state change is
@@ -323,10 +322,10 @@ uint32_t os_get_build_time_shared_libraries(uint32_t excl_maximum,
                                        void** opt_store_handles,
                                        const char *opt_store_names[])
 {
-    void* base = opt_root ? opt_root : (void*)runtime_module_handle;
+    char* base = opt_root ? opt_root : (void*)runtime_module_handle;
     /* base defaults to 0x400000 with GCC/mingw32. If you dereference
      * that location, you'll see 'MZ' bytes */
-    void* base_magic_location =
+    char* base_magic_location =
         base + ((IMAGE_DOS_HEADER*)base)->e_lfanew;
 
     /* dos header provided the offset from `base' to
@@ -346,13 +345,13 @@ uint32_t os_get_build_time_shared_libraries(uint32_t excl_maximum,
          * fortunately, those places are irrelevant to the task at
          * hand. */
 
-        IMAGE_FILE_HEADER* image_file_header = (base_magic_location + 4);
+        IMAGE_FILE_HEADER* image_file_header = (void*)(base_magic_location + 4);
         IMAGE_OPTIONAL_HEADER* image_optional_header =
             (void*)(image_file_header + 1);
         IMAGE_DATA_DIRECTORY* image_import_direntry =
             &image_optional_header->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         IMAGE_IMPORT_DESCRIPTOR* image_import_descriptor =
-            base + image_import_direntry->VirtualAddress;
+            (void*)(base + image_import_direntry->VirtualAddress);
         uint32_t nlibrary, j;
 
         for (nlibrary=0u; nlibrary < excl_maximum
@@ -490,9 +489,9 @@ struct {
     CONDITION_VARIABLE cond_has_data;
     CONDITION_VARIABLE cond_has_client;
     HANDLE thread;
-    boolean initialized;
+    bool initialized;
     HANDLE handle;
-    boolean in_progress;
+    bool in_progress;
 } ttyinput;
 
 #ifdef LISP_FEATURE_64_BIT
@@ -570,7 +569,7 @@ static void resolve_optional_imports()
 
 #undef RESOLVE
 
-intptr_t win32_get_module_handle_by_address(os_vm_address_t addr)
+intptr_t win32_get_module_handle_by_address(void* addr)
 {
     HMODULE result = 0;
     /* So apparently we could use VirtualQuery instead of
@@ -752,8 +751,8 @@ win32_reset_stack_overflow_guard_page() {
      * unwinding from a stack overflow condition without retriggering the guard
      * page. See test (:EXHAUST :WRITE-TO-STACK-ON-UNWIND). */
 #define WIN32_STACK_GUARD_SLACK (2*win32_stack_guarantee + win32_page_size)
-    void *stack_guard_start = CONTROL_STACK_GUARD_PAGE(self);
-    fprintf(stderr, "INFO: Reprotecting control stack guard (0x%p+0x%x)\n",
+    char *stack_guard_start = CONTROL_STACK_GUARD_PAGE(self);
+    fprintf(stderr, "INFO: Reprotecting control stack guard (0x%p+0x%lx)\n",
             stack_guard_start, WIN32_STACK_GUARD_SLACK);
     fflush(stderr);
 
@@ -844,11 +843,6 @@ void os_commit_memory(os_vm_address_t addr, os_vm_size_t len)
     if (len) gc_assert(VirtualAlloc(addr, len, MEM_COMMIT, PAGE_EXECUTE_READWRITE));
 }
 
-void os_decommit_mem(os_vm_address_t addr,  os_vm_size_t len) {
-    gc_assert(gc_active_p);
-    gc_assert(VirtualFree(addr, len, MEM_DECOMMIT));
-}
-
 /*
  * load_core_bytes() is called to load a chunk of the core file into memory.
  *
@@ -913,7 +907,7 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 }
 
 /* A tiny bit of interrupt.c state we want our paws on. */
-extern boolean internal_errors_enabled;
+extern int internal_errors_enabled;
 
 extern void exception_handler_wrapper();
 
@@ -1205,6 +1199,7 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
     EXCEPTION_DISPOSITION disp = ExceptionContinueExecution;
     switch (code) {
     case EXCEPTION_STACK_OVERFLOW:
+    {
         void *sp = voidreg(win32_context, sp);
         fprintf(stderr, "INFO: Caught stack overflow exception (sp=0x%p); "
                         "proceed with caution.\n", sp);
@@ -1212,6 +1207,7 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
         self->state_word.control_stack_guard_page_protected = 0;
         rc = -1;
         break;
+    }
 
     case EXCEPTION_ACCESS_VIOLATION:
         rc = handle_access_violation(ctx, exception_record, fault_address, self);
@@ -1411,8 +1407,7 @@ socket_input_available(HANDLE socket, long time, long utime)
  * on handle, if no cancellation is requested yet (and return TRUE),
  * otherwise clear thread's I/O cancellation flag and return false.
  */
-static
-boolean io_begin_interruptible(HANDLE handle)
+static bool io_begin_interruptible(HANDLE handle)
 {
     /* No point in doing it unless OS supports cancellation from other
      * threads */
@@ -1550,8 +1545,7 @@ static __stdcall unsigned int tty_read_line_server(LPVOID arg)
     return 0;
 }
 
-static boolean
-tty_maybe_initialize_unlocked(HANDLE handle)
+static bool tty_maybe_initialize_unlocked(HANDLE handle)
 {
     if (!ttyinput.initialized) {
         if (!DuplicateHandle(GetCurrentProcess(),handle,
@@ -1571,10 +1565,9 @@ tty_maybe_initialize_unlocked(HANDLE handle)
     return 1;
 }
 
-boolean
-win32_tty_listen(HANDLE handle)
+bool win32_tty_listen(HANDLE handle)
 {
-    boolean result = 0;
+    bool result = 0;
     INPUT_RECORD ir;
     DWORD nevents;
     EnterCriticalSection(&ttyinput.lock);
@@ -1670,11 +1663,10 @@ unlock:
     return result;
 }
 
-boolean
-win32_maybe_interrupt_io(void* thread)
+bool win32_maybe_interrupt_io(void* thread)
 {
     struct thread *th = thread;
-    boolean done = 0;
+    bool done = 0;
 
 #ifdef LISP_FEATURE_SB_FUTEX
     if (thread_extra_data(th)->waiting_on_address)

@@ -17,14 +17,16 @@
 
 #define _OS_H_INCLUDED_
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 
 #include <inttypes.h>
+#include <stdbool.h>
 
-#if defined(LISP_FEATURE_GENCGC) && !defined(ENABLE_PAGE_PROTECTION)
+#if defined LISP_FEATURE_GENERATIONAL && !defined ENABLE_PAGE_PROTECTION
 /* Should we use page protection to help avoid the scavenging of pages
  * that don't have pointers to younger generations?
+ * (Protection can mean either MMU-based or logical protection)
  * You can change this to 0 if you want SBCL not to install the handlers
  * for SIGSEGV and SIGBUS. That will slow down GC, but might be desirable
  * for debugging or for exploring GC strategies such as remembered sets */
@@ -34,7 +36,7 @@
 #if defined LISP_FEATURE_CHENEYGC || defined LISP_FEATURE_SB_SAFEPOINT
 // safepoint traps always require a signal handler
 #define INSTALL_SIG_MEMORY_FAULT_HANDLER 1
-#elif defined LISP_FEATURE_GENCGC
+#elif defined LISP_FEATURE_GENERATIONAL
 #define INSTALL_SIG_MEMORY_FAULT_HANDLER ENABLE_PAGE_PROTECTION
 #endif
 
@@ -58,6 +60,12 @@
 
 #include "target-os.h"
 
+#ifndef LISP_FEATURE_WIN32
+// all posix systems can use the same #defines
+#define OS_VM_PROT_READ    PROT_READ
+#define OS_VM_PROT_WRITE   PROT_WRITE
+#define OS_VM_PROT_EXECUTE PROT_EXEC
+#endif
 
 #define OS_VM_PROT_ALL \
   (OS_VM_PROT_READ | OS_VM_PROT_WRITE | OS_VM_PROT_EXECUTE)
@@ -67,7 +75,7 @@
 extern os_vm_size_t os_vm_page_size;
 
 #if defined LISP_FEATURE_WIN32 || defined LISP_FEATURE_LINUX
-boolean os_preinit(char *argv[], char *envp[]);
+int os_preinit(char *argv[], char *envp[]);
 #else
 #define os_preinit(dummy1,dummy2) (0)
 #endif
@@ -140,9 +148,9 @@ extern void os_protect(os_vm_address_t addr,
 
 /* Return true for an address (with or without lowtag bits) within
  * any range of memory understood by the garbage collector. */
-extern boolean gc_managed_addr_p(lispobj addr);
+extern bool gc_managed_addr_p(lispobj addr);
 /* As for above, but consider only the heap spaces, not stacks */
-extern boolean gc_managed_heap_space_p(lispobj addr);
+extern bool gc_managed_heap_space_p(lispobj addr);
 
 /* Given a signal context, return the address for storage of the
  * register, of the specified offset, for that context. The offset is
@@ -221,13 +229,13 @@ extern char *os_get_runtime_executable_path();
 #define OS_VM_SIZE_FMTX PRIxPTR
 
 #if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX
-#  ifndef USE_DARWIN_GCD_SEMAPHORES
+#  if !defined USE_DARWIN_GCD_SEMAPHORES && !defined CANNOT_USE_POSIX_SEM_T
 #    include <semaphore.h>
      typedef sem_t os_sem_t;
 #  endif
    void os_sem_init(os_sem_t *sem, unsigned int value);
-   void os_sem_wait(os_sem_t *sem, char *what);
-   void os_sem_post(os_sem_t *sem, char *what);
+   void os_sem_wait(os_sem_t *sem);
+   void os_sem_post(os_sem_t *sem);
    void os_sem_destroy(os_sem_t *sem);
 #endif
 

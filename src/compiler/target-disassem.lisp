@@ -1245,6 +1245,8 @@
         ;; 4 bits per hex digit
         (ceiling (integer-length (logxor from (+ from length))) 4)))
 
+(defconstant label-column-width 7)
+
 ;;; Print the current address in DSTATE to STREAM, plus any labels that
 ;;; correspond to it, and leave the cursor in the instruction column.
 (defun print-current-address (stream dstate)
@@ -1863,7 +1865,20 @@
            (type disassem-length length))
   (unless (sb-c::compiled-debug-info-p (%code-debug-info code))
     (return-from get-code-segments
-      (list (make-code-segment code start-offset length))))
+      (if (typep (%code-debug-info code) '(or hash-table (cons hash-table)))
+          (collect ((segs))
+            (dohash ((name locs) (sb-fasl::%asm-routine-table code))
+              (destructuring-bind (start end . index) locs
+                (declare (ignore index))
+                (let ((seg (make-code-segment code start (- (1+ end) start))))
+                  (push (make-offs-hook :offset 0
+                                        :fun (lambda (stream dstate)
+                                               (declare (ignore stream))
+                                               (note (string name) dstate)))
+                        (seg-hooks seg))
+                  (segs seg))))
+            (sort (segs) #'< :key #'seg-virtual-location))
+          (list (make-code-segment code start-offset length)))))
   (let ((segments nil)
         (sfcache (make-source-form-cache))
         (last-offset (code-n-unboxed-data-bytes code))
@@ -2089,22 +2104,7 @@
            (function (fun-code-header (%fun-fun thing)))
            (code-component thing)))
          (dstate (make-dstate))
-         (segments
-          (if (eq code-component sb-fasl:*assembler-routines*)
-              (collect ((segs))
-                (dohash ((name locs) (sb-fasl::%asm-routine-table code-component))
-                  (destructuring-bind (start end . index) locs
-                    (declare (ignore index))
-                    (let ((seg (make-code-segment
-                                code-component start (- (1+ end) start))))
-                      (push (make-offs-hook :offset 0
-                                            :fun (lambda (stream dstate)
-                                                   (declare (ignore stream))
-                                                   (note (string name) dstate)))
-                            (seg-hooks seg))
-                      (segs seg))))
-                (sort (segs) #'< :key #'seg-virtual-location))
-              (get-code-segments code-component))))
+         (segments (get-code-segments code-component)))
     (when use-labels
       (label-segments segments dstate))
     (disassemble-segments segments stream dstate)
@@ -2223,14 +2223,12 @@
       ;; is compiled, so don't fail in function-raw-address.
       (when (fboundp name)
         (let ((address
-               #+immobile-code (sb-vm::function-raw-address name :rel32)
-               #-immobile-code (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
+                #+(and x86-64 immobile-code) (sb-vm::function-raw-address name :rel32)
+                #-(and x86-64 immobile-code) (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
           (setf (gethash address addr->name) name))))
     ;; Not really a routine, but it uses the similar logic for annotations
-    #+sb-safepoint
-    (setf (gethash (+ sb-vm:gc-safepoint-page-addr
-                      sb-c:+backend-page-bytes+
-                      (- sb-vm:gc-safepoint-trap-offset)) addr->name)
+    #+(and sb-safepoint (not x86-64))
+    (setf (gethash (- sb-vm:static-space-start sb-vm:gc-safepoint-trap-offset) addr->name)
           "safepoint"))
   (let ((found (gethash address addr->name)))
     (cond (found

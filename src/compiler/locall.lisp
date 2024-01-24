@@ -59,29 +59,29 @@
 
   (values))
 
-;;; Given a local call CALL to FUN, mark the associated args of CALL
-;;; corresponding to declared dynamic extent LAMBDA-VARs as dynamic
-;;; extent, setting up the corresponding cleanup. We do this now so
-;;; that the cleanup has the right scope. Environment analysis is
-;;; responsible for actually deciding if the arguments can be
-;;; dynamic-extent allocated, and deals with transitively marking the
-;;; otherwise-inaccessible parts of these values as dynamic extent as
-;;; well. We do this because environment analysis happens after all
-;;; major changes to the dataflow in IR1 have been done and it is
-;;; clear whether a combination can actually stack allocate it's value.
+;;; Given a local call CALL to FUN, set up the correct dynamic extent
+;;; for the associated args of CALL corresponding to declared dynamic
+;;; extent LAMBDA-VARs. We do this now so that we can find the right
+;;; dynamic extent even when variables are substituted. Environment
+;;; analysis is responsible for marking each of the other values that
+;;; a dynamic extent declared variable can take on (via assignment) as
+;;; dynamic extent. It also determines whether values which have
+;;; dynamic extent can actually be stack-allocated and transitively
+;;; marks the otherwise-inaccessible parts of these values as stack
+;;; allocatable as well. This is because environment analysis happens
+;;; after all major changes to the dataflow in IR1 have been done and
+;;; it is clear by then whether a combination can actually stack
+;;; allocate its value.
 (defun mark-dynamic-extent-args (call fun)
   (declare (type combination call) (type clambda fun))
-  (let (cleanup)
+  (let (dynamic-extent)
     (loop for arg in (basic-combination-args call)
           for var in (lambda-vars fun)
-          do (let ((dx-kind (leaf-dynamic-extent var)))
-               (when (and arg dx-kind (not (lvar-dynamic-extent arg)))
-                 (unless cleanup
-                   (setq cleanup (insert-dynamic-extent-cleanup call)))
-                 (let ((dx-info (make-dx-info :kind dx-kind :value arg
-                                              :cleanup cleanup)))
-                   (setf (lvar-dynamic-extent arg) dx-info)
-                   (push dx-info (cleanup-nlx-info cleanup)))))))
+          do (when (and arg (leaf-dynamic-extent var) (not (lvar-dynamic-extent arg)))
+               (unless dynamic-extent
+                 (setq dynamic-extent (insert-dynamic-extent call)))
+               (setf (lvar-dynamic-extent arg) dynamic-extent)
+               (push arg (dynamic-extent-values dynamic-extent)))))
   (values))
 
 ;;; This function handles merging the tail sets if CALL is potentially
@@ -405,17 +405,18 @@
    (let ((did-something nil))
      (dolist (clambda clambdas)
        (let ((component (lambda-component clambda)))
-         ;; The original CMU CL code seemed to implicitly assume that
-         ;; COMPONENT is the only one here. Let's make that explicit.
-         (aver (= 1 (length (functional-components clambda))))
-         (aver (eql component (first (functional-components clambda))))
          (when (or (component-new-functionals component)
                    (component-reanalyze-functionals component))
            (setf did-something t)
-           (locall-analyze-component component)
-           (clean-component component))))
+           (locall-analyze-component component))))
      (unless did-something
        (return))))
+  ;; find-initial-dfo doesn't do a good job of ignoring unreachable
+  ;; functions.
+  (dolist (clambda clambdas)
+    (let ((component (lambda-component clambda)))
+      (find-dfo component t)
+      (clear-flags component)))
   (values))
 
 ;;; If policy is auspicious and CALL is not in an XEP and we don't seem
@@ -504,18 +505,19 @@
     (unless (or (member (basic-combination-kind call) '(:local :error))
                 (node-to-be-deleted-p call)
                 (member (functional-kind original-fun)
-                        '(:toplevel-xep :deleted))
-                (not (or (eq (component-kind component) :initial)
-                         (eq (block-component
-                              (node-block
-                               (lambda-bind (main-entry original-fun))))
-                             component))))
+                        '(:toplevel-xep :deleted)))
       (let ((fun (if (xep-p original-fun)
                      (functional-entry-fun original-fun)
                      original-fun))
             (*compiler-error-context* call))
 
-        (when (and (eq (functional-inlinep fun) 'inline)
+        (when (and (or (eq (functional-inlinep fun) 'inline)
+                       (and (and (neq (component-kind component) :initial)
+                                 (neq (node-component (lambda-bind (main-entry fun))) component))
+                            ;; If it's in a different component then inline it anyway,
+                            ;; othrewise it won't get any benefits of maybe-inline.
+                            (eq (functional-inlinep fun) 'maybe-inline)))
+
                    (rest (leaf-refs original-fun))
                    ;; Some REFs are already unused bot not yet deleted,
                    ;; avoid unnecessary inlining
@@ -524,15 +526,17 @@
                    ;; let-converted.
                    (let-convertable-p call fun))
           (setq fun (maybe-expand-local-inline fun ref call)))
-
-        (aver (member (functional-kind fun)
-                      '(nil :escape :cleanup :optional :assignment)))
-        (cond ((mv-combination-p call)
-               (convert-mv-call ref call fun))
-              ((lambda-p fun)
-               (convert-lambda-call ref call fun))
-              (t
-               (convert-hairy-call ref call fun))))))
+        ;; Expanding inline might move it to the current component
+        (when (or (eq (component-kind component) :initial)
+                  (eq (node-component (lambda-bind (main-entry fun))) component))
+          (aver (member (functional-kind fun)
+                        '(nil :escape :cleanup :optional :assignment)))
+          (cond ((mv-combination-p call)
+                 (convert-mv-call ref call fun))
+                ((lambda-p fun)
+                 (convert-lambda-call ref call fun))
+                (t
+                 (convert-hairy-call ref call fun)))))))
 
   (values))
 
@@ -543,7 +547,15 @@
         ((lambda-p fun)
          t)
         (t ;; Hairy
-         t)))
+         (let ((min-args (optional-dispatch-min-args fun))
+               (max-args (optional-dispatch-max-args fun))
+               (call-args (length (combination-args call))))
+           (cond ((< call-args min-args)
+                  nil)
+                 ((<= call-args max-args)
+                  t)
+                 ((optional-dispatch-more-entry fun)
+                  (convert-more-call-p call fun)))))))
 
 ;;; Attempt to convert a multiple-value call. The only interesting
 ;;; case is a call to a function that LOOKS-LIKE-AN-MV-BIND, has
@@ -854,6 +866,53 @@
                                  (ignores) (call-args)))))
 
   (values))
+
+(defun convert-more-call-p (call fun)
+  (let* ((max (optional-dispatch-max-args fun))
+         (arglist (optional-dispatch-arglist fun))
+         (args (combination-args call))
+         (more (nthcdr max args))
+         (loser nil)
+         (allowp nil)
+         (allow-found nil))
+    (dolist (var arglist)
+      (let ((info (lambda-var-arg-info var)))
+        (when info
+          (case (arg-info-kind info)
+            ((:more-context :more-count)
+             (return-from convert-more-call-p nil))))))
+
+    (when (optional-dispatch-keyp fun)
+      (when (oddp (length more))
+        (return-from convert-more-call-p nil))
+
+      (do ((key more (cddr key)))
+          ((null key))
+        (let ((lvar (first key)))
+          (unless (constant-lvar-p lvar)
+            (return-from convert-more-call-p nil))
+
+          (let ((name (lvar-value lvar)))
+            (when (and (eq name :allow-other-keys) (not allow-found))
+              (let ((val (second key)))
+                (cond ((constant-lvar-p val)
+                       (setq allow-found t
+                             allowp (lvar-value val)))
+                      (t
+                       (return-from convert-more-call-p nil)))))
+            (dolist (var arglist
+                         (unless (eq name :allow-other-keys)
+                           (setq loser (list name))))
+              (let ((info (lambda-var-arg-info var)))
+                (when info
+                  (case (arg-info-kind info)
+                    (:keyword
+                     (when (eq (arg-info-key info) name)
+                       (return))))))))))
+
+      (when (and loser (not (optional-dispatch-allowp fun)) (not allowp))
+        (return-from convert-more-call-p nil)))
+    t))
 
 ;;;; LET conversion
 ;;;;
@@ -971,6 +1030,10 @@
     (setf (lambda-entries home)
           (nconc (lambda-entries clambda)
                  (lambda-entries home)))
+    ;; All of CLAMBDA's DYNAMIC-EXTENTS belong to HOME now.
+    (setf (lambda-dynamic-extents home)
+          (nconc (lambda-dynamic-extents clambda)
+                 (lambda-dynamic-extents home)))
     ;; CLAMBDA no longer has an independent existence as an entity
     ;; with ENTRIES.
     (setf (lambda-entries clambda) nil))
@@ -1136,28 +1199,24 @@
   (reoptimize-lvar (node-lvar call))
   (values))
 
-;;; Are there any declarations in force to say CLAMBDA shouldn't be
-;;; LET converted?
-(defun declarations-suppress-let-conversion-p (clambda)
-  ;; From the user's point of view, LET-converting something that
-  ;; has a name is inlining it. (The user can't see what we're doing
-  ;; with anonymous things, and suppressing inlining
-  ;; for such things can easily give Python acute indigestion, so
-  ;; we don't.)
-  ;;
-  ;; A functional that is already inline-expanded in this componsne definitely
-  ;; deserves let-conversion -- and in case of main entry points for inline
-  ;; expanded optional dispatch, the main-etry isn't explicitly marked INLINE
-  ;; even if the function really is.
-  (when (and (leaf-has-source-name-p clambda)
-             (not (functional-inline-expanded clambda)))
-    ;; ANSI requires that explicit NOTINLINE be respected.
-    (or (eq (lambda-inlinep clambda) 'notinline)
-        ;; If (= LET-CONVERSION 0) or (= DEBUG 3) we can guess that inlining
-        ;; generally won't be appreciated, but if the user specifically requests
-        ;; inlining, that takes precedence over our general guess.
-        (and (or (policy clambda (or (= let-conversion 0) (= debug 3))))
-             (not (eq (lambda-inlinep clambda) 'inline))))))
+;;; Are there any declarations in force to say FUN shouldn't be LET
+;;; converted?
+(defun declarations-suppress-let-conversion-p (fun)
+  (declare (type clambda fun))
+  ;; From the user's point of view, LET-converting something that has
+  ;; a name is inlining it. (The user can't see what we're doing with
+  ;; anonymous things, and suppressing inlining for such things can
+  ;; easily give Python acute indigestion, so we don't.)
+  (and (leaf-has-source-name-p fun)
+       ;; If FUN is/was an entry point for an OPTIONAL-DISPATCH, then
+       ;; INLINEP information is only recorded on the optional dispatch.
+       (case (functional-inlinep (or (lambda-optional-dispatch fun) fun))
+         ;; If the user specifically requests inlining, that takes
+         ;; precedence over our general guess.
+         (inline nil)
+         ;; ANSI requires that explicit NOTINLINE be respected.
+         (notinline t)
+         (t (policy fun (or (= let-conversion 0) (= debug 3)))))))
 
 ;;; We also don't convert calls to named functions which appear in the
 ;;; initial component, delaying this until optimization. This
@@ -1419,38 +1478,35 @@
                                     (setq outside-calls-cleanup dest-cleanup)))
                              (push dest outside-calls))))))
                  (ok-initial-convert-p fun))
-        (cond (outside-calls
-               (setf (functional-kind fun) :assignment)
-               ;; The only time OUTSIDE-CALLS contains a mix of both
-               ;; tail and non-tail calls is when calls to FUN are
-               ;; derived to not return, in which case it doesn't
-               ;; matter whether a given call is tail, so there is no
-               ;; harm in the arbitrary choice here.
-               (let ((first-outside-call (first outside-calls)))
-                 (let ((original-tail-p (node-tail-p first-outside-call)))
-                   (let-convert fun first-outside-call)
-                   (unless original-tail-p
-                     (reoptimize-call first-outside-call)))
-                 (dolist (outside-call outside-calls)
-                   ;; Splice in the other calls, without the rest of
-                   ;; the let converting return semantics machinery,
-                   ;; since we've already let converted the function.
-                   (unless (eq outside-call first-outside-call)
-                     (insert-let-body fun outside-call))
-                   (delete-lvar-use outside-call)
-                   ;; Make sure these calls are local converted as
-                   ;; soon as possible, to avoid having a window of
-                   ;; time where there are :ASSIGNMENT lambdas
-                   ;; floating around which are still called by :FULL
-                   ;; combinations, as this confuses stuff like
-                   ;; MAYBE-TERMINATE-BLOCK.
-                   (convert-call-if-possible (lvar-use (combination-fun outside-call))
-                                             outside-call)
-                   (unless (or (eq outside-call first-outside-call)
-                               (node-tail-p outside-call))
-                     (reoptimize-call first-outside-call))
-                   (setf (node-tail-p outside-call) nil)))
-               t)
-              (t
-               (delete-lambda fun)
-               nil))))))
+        (when outside-calls
+          (setf (functional-kind fun) :assignment)
+          ;; The only time OUTSIDE-CALLS contains a mix of both
+          ;; tail and non-tail calls is when calls to FUN are
+          ;; derived to not return, in which case it doesn't
+          ;; matter whether a given call is tail, so there is no
+          ;; harm in the arbitrary choice here.
+          (let ((first-outside-call (first outside-calls)))
+            (let ((original-tail-p (node-tail-p first-outside-call)))
+              (let-convert fun first-outside-call)
+              (unless original-tail-p
+                (reoptimize-call first-outside-call)))
+            (dolist (outside-call outside-calls)
+              ;; Splice in the other calls, without the rest of
+              ;; the let converting return semantics machinery,
+              ;; since we've already let converted the function.
+              (unless (eq outside-call first-outside-call)
+                (insert-let-body fun outside-call))
+              (delete-lvar-use outside-call)
+              ;; Make sure these calls are local converted as
+              ;; soon as possible, to avoid having a window of
+              ;; time where there are :ASSIGNMENT lambdas
+              ;; floating around which are still called by :FULL
+              ;; combinations, as this confuses stuff like
+              ;; MAYBE-TERMINATE-BLOCK.
+              (convert-call-if-possible (lvar-use (combination-fun outside-call))
+                                        outside-call)
+              (unless (or (eq outside-call first-outside-call)
+                          (node-tail-p outside-call))
+                (reoptimize-call first-outside-call))
+              (setf (node-tail-p outside-call) nil)))
+          t)))))

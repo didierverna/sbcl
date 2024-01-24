@@ -13,7 +13,7 @@
  * files for more information.
  */
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -43,7 +43,7 @@
 #include <time.h>
 
 #ifndef LISP_FEATURE_WIN32
-#include "signal.h"
+#include <signal.h>
 #endif
 
 #include "runtime.h"
@@ -51,13 +51,11 @@
 #include "globals.h"
 #include "os.h"
 #include "interr.h"
-#include "alloc.h"
 #include "interrupt.h"
 #include "arch.h"
 #include "gc.h"
 #include "validate.h"
 #include "core.h"
-#include "save.h"
 #include "lispregs.h"
 #include "thread.h"
 
@@ -323,7 +321,7 @@ parse_size_arg(char *arg, char *arg_name)
 
 char *core_string;
 
-static void print_environment(int argc, char *argv[])
+static void print_environment(int argc, char *argv[], char *envp[])
 {
     int n = 0;
     printf("; Commandline arguments:\n");
@@ -333,8 +331,8 @@ static void print_environment(int argc, char *argv[])
     }
     n = 0;
     printf(";\n; Environment:\n");
-    while (ENVIRON[n]) {
-        printf(";  %2d: \"%s\"\n", n, ENVIRON[n]);
+    while (envp[n]) {
+        printf(";  %2d: \"%s\"\n", n, envp[n]);
         ++n;
     }
 }
@@ -366,7 +364,6 @@ char *dir_name(char *path) {
 }
 
 
-extern void write_protect_immobile_space();
 struct lisp_startup_options lisp_startup_options;
 
 struct cmdline_options {
@@ -377,7 +374,7 @@ struct cmdline_options {
     char
 #endif
      **argv;
-    boolean disable_lossage_handler_p;
+    bool disable_lossage_handler_p;
     int merge_core_pages;
 };
 
@@ -427,7 +424,7 @@ static int is_memsize_arg(char *argv[], int argi, int argc, int *merge_core_page
 
 static struct cmdline_options
 parse_argv(struct memsize_options memsize_options,
-           int argc, char *argv[], char *core)
+           int argc, char *argv[], char *envp[], char *core)
 {
 #ifdef LISP_FEATURE_WIN32
     wchar_t
@@ -436,13 +433,13 @@ parse_argv(struct memsize_options memsize_options,
 #endif
         **sbcl_argv = 0;
     /* other command line options */
-    boolean disable_lossage_handler_p
+    bool disable_lossage_handler_p
 #if defined(LISP_FEATURE_SB_LDB)
         = 0;
 #else
         = 1;
 #endif
-    boolean debug_environment_p = 0;
+    bool debug_environment_p = 0;
     int merge_core_pages = -1;
 
     int argi = 1;
@@ -465,29 +462,33 @@ parse_argv(struct memsize_options memsize_options,
         dynamic_space_size = memsize_options.dynamic_space_size;
         thread_control_stack_size = memsize_options.thread_control_stack_size;
         dynamic_values_bytes = memsize_options.thread_tls_bytes;
-#ifndef LISP_FEATURE_WIN32
-        sbcl_argv = successful_malloc((argc + 1) * sizeof(char *));
-        sbcl_argv[0] = argv[0];
         int stop_parsing = 0; // have we seen '--'
         int output_index = 1;
+
+#ifndef LISP_FEATURE_WIN32
+        sbcl_argv = successful_malloc((argc + 1) * sizeof(char *));
+        char **argv_source = argv;
+#else
+        int wargc;
+        wchar_t **argv_source;
+        argv_source = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        sbcl_argv = successful_malloc((wargc + 1) * sizeof(wchar_t *));
+#endif
+        sbcl_argv[0] = argv_source[0];
+
         while (argi < argc) {
             if (stop_parsing) // just copy it over
-                sbcl_argv[output_index++] = argv[argi++];
+                sbcl_argv[output_index++] = argv_source[argi++];
             else if (!strcmp(argv[argi], "--")) // keep it, but parse nothing else
-                sbcl_argv[output_index++] = argv[argi++], stop_parsing = 1;
+                sbcl_argv[output_index++] = argv_source[argi++], stop_parsing = 1;
             else if ((n_consumed = is_memsize_arg(argv, argi, argc, &merge_core_pages)))
                 argi += n_consumed; // eat it
             else // default action - copy it
-                sbcl_argv[output_index++] = argv[argi++];
+                sbcl_argv[output_index++] = argv_source[argi++];
         }
         sbcl_argv[output_index] = 0;
-#else
-        int wargc;
-        sbcl_argv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-        // Somebody who wishes this to work for #+win32 should feel free to do the same...
-#endif
     } else {
-        boolean end_runtime_options = 0;
+        bool end_runtime_options = 0;
         /* Parse our any of the command-line options that we handle from C,
          * stopping at the first one that we don't, and leave the rest */
         while (argi < argc) {
@@ -596,7 +597,7 @@ parse_argv(struct memsize_options memsize_options,
         }
     }
     if (debug_environment_p) {
-        print_environment(argc, argv);
+        print_environment(argc, argv, envp);
     }
 
     struct cmdline_options o;
@@ -615,6 +616,12 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     struct lisp_exception_frame exception_frame;
 #endif
 #ifdef LISP_FEATURE_UNIX
+#ifdef LISP_FEATURE_AVOID_CLOCK_GETTIME
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    lisp_init_time.tv_sec = tv.tv_sec;
+    lisp_init_time.tv_nsec = tv.tv_usec * 1000;
+#else
     clock_gettime(
 #ifdef LISP_FEATURE_LINUX
         CLOCK_MONOTONIC_COARSE
@@ -622,6 +629,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
         CLOCK_MONOTONIC
 #endif
         , &lisp_init_time);
+#endif
 #endif
 
     /* the name of the core file we're to execute. Note that this is
@@ -634,7 +642,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     struct memsize_options memsize_options;
     memsize_options.present_in_core = 0;
 
-    boolean have_hardwired_spaces = os_preinit(argv, envp);
+    bool have_hardwired_spaces = os_preinit(argv, envp);
 
     interrupt_init();
 #ifdef LISP_FEATURE_UNIX
@@ -647,27 +655,45 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     /* Check early to see if this executable has an embedded core,
      * which also populates runtime_options if the core has runtime
      * options */
-    if (!(sbcl_runtime = os_get_runtime_executable_path()))
-        sbcl_runtime = search_for_executable(argv[0]);
-
-    if (!(sbcl_runtime_home = dir_name(argv[0])))
-      if (!(sbcl_runtime_home = dir_name(sbcl_runtime)))
-        sbcl_runtime_home = libpath;
-
+    sbcl_runtime = os_get_runtime_executable_path();
     if (sbcl_runtime) {
         os_vm_offset_t offset = search_for_embedded_core(sbcl_runtime, &memsize_options);
         if (offset != -1) {
-            embedded_core_offset = offset;
             core = sbcl_runtime;
+            embedded_core_offset = offset;
         }
     }
 
-    struct cmdline_options options = parse_argv(memsize_options, argc, argv, core);
+    if (!core) {
+        char *exe_path = search_for_executable(argv[0]);
+        if (exe_path && !(sbcl_runtime && strcmp(sbcl_runtime, exe_path) == 0)) {
+            os_vm_offset_t offset = search_for_embedded_core(exe_path, &memsize_options);
+            if (offset != -1) {
+                free(core);
+                sbcl_runtime = exe_path;
+                core = exe_path;
+                embedded_core_offset = offset;
+            } else {
+                if (!sbcl_runtime)
+                    sbcl_runtime = exe_path;
+                else
+                    free(exe_path);
+            }
+        } else {
+            free(exe_path);
+        }
+    }
+
+    if (!(sbcl_runtime_home = dir_name(argv[0])))
+        if (!(sbcl_runtime_home = dir_name(sbcl_runtime)))
+            sbcl_runtime_home = libpath;
+
+    struct cmdline_options options = parse_argv(memsize_options, argc, argv, envp, core);
 
     /* Align down to multiple of page_table page size, and to the appropriate
      * stack alignment. */
     dynamic_space_size &= ~(sword_t)(BACKEND_PAGE_BYTES-1);
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
     dynamic_space_size &= ~(sword_t)(GENCGC_PAGE_BYTES-1);
 #endif
     thread_control_stack_size &= ~(sword_t)(CONTROL_STACK_ALIGNMENT_BYTES-1);
@@ -758,6 +784,12 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     write_protect_immobile_space();
 #endif
 
+    /* Requires STATIC_SPACE_START to have been calculated. */
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
+    extern void safepoint_init(void);
+    safepoint_init();
+#endif
+
     arch_install_interrupt_handlers();
 #ifndef LISP_FEATURE_WIN32
     os_install_interrupt_handlers();
@@ -777,8 +809,6 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     core_string = core;
     posix_argv = options.argv;
 
-    FSHOW((stderr, "/funcalling initial_function=0x%lx\n",
-          (unsigned long)initial_function));
     create_main_lisp_thread(initial_function);
     return 0;
 }

@@ -160,7 +160,6 @@
 (!define-var-binop + 4 add)
 (!define-var-binop - 4 sub)
 (!define-var-binop logand 2 and)
-(!define-var-binop logandc1 2 andc t)
 (!define-var-binop logandc2 2 andc)
 (!define-var-binop logior 2 or)
 (!define-var-binop logorc1 2 orc t t)
@@ -240,6 +239,24 @@
   (define-const-logop logior 2 ori oris or)
   (define-const-logop logxor 2 xori xoris xor))
 
+(define-vop (fast-logandc2/unsigned-signed=>unsigned fast-logandc2/unsigned=>unsigned)
+  (:args (x :scs (unsigned-reg))
+         (y :scs (signed-reg)))
+  (:arg-types unsigned-num signed-num))
+
+(define-vop (fast-logand/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r)
+         (y :scs (unsigned-reg) :target r))
+  (:arg-types signed-num unsigned-num))
+
+(define-vop (fast-logand-c/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r))
+  (:arg-types signed-num (:constant (eql #.most-positive-word)))
+  (:info y)
+  (:ignore y)
+  (:generator 1
+    (move r x)))
+
 (define-vop (fast-*/fixnum=>fixnum fast-fixnum-binop)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:translate *)
@@ -291,7 +308,7 @@
                       (inst sld result number amount))
                      (immediate
                       (let ((amount (tn-value amount)))
-                        (aver (> amount 0))
+                        (aver (>= amount 0))
                         (inst sldi result number amount))))))))
   ;; FIXME: There's the opportunity for a sneaky optimization here, I
   ;; think: a FAST-ASH-LEFT-C/FIXNUM=>SIGNED vop.  -- CSR, 2003-09-03
@@ -379,6 +396,38 @@
          (if (minusp amount)
              (inst sradi result number (min 63 (- amount)))
              (inst sldi result number amount)))))))
+
+(define-vop (fast-%ash/right/unsigned)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (unsigned-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 1
+    (inst srd result number amount)))
+
+(define-vop (fast-%ash/right/signed)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (signed-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types signed-num unsigned-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 1
+    (inst srad result number amount)))
+
+(define-vop (fast-%ash/right/fixnum)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (any-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types tagged-num unsigned-num)
+  (:results (result :scs (any-reg)))
+  (:result-types tagged-num)
+  (:temporary (:sc signed-reg) temp)
+  (:generator 2
+    (inst srad temp number amount)
+    (inst clrrdi result temp n-fixnum-tag-bits)))
 
 (define-vop (signed-byte-64-len)
   (:translate integer-length)
@@ -1015,19 +1064,6 @@
   (:generator 15
     (inst mulhdu temp x y)
     (inst clrrdi hi temp n-fixnum-tag-bits)))
-
-(define-vop (bignum-lognot lognot-mod64/unsigned=>unsigned)
-  (:translate sb-bignum:%lognot))
-
-(define-vop (fixnum-to-digit)
-  (:translate sb-bignum:%fixnum-to-digit)
-  (:policy :fast-safe)
-  (:args (fixnum :scs (any-reg)))
-  (:arg-types tagged-num)
-  (:results (digit :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 1
-    (inst sradi digit fixnum n-fixnum-tag-bits)))
 
 ;;; Algorithm from page 74 of of Power ISA version 2.07
 ;;; under "Programming Note" for the divweu instruction

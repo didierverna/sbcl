@@ -8,7 +8,7 @@
 #include <errno.h>
 #include <sys/param.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "interr.h"
@@ -22,9 +22,7 @@
 #include "genesis/fdefn.h"
 #endif
 
-#ifdef LISP_FEATURE_GENCGC
-#include "gc-internal.h"
-#endif
+#include "gc.h"
 
 void os_init() {}
 
@@ -53,7 +51,7 @@ os_vm_address_t os_alloc_gc_space(int __attribute__((unused)) space_id,
     return addr;
 }
 
-#if defined LISP_FEATURE_GENCGC
+#if defined LISP_FEATURE_GENERATIONAL
 
 void
 sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)

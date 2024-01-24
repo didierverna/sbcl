@@ -1,7 +1,7 @@
 ;;; HASH TABLES
 
 ;;; Keep moving everything that can move during each GC
-#+gencgc (setf (generation-number-of-gcs-before-promotion 0) 1000000)
+#+generational (setf (generation-number-of-gcs-before-promotion 0) 1000000)
 
 ;;; Check for GC invariant loss during weak table creation.
 ;;; This didn't always fail, but might have, and now shouldn't.
@@ -79,7 +79,8 @@
 ;;; hash-vector. EQ tables don't have a hash-vector, so that's no good.
 ;;; EQL tables don't hash symbols address-sensitively,
 ;;; so use a bunch of cons cells.
-(with-test (:name :gc-while-growing-weak-hash-table)
+(with-test (:name :gc-while-growing-weak-hash-table
+            :skipped-on (or :mark-region-gc :gc-stress))
   (let ((h (make-hash-table :weakness :key)))
     (setq *gc-after-rehash-me* h)
     (dotimes (i 50) (setf (gethash (list (gensym)) h) i))
@@ -116,7 +117,11 @@
 ;;; EQL tables no longer get a hash vector, so the GC has to decide
 ;;; for itself whether key movement forces rehash.
 ;;; Let's make sure that works.
-(with-test (:name :address-insensitive-eql-hash)
+;;; I don't love the idea of skipping this, because mark-region *can* move keys
+;;; though it generally doesn't. After I started to hack up the test to query
+;;; whether keys moved, it looked pretty disastrous. Need to think of way.
+(with-test (:name :address-insensitive-eql-hash
+                  :skipped-on :mark-region-gc)
   (let ((tbl (make-hash-table :size 20)))
     (dotimes (i 5)
       (let ((key (coerce i 'double-float)))

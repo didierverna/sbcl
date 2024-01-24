@@ -28,6 +28,7 @@
   (let ((threads sb-thread::*starting-threads*))
     (when (find-if-not #'thread-ephemeral-p threads)
       (error "Should not see new thread in starting list: ~S" threads)))
+  #-gc-stress
   (let ((threads (remove sb-thread::*initial-thread*
                          (sb-thread::avltree-list sb-thread::*all-threads*))))
     (when (find-if-not #'thread-ephemeral-p threads)
@@ -137,7 +138,8 @@
 ;;; In fact, assert something stronger: there are no young objects
 ;;; between the current SP and end of stack.
 (test-util:with-test (:name :expected-gc-roots
-                      :skipped-on (or :interpreter (not :sb-thread)))
+                      :skipped-on (or :interpreter (not :sb-thread)
+                                      :debug-gc-barriers))
   (let ((list
           (delete-if (lambda (x)
                        (or (eq x #'actually-get-stack-roots)

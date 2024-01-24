@@ -78,20 +78,21 @@
                    (:code-object (get-lisp-obj-address real-code-obj))
                    #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index name))
                    (:layout (get-lisp-obj-address
-                             (wrapper-friend (if (symbolp name) (find-layout name) name))))
+                             (if (symbolp name) (find-layout name) name)))
                    (:layout-id (layout-id name))
-                   #+gencgc (:card-table-index-mask (extern-alien "gc_card_table_nbits" int))
+                   (:card-table-index-mask (extern-alien "gc_card_table_nbits" int))
                    (:immobile-symbol (get-lisp-obj-address name))
                    ;; It is legal to take the address of symbol-value only if the
                    ;; value is known to be an immobile object
                    ;; (whose address we don't want to wire in).
                    (:symbol-value (get-lisp-obj-address (symbol-global-value name)))
-                   #+immobile-code
+                   #+(and immobile-code x86-64)
                    (:fdefn-call
                     (prog1 (sb-vm::fdefn-entry-address name) ; creates if didn't exist
                       (when statically-link-p
                         (push (cons offset (find-fdefn name)) (elt preserved-lists 0)))))
-                   #+immobile-code (:static-call (sb-vm::function-raw-address name kind)))
+                   #+(and immobile-code x86-64)
+                   (:static-call (sb-vm::function-raw-address name kind)))
                  kind flavor))
 
        (finish-fixups (code-obj preserved-lists)
@@ -107,7 +108,7 @@
              (setf (sap-ref-32 (int-sap (get-lisp-obj-address fun))
                                (- 4 sb-vm:fun-pointer-lowtag))
                    (truly-the (unsigned-byte 32)
-                     (get-lisp-obj-address (wrapper-friend #.(find-layout 'function)))))))
+                              (get-lisp-obj-address #.(find-layout 'function))))))
          ;; And finally, make the memory range executable.
          ;; x86 doesn't need it, and darwin-jit doesn't do it because the
          ;; temporary object is not executable.
@@ -184,7 +185,7 @@
             (when (typep const '(cons (eql :fdefinition)))
               (incf count)
               (setf (second const) (find-or-create-fdefn (second const)))))))
-       (retained-fixups (pack-retained-fixups fixup-notes))
+       (retained-fixups (sb-fasl::pack-fixups-for-reapplication fixup-notes))
        ((code-obj total-nwords)
         (allocate-code-object (component-mem-space component)
                               (align-up n-boxed-words code-boxed-words-align)

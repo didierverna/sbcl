@@ -17,9 +17,6 @@
 (declaim (maybe-inline upper-case-p lower-case-p both-case-p
                        digit-char-p))
 
-(deftype char-code ()
-  `(integer 0 (,char-code-limit)))
-
 (declaim (inline pack-3-codepoints))
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun pack-3-codepoints (first &optional (second 0) (third 0))
@@ -60,7 +57,7 @@
 
 (macrolet ((frob ()
              (flet ((file (name type)
-                      (sb-cold:find-bootstrap-file (format nil "output/~A.~A" name type)))
+                      (sb-cold:find-bootstrap-file (format nil "output/ucd/~A.~A" name type)))
                     (read-ub8-vector (pathname)
                       (with-open-file (stream pathname
                                               :element-type '(unsigned-byte 8))
@@ -324,28 +321,30 @@
 ;;; and also sets its high bit if the decompositions are compatibility
 ;;; decompositions. The other flags byte encodes boolean properties. Bit 7 is
 ;;; set if the entry's characters are BOTH-CASE-P in the Common Lisp sense. Bit
-;;; 6 is set if the entry's characters hav a defined case transformation in
+;;; 6 is set if the entry's characters have a defined case transformation in
 ;;; Unicode. Bit 5 is set if the characters have the property BIDI_Mirrored=Y.
 ;;; Bits 3-0 encode the entry's East Asian Width. Bit 4 is unused. Age stores
 ;;; the minor version in bits 0-2, and the major version in the remaining 5
 ;;; bits.
 ;;;
-;;; To find which entry in +CHARACTER-MISC-DATABASE+ encodes a character's
-;;; attributes, first index +CHARACTER-HIGH-PAGES+ (an array of 16-bit
-;;; values) with the high 13 bits of the character's codepoint. If the result
-;;; value has its high bit set, the character is in a "compressed page". To
-;;; find the misc entry number, simply clear the high bit. If the high bit is
-;;; not set, the misc entry number must be looked up in
-;;; +CHARACTER-LOW-PAGES+, which is an array of 16-bit values. Each entry in
-;;; the array consists of two such values, the misc entry number and the
-;;; decomposition index. To find the misc entry number, index into
-;;; +CHARACTER-LOW-PAGES+ using the value retreived from
-;;; +CHARACTER-HIGH-PAGES+ (shifted left 8 bits) plus the low 8 bits of the
-;;; codepoint, all times two to account for the widtth of the entries. The
-;;; value in +CHARACTER-LOW-PAGES+ at this point is the misc entry number. To
-;;; transform a misc entry number into an index into
-;;; +CHARACTER-MISC-DATABASE+, multiply it by +MISC-WIDTH+. This gives the
-;;; index of the start of the charater's misc entry in
+;;; To find which entry in +CHARACTER-MISC-DATABASE+ encodes a
+;;; character's attributes, first index +CHARACTER-HIGH-PAGES+ (an
+;;; array of 16-bit values) with the high 13 bits of the character's
+;;; codepoint. If the result value has its high bit set, the character
+;;; is in a "compressed page", where all characters on that
+;;; 256-character page have the same misc entry. To find the misc
+;;; entry number, simply clear the high bit. If the high bit is not
+;;; set, the misc entry number must be looked up in
+;;; +CHARACTER-LOW-PAGES+, which is an array of 16-bit values. Each
+;;; entry in the array consists of two such values, the misc entry
+;;; number and the decomposition index. To find the misc entry number,
+;;; index into +CHARACTER-LOW-PAGES+ using the value retreived from
+;;; +CHARACTER-HIGH-PAGES+ (shifted left 8 bits) plus the low 8 bits
+;;; of the codepoint, all times two to account for the widtth of the
+;;; entries. The value in +CHARACTER-LOW-PAGES+ at this point is the
+;;; misc entry number. To transform a misc entry number into an index
+;;; into +CHARACTER-MISC-DATABASE+, multiply it by +MISC-WIDTH+. This
+;;; gives the index of the start of the charater's misc entry in
 ;;; +CHARACTER-MISC-DATABASE+.
 ;;;
 ;;; To look up a character's decomposition, first retreive its
@@ -372,9 +371,9 @@
 ;;; a flat array twice as large, and it includes only the standard casing rules,
 ;;; so there's always just two characters.
 ;;;
-;;; Similarly, composition information is stored in **CHARACTER-COMPOSITIONS**,
-;;; which is a hash table of codepoints indexed by (+ (ash codepoint1 21)
-;;; codepoint2).
+;;; Primary composition information is stored in a hash table local to
+;;; PRIMARY-COMPOSITION, with (+ (ash codepoint1 21) codepoint2) as
+;;; keys and the composition as the value
 
 (declaim (ftype (sfunction (t) (unsigned-byte 16)) misc-index))
 (defun misc-index (char)
@@ -551,7 +550,7 @@ lowercase eszet (U+DF)."
     (let ((code (aref cases (1+ index))))
       (if (zerop code)
           char
-          (code-char (truly-the char-code code))))))
+          (code-char (truly-the %char-code code))))))
 
 (defun char-downcase (char)
   "Return CHAR converted to lower-case if that is possible."
@@ -560,7 +559,7 @@ lowercase eszet (U+DF)."
     (let ((code (aref cases index)))
       (if (zerop code)
           char
-          (code-char (truly-the char-code code))))))
+          (code-char (truly-the %char-code code))))))
 
 (defun alphanumericp (char)
   "Given a character-object argument, ALPHANUMERICP returns T if the argument
@@ -714,21 +713,23 @@ Case is ignored." t))
 (defun digit-char-p (char &optional (radix 10.))
   "If char is a digit in the specified radix, returns the fixnum for which
 that digit stands, else returns NIL."
-  (if (<= (char-code char) 127)
-      (let ((weight (- (char-code char) 48)))
-        (cond ((minusp weight) nil)
-              ((<= radix 10.)
-               ;; Special-case ASCII digits in decimal and smaller radices.
-               (if (< weight radix) weight nil))
-              ;; Digits 0 - 9 are used as is, since radix is larger.
-              ((< weight 10) weight)
-              ;; Check for upper case A - Z.
-              ((and (>= (decf weight 7) 10) (< weight radix)) weight)
-              ;; Also check lower case a - z.
-              ((and (>= (decf weight 32) 10) (< weight radix)) weight)))
-      (let ((number (ucd-decimal-digit char)))
-        (when (and number (< (truly-the fixnum number) radix))
-          number))))
+  (let ((code (char-code char)))
+    (if (<= code 1632) ;; (loop for code from 127 when (digit-char-p (code-char code)) return code)
+        (let ((weight (- code 48)))
+          (cond ((minusp weight) nil)
+                ((<= radix 10.)
+                 ;; Special-case ASCII digits in decimal and smaller radices.
+                 (if (< weight radix) weight nil))
+                ;; Digits 0 - 9 are used as is, since radix is larger.
+                ((< weight 10) weight)
+                (t
+                 (let ((weight (logior #x20 code))) ;; downcase ASCII characters.
+                   (when (and (>= (decf weight (- (char-code #\a) 10)) 10)
+                              (< weight radix))
+                     weight) ))))
+        (let ((number (ucd-decimal-digit char)))
+          (when (and number (< number radix))
+            number)))))
 
 (defun digit-char (weight &optional (radix 10))
   "All arguments must be integers. Returns a character object that represents

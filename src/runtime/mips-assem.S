@@ -18,14 +18,9 @@
 .section .note.GNU-stack,"",%progbits
 #endif
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "lispregs.h"
-#include "globals.h"
-#include "genesis/fdefn.h"
 #include "genesis/closure.h"
-#include "genesis/code.h"
-#include "genesis/funcallable-instance.h"
-#include "genesis/simple-fun.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 

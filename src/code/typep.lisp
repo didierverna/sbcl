@@ -34,9 +34,6 @@
   (declare (explicit-check))
   (%%typep object (specifier-type specifier)))
 
-;;; probably not the right place for this declamation. The benefits
-;;; should be more widespread.
-(declaim (freeze-type ctype))
 (defun %%typep (object type &optional (strict t))
  (declare (type ctype type))
  (typep-impl-macro (object :defaults nil)
@@ -86,7 +83,7 @@
          (funcall (built-in-classoid-predicate type) object)
          (and (or (%instancep object)
                   (functionp object))
-              (classoid-typep (wrapper-of object) type object))))
+              (classoid-typep (layout-of object) type object))))
     (union-type
      (some (lambda (union-type-type) (recurse object union-type-type))
            (union-type-types type)))
@@ -150,8 +147,8 @@
                       (block nil
                         (classoid-typep
                          (typecase object
-                           (instance (%instance-wrapper object))
-                           (funcallable-instance (%fun-wrapper object))
+                           (instance (%instance-layout object))
+                           (funcallable-instance (%fun-layout object))
                            (t (return)))
                          (cdr (truly-the cons cache))
                          object)))
@@ -161,19 +158,6 @@
           (sb-thread:barrier (:write))
           (setf (car cache) fun)
           (funcall fun cache object)))))
-
-;;; Do a type test from a class cell, allowing forward reference and
-;;; redefinition.
-(defun classoid-cell-typep (cell object)
-  (let ((layout (typecase object
-                  (instance (%instance-layout object))
-                  (funcallable-instance (%fun-layout object))
-                  (t (return-from classoid-cell-typep))))
-        (classoid (classoid-cell-classoid cell)))
-    (unless classoid
-      (error "The class ~S has not yet been defined."
-             (classoid-cell-name cell)))
-    (classoid-typep (layout-friend layout) classoid object)))
 
 ;;; Return true of any object which is either a funcallable-instance,
 ;;; or an ordinary instance that is not a structure-object.
@@ -191,9 +175,9 @@
 ;;; Try to ensure that the object's layout is up-to-date only if it is an instance
 ;;; or funcallable-instance of other than a static or structure classoid type.
 (defun update-object-layout (object)
-  (wrapper-friend (if (%pcl-instance-p object)
-                      (sb-pcl::check-wrapper-validity object)
-                      (wrapper-of object))))
+  (if (%pcl-instance-p object)
+      (sb-pcl::check-wrapper-validity object)
+      (layout-of object)))
 
 ;;; Test whether OBJ-LAYOUT is from an instance of CLASSOID.
 
@@ -225,7 +209,7 @@
 ;;; of thousands of iterations of 'classoid-typep.impure.lisp'
 
 (defun classoid-typep (obj-layout classoid object)
-  (declare (type wrapper obj-layout))
+  (declare (type layout obj-layout))
   ;; FIXME & KLUDGE: We could like to grab the *WORLD-LOCK* here (to ensure that
   ;; class graph doesn't change while we're doing the typep test), but in
   ;; practice that causes trouble -- deadlocking against the compiler
@@ -240,27 +224,40 @@
              ;; that we're testing against. Whether obj-layout is "valid" has no relevance.
              ;; This is racy though because %ENSURE-CLASSOID-VALID should return
              ;; the most up-to-date layout for the classoid, but it doesn't. Oh well.
-             (%ensure-classoid-valid classoid (classoid-wrapper classoid) "typep")
-             (values obj-layout (classoid-wrapper classoid)))
+             (%ensure-classoid-valid classoid (classoid-layout classoid) "typep")
+             (values obj-layout (classoid-layout classoid)))
             (t
              ;; And this case is even more racy, naturally.
-             (do ((layout (classoid-wrapper classoid) (classoid-wrapper classoid))
+             (do ((layout (classoid-layout classoid) (classoid-layout classoid))
                   (i 0 (+ i 1))
                   (obj-layout obj-layout))
-                 ((and (not (wrapper-invalid obj-layout))
-                       (not (wrapper-invalid layout)))
+                 ((and (not (layout-invalid obj-layout))
+                       (not (layout-invalid layout)))
                   (values obj-layout layout))
                (aver (< i 2))
                (%ensure-classoid-valid classoid layout "typep")
-               (when (zerop (wrapper-clos-hash obj-layout))
+               (when (zerop (layout-clos-hash obj-layout))
                  (setq obj-layout (sb-pcl::check-wrapper-validity object))))))
     ;; FIXME: if LAYOUT is for a structure, use the STRUCTURE-IS-A test
     ;; which avoids iterating.
     (or (eq obj-layout layout)
-        (let ((obj-inherits (wrapper-inherits obj-layout)))
+        (let ((obj-inherits (layout-inherits obj-layout)))
           (dotimes (i (length obj-inherits) nil)
             (when (eq (svref obj-inherits i) layout)
               (return t)))))))
+
+;;; Do a type test from a class cell, allowing forward reference and
+;;; redefinition.
+(defun classoid-cell-typep (cell object)
+  (let ((layout (typecase object
+                  (instance (%instance-layout object))
+                  (funcallable-instance (%fun-layout object))
+                  (t (return-from classoid-cell-typep))))
+        (classoid (classoid-cell-classoid (truly-the classoid-cell cell))))
+    (unless classoid
+      (error "The class ~S has not yet been defined."
+             (classoid-cell-name cell)))
+    (classoid-typep layout classoid object)))
 
 (declaim (end-block))
 
@@ -297,7 +294,7 @@
          (if (if (csubtypep type (specifier-type 'function))
                  (funcallable-instance-p obj)
                  (%instancep obj))
-             (if (eq (classoid-wrapper type)
+             (if (eq (classoid-layout type)
                      (info :type :compiler-layout (classoid-name type)))
                  (values (sb-xc:typep obj type) t)
                  (values nil nil))
@@ -316,17 +313,10 @@
      ;; to happen in more places too. (Like the array hairy type
      ;; testing.)
      (if (unknown-type-p type)
-         (let ((spec (unknown-type-specifier type)))
-           ;; KLUDGE: Work around the fact that we load PCL after we
-           ;; type test certain things defined there. This is somewhat
-           ;; suboptimal because this is really only a concern during
-           ;; warm load.
-           (if (member spec '(class sb-pcl::condition-class))
+         (let ((type (specifier-type (unknown-type-specifier type))))
+           (if (unknown-type-p type)
                (values nil nil)
-               (let ((type (specifier-type spec)))
-                 (if (unknown-type-p type)
-                     (values nil nil)
-                     (ctypep obj type)))))
+               (ctypep obj type)))
          ;; Now the tricky stuff.
          (let ((predicate (cadr (hairy-type-specifier type))))
            (case predicate
@@ -442,27 +432,46 @@ Experimental."
        ;; to pass to %MAKE-ARRAY-TYPE but with care we can usually avoid consing.
        (let ((etype (sb-vm::array-element-ctype x))
              (rank (array-rank x))
-             (complexp (not (simple-array-p x))))
-         (case rank
-           (0 (%make-array-type '() complexp etype etype))
-           ((1 2 3)
-            (dx-let ((dims (list (array-dimension x 0) nil nil)))
-              (case rank
-                (1 (setf (cdr dims) nil))
-                (2 (setf (cadr dims) (array-dimension x 1)
-                         (cddr dims) nil))
-                (t (setf (cadr dims) (array-dimension x 1)
-                         (caddr dims) (array-dimension x 2))))
-              (%make-array-type dims complexp etype etype)))
-           (t
-            (let ((dims (make-list rank)))
-              ;; Need ALLOCATE-LIST-ON-STACK for this decl. Can't use vop-exists-p
-              ;; because can't macroexpand into DECLARE. Maybe sharp-dot it ?
-              #+x86-64 (declare (truly-dynamic-extent dims))
-              (dotimes (i rank)
-                (setf (nth i dims) (array-dimension x i)))
-           (%make-array-type dims complexp etype etype))))))
-      (cons (specifier-type 'cons))
+             (complexp (and (not (simple-array-p x))
+                            :maybe)))
+         ;; Complex arrays get turned into simple arrays when compiling to a fasl.
+         (if complexp
+             (%make-array-type (make-list rank :initial-element '*) complexp etype etype)
+             (case rank
+               (0 (%make-array-type '() complexp etype etype))
+               ((1 2 3)
+                (dx-let ((dims (list (array-dimension x 0) nil nil)))
+                  (case rank
+                    (1 (setf (cdr dims) nil))
+                    (2 (setf (cadr dims) (array-dimension x 1)
+                             (cddr dims) nil))
+                    (t (setf (cadr dims) (array-dimension x 1)
+                             (caddr dims) (array-dimension x 2))))
+                  (%make-array-type dims complexp etype etype)))
+               (t
+                (let ((dims (make-list rank)))
+                  ;; Need ALLOCATE-LIST-ON-STACK for this decl. Can't use vop-exists-p
+                  ;; because can't macroexpand into DECLARE. Maybe sharp-dot it ?
+                  #+x86-64 (declare (dynamic-extent dims))
+                  (dotimes (i rank)
+                    (setf (nth i dims) (array-dimension x i)))
+                  (%make-array-type dims complexp etype etype)))))))
+      (cons
+       (let ((car (car x))
+             (cdr (cdr x)))
+         (make-cons-type (cond ((eq car x)
+                                (specifier-type 'cons))
+                               ;; Creates complicated unions
+                               ((functionp car)
+                                (specifier-type 'function))
+                               (t
+                                (ctype-of car)))
+                         (cond ((consp cdr)
+                                (specifier-type 'cons))
+                               ((functionp cdr)
+                                (specifier-type 'function))
+                               (t
+                                (ctype-of cdr))))))
       (character ; Why not return an EQL type?
        (typecase x
          (standard-char (specifier-type 'standard-char))
@@ -474,3 +483,37 @@ Experimental."
       (simd-pack-256 (simd-subtype (%simd-pack-256-tag x) simd-pack-256))
       (t
        (classoid-of x)))))
+
+;;; The stub for sb-c::%structure-is-a should really use layout-id in the same way
+;;; that the vop does, however, because the all 64-bit architectures other than
+;;; x86-64 need to use with-pinned-objects to extract a layout-id, it is cheaper not to.
+;;; I should add a vop for uint32 access to raw slots.
+(defun sb-c::%structure-is-a (object-layout test-layout)
+  (or (eq object-layout test-layout)
+      (let ((depthoid (layout-depthoid test-layout))
+            (inherits (layout-inherits object-layout)))
+        (and (> (length inherits) depthoid)
+             (eq (svref inherits depthoid) test-layout)))))
+
+(defun sb-c::structure-typep (object test-layout)
+  (and (%instancep object)
+       (let ((object-layout (%instance-layout object)))
+        (or (eq object-layout test-layout)
+            (let ((depthoid (layout-depthoid test-layout))
+                  (inherits (layout-inherits object-layout)))
+              (and (> (length inherits) depthoid)
+                   (eq (svref inherits depthoid) test-layout)))))))
+
+;;; TODO: this could be further generalized to handle any type where layout-of correctly
+;;; chooses a clause. It would of course not work for types like MEMBER or (MOD 5)
+(defun %typecase-index (layout-lists object sealed)
+  (declare (ignore sealed))
+  (when (%instancep object)
+    (let ((object-layout (%instance-layout object)))
+      (let ((clause-index 1))
+        (dovector (layouts layout-lists)
+          (dolist (layout layouts)
+            (when (sb-c::%structure-is-a object-layout layout)
+              (return-from %typecase-index clause-index)))
+          (incf clause-index)))))
+  0)

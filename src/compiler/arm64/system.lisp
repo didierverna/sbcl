@@ -209,26 +209,6 @@
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst add-sub result result (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes)))))
-;;;
-
-(defun load-symbol-dbinfo (result symbol temp)
-  (assemble ()
-    (loadw result symbol symbol-info-slot other-pointer-lowtag)
-    ;; If RESULT has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    (inst and temp result lowtag-mask)
-    (inst cmp temp list-pointer-lowtag)
-    (inst b :ne NE)
-    (loadw result result cons-cdr-slot list-pointer-lowtag)
-    NE))
-
-(define-vop (symbol-dbinfo)
-  (:policy :fast-safe)
-  (:translate symbol-dbinfo)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (load-symbol-dbinfo res x temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -264,7 +244,9 @@
     (:arg-types (:constant (satisfies ldr-str-word-offset-encodable)))
     (:policy :fast-safe)
     (:generator 1
-      (inst ldr sap (@ thread-tn (ash n word-shift)))))
+      (if (= n thread-this-slot)
+          (move sap thread-tn)
+          (inst ldr sap (@ thread-tn (ash n word-shift))))))
 
   (define-vop (current-thread-offset-sap)
     (:results (sap :scs (sap-reg)))
@@ -315,7 +297,7 @@
    (inst store-coverage-mark index tmp vector)))
 
 (define-vop ()
-  (:translate sb-lockless::get-next)
+  (:translate sb-lockless:get-next)
   (:policy :fast-safe)
   (:args (node :scs (descriptor-reg)))
   (:results (next-tagged :scs (descriptor-reg))

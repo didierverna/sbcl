@@ -316,6 +316,7 @@
             (,mode (sb-posix::stat-mode ,stat)))
        ,@body)))
 
+#-(and darwin x86)
 (deftest stat-mode.1
   (with-stat-mode (mode *test-directory*)
     (sb-posix:s-isreg mode))
@@ -332,6 +333,7 @@
     (sb-posix:s-ischr mode))
   nil)
 
+#-(and darwin x86)
 (deftest stat-mode.4
   (with-stat-mode (mode *test-directory*)
     (sb-posix:s-isblk mode))
@@ -410,14 +412,14 @@
 
 ;; O_LARGEFILE is always set on 64-bit *nix platforms even though the whole
 ;; flag makes no sense.
-#-win32
+#-(or (and darwin x86) win32)
 (deftest fcntl.1
     (let ((fd (sb-posix:open "/dev/null" sb-posix::o-nonblock)))
       (logtest (sb-posix:fcntl fd sb-posix::f-getfl)
                sb-posix::o-nonblock))
   t)
 
-#-(or win32 netbsd) ; fix: cant handle c-vargs
+#-(or gc-stress win32 netbsd) ; fix: cant handle c-vargs
 (deftest fcntl.flock.1
     (locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
       (let ((flock (make-instance 'sb-posix:flock
@@ -452,7 +454,7 @@
   42)
 
 
-#-(or win32 netbsd)
+#-(or gc-stress win32 netbsd)
 (deftest fcntl.flock.2
     (locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
       (let ((flock (make-instance 'sb-posix:flock
@@ -578,6 +580,41 @@
       (t (cond) (declare (ignore cond)) t))
   nil)
 
+#-(or android win32 (not sb-thread))
+(deftest do-passwds.concurrency
+    (let* (thread1 thread2
+           (t1
+            (sb-posix:do-passwds (passwd)
+              ;; Both the two following threads should wait
+              ;; for WITH-PASSWD-DATABASE to exit.
+              (setq
+               thread1
+               (sb-thread:make-thread
+                (lambda ()
+                  (sb-posix:getpwnam "root")
+                  (get-universal-time)))
+               thread2
+               (sb-thread:make-thread
+                (lambda ()
+                  (sb-posix:getpwuid 0)
+                  (get-universal-time))))
+             (let ((ut (get-universal-time)))
+               (sleep 1.1)
+               (return ut))))
+           (t2 (sb-thread:join-thread thread1))
+           (t3 (sb-thread:join-thread thread2)))
+      (values (> t2 t1) (> t3 t1)))
+  t t)
+
+#-(or android win32)
+(deftest do-passwds.1
+    ;; Just check that we get something back.
+    (typep
+     (sb-posix:do-passwds (passwd)
+      (return passwd))
+     'sb-posix:passwd)
+  t)
+
 #-(or android win32)
 (deftest grent.1
   ;; make sure that we found something
@@ -600,6 +637,44 @@
                          nil)
       (t (cond) (declare (ignore cond)) t))
   nil)
+
+#-(or android win32 (not sb-thread))
+(deftest do-group-database/getgrnam/getgruid.concurrency
+    (let* (thread1 thread2
+           (group-name (let ((group (sb-posix:getgrgid 0)))
+                         (assert group) ;; see test grent.1
+                         (sb-posix:group-name group)))
+           (t1
+            (sb-posix:do-groups (group)
+              ;; Both the two following threads should wait
+              ;; for WITH-PASSWD-DATABASE to exit.
+              (setq
+               thread1
+               (sb-thread:make-thread
+                (lambda ()
+                  (sb-posix:getgrnam group-name)
+                  (get-universal-time)))
+               thread2
+               (sb-thread:make-thread
+                (lambda ()
+                  (sb-posix:getgrgid 0)
+                  (get-universal-time))))
+              (let ((ut (get-universal-time)))
+                (sleep 1.1)
+                (return ut))))
+           (t2 (sb-thread:join-thread thread1))
+           (t3 (sb-thread:join-thread thread2)))
+      (values (> t2 t1) (> t3 t1)))
+  t t)
+
+#-(or android win32)
+(deftest do-groups.1
+    ;; Just check that we get something back.
+    (typep
+     (sb-posix:do-groups (group)
+      (return group))
+     'sb-posix:group)
+  t)
 
 #+nil
 ;; Requires root or special group + plus a sensible thing on the port
@@ -687,23 +762,25 @@
   ;; The error tests are in the order of exposition from SUSv3.
   #-freebsd
   (deftest readlink.error.1
-      (let* ((subdir-pathname (merge-pathnames
-                               (make-pathname
-                                :directory '(:relative "readlink.error.1"))
-                               *test-directory*))
-             (link-pathname (make-pathname :name "readlink.error.1"
-                                           :defaults subdir-pathname)))
-        (sb-posix:mkdir subdir-pathname #o777)
-        (sb-posix:symlink "/" link-pathname)
-        (sb-posix:chmod subdir-pathname 0)
-        (unwind-protect
-             (handler-case (sb-posix:readlink link-pathname)
-               (sb-posix:syscall-error (c)
-                 (sb-posix:syscall-errno c)))
-          (ignore-errors
-           (sb-posix:chmod subdir-pathname #o777)
-           (sb-posix:unlink link-pathname)
-           (sb-posix:rmdir subdir-pathname))))
+    (if (zerop (sb-posix:getuid))
+        sb-posix:eacces
+        (let* ((subdir-pathname (merge-pathnames
+                                 (make-pathname
+                                  :directory '(:relative "readlink.error.1"))
+                                 *test-directory*))
+               (link-pathname (make-pathname :name "readlink.error.1"
+                                             :defaults subdir-pathname)))
+          (sb-posix:mkdir subdir-pathname #o777)
+          (sb-posix:symlink "/" link-pathname)
+          (sb-posix:chmod subdir-pathname 0)
+          (unwind-protect
+               (handler-case (sb-posix:readlink link-pathname)
+                 (sb-posix:syscall-error (c)
+                   (sb-posix:syscall-errno c)))
+            (ignore-errors
+             (sb-posix:chmod subdir-pathname #o777)
+             (sb-posix:unlink link-pathname)
+             (sb-posix:rmdir subdir-pathname)))))
     #.sb-posix:eacces)
   (deftest readlink.error.2
       (let* ((non-link-pathname (make-pathname :name "readlink.error.2"

@@ -14,7 +14,6 @@
 ;;; We need to define these predicates, since the TYPEP source
 ;;; transform picks whichever predicate was defined last when there
 ;;; are multiple predicates for equivalent types.
-(define-source-transform short-float-p (x) `(single-float-p ,x))
 #-long-float
 (define-source-transform long-float-p (x) `(double-float-p ,x))
 
@@ -108,7 +107,7 @@
          (class-eq (and name
                         (eq (classoid-state classoid) :sealed)
                         (not (classoid-subclasses classoid))))
-         (dd (and class-eq (wrapper-info layout)))
+         (dd (and class-eq (layout-info layout)))
          (dd-copier (and dd (sb-kernel::dd-copier-name dd)))
          (max-inlined-words 5))
     (unless (and result ; could be unused result (but entire call wasn't flushed?)
@@ -121,7 +120,7 @@
 
                  ;; Definitely do this if copying to stack
                  ;; (Allocation has to be inlined, otherwise there's no way to DX it)
-                 (or (lvar-dynamic-extent result)
+                 (or (node-stack-allocate-p node)
                      (and dd-copier
                           (eq (sb-int:info :function :inlinep dd-copier) 'inline))
                      ;; Or if it's a small fixed number of words
@@ -165,7 +164,7 @@
              (not (varying-length-struct-p classoid))
              ;; TODO: if sealed with subclasses which add no slots, use the fixed length
              (not (classoid-subclasses classoid)))
-        (dd-length (wrapper-dd (sb-kernel::compiler-layout-or-lose (classoid-name classoid))))
+        (dd-length (layout-dd (sb-kernel::compiler-layout-or-lose (classoid-name classoid))))
         (give-up-ir1-transform))))
 
 ;;; This doesn't help a whole lot, but it does fire during compilation of 'info-vector'
@@ -177,21 +176,16 @@
      (%instance-set .instance. .index. .newval.)
      .newval.))
 
-(define-source-transform %instance-wrapper (x) `(layout-friend (%instance-layout ,x)))
-(define-source-transform %fun-wrapper (x) `(layout-friend (%fun-layout ,x)))
-
-;;; *** These transforms should be the only code, aside from the C runtime
-;;;     with knowledge of the layout index.
 #+compact-instance-header
 (define-source-transform function-with-layout-p (x) `(functionp ,x))
 #-compact-instance-header
 (progn
+  (define-source-transform function-with-layout-p (x) `(funcallable-instance-p ,x))
+  ;; Nothing but these transforms should assume that slot 0 holds a layout
   (define-source-transform %instance-layout (x)
-    `(truly-the sb-vm:layout (%instance-ref ,x 0)))
+    `(truly-the layout (%instance-ref ,x 0)))
   (define-source-transform %set-instance-layout (instance layout)
-    `(%instance-set ,instance 0 (the sb-vm:layout ,layout)))
-  (define-source-transform function-with-layout-p (x)
-    `(funcallable-instance-p ,x)))
+    `(%instance-set ,instance 0 (the layout ,layout))))
 
 ;;;; simplifying HAIRY-DATA-VECTOR-REF and HAIRY-DATA-VECTOR-SET
 
@@ -312,20 +306,24 @@
          (element-ctype (array-type-upgraded-element-type type))
          (declared-element-ctype (declared-array-element-type type)))
     (declare (type ctype element-ctype))
-    (when (eq *wild-type* element-ctype)
-      (give-up-ir1-transform
-       "Upgraded element type of array is not known at compile time."))
-    (let ((element-type-specifier (type-specifier element-ctype)))
-      `(multiple-value-bind (array index)
-           (%data-vector-and-index array index)
-         (declare (type (simple-array ,element-type-specifier 1) array)
-                  (type ,element-type-specifier new-value))
-         ,(if (type= element-ctype declared-element-ctype)
-              '(progn (data-vector-set array index new-value)
-                      new-value)
-              `(progn (data-vector-set array index
-                       ,(the-unwild declared-element-ctype 'new-value))
-                      ,(truly-the-unwild declared-element-ctype 'new-value)))))))
+    (cond ((eq *wild-type* element-ctype)
+           ;; The new value is only suitable for a simple-vector
+           (if (csubtypep (lvar-type new-value) (specifier-type '(not (or number character))))
+               `(hairy-data-vector-set (the simple-vector array) index new-value)
+               (give-up-ir1-transform
+                "Upgraded element type of array is not known at compile time.")))
+          (t
+           (let ((element-type-specifier (type-specifier element-ctype)))
+             `(multiple-value-bind (array index)
+                  (%data-vector-and-index array index)
+                (declare (type (simple-array ,element-type-specifier 1) array)
+                         (type ,element-type-specifier new-value))
+                ,(if (type= element-ctype declared-element-ctype)
+                     '(progn (data-vector-set array index new-value)
+                       new-value)
+                     `(progn (data-vector-set array index
+                                              ,(the-unwild declared-element-ctype 'new-value))
+                             ,(truly-the-unwild declared-element-ctype 'new-value)))))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.
@@ -546,49 +544,6 @@
           (if (zerop (lvar-value item)) '(- length count) 'count)
           '(if (zerop item) (- length count) count))))
 
-;;; This transform does not require that ITEM be derived as BIT,
-;;; but at runtime it has to be.
-(deftransform fill ((sequence item) (simple-bit-vector t) *
-                    :policy (>= speed space))
-  `(let ((value (logand (- (the bit item)) most-positive-word)))
-     ;; Unlike for the SIMPLE-BASE-STRING case, we are allowed to touch
-     ;; bits beyond LENGTH with impunity.
-     (dotimes (index (ceiling (vector-length sequence) sb-vm:n-word-bits))
-       (declare (optimize (speed 3) (safety 0))
-                (type index index))
-       (setf (%vector-raw-bits sequence index) value))
-     sequence))
-
-(deftransform fill ((sequence item) (simple-base-string t) *
-                                    :policy (>= speed space))
-  (let ((multiplier (logand #x0101010101010101 most-positive-word)))
-    `(let* ((value ,(if (and (constant-lvar-p item)
-                             (typep (lvar-value item) 'base-char))
-                        (* multiplier (char-code (lvar-value item)))
-                        ;; Use multiplication if it's known to be cheap
-                        #+(or x86 x86-64)
-                        `(* ,multiplier (char-code (the base-char item)))
-                        #-(or x86 x86-64)
-                        '(let ((code (char-code (the base-char item))))
-                          (setf code (dpb code (byte 8 8) code))
-                          (setf code (dpb code (byte 16 16) code))
-                          #+64-bit (dpb code (byte 32 32) code))))
-            (len (vector-length sequence))
-            (words (truncate len sb-vm:n-word-bytes)))
-       (dotimes (index words)
-         (declare (optimize (speed 3) (safety 0))
-                  (type index index))
-         (setf (%vector-raw-bits sequence index) value))
-       ;; For 64-bit:
-       ;;  if 1 more byte should be written, then shift-towards-start 56
-       ;;  if 2 more bytes ...               then shift-towards-start 48
-       ;;  etc
-       ;; This correctly rewrites the trailing null in its proper place.
-       (let ((bits (ash (mod len sb-vm:n-word-bytes) 3)))
-         (when (plusp bits)
-           (setf (%vector-raw-bits sequence words)
-                 (shift-towards-start value (- bits)))))
-       sequence)))
 
 ;;;; %BYTE-BLT
 
@@ -599,7 +554,7 @@
 ;;; currently (ca. sbcl-0.6.12.30) the main interface for code in
 ;;; SB-KERNEL and SB-SYS (e.g. i/o code). It's not clear that it's the
 ;;; ideal interface, though, and it probably deserves some thought.
-(deftransform %byte-blt ((src src-start dst dst-start dst-end)
+(deftransform %byte-blt ((src src-start dst dst-start nbytes)
                          ((or (simple-unboxed-array (*)) system-area-pointer)
                           index
                           (or (simple-unboxed-array (*)) system-area-pointer)
@@ -633,19 +588,21 @@
               (sap-ref-8 dst (1- dst-end)) (sap-ref-8 dst (1- dst-end))))
       (memmove (sap+ (sapify dst) dst-start)
                (sap+ (sapify src) src-start)
-               (- dst-end dst-start)))
+               nbytes))
      (values)))
 
 ;;;; transforms for EQL of floating point values
 (unless (vop-existsp :named sb-vm::eql/single-float)
-(deftransform eql ((x y) (single-float single-float))
-  '(= (single-float-bits x) (single-float-bits y))))
+(deftransform eql ((x y) (single-float single-float) * :node node)
+  (delay-ir1-transform node :ir1-phases)
+  '(eql (single-float-bits x) (single-float-bits y))))
 
 (unless (vop-existsp :named sb-vm::eql/double-float)
-(deftransform eql ((x y) (double-float double-float))
-  #-64-bit '(and (= (double-float-low-bits x) (double-float-low-bits y))
-                  (= (double-float-high-bits x) (double-float-high-bits y)))
-  #+64-bit '(= (double-float-bits x) (double-float-bits y))))
+(deftransform eql ((x y) (double-float double-float) * :node node)
+  (delay-ir1-transform node :ir1-phases)
+  #-64-bit '(and (eql (double-float-low-bits x) (double-float-low-bits y))
+             (eql (double-float-high-bits x) (double-float-high-bits y)))
+  #+64-bit '(eql (double-float-bits x) (double-float-bits y))))
 
 
 ;;;; modular functions
@@ -669,7 +626,7 @@
                      (push `(define-good-modular-fun ,fun :untagged t) result)
                      (push `(define-good-modular-fun ,fun :tagged t) result))))))
   (define-good-signed-modular-funs
-      logand logandc1 logandc2 logeqv logior lognand lognor lognot
+      logand logandc2 logeqv logior lognand lognor lognot
       logorc1 logorc2 logxor))
 
 ;;;; word-wise logical operations
@@ -705,7 +662,7 @@
   `(logand (logorc2 x y) ,most-positive-word))
 
 (deftransform word-logical-andc1 ((x y))
-  `(logand (logandc1 x y) ,most-positive-word))
+  `(logand (logandc2 y x) ,most-positive-word))
 
 (deftransform word-logical-andc2 ((x y))
   `(logand (logandc2 x y) ,most-positive-word))

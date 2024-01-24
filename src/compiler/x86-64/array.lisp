@@ -150,6 +150,11 @@
              (inst cmp :word (ea temp) c))))
     OUT))
 
+
+(defun power-of-two-limit-p (x)
+  (and (fixnump x)
+       (= (logcount (1+ x)) 1)))
+
 ;;;; bounds checking routine
 (defun emit-bounds-check (vop %test-fixnum array index limit)
   (let*  ((use-length-p (null limit))
@@ -319,7 +324,8 @@
 ;;; variants which affect an entire lispword-sized value.
 ;;; Toplevel macro for ease of viewing the expansion.
 (defmacro define-full-setter+addend (name type offset lowtag scs el-type)
-  `(progn
+  (let ((scs (adjoin 'immediate scs)))
+   `(progn
      (define-vop (,name dvset)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg signed-reg unsigned-reg))
@@ -339,7 +345,8 @@
                            object index (index-scale n-word-bytes index))))
            ,@(when (eq type 'simple-vector)
                '((emit-gengc-barrier object ea val-temp (vop-nth-arg 2 vop) value)))
-           (emit-store ea value val-temp))))
+           (emit-store ea value val-temp
+                       ,(not (intersection '(signed-reg unsigned-reg) scs))))))
      (define-vop (,(symbolicate name "-C") dvset)
        (:args (object :scs (descriptor-reg))
               (value :scs ,scs))
@@ -359,7 +366,8 @@
          (let ((ea (ea (- (* (+ ,offset index addend) n-word-bytes) ,lowtag) object)))
            ,@(when (eq type 'simple-vector)
                '((emit-gengc-barrier object ea val-temp (vop-nth-arg 1 vop) value)))
-           (emit-store ea value val-temp))))))
+           (emit-store ea value val-temp
+                       ,(not (intersection '(signed-reg unsigned-reg) scs)))))))))
 (defmacro def-full-data-vector-frobs (type element-type &rest scs)
   `(progn
      (define-full-reffer+addend ,(symbolicate "DATA-VECTOR-REF-WITH-OFFSET/" type)
@@ -456,15 +464,10 @@
      (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))
 
 (defun emit-sbit-op (inst bv index &optional word temp)
-  (cond ((integerp index)
-         (multiple-value-bind (dword-index bit) (floor index 32)
+  (cond ((sc-is index immediate)
+         (multiple-value-bind (dword-index bit) (floor (tn-value index) 32)
            (let ((disp (bit-base dword-index)))
-             (cond ((typep disp '(signed-byte 32))
-                    (inst* inst :dword (ea disp bv) bit))
-                   (t                   ; excessive index, really?
-                    (aver temp)
-                    (inst mov temp index)
-                    (inst* inst (ea (bit-base 0) bv) temp))))))
+             (inst* inst :dword (ea disp bv) bit))))
         (t
          ;; mem/reg BT[SR] are really slow.
          (inst mov word index)
@@ -481,7 +484,8 @@
   ;; Arg order is (VECTOR INDEX ADDEND VALUE)
   (:arg-types simple-bit-vector positive-fixnum (:constant (eql 0)) positive-fixnum)
   (:args (bv :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
+         (index :scs (unsigned-reg (immediate
+                                    (typep (bit-base (floor (tn-value tn) 32)) '(signed-byte 32)))))
          (value :scs (immediate any-reg signed-reg unsigned-reg control-stack
                                 signed-stack unsigned-stack)))
   (:temporary (:sc unsigned-reg) word temp)
@@ -489,47 +493,32 @@
   (:ignore addend)
   (:generator 6
     (unpoison-element bv index)
-    (if (sc-is value immediate)
-        (ecase (tn-value value)
-          (1 (emit-sbit-op 'bts bv index word temp))
-          (0 (emit-sbit-op 'btr bv index word temp)))
-        (emit-sbit-op (lambda ()
-                        (assemble ()
-                          (inst test :byte value
-                                (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
-                          (inst jmp :z ZERO)
-                          (inst bts temp index)
-                          (inst jmp OUT)
-                          ZERO
-                          (inst btr temp index)
-                          OUT))
-                      bv index word temp))))
-
-(define-vop (data-vector-set-with-offset/simple-bit-vector/c-index)
-  (:translate data-vector-set-with-offset)
-  (:policy :fast-safe)
-  ;; Arg order is (VECTOR INDEX ADDEND VALUE)
-  (:arg-types simple-bit-vector (:constant fixnum) (:constant (eql 0)) positive-fixnum)
-  (:args (bv :scs (descriptor-reg))
-         (value :scs (immediate any-reg signed-reg unsigned-reg control-stack
-                                signed-stack unsigned-stack)))
-  (:info index addend)
-  (:ignore addend)
-  (:generator 5
-    (unpoison-element bv index)
-    (when (sc-is value immediate)
-      (ecase (tn-value value)
-        (1 (emit-sbit-op 'bts bv index))
-        (0 (emit-sbit-op 'btr bv index)))
-      (return-from data-vector-set-with-offset/simple-bit-vector/c-index))
-    (inst test :byte value
-          (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
-    (inst jmp :z ZERO)
-    (emit-sbit-op 'bts bv index)
-    (inst jmp OUT)
-    ZERO
-    (emit-sbit-op 'btr bv index)
-    OUT))
+    (cond ((sc-is value immediate)
+           (ecase (tn-value value)
+             (1 (emit-sbit-op 'bts bv index word temp))
+             (0 (emit-sbit-op 'btr bv index word temp))))
+          ((sc-is index immediate)
+           (assemble ()
+             (inst test :byte value
+                   (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
+             (inst jmp :z ZERO)
+             (emit-sbit-op 'bts bv index)
+             (inst jmp OUT)
+             ZERO
+             (emit-sbit-op 'btr bv index)
+             OUT))
+          (t
+           (emit-sbit-op (lambda ()
+                           (assemble ()
+                             (inst test :byte value
+                                   (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
+                             (inst jmp :z ZERO)
+                             (inst bts temp index)
+                             (inst jmp OUT)
+                             ZERO
+                             (inst btr temp index)
+                             OUT))
+                         bv index word temp)))))
 
 (define-vop (data-vector-ref-with-offset/simple-bit-vector-c dvref)
   (:args (object :scs (descriptor-reg)))
@@ -1010,11 +999,10 @@
            (:results (value :scs ,scs))
            (:result-types ,type)
            (:generator 4 (inst ,mov-inst ',opcode-modifier value ,ea-expr-const)))
-         ;; FIXME: these all need to accept immediate SC for the value
          (define-vop (,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype) dvset)
            (:args (object :scs (descriptor-reg) :to (:eval 0))
                   (index :scs ,index-scs :to (:eval 0))
-                  (value :scs ,scs))
+                  (value :scs (,@scs immediate)))
            (:info addend)
            (:arg-types ,ptype tagged-num
                        (:constant (constant-displacement other-pointer-lowtag
@@ -1022,10 +1010,10 @@
                        ,type)
            (:generator 5
             (unpoison-element object index addend)
-            (inst mov ,operand-size ,ea-expr value)))
+            (inst mov ,operand-size ,ea-expr (encode-value-if-immediate value nil))))
          (define-vop (,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype "-C") dvset)
            (:args (object :scs (descriptor-reg) :to (:eval 0))
-                  (value :scs ,scs))
+                  (value :scs (,@scs immediate)))
            (:info index addend)
            (:arg-types ,ptype (:constant low-index)
                        (:constant (constant-displacement other-pointer-lowtag
@@ -1033,7 +1021,7 @@
                        ,type)
            (:generator 4
             (unpoison-element object (+ index addend))
-            (inst mov ,operand-size ,ea-expr-const value)))))))
+            (inst mov ,operand-size ,ea-expr-const (encode-value-if-immediate value nil))))))))
   (define-data-vector-frobs simple-array-unsigned-byte-7 movzx :byte
     positive-fixnum unsigned-reg signed-reg)
   (define-data-vector-frobs simple-array-unsigned-byte-8 movzx :byte
@@ -1065,6 +1053,12 @@
   (unsigned-reg) unsigned-num %vector-raw-bits)
 (define-full-setter set-vector-raw-bits * vector-data-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num %set-vector-raw-bits)
+
+;;; Weak vectors
+(define-full-reffer %weakvec-ref * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-ref)
+(define-full-setter %weakvec-set * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-set)
 
 ;;;; ATOMIC-INCF for arrays
 

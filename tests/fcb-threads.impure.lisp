@@ -125,11 +125,6 @@
       (setq *keepon* nil)
       (sb-thread:barrier (:write))
       (let ((stop (get-internal-real-time)))
-        #+darwin
-        (with-alien ((count int :extern "sigwait_bug_mitigation_count"))
-          (when (plusp count)
-            (format t "Bug mitigation strategy applied ~D time~:P~%" count)
-            (setf count 0)))
         (sb-thread:join-thread watchdog-thread)
         (when gc-thr
           (sb-thread:join-thread gc-thr)
@@ -171,28 +166,30 @@
 (defun tryjoiner ()
   (setq *my-foreign-thread* nil)
   (sb-int:dx-let ((pthread (make-array 1 :element-type 'sb-vm:word)))
-    (alien-funcall
-     (extern-alien "pthread_create"
-                   (function int system-area-pointer unsigned
-                             system-area-pointer unsigned))
-     (sb-sys:vector-sap pthread) 0 (alien-sap (alien-callable-function 'tryjointhis)) 0)
-    (format t "Alien pthread is ~x~%" (aref pthread 0))
-    (let (found)
-      (loop
-        (setq found *my-foreign-thread*)
-        (when found (return))
-        (sleep .05))
-      (format t "Got ~s~%" found)
-      (let ((result (handler-case (sb-thread:join-thread found)
-                      (sb-thread:join-thread-error () 'ok))))
-        (when (eq result 'ok)
-          ;; actually join it to avoid resource leak
-          (alien-funcall
-           (extern-alien "pthread_join" (function int unsigned unsigned))
-           (aref pthread 0)
-           0))
-        (format t "Pthread joined ~s~%" found)
-        result))))
+    (sb-sys:with-pinned-objects (pthread)
+      (alien-funcall
+       (extern-alien "pthread_create"
+                     (function int system-area-pointer unsigned
+                               system-area-pointer unsigned))
+       (sb-sys:vector-sap pthread) 0 (alien-sap (alien-callable-function 'tryjointhis)) 0)
+      (format t "Alien pthread is ~x~%" (aref pthread 0))
+      (let (found)
+        (loop
+         (setq found *my-foreign-thread*)
+         (when found (return))
+         (sleep .05))
+        (format t "Got ~s~%" found)
+        (let ((result (handler-case (sb-thread:join-thread found)
+                        (sb-thread:join-thread-error () 'ok))))
+          (when (eq result 'ok)
+            ;; actually join it to avoid resource leak
+            (assert (zerop
+                     (alien-funcall
+                      (extern-alien "pthread_join" (function int unsigned unsigned))
+                      (aref pthread 0)
+                      0))))
+          (format t "Pthread joined ~s~%" found)
+          result)))))
 
 (with-test (:name :try-join-foreign-thread)
   (assert (eq (tryjoiner) 'ok)))

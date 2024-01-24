@@ -94,6 +94,12 @@
           (t (delay-ir1-transform node :constraint)
              `(sb-pcl::accessor-slot-makunbound object ',(lvar-value slot-name)))))
 
+  ;; this transform is tried LAST because we like to make things unintuitive
+  (deftransform slot-value ((object slot-name) (structure-object symbol) *
+                            ;; safety 3 should check slot-unbound on structures
+                            :policy (< safety 3))
+    `(sb-pcl::structure-slot-value object slot-name))
+
   (deftransform slot-value ((object slot-name) (t (constant-arg symbol)) *
                             :node node)
     (acond ((always-bound-struct-accessor-p object slot-name)

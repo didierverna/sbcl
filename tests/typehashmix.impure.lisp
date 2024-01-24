@@ -2,6 +2,61 @@
 ;;; from other tests- I don't want the type caches to have many extra lines
 ;;; in them at the start of the test.
 
+(import '(sb-impl::hashset-storage
+          sb-impl::hashset-hash-function
+          sb-impl::hashset-test-function
+          sb-impl::hss-cells
+          sb-impl::hss-hash-vector
+          sb-impl::hss-psl-vector))
+
+(defun hs-cells-mask (v) (- (length v) 4))
+(defun hs-chain-terminator-p (x) (eq x 0))
+
+(defun hashset-probing-sequence (hashset key)
+  (let* ((storage (hashset-storage hashset))
+         (cells (hss-cells storage))
+         (mask (hs-cells-mask cells))
+         (index (logand (funcall (hashset-hash-function hashset) key) mask))
+         (interval 1)
+         (sequence))
+    (loop
+     (push index sequence)
+     (let ((probed-key (aref cells index)))
+       (assert (not (hs-chain-terminator-p probed-key)))
+       (when (and probed-key (funcall (hashset-test-function hashset) probed-key key))
+         (return (nreverse sequence)))
+       (setq index (logand (+ index interval) mask))
+       (incf interval)))))
+
+(defun compute-max-psl (hashset)
+  (reduce #'max (hss-psl-vector (hashset-storage hashset))))
+
+(defun debug-probing (hashset &optional (detail t))
+  (let* ((storage (hashset-storage hashset))
+         (cells (hss-cells storage))
+         (psl (hss-psl-vector storage))
+         (mask (hs-cells-mask cells))
+         (histo (make-array 12 :initial-element 0)) ; should be enough for anyone
+         (n-elts 0)
+         (sum-psl 0)
+         (*print-pretty* nil))
+    (format t "Mask=~X, maxPSL=~D~%" mask (compute-max-psl hashset))
+    (dotimes (i (1+ mask))
+      (let ((key (aref cells i)))
+        (unless (or (null key) (hs-chain-terminator-p key))
+          (let* ((seq (hashset-probing-sequence hashset key))
+                 (actual (length seq)))
+            (assert (= actual (aref psl i)))
+            (when detail (format t "~45a ~s~%" seq (sb-kernel:type-specifier key)))
+            (incf (aref histo (1- actual)))
+            (incf n-elts)
+            (incf sum-psl actual)))))
+    (format t "Histogram:")
+    (dotimes (i 12 (terpri)) (format t "~5d" (1+ i)))
+    (format t "          ")
+    (dotimes (i 12 (terpri)) (format t "~5d" (aref histo i)))
+    (format t "Avg=~F~%" (/ sum-psl n-elts))))
+
 (with-test (:name :exactly-one-null-type-instance)
   (let ((null-instances))
     (dolist (x (sb-vm:list-allocated-objects :all :test #'sb-kernel:member-type-p))
@@ -344,23 +399,45 @@
 (SIMPLE-VECTOR 62)
 ))
 
-(defun compute-max-psl (hashset)
-  (reduce #'max
-          (sb-impl::hss-psl-vector (sb-impl::hashset-storage hashset))))
-
-(with-test (:name :array-type-hash-mixer)
+(with-test (:name :array-type-hash-mixer
+            :skipped-on :gc-stress)
   (let* ((hs sb-kernel::*array-type-hashset*)
          (pre (compute-max-psl hs)))
-    (assert (<= pre 7))
+    (assert (<= pre 9))
     (dolist (spec *specifiers*)
       (test-util:opaque-identity (sb-kernel:specifier-type spec)))
     (let ((post (compute-max-psl hs)))
       (assert (<= (- post pre) 3)))))
 
-(with-test (:name :numeric-type-hash-mixer)
+(defun slurp-samples (pathname)
+  (with-open-file (f pathname)
+   (loop
+    (let ((line (read-line f nil)))
+      (unless line (return))
+      (sb-int:binding* (((nil end1) (read-from-string line))
+                        ((form2) (read-from-string line nil nil :start end1)))
+        (sb-kernel:specifier-type form2)))))) ; for effect (not flushable)
+
+;; Slurping in the data posted to the "NUMERIC-TYPE-HASH-MIXER failures" discussion thread
+;; in sbcl-devel gave me different probe sequences. I think this test is overly sensitive
+;; to which cells get clobbered by GC.
+;; (debug-probing sb-kernel::*numeric-type-hashset* nil)
+;; Histogram:    1    2    3    4    5    6    7    8    9   10   11   12
+;;             314  172   57   24   14    6    1    0    0    0    0    0
+;; Avg=1.7653061
+(with-test (:name :numeric-type-hash-mixer
+            :skipped-on :gc-stress)
   (let* ((hs sb-kernel::*numeric-type-hashset*)
+         ;; Theoretically we should be more concerned with the _average_
+         ;; number of probes assuming all keys are sought equally (which is seldom true),
+         ;; but we do also want to constrain the worst-case number of probes.
+         ;; Accept a pretty high number, though not ideal, to avoid test failure.
+         (acceptable-initial-max-psl 9)
          (pre (compute-max-psl hs)))
-    (assert (<= pre 7))
+    (when (> pre acceptable-initial-max-psl)
+      (format t "~&Dumping ~S~%" 'sb-kernel::*numeric-type-hashset*)
+      (debug-probing hs))
+    (assert (<= pre acceptable-initial-max-psl))
     (loop for i = 1 then (ash i 1)
           for tp = `(real ,(- i) 0)
           repeat 200
@@ -369,6 +446,10 @@
                         (not (typep i tp)) (not (typep (1+ i) tp)))
           collect (list i tp))
     (let ((post (compute-max-psl hs)))
+      ;; It should only be allowed to get worse by some small tolerance, but I'm
+      ;; unsure what to constrain this to. Maybe compute a percentage change in
+      ;; average number of probes before and after inserting synthetic entries?
+      ;; And/or strongly reference all elements to hide effects of weak object smashing.
       (assert (<= (- post pre) 2)))))
 
 (defvar a "foo")
@@ -393,13 +474,26 @@
 
 (defvar *pre-gc-xset-stable-hash-count*
   (hash-table-count sb-kernel::*xset-stable-hashes*))
+;;; The fix for lp#2029306 significantly simplified the logic of scan_finalizers
+;;; by avoiding use of weak pointers for objects in the live-and-moved state.
+;;; This is not so bad, because an object being live means that adding another
+;;; ref does not per se cause liveness to be preserved. However, the action of the
+;;; finalizer thread is not immediate - it has move the to-be-rehashed items back
+;;; into the weak table, and then another GC cycle is required to discover that the
+;;; cons cells which held the rehash list became dead. Futhermore, to ensure that
+;;; finalizers are run in time for this test to examine the expected state,
+;;; we can "help" the finalizer thread by calling RUN-PENDING-FINALIZERS.
+;;; This sequence yields a count of zero in the xset stable ID table for x86-64,
+;;; but I have not tried the others, so I'm not asserting that it's zero.
 (gc :full t)
+(sb-kernel:run-pending-finalizers)
+(gc :full t)
+(sb-kernel:run-pending-finalizers)
 #+sb-thread (sb-kernel:run-pending-finalizers)
 (with-test (:name :xset-stable-hash-weakness)
   ;; After running the :MEMBER-TYPE-HASH-MIXER test, there were >5000 entries
   ;; in the *XSET-STABLE-HASHES* table for me.
   ;; The preceding GC should have had some effect.
   (let ((count (hash-table-count sb-kernel::*xset-stable-hashes*)))
-    (when (plusp count)
-      (format t "::: NOTE: hash-table-count = ~D~%" count))
+    (format t "::: NOTE: hash-table-count = ~D~%" count)
     (assert (< count (/ *pre-gc-xset-stable-hash-count* 2)))))

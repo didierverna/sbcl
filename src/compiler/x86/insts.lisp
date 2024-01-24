@@ -761,7 +761,7 @@
            (emit-absolute-fixup segment src)
            (emit-imm-operand segment src size))))))
 
-(defun emit-move-with-extension (segment dst src opcode)
+(flet ((emit* (segment dst src opcode)
   (aver (register-p dst))
   (let ((dst-size (operand-size dst))
         (src-size (operand-size src)))
@@ -782,19 +782,19 @@
          (:word
           (emit-byte segment #b00001111)
           (emit-byte segment (logior opcode 1))
-          (emit-ea segment src (reg-tn-encoding dst))))))))
+          (emit-ea segment src (reg-tn-encoding dst)))))))))
 
 (define-instruction movsx (segment dst src)
   (:printer ext-reg-reg/mem ((op #b1011111)
                              (reg nil :type 'word-reg)
                              (reg/mem nil :type 'sized-reg/mem)))
-  (:emitter (emit-move-with-extension segment dst src #b10111110)))
+  (:emitter (emit* segment dst src #b10111110)))
 
 (define-instruction movzx (segment dst src)
   (:printer ext-reg-reg/mem ((op #b1011011)
                              (reg nil :type 'word-reg)
                              (reg/mem nil :type 'sized-reg/mem)))
-  (:emitter (emit-move-with-extension segment dst src #b10110110)))
+  (:emitter (emit* segment dst src #b10110110))))
 
 (define-instruction push (segment src &optional prefix)
   ;; register
@@ -2435,7 +2435,7 @@
          (setf (sap-ref-32 sap offset) rel-val)))))
   nil)
 
-(defun sb-c::pack-retained-fixups (fixup-notes)
+(defun sb-fasl::pack-fixups-for-reapplication (fixup-notes)
   (let (abs-fixups rel-fixups imm-fixups)
     (dolist (note fixup-notes)
       (let* ((fixup (fixup-note-fixup note))

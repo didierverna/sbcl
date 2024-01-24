@@ -214,6 +214,17 @@
          (compiler-warn "~(~a~) ~s where a function is expected" kind name)))
       (let ((ftype (global-ftype name))
             (notinline (fun-lexically-notinline-p name)))
+        #-sb-xc-host
+        (when (and (eq where :declared)
+                   (policy *lexenv* (and (>= safety 1)
+                                         (= debug 3)))
+                   (not (or
+                         (info :function :info name)
+                         (let ((name (if (consp name)
+                                         (second name)
+                                         name)))
+                           (system-package-p (symbol-package name))))))
+          (setf where :declared-verify))
         (make-global-var
          :kind :global-function
          :%source-name name
@@ -337,7 +348,7 @@
       (cl:typep obj 'debug-name-marker)
       ;; STANDARD-OBJECT layouts use MAKE-LOAD-FORM, but all other layouts
       ;; have the same status as symbols - composite objects but leaflike.
-      (and (typep obj 'wrapper) (not (layout-for-pcl-obj-p obj)))
+      (and (typep obj 'layout) (not (layout-for-pcl-obj-p obj)))
       ;; PACKAGEs are also leaflike.
       (cl:typep obj 'package)
       ;; The cross-compiler wants to dump CTYPE instances as leaves,
@@ -388,7 +399,7 @@
            ;; user-defined MAKE-LOAD-FORM methods?
            (when (emit-make-load-form value)
              #+sb-xc-host
-             (aver (eql (wrapper-bitmap (%instance-wrapper value))
+             (aver (eql (layout-bitmap (%instance-layout value))
                         sb-kernel:+layout-all-tagged+))
              (do-instance-tagged-slot (i value)
                (grovel (%instance-ref value i)))))
@@ -1070,15 +1081,13 @@
            (type (or lvar null) result)
            (list form)
            (type global-var var))
-  (if (vop-existsp :named sb-vm::move-conditional-result)
-      (ir1-convert-combination-checking-type start next result form var)
-      (let ((info (info :function :info (leaf-source-name var))))
-        (if (and info
-                 (ir1-attributep (fun-info-attributes info) predicate)
-                 (not (if-p (and result (lvar-dest result)))))
-            (let ((*instrument-if-for-code-coverage* nil))
-              (ir1-convert start next result `(if ,form t nil)))
-            (ir1-convert-combination-checking-type start next result form var)))))
+  (let ((info (info :function :info (leaf-source-name var))))
+    (if (and info
+             (ir1-attributep (fun-info-attributes info) predicate)
+             (not (if-p (and result (lvar-dest result)))))
+        (let ((*instrument-if-for-code-coverage* nil))
+          (ir1-convert start next result `(if ,form t nil)))
+        (ir1-convert-combination-checking-type start next result form var))))
 
 ;;; Actually really convert a global function call that we are allowed
 ;;; to early-bind.
@@ -1465,69 +1474,57 @@
   (values))
 
 (defvar *stack-allocate-dynamic-extent* t
-  "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
+  "If true (the default), the compiler believes DYNAMIC-EXTENT declarations
 and stack allocates otherwise inaccessible parts of the object whenever
-possible. Potentially long (over one page in size) vectors are, however, not
-stack allocated except in zero SAFETY code, as such a vector could overflow
-the stack without triggering overflow protection.")
+possible.")
 
-(defun process-extent-decl (names vars fvars kind)
-  (let ((extent
-          (ecase kind
-            ((dynamic-extent)
-             (when *stack-allocate-dynamic-extent*
-               kind))
-            ((truly-dynamic-extent)
-             kind))))
-    (if extent
-        (dolist (name names)
-          (cond
-            ((symbolp name)
-             (let* ((bound-var (find-in-bindings vars name))
-                    (var (or bound-var
-                             (lexenv-find name vars)
-                             (find-free-var name))))
-               (maybe-note-undefined-variable-reference var name)
-               (etypecase var
-                 (leaf
-                  (cond
-                    ((and (typep var 'global-var) (eq (global-var-kind var) :unknown)))
-                    (bound-var
-                     (if (and (leaf-dynamic-extent var)
-                              (neq extent (leaf-dynamic-extent var)))
-                         (warn "Multiple incompatible extent declarations for ~S?" name)
-                         (setf (leaf-dynamic-extent var) extent)))
-                    (t (compiler-notify "Ignoring free ~S declaration: ~S" kind name))))
-                 (cons
-                  (compiler-error "~S on symbol-macro: ~S" kind name))
-                 (heap-alien-info
-                  (compiler-error "~S on alien-variable: ~S" kind name)))))
-            ((and (consp name)
-                  (eq (car name) 'function)
-                  (null (cddr name))
-                  (valid-function-name-p (cadr name)))
-             (let* ((fname (cadr name))
-                    (bound-fun (find fname fvars
-                                     :key (lambda (x)
-                                            (unless (consp x) ;; macrolet
-                                              (leaf-source-name x)))
-                                     :test #'equal))
-                    (fun (or bound-fun (lexenv-find fname funs))))
-               (etypecase fun
-                 (leaf
-                  (if bound-fun
-                      (setf (leaf-dynamic-extent bound-fun) extent)
-                      (compiler-notify
-                       "Ignoring free DYNAMIC-EXTENT declaration: ~S" name)))
-                 (cons
-                  (compiler-error "DYNAMIC-EXTENT on macro: ~S" name))
-                 (null
-                  (compiler-style-warn
-                   "Unbound function declared DYNAMIC-EXTENT: ~S" name)))))
-            (t
-             (compiler-error "~S on a weird thing: ~S" kind name))))
-        (when (policy *lexenv* (= speed 3))
-          (compiler-notify "Ignoring DYNAMIC-EXTENT declarations: ~S" names)))))
+(defun process-dynamic-extent-decl (names vars fvars)
+  (if *stack-allocate-dynamic-extent*
+      (dolist (name names)
+        (cond
+          ((symbolp name)
+           (let* ((bound-var (find-in-bindings vars name))
+                  (var (or bound-var
+                           (lexenv-find name vars)
+                           (find-free-var name))))
+             (maybe-note-undefined-variable-reference var name)
+             (etypecase var
+               (leaf
+                (cond
+                  ((and (typep var 'global-var) (eq (global-var-kind var) :unknown)))
+                  (bound-var
+                   (setf (leaf-dynamic-extent var) t))
+                  (t (compiler-notify "Ignoring free DYNAMIC-EXTENT declaration: ~S" name))))
+               (cons
+                (compiler-error "DYNAMIC-EXTENT on symbol-macro: ~S" name))
+               (heap-alien-info
+                (compiler-error "DYNAMIC-EXTENT on alien-variable: ~S" name)))))
+          ((and (consp name)
+                (eq (car name) 'function)
+                (null (cddr name))
+                (valid-function-name-p (cadr name)))
+           (let* ((fname (cadr name))
+                  (bound-fun (find fname fvars
+                                   :key (lambda (x)
+                                          (unless (consp x) ;; macrolet
+                                            (leaf-source-name x)))
+                                   :test #'equal))
+                  (fun (or bound-fun (lexenv-find fname funs))))
+             (etypecase fun
+               (leaf
+                (if bound-fun
+                    (setf (leaf-dynamic-extent bound-fun) t)
+                    (compiler-notify
+                     "Ignoring free DYNAMIC-EXTENT declaration: ~S" name)))
+               (cons
+                (compiler-error "DYNAMIC-EXTENT on macro: ~S" name))
+               (null
+                (compiler-style-warn
+                 "Unbound function declared DYNAMIC-EXTENT: ~S" name)))))
+          (t
+           (compiler-error "DYNAMIC-EXTENT on a weird thing: ~S" name))))
+      (when (policy *lexenv* (= speed 3))
+        (compiler-notify "Ignoring DYNAMIC-EXTENT declarations: ~S" names))))
 
 ;;; FIXME: This is non-ANSI, so the default should be T, or it should
 ;;; go away, I think.
@@ -1585,8 +1582,8 @@ the stack without triggering overflow protection.")
          :default res
          :handled-conditions (process-unmuffle-conditions-decl
                               spec (lexenv-handled-conditions res))))
-       ((dynamic-extent truly-dynamic-extent)
-        (process-extent-decl (cdr spec) vars fvars (first spec))
+       ((dynamic-extent)
+        (process-dynamic-extent-decl (cdr spec) vars fvars)
         res)
        ((disable-package-locks enable-package-locks)
         (make-lexenv
@@ -1666,7 +1663,7 @@ the stack without triggering overflow protection.")
         (post-binding-lexenv (if binding-form-p (list nil)))) ; dummy cell
     (flet ((process-it (spec decl)
              (cond ((atom spec)
-                    (compiler-error "malformed declaration specifier ~S in ~S"
+                    (compiler-warn "malformed declaration specifier ~S in ~S"
                                     spec decl))
                    ((and (eq allow-lambda-list t)
                          (typep spec '(cons (eql lambda-list) (cons t null))))

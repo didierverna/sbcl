@@ -19,7 +19,7 @@
 #include <strings.h>
 #include <errno.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "os.h"
 #include "globals.h"
@@ -28,13 +28,10 @@
 #include "purify.h"
 #include "interr.h"
 #include "gc.h"
-#include "gc-internal.h"
-#include "gc-private.h"
 #include "thread.h"
 #include "genesis/gc-tables.h"
 #include "genesis/primitive-objects.h"
 #include "genesis/static-symbols.h"
-#include "genesis/layout.h"
 #include "genesis/defstruct-description.h"
 #include "genesis/hash-table.h"
 #include "code.h"
@@ -45,7 +42,7 @@
  * x86oids, which has now been removed. So this code can't even be
  * compiled with GENCGC any more.  -- JES, 2007-04-30.
  */
-#ifndef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_CHENEYGC
 
 #define PRINTNOISE
 
@@ -414,7 +411,7 @@ ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
       case SAP_WIDETAG:
           return ptrans_unboxed(thing, header);
       case RATIO_WIDETAG:
-      case COMPLEX_WIDETAG:
+      case COMPLEX_RATIONAL_WIDETAG:
       case SIMPLE_ARRAY_WIDETAG:
       case COMPLEX_BASE_STRING_WIDETAG:
 #ifdef COMPLEX_CHARACTER_STRING_WIDETAG
@@ -736,11 +733,11 @@ purify(lispobj static_roots, lispobj read_only_roots)
     //fclose(xlog);
     return 0;
 }
-#else /* LISP_FEATURE_GENCGC */
+#else // dummy stub
 int
 purify(lispobj __attribute__((unused)) static_roots,
        lispobj __attribute__((unused)) read_only_roots)
 {
     lose("purify called for GENCGC. This should not happen.");
 }
-#endif /* LISP_FEATURE_GENCGC */
+#endif /* LISP_FEATURE_GENERATIONAL */

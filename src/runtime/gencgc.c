@@ -27,7 +27,7 @@
 #include <errno.h>
 #include <string.h>
 #include <inttypes.h>
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "os.h"
 #include "interr.h"
@@ -37,75 +37,23 @@
 #include "lispregs.h"
 #include "arch.h"
 #include "gc.h"
-#include "gc-internal.h"
-#include "gc-private.h"
-#include "gencgc-private.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
-#include "alloc.h"
 #include "code.h"
 #include "genesis/gc-tables.h"
 #include "genesis/vector.h"
 #include "genesis/weak-pointer.h"
 #include "genesis/fdefn.h"
-#include "genesis/simple-fun.h"
-#include "save.h"
 #include "genesis/hash-table.h"
-#include "genesis/list-node.h"
 #include "genesis/instance.h"
-#include "genesis/layout.h"
 #include "hopscotch.h"
 #include "genesis/cons.h"
 #include "genesis/brothertree.h"
-#include "forwarding-ptr.h"
+#include "genesis/split-ordered-list.h"
 #include "var-io.h"
 
 /* forward declarations */
 extern FILE *gc_activitylog();
-
-
-/*
- * GC parameters
- */
-
-/* As usually configured, generations 0-5 are normal collected generations,
-   6 is pseudo-static (the objects in which are never moved nor reclaimed),
-   and 7 is scratch space used when collecting a generation without promotion,
-   wherein it is moved to generation 7 and back again.
- */
-/*
- * SCRATCH_GENERATION as we've defined it is kinda stupid because "<"
- * doesn't do what you want. Other choices of value do, and since this an
- * enum, it should be possible to change. Except it isn't because .. reasons.
- * Here are some alternatives:
- *  A: gen 0 through 6 remain as-is and SCRATCH becomes -1
- *
- *  B: 1 = nursery, 2 = older, ... up through "old" 6 which becomes the new 7;
- *     and SCRATCH becomes 0. This is like alternative (A) but avoids negatives.
- *
- *  C: (probably the best)
- *  generations are stored with an implied decimal and one bit of fraction
- *  representing a half step so that:
- *     #b0000 = 0, #b0001 = 1/2   | #b0010 = 1, #b0011 = 1 1/2
- *     #b0100 = 2, #b0101 = 2 1/2 | #b0110 = 3, #b0111 = 3 1/2 ...
- *  up to 6 1/2. When GCing without promotion, we'd raise each object by half
- *  a generation, and then demote en masse, which is good because it makes the
- *  scratch pages older than from_space but younger than the youngest root gen.
- *
- * Of course, you could try to solve all this by keeping the existing numbering,
- * but expressing comparison "a < b" as either:
- *     "logical_gen(a) < logical_gen(b)" // re-map numerically before compare
- *  or "gen_lessp(a,b)" // just rename the comparator
- *
- * I generally prefer numeric comparison to just work, though we have a further
- * difficulty that page_table[page].gen is not always the generation of an object,
- * as when it is non-large and pinned. So the helpers might be needed anyway.
- */
-
-enum {
-    SCRATCH_GENERATION = PSEUDO_STATIC_GENERATION+1,
-    NUM_GENERATIONS
-};
 
 /* Largest allocation seen since last GC. */
 os_vm_size_t large_allocation = 0;
@@ -118,20 +66,8 @@ int n_gcs;
 
 /* the verbosity level. All non-error messages are disabled at level 0;
  * and only a few rare messages are printed at level 1. */
-boolean gencgc_verbose = 0;
+int gencgc_verbose = 0;
 
-/* FIXME: At some point enable the various error-checking things below
- * and see what they say. */
-
-/* We hunt for pointers to old-space, when GCing generations >= verify_gen.
- * Set verify_gens to HIGHEST_NORMAL_GENERATION + 2 to disable this kind of
- * check. */
-generation_index_t verify_gens = HIGHEST_NORMAL_GENERATION + 2;
-
-/* Should we do a pre-scan of the heap before it's GCed? */
-boolean pre_verify_gen_0 = 0; // FIXME: should be named 'pre_verify_gc'
-
-
 /*
  * GC structures and variables
  */
@@ -146,11 +82,11 @@ generation_index_t from_space;
 generation_index_t new_space;
 
 /* Set to 1 when in GC */
-boolean gc_active_p = 0;
+bool gc_active_p = 0;
 
 /* should the GC be conservative on stack. If false (only right before
  * saving a core), don't scan the stack / mark pages pinned. */
-static boolean conservative_stack = 1;
+bool conservative_stack = 1;
 int save_lisp_gc_iteration;
 
 /* An array of page structures is allocated on gc initialization.
@@ -160,30 +96,24 @@ page_index_t page_table_pages;
 struct page *page_table;
 unsigned char *gc_page_pins;
 unsigned char *gc_card_mark;
-lispobj gc_object_watcher;
-int gc_traceroot_criterion;
 // Filtered pins include code but not simple-funs,
 // and must not include invalid pointers.
-lispobj* gc_filtered_pins;
+static lispobj* gc_filtered_pins;
 static int pins_alloc_size;
-int gc_pin_count;
+static int gc_pin_count;
 struct hopscotch_table pinned_objects;
 
 /* This is always 0 except during gc_and_save() */
 lispobj lisp_init_function;
 
-static inline boolean page_free_p(page_index_t page) {
-    return (page_table[page].type == FREE_PAGE_FLAG);
-}
-
-static inline boolean boxed_type_p(int type) { return type > 1; }
-static inline boolean page_boxed_p(page_index_t page) {
+static inline bool boxed_type_p(int type) { return type > 1; }
+static inline bool page_boxed_p(page_index_t page) {
     // ignore SINGLE_OBJECT_FLAG and OPEN_REGION_PAGE_FLAG
     return boxed_type_p(page_table[page].type & PAGE_TYPE_MASK);
 }
 
 #ifndef LISP_FEATURE_SOFT_CARD_MARKS
-static inline boolean protect_page_p(page_index_t page, generation_index_t generation) {
+static inline bool protect_page_p(page_index_t page, generation_index_t generation) {
     return (page_boxed_p(page)
             && !(page_table[page].type & OPEN_REGION_PAGE_FLAG)
             && (page_words_used(page) != 0)
@@ -210,14 +140,9 @@ page_scan_start(page_index_t page_index)
  * scan_start of zero, to optimize page_ends_contiguous_block_p().
  * Clear all the flags that don't pertain to a free page.
  * Particularly the 'need_zerofill' bit MUST remain as-is */
-static inline void reset_page_flags(page_index_t page) {
+void reset_page_flags(page_index_t page) {
     page_table[page].scan_start_offset_ = 0;
-#ifdef LISP_FEATURE_DARWIN_JIT
-    // Whenever a page was mapped as code, it potentially needs to be remapped on the next use.
-    // This avoids any affect of pthread_jit_write_protect_np when next used.
-    if (page_table[page].type == PAGE_TYPE_CODE) set_page_need_to_zero(page, 1);
-#endif
-    page_table[page].type = 0;
+    set_page_type(page_table[page], FREE_PAGE_FLAG);
     gc_page_pins[page] = 0;
     // Why can't the 'gen' get cleared? It caused failures. THIS MAKES NO SENSE!!!
     //    page_table[page].gen = 0;
@@ -226,18 +151,8 @@ static inline void reset_page_flags(page_index_t page) {
     assign_page_card_marks(page, CARD_MARKED);
 }
 
-/* SIMD-within-a-register algorithms
- *
- * from https://graphics.stanford.edu/~seander/bithacks.html
- */
-#ifdef LISP_FEATURE_SOFT_CARD_MARKS
-static inline uword_t word_haszero(uword_t word) {
-  return ((word - 0x0101010101010101LL) & ~word & 0x8080808080808080LL) != 0;
-}
-static inline uword_t word_has_stickymark(uword_t word) {
-  return word_haszero(word ^ 0x0202020202020202LL);
-}
 #include "genesis/cardmarks.h"
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
 int page_cards_all_marked_nonsticky(page_index_t page) {
     return cardseq_all_marked_nonsticky(page_to_card_index(page));
 }
@@ -245,22 +160,6 @@ int page_cards_all_marked_nonsticky(page_index_t page) {
 
 /// External function for calling from Lisp.
 page_index_t ext_find_page_index(void *addr) { return find_page_index(addr); }
-
-static os_vm_size_t
-npage_bytes(page_index_t npages)
-{
-    gc_assert(npages>=0);
-    return ((os_vm_size_t)npages)*GENCGC_PAGE_BYTES;
-}
-
-/* Check that X is a higher address than Y and return offset from Y to
- * X in bytes. */
-static inline os_vm_size_t
-addr_diff(void *x, void *y)
-{
-    gc_assert(x >= y);
-    return (uintptr_t)x - (uintptr_t)y;
-}
 
 /* an array of generation structures. There needs to be one more
  * generation structure than actual generations as the oldest
@@ -300,9 +199,6 @@ static pthread_mutex_t free_pages_lock = PTHREAD_MUTEX_INITIALIZER;
 void acquire_gc_page_table_lock() { ignore_value(mutex_acquire(&free_pages_lock)); }
 void release_gc_page_table_lock() { ignore_value(mutex_release(&free_pages_lock)); }
 
-extern os_vm_size_t gencgc_release_granularity;
-os_vm_size_t gencgc_release_granularity = GENCGC_RELEASE_GRANULARITY;
-
 extern os_vm_size_t gencgc_alloc_granularity;
 os_vm_size_t gencgc_alloc_granularity = GENCGC_ALLOC_GRANULARITY;
 
@@ -310,28 +206,6 @@ os_vm_size_t gencgc_alloc_granularity = GENCGC_ALLOC_GRANULARITY;
 /*
  * miscellaneous heap functions
  */
-
-/* Count the number of pages in the given generation.
- * Additionally, if 'n_write_protected' is non-NULL, then assign
- * into *n_write_protected the count of marked pages.
- */
-page_index_t
-count_generation_pages(generation_index_t generation, page_index_t* n_dirty)
-{
-    page_index_t i, total = 0, dirty = 0;
-    int j;
-
-    for (i = 0; i < next_free_page; i++)
-        if (!page_free_p(i) && (page_table[i].gen == generation)) {
-            total++;
-            long card = page_to_card_index(i);
-            for (j=0; j<CARDS_PER_PAGE; ++j, ++card)
-                if (card_dirtyp(card)) ++dirty;
-        }
-    // divide by cards per page rounding up
-    if (n_dirty) *n_dirty = (dirty + (CARDS_PER_PAGE-1)) / CARDS_PER_PAGE;
-    return total;
-}
 
 static void show_pinnedobj_count()
 {
@@ -364,450 +238,13 @@ count_generation_bytes_allocated (generation_index_t gen)
     }
     return result*N_WORD_BYTES;
 }
-
-/* Return the average age of the memory in a generation. */
-extern double
-generation_average_age(generation_index_t gen_index)
-{
-    struct generation* gen = &generations[gen_index];
-    if (gen->bytes_allocated == 0)
-        return 0.0;
-
-    return (double)gen->cum_sum_bytes_allocated / (double)gen->bytes_allocated;
-}
-
-#ifdef LISP_FEATURE_X86
-extern void fpu_save(void *);
-extern void fpu_restore(void *);
-#endif
-
-#define PAGE_INDEX_FMT PRIdPTR
-
-int count_immobile_objects(__attribute__((unused)) int gen, int res[4])
-{
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    lispobj* where = (lispobj*)FIXEDOBJ_SPACE_START;
-    lispobj* end = fixedobj_free_pointer;
-    while (where < end) {
-        if (immobile_obj_generation(where) == gen) {
-            switch (widetag_of(where)) {
-            case INSTANCE_WIDETAG: ++res[0]; break;
-            case FDEFN_WIDETAG: ++res[1]; break;
-            case SYMBOL_WIDETAG: ++res[2]; break;
-            }
-        }
-        where += object_size(where);
-    }
-    where = (lispobj*)TEXT_SPACE_START;
-    end = text_space_highwatermark;
-    while (where < end) {
-        if (widetag_of(where) != FILLER_WIDETAG && immobile_obj_generation(where) == gen)
-            ++res[3];
-        where += object_size(where);
-    }
-#endif
-    return (res[0] | res[1] | res[2] | res[3]) != 0;
-}
-
-// You can call this with 0 and NULL to perform its assertions silently
-void gc_gen_report_to_file(int filedes, FILE *file)
-{
-#ifdef LISP_FEATURE_X86
-    int fpu_state[27];
-
-    /* Can end up here after calling alloc_tramp which doesn't prepare
-     * the x87 state, and the C ABI uses a different mode */
-    fpu_save(fpu_state);
-#endif
-
-#define OUTPUT(str, len) \
-    {if (file) fwrite(str, 1, len, file); if (filedes>=0) ignore_value(write(filedes, str, len));}
-
-    /* Print the heap stats. */
-    char header1[] =
-            "        Immobile Object Counts\n";
-    OUTPUT(header1, sizeof header1-1);
-    char header2[] =
-            " Gen layout fdefn symbol   code  Boxed   Cons    Raw   Code  SmMix  Mixed  LgRaw LgCode  LgMix"
-            " Waste%       Alloc        Trig   Dirty GCs Mem-age\n";
-    OUTPUT(header2, sizeof header2-1);
-
-    generation_index_t gen_num, begin, end;
-    int immobile_matrix[8][4], have_immobile_obj = 0;
-    int immobile_totals[4];
-    memset(immobile_matrix, 0, sizeof immobile_matrix);
-    memset(immobile_totals, 0, sizeof immobile_totals);
-    for (gen_num = 0; gen_num <= 6; ++gen_num) {
-        if (count_immobile_objects(gen_num, immobile_matrix[gen_num]))
-            have_immobile_obj |= 1 << gen_num;
-        immobile_totals[0] += immobile_matrix[gen_num][0];
-        immobile_totals[1] += immobile_matrix[gen_num][1];
-        immobile_totals[2] += immobile_matrix[gen_num][2];
-        immobile_totals[3] += immobile_matrix[gen_num][3];
-    }
-    // Print from the lowest gen that has any allocated pages.
-    for (begin = 0; begin <= PSEUDO_STATIC_GENERATION; ++begin)
-        if ((have_immobile_obj>>begin)&1 || generations[begin].bytes_allocated) break;
-    // Print up to and including the highest gen that has any allocated pages.
-    for (end = SCRATCH_GENERATION; end >= 0; --end)
-        if (generations[end].bytes_allocated) break;
-
-    char linebuf[180];
-    page_index_t coltot[9];
-    uword_t eden_words_allocated = 0;
-    page_index_t eden_pages = 0;
-    memset(coltot, 0, sizeof coltot);
-    for (gen_num = begin; gen_num <= end; gen_num++) {
-        page_index_t page;
-        page_index_t pagect[9];
-        int *objct = immobile_matrix[gen_num];
-        memset(pagect, 0, sizeof pagect);
-        if (gen_num == 0) { // Count the eden pages
-            for (page = 0; page < next_free_page; page++)
-                if (page_table[page].gen == 0 && page_table[page].type & THREAD_PAGE_FLAG) {
-                    int column;
-                    switch (page_table[page].type & ~THREAD_PAGE_FLAG) {
-                    case PAGE_TYPE_BOXED:   column = 0; break;
-                    case PAGE_TYPE_CONS:    column = 1; break;
-                    case PAGE_TYPE_CODE:    column = 3; break;
-                    case PAGE_TYPE_MIXED:   column = 5; break;
-                    default: lose("Bad eden page subtype: %x\n", page_table[page].type);
-                    }
-                    pagect[column]++;
-                    coltot[column]++;
-                    ++eden_pages;
-                    eden_words_allocated += page_words_used(page);
-                }
-            uword_t waste = npage_bytes(eden_pages) - (eden_words_allocated<<WORD_SHIFT);
-            double pct_waste = eden_pages > 0 ?
-                               (double)waste / (double)npage_bytes(eden_pages) * 100 : 0.0;
-            if (eden_pages) {
-                int linelen = snprintf(linebuf, sizeof linebuf,
-                        "  E %6d %6d %6d %6d %7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%14"PAGE_INDEX_FMT
-                        "%14"PAGE_INDEX_FMT
-                        "%28.1f %11"OS_VM_SIZE_FMT"\n",
-                        objct[0], objct[1], objct[2], objct[3],
-                        pagect[0], pagect[1], pagect[3], pagect[5],
-                        pct_waste, eden_words_allocated<<WORD_SHIFT);
-                OUTPUT(linebuf, linelen);
-            }
-            memset(pagect, 0, sizeof pagect);
-        }
-        uword_t words_allocated = 0;
-        page_index_t tot_pages = 0;
-        for (page = 0; page < next_free_page; page++)
-            if (!page_free_p(page) && page_table[page].gen == gen_num
-                && !(page_table[page].type & THREAD_PAGE_FLAG)) {
-                int column;
-                switch (page_table[page].type & (SINGLE_OBJECT_FLAG|PAGE_TYPE_MASK)) {
-                case PAGE_TYPE_BOXED:   column = 0; break;
-                case PAGE_TYPE_CONS:    column = 1; break;
-                case PAGE_TYPE_UNBOXED: column = 2; break;
-                case PAGE_TYPE_CODE:    column = 3; break;
-                case PAGE_TYPE_SMALL_MIXED:   column = 4; break;
-                case PAGE_TYPE_MIXED:   column = 5; break;
-                case SINGLE_OBJECT_FLAG|PAGE_TYPE_UNBOXED: column = 6; break;
-                case SINGLE_OBJECT_FLAG|PAGE_TYPE_CODE:    column = 7; break;
-                case SINGLE_OBJECT_FLAG|PAGE_TYPE_MIXED:   column = 8; break;
-                default: lose("Invalid page type %#x (p%"PAGE_INDEX_FMT")", page_table[page].type, page);
-                }
-                pagect[column]++;
-                coltot[column]++;
-                ++tot_pages;
-                words_allocated += page_words_used(page);
-            }
-        struct generation* gen = &generations[gen_num];
-        if (gen_num == 0)
-            gc_assert(gen->bytes_allocated ==
-                      (words_allocated+eden_words_allocated) << WORD_SHIFT);
-        else {
-            gc_assert(gen->bytes_allocated == words_allocated << WORD_SHIFT);
-        }
-        page_index_t n_dirty;
-        count_generation_pages(gen_num, &n_dirty);
-        uword_t waste = npage_bytes(tot_pages) - (words_allocated<<WORD_SHIFT);
-        double pct_waste = tot_pages > 0 ?
-          (double)waste / (double)npage_bytes(tot_pages) * 100 : 0.0;
-        int linelen =
-            snprintf(linebuf, sizeof linebuf,
-                "  %d %6d %6d %6d %6d"
-                "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
-                "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
-                "%7"PAGE_INDEX_FMT" %6.1f %11"OS_VM_SIZE_FMT" %11"OS_VM_SIZE_FMT,
-                gen_num, objct[0], objct[1], objct[2], objct[3],
-                pagect[0], pagect[1], pagect[2], pagect[3], pagect[4], pagect[5],
-                pagect[6], pagect[7], pagect[8],
-                pct_waste, words_allocated<<WORD_SHIFT,
-                (uintptr_t)gen->gc_trigger);
-        // gen0 pages are never WPed
-        linelen += snprintf(linebuf+linelen, sizeof linebuf-linelen,
-                            gen_num==0?"       -" : " %7"PAGE_INDEX_FMT, n_dirty);
-        linelen += snprintf(linebuf+linelen, sizeof linebuf-linelen,
-                            " %3d %7.4f\n", gen->num_gc, generation_average_age(gen_num));
-        OUTPUT(linebuf, linelen);
-    }
-    page_index_t tot_pages = coltot[0] + coltot[1] + coltot[2] + coltot[3] + coltot[4] +
-                             coltot[5] + coltot[6] + coltot[7] + coltot[8];
-    uword_t waste = npage_bytes(tot_pages) - bytes_allocated;
-    double pct_waste = (double)waste / (double)npage_bytes(tot_pages) * 100;
-    double heap_use_frac = 100 * (double)bytes_allocated / (double)dynamic_space_size;
-    int *objct = immobile_totals;
-    int linelen =
-        snprintf(linebuf, sizeof linebuf,
-            "Tot %6d %6d %6d %6d"
-            "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
-            "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
-            "%7"PAGE_INDEX_FMT" %6.1f%12"OS_VM_SIZE_FMT
-            " [%.1f%% of %"OS_VM_SIZE_FMT" max]\n",
-            objct[0], objct[1], objct[2], objct[3],
-            coltot[0], coltot[1], coltot[2], coltot[3], coltot[4], coltot[5], coltot[6],
-            coltot[7], coltot[8], pct_waste,
-            (uintptr_t)bytes_allocated, heap_use_frac, (uintptr_t)dynamic_space_size);
-    OUTPUT(linebuf, linelen);
-#undef OUTPUT
-
-#ifdef LISP_FEATURE_X86
-    fpu_restore(fpu_state);
-#endif
-}
-void write_generation_stats(FILE *file) { gc_gen_report_to_file(-1, file); }
-
-extern void
-write_heap_exhaustion_report(FILE *file, long available, long requested,
-                             struct thread __attribute__((unused)) *thread)
-{
-    fprintf(file,
-            "Heap exhausted during %s: %ld bytes available, %ld requested.\n",
-            gc_active_p ? "garbage collection" : "allocation",
-            available,
-            requested);
-    write_generation_stats(file);
-    fprintf(file, "GC control variables:\n");
-    fprintf(file, "   *GC-INHIBIT* = %s\n   *GC-PENDING* = %s\n",
-            read_TLS(GC_INHIBIT,thread)==NIL ? "false" : "true",
-            (read_TLS(GC_PENDING, thread) == LISP_T) ?
-            "true" : ((read_TLS(GC_PENDING, thread) == NIL) ?
-                      "false" : "in progress"));
-#ifdef LISP_FEATURE_SB_THREAD
-    fprintf(file, "   *STOP-FOR-GC-PENDING* = %s\n",
-            read_TLS(STOP_FOR_GC_PENDING,thread)==NIL ? "false" : "true");
-#endif
-}
-
-extern void
-print_generation_stats(void)
-{
-    write_generation_stats(stderr);
-}
-
-extern char* gc_logfile;
-char * gc_logfile = NULL;
-
-extern void
-log_generation_stats(char *logfile, char *header)
-{
-    if (logfile) {
-        FILE * log = fopen(logfile, "a");
-        if (log) {
-            fprintf(log, "%s\n", header);
-            write_generation_stats(log);
-            fclose(log);
-        } else {
-            fprintf(stderr, "Could not open gc logfile: %s\n", logfile);
-            fflush(stderr);
-        }
-    }
-}
-
-extern void
-report_heap_exhaustion(long available, long requested, struct thread *th)
-{
-    if (gc_logfile) {
-        FILE * log = fopen(gc_logfile, "a");
-        if (log) {
-            write_heap_exhaustion_report(log, available, requested, th);
-            fclose(log);
-        } else {
-            fprintf(stderr, "Could not open gc logfile: %s\n", gc_logfile);
-            fflush(stderr);
-        }
-    }
-    /* Always to stderr as well. */
-    write_heap_exhaustion_report(stderr, available, requested, th);
-}
 
-
-/* Zero the memory at ADDR for LENGTH bytes, but use mmap/munmap instead
- * of zeroing it ourselves, i.e. in practice give the memory back to the
- * OS. Generally done after a large GC.
- */
-static void __attribute__((unused))
-zero_range_with_mmap(os_vm_address_t addr, os_vm_size_t length) {
-#ifdef LISP_FEATURE_WIN32
-    os_decommit_mem(addr, length);
-#elif defined LISP_FEATURE_LINUX
-    // We use MADV_DONTNEED only on Linux due to differing semantics from BSD.
-    // Linux treats it as a demand that the memory be 0-filled, or refreshed
-    // from a file that backs the range. BSD takes it as a hint that you don't
-    // care if the memory has to brought in from swap when next accessed,
-    // i.e. it's not a request to make a user-visible alteration to memory.
-    // So in theory this can bring a page in from the core file, if we happen
-    // to hit a page that resides in the portion of memory mapped by coreparse.
-    // In practice this should not happen because objects from a core file can't
-    // become garbage. Except in save-lisp-and-die they can, and we must be
-    // cautious not to resurrect bytes that originally came from the file.
-    if ((os_vm_address_t)addr >= anon_dynamic_space_start) {
-        if (madvise(addr, length, MADV_DONTNEED) != 0)
-            lose("madvise failed");
-    } else { // See doc/internals-notes/zero-with-mmap-bug.txt
-        // Trying to see how often this happens.
-        // fprintf(stderr, "zero_range_with_mmap: fallback to memset()\n");
-        memset(addr, 0, length);
-    }
-#else
-    void *new_addr;
-    os_deallocate(addr, length);
-    new_addr = os_alloc_gc_space(DYNAMIC_CORE_SPACE_ID, NOT_MOVABLE, addr, length);
-    if (new_addr == NULL || new_addr != addr) {
-        lose("remap_free_pages: page moved, %p ==> %p",
-             addr, new_addr);
-    }
-#endif
-}
-
-/*
-Regarding zero_pages(), if the next operation would be memcpy(),
-then zeroing is a total waste of time and we should skip it.
-
-The most simple case seems to be ALLOCATE-CODE-OBJECT because we can treat pages
-of code consistently in terms of whether the newly allocated page is for Lisp or
-for the garbage collector's transport function. The object is basically an unboxed
-object, so there are no "wild pointers" in it, at least until the boxed size is
-written. So we can skip prezeroing because the bulk of the object will be subject
-to memcpy() from either an octet vector produced by the assember, or a fasl stream.
-We only need to prezero the boxed words. GC avoids prezeroing of its code pages.
-
-The next simplest case seems to be unboxed pages - Lisp can never directly request
-an unboxed page (at least in the current design), so any unboxed page is for GC,
-and will always be used for a transport function. We can skip zeroing those pages,
-because even if GC does not fill the page completely, it can not be used for other
-object allocations from Lisp.
-
-Boxed pages are the problem. Except for pages which are 100% used by GC, they  might
-later by consumed in part by Lisp. Unfortunately we don't know whether it will be
-100% used until it's 100% used. So we can't skip zeroing.
-However, in general, we should try to convert Lisp allocators to be aware of
-the issue of zeroing rather than relying on C to do it, as this will relieve
-a pain point (a so-called "impedence mismatch") when trying to plug in other
-allocators that do not intrinsically give you zero-initialized memory.
-
-The cases can be broken down as follows:
- - unboxed objects can always be zeroed at leisure in Lisp. This is hard only because
-   Lisp does not distinguish in the slow path allocator whether it is asking for boxed
-   or unboxed memory, so even if we made the Lisp code perform explicit zero-filling of
-   strings and numeric vectors, the allocation macros needs to be enhanced
-   to inform C of the fact that zeroing will happen in Lisp whenever we have to go to
-   the slow path; and we'll need unboxed thread-local regions of course.
-
- - structure objects almost always have all slots written immediately after
-   allocation, so they don't necessarily demand prezeroing, but we have to think about
-   to the scope of the pseudatomic wrapping. One of the following must pertain:
-   * Widen the pseudo-atomic scope so that initialization happens within it,
-     never permitting GC to see old garbage, OR
-   * Store the layout last rather than first, and say that until the layout is stored,
-     GC might see garbage, treating any bit pattern as a conservative pointer.
-     (because there are two separate issues: ignoring old values, and ensuring that
-     newly written slots are perceived as enlivening what they point to)
-   * Add some bits indicating how many slots of the object are initialized.
-     This seems impractical
-
- - general arrays present the largest problem - the choice of when to zero should be
-   based on whether the object is large or not and whether one of :initial-element
-   or :initial-contents were specified. If the initial-element is NIL, then the initial
-   zero-fill was a waste.
-
- - closures and everything else except arrays are basically structure-like
-   and have the same issue. Fixed-sized objects are simple though - e.g. value-cells
-   can move the store of the 1 word payload inside pseudo-atomic if it isn't already.
-   Thusly, any value-cell could go on a non-prezeroed page.
-
-In general, deciding when to zero-initialize to attain maximum performance is nontrivial.
-See "Why Nothing Matters: The Impact of Zeroing"
-https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/zero-oopsla-2011.pdf
-
- */
-
-/* Zero the pages from START to END (inclusive). Generally done just after
- * a new region has been allocated.
- */
-static inline void zero_pages(page_index_t start, page_index_t end) {
-    if (start <= end)
-#ifdef LISP_FEATURE_DARWIN_JIT
-        zero_range_with_mmap(page_address(start), npage_bytes(1+end-start));
-#else
-        memset(page_address(start), 0, npage_bytes(1+end-start));
-#endif
-}
 
 /* The generation currently being allocated to. */
 static generation_index_t gc_alloc_generation;
+
 __attribute__((unused)) static const char * const page_type_description[8] =
   {0, "unboxed", "boxed", "mixed", "sm_mix", "cons", "?", "code"};
-
-/* Zero the pages from START to END (inclusive), except for those
- * pages which: (a) don't require pre-clearing, or (b) do but are already clear.
- * For each page in the range that got cleared right now, change the
- * page's need_to_zero flag to 0; otherwise, leave that flag alone.
- */
-#if defined LISP_FEATURE_RISCV && defined LISP_FEATURE_LINUX // KLUDGE
-int mmap_does_not_zero;
-#endif
-void zeroize_pages_if_needed(page_index_t start, page_index_t end, int page_type) {
-    // If allocating mixed pages to gen0 (or scratch which becomes gen0) then
-    // this allocation is potentially going to be extended by lisp (if it happens to
-    // pick up the tail of the page as its next available region)
-    // and we really have to zeroize the page. Otherwise, if not mixed or allocating
-    // memory that is entirely within GC, then lisp will never use parts of the page.
-    // So we can avoid pre-zeroing all codes pages, all unboxed pages,
-    // all strictly boxed pages, and all mixed pages allocated to gen>=1.
-
-    page_index_t i;
-#ifdef LISP_FEATURE_DARWIN_JIT
-    /* Must always zero, as it may need changing the protection bits. */
-    boolean any_need_to_zero = 0;
-    for (i = start; i <= end; i++) any_need_to_zero |= page_need_to_zero(i);
-    if (any_need_to_zero) {
-        zero_pages(start, end);
-        for (i = start; i <= end; i++) set_page_need_to_zero(i, 0);
-    }
-#elif defined LISP_FEATURE_MIPS
-    /* Technically this case is for "if BACKEND_PAGE_BYTES > GENCGC_CARD_BYTES"
-     * but #+win32 has that, and works fine because we don't map the core to memory
-     * from the file directly. The issue is that load_core_bytes() has a larger
-     * granularity than saving thinks it used, so loading picks up junk from pages
-     * that are supposedly zeroed. Until I fix it better, just zeroize always.
-     * Basically we want to decouple the allocator's quantum of GENCGC_PAGE_BYTES
-     * from the OS's requirement on file mappings. I don't know why rev 2faf4b79a7
-     * exposed the bug, but it seems that the older  strategy for gc_and_save left
-     * zeroed pages in exactly the right places either by accident or by design */
-    for (i = start; i <= end; i++) {
-        zero_pages(i, i);
-        set_page_need_to_zero(i, 0);
-    }
-#else
-    boolean usable_by_lisp =
-        gc_alloc_generation == 0 || (gc_alloc_generation == SCRATCH_GENERATION
-                                     && from_space == 0);
-    if ((page_type == PAGE_TYPE_MIXED && usable_by_lisp) || page_type == 0) {
-        for (i = start; i <= end; i++)
-            if (page_need_to_zero(i)) {
-                zero_pages(i, i);
-                set_page_need_to_zero(i, 0);
-            }
-    }
-#endif
-}
-
 
 /*
  * To support quick and inline allocation, regions of memory can be
@@ -860,8 +297,8 @@ struct alloc_region gc_alloc_region[6];
 
 static page_index_t
   alloc_start_pages[8], // one for each value of PAGE_TYPE_x
-  gencgc_alloc_start_page, // initializer for the preceding array
   max_alloc_start_page; // the largest of any array element
+page_index_t gencgc_alloc_start_page; // initializer for the preceding array
 
 /* Each 'start_page' informs the region-opening logic where it should
  * attempt to continue allocating after closing a region associated
@@ -953,7 +390,7 @@ set_alloc_start_page(unsigned int page_type, page_index_t page)
 /* Test whether page 'index' can continue a non-large-object region
  * having specified 'gen' and 'type' values. It must not be pinned
  * and must be marked but not referenced from the stack */
-static inline boolean
+static inline bool
 page_extensible_p(page_index_t index, generation_index_t gen, int type) {
 #ifdef LISP_FEATURE_BIG_ENDIAN /* TODO: implement this as single comparison */
     int attributes_match =
@@ -1016,22 +453,8 @@ static page_index_t find_single_page(int page_type, sword_t nbytes, generation_i
     gc_heap_exhausted_error_or_lose(bytes_avail, nbytes);
 }
 
-/* CONS pages have a subrange (about 1/128th or 1/64th of the page)
- * that demands prezeroing, but the bulk of the page does not require zeroing.
- * We can't accurately represent the need_to_zero state on a part of the page.
- * So if the page is in need_to_zero state, clear that subrange,
- * but KEEP the need_to_zero state, because overall it is in that state. */
-static inline void ensure_cons_markbits_clear(page_index_t page)
-{
-    // If and only if the page was already completely zeroed, skip this
-    if (page_need_to_zero(page)) {
-        char *trailer = page_address(page) + CONS_PAGE_USABLE_BYTES;
-        memset(trailer, 0, GENCGC_PAGE_BYTES - CONS_PAGE_USABLE_BYTES);
-    }
-}
-
 #if 0
-boolean page_is_zeroed(page_index_t page)
+bool page_is_zeroed(page_index_t page)
 {
     int nwords_per_page = GENCGC_PAGE_BYTES/N_WORD_BYTES;
     uword_t *pagebase = (void*)page_address(page);
@@ -1057,18 +480,9 @@ gc_alloc_new_region(sword_t nbytes, int page_type, struct alloc_region *alloc_re
                       et_find_freeish_page);
         if (page+1 > next_free_page) next_free_page = page+1;
         page_table[page].gen = gc_alloc_generation;
-        page_table[page].type = OPEN_REGION_PAGE_FLAG | page_type;
-#ifdef LISP_FEATURE_DARWIN_JIT
+        set_page_type(page_table[page], OPEN_REGION_PAGE_FLAG | page_type);
         if (!page_words_used(page))
-            /* May need to be remapped from PAGE_TYPE_CODE */
-            zeroize_pages_if_needed(page, page, page_type);
-#elif defined LISP_FEATURE_WIN32
-        // don't incur access violations
-        os_commit_memory(page_address(page), GENCGC_PAGE_BYTES);
-#endif
-        // TODO: move this out of the mutex scope
-        if (page_type == PAGE_TYPE_CONS && !page_words_used(page))
-            ensure_cons_markbits_clear(page);
+            prepare_pages(1, page, page, page_type, gc_alloc_generation);
         // Don't need to set the scan_start_offset because free pages have it 0
         // (and each of these page types starts a new contiguous block)
         gc_dcheck(page_table[page].scan_start_offset_ == 0);
@@ -1109,47 +523,24 @@ gc_alloc_new_region(sword_t nbytes, int page_type, struct alloc_region *alloc_re
     } else {
         page_table[first_page].gen = gc_alloc_generation;
     }
-    page_table[first_page].type = OPEN_REGION_PAGE_FLAG | page_type;
+    set_page_type(page_table[first_page], OPEN_REGION_PAGE_FLAG | page_type);
 
     page_index_t i;
     for (i = first_page+1; i <= last_page; i++) {
-        page_table[i].type = OPEN_REGION_PAGE_FLAG | page_type;
+        set_page_type(page_table[i], OPEN_REGION_PAGE_FLAG | page_type);
         page_table[i].gen = gc_alloc_generation;
         set_page_scan_start_offset(i,
             addr_diff(page_address(i), alloc_region->start_addr));
     }
-#ifdef LISP_FEATURE_DARWIN_JIT
-    if (page_type == PAGE_TYPE_CODE) {
-        /* Remap before releasing the mutex so that no other thread can manipulate
-         * this range of code until it has been correctly set up. If page(s) were
-         * previously utilized for code, this is not necessary, but there's no way
-         * to know that.  If the first page was already in use, remapping would trash
-         * what's there, so don't do that */
-        int remap_from = first_page + (page_words_used(first_page)?1:0);
-        if (last_page >= remap_from) {
-            long len = npage_bytes(1+last_page-remap_from);
-            os_deallocate(page_address(remap_from), len);
-            mmap(page_address(remap_from), len,
-                 OS_VM_PROT_ALL, MAP_ANON|MAP_PRIVATE|MAP_JIT, -1, 0);
-            page_index_t p;
-            // Ensure that zeroize_pages_if_needed() below does ABSOLUTELY NOTHING!
-            for(p=remap_from; p<=last_page; ++p) set_page_need_to_zero(p,0);
-        }
-    }
-#elif defined LISP_FEATURE_WIN32
-    // don't incur access violations
-    long commit_from = first_page + (page_words_used(first_page)?1:0);
-    long len = npage_bytes(1+last_page-commit_from);
-    os_commit_memory(page_address(commit_from), len);
-#endif
     if (unlock) {
         int __attribute__((unused)) ret = mutex_release(&free_pages_lock);
         gc_assert(ret);
     }
 
-    // Like above: if first page was in use, don't zeroize
-    INSTRUMENTING(zeroize_pages_if_needed(first_page+(page_words_used(first_page)?1:0),
-                                          last_page, page_type), et_bzeroing);
+    if (page_words_used(first_page)) ++first_page;
+    if (first_page <= last_page)
+        INSTRUMENTING(prepare_pages(1, first_page, last_page, page_type, gc_alloc_generation),
+                      et_bzeroing);
 
     return alloc_region->free_pointer;
 }
@@ -1287,7 +678,7 @@ gc_close_region(struct alloc_region *alloc_region, int page_type)
         /* Calculate the number of bytes used in this page. This is not
          * always the number of new bytes, unless it was free. */
         os_vm_size_t bytes_used = addr_diff(free_pointer, page_base);
-        boolean more;
+        bool more;
         if ((more = (bytes_used > GENCGC_PAGE_BYTES)))
             bytes_used = GENCGC_PAGE_BYTES;
         set_page_bytes_used(first_page, bytes_used);
@@ -1366,7 +757,6 @@ void *gc_alloc_large(sword_t nbytes, int page_type)
                                       SINGLE_OBJECT_FLAG | page_type,
                                       gc_alloc_generation),
     et_find_freeish_page);
-
     // No need to check whether last_page > old max; it's gotta be.
     max_alloc_start_page = last_page;
 
@@ -1375,7 +765,7 @@ void *gc_alloc_large(sword_t nbytes, int page_type)
     for (page = first_page; page <= last_page; ++page) {
         /* Large objects don't share pages with other objects. */
         gc_assert(page_words_used(page) == 0);
-        page_table[page].type = SINGLE_OBJECT_FLAG | page_type;
+        set_page_type(page_table[page], SINGLE_OBJECT_FLAG | page_type);
         page_table[page].gen = gc_alloc_generation;
     }
 
@@ -1394,9 +784,13 @@ void *gc_alloc_large(sword_t nbytes, int page_type)
     // Anyway it's best if the new page resembles a valid object ASAP.
     uword_t nwords = nbytes >> WORD_SHIFT;
     lispobj* addr = (lispobj*)page_address(first_page);
-    if (locked) { THREAD_JIT(0); }
+
+    /* The test of whether to use THREAD_JIT_WP here is not based on 'page_type'
+     * but rather how the page _is_mapped_now_. Conservatively do the call
+     * because thning about all 4 combinations of how-it-was-mapped x how-it-will-be-mapped,
+     * here and down below is too confusing */
+    if (locked) { THREAD_JIT_WP(0); }
     *addr = make_filler_header(nwords);
-    if (locked) { THREAD_JIT(1); } // avoid enabling while GCing
 
     os_vm_size_t scan_start_offset = 0;
     for (page = first_page; page < last_page; ++page) {
@@ -1416,7 +810,8 @@ void *gc_alloc_large(sword_t nbytes, int page_type)
         int __attribute__((unused)) ret = mutex_release(&free_pages_lock);
         gc_assert(ret);
     }
-    INSTRUMENTING(zeroize_pages_if_needed(first_page, last_page, page_type), et_bzeroing);
+    INSTRUMENTING(prepare_pages(0, first_page, last_page, page_type, gc_alloc_generation),
+                  et_bzeroing);
 
     /* Add the region to the new_areas if requested. */
     if (boxed_type_p(page_type)) add_new_area(first_page, 0, nbytes);
@@ -1425,53 +820,9 @@ void *gc_alloc_large(sword_t nbytes, int page_type)
     // turning the putative object temporarily into a page filler object.
     // Now turn it back into free space.
     *addr = 0;
-
-#ifdef LISP_FEATURE_DARWIN_JIT
-    if (page_type == PAGE_TYPE_CODE) {
-        os_protect(page_address(first_page), npage_bytes(1+last_page-first_page), OS_VM_PROT_ALL);
-    }
-#endif
+    if (locked) { THREAD_JIT_WP(1); }
 
     return addr;
-}
-
-void
-gc_heap_exhausted_error_or_lose (sword_t available, sword_t requested)
-{
-    struct thread *thread = get_sb_vm_thread();
-    /* Write basic information before doing anything else: if we don't
-     * call to lisp this is a must, and even if we do there is always
-     * the danger that we bounce back here before the error has been
-     * handled, or indeed even printed.
-     */
-    report_heap_exhaustion(available, requested, thread);
-    if (gc_active_p || (available == 0)) {
-        /* If we are in GC, or totally out of memory there is no way
-         * to sanely transfer control to the lisp-side of things.
-         */
-        lose("Heap exhausted, game over.");
-    }
-    else {
-        (void)mutex_release(&free_pages_lock);
-#ifndef LISP_FEATURE_WIN32
-        gc_assert(get_pseudo_atomic_atomic(thread));
-        clear_pseudo_atomic_atomic(thread);
-        if (get_pseudo_atomic_interrupted(thread))
-            do_pending_interrupt();
-#endif
-        /* Another issue is that signalling HEAP-EXHAUSTED error leads
-         * to running user code at arbitrary places, even in a
-         * WITHOUT-INTERRUPTS which may lead to a deadlock without
-         * running out of the heap. So at this point all bets are
-         * off. */
-        if (read_TLS(INTERRUPTS_ENABLED,thread) == NIL)
-            corruption_warning_and_maybe_lose
-                ("Signalling HEAP-EXHAUSTED in a WITHOUT-INTERRUPTS.");
-        /* available and requested should be double word aligned, thus
-           they can passed as fixnums and shifted later. */
-        funcall2(StaticSymbolFunction(HEAP_EXHAUSTED_ERROR), available, requested);
-        lose("HEAP-EXHAUSTED-ERROR fell through");
-    }
 }
 
 /* Search for at least nbytes of space, possibly picking up any
@@ -1728,7 +1079,7 @@ static uword_t adjust_obj_ptes(page_index_t first_page,
                 page_table[page].gen = new_gen;
         } else {
             for (page = first_page; page <= final_page; ++page) {
-                page_table[page].type = new_allocated;
+                set_page_type(page_table[page], new_allocated);
                 page_table[page].gen = new_gen;
             }
         }
@@ -1742,7 +1093,7 @@ static uword_t adjust_obj_ptes(page_index_t first_page,
         gc_assert(page_table[page].gen == from_space); \
         gc_assert(page_scan_start_offset(page) == npage_bytes(page-first_page)); \
         page_table[page].gen = new_gen; \
-        page_table[page].type = new_allocated
+        set_page_type(page_table[page], new_allocated)
 
     gc_assert(page_starts_contiguous_block_p(first_page));
     page_index_t page = first_page;
@@ -1928,10 +1279,17 @@ static inline int immune_set_memberp(page_index_t page)
              (is_code(page_table[page].type) && pin_all_dynamic_space_code)));
 }
 
+#ifndef LISP_FEATURE_WEAK_VECTOR_READBARRIER
 // Only a bignum, code blob, or vector could be on a single-object page.
 #define potential_largeobj_p(w) \
   (w==BIGNUM_WIDETAG || w==CODE_HEADER_WIDETAG || \
    (w>=SIMPLE_VECTOR_WIDETAG && w < COMPLEX_BASE_STRING_WIDETAG))
+#else
+// also include WEAK_POINTER_WIDETAG because it could be vector-like
+#define potential_largeobj_p(w) \
+  (w==BIGNUM_WIDETAG || w==CODE_HEADER_WIDETAG || w==WEAK_POINTER_WIDETAG || \
+   (w>=SIMPLE_VECTOR_WIDETAG && w < COMPLEX_BASE_STRING_WIDETAG))
+#endif
 
 static inline __attribute__((unused))
 int lowtag_ok_for_page_type(__attribute__((unused)) lispobj ptr,
@@ -2002,7 +1360,7 @@ static lispobj conservative_root_p(lispobj addr, page_index_t addr_page_index)
 {
     /* quick check 1: Address is quite likely to have been invalid. */
     struct page* page = &page_table[addr_page_index];
-    boolean enforce_lowtag = !is_code(page->type);
+    bool enforce_lowtag = !is_code(page->type);
 
     if ((addr & (GENCGC_PAGE_BYTES - 1)) >= page_bytes_used(addr_page_index) ||
         (!is_lisp_pointer(addr) && enforce_lowtag) ||
@@ -2501,10 +1859,6 @@ static void obliterate_nonpinned_words()
 #undef page_base
     if (pins_alloc_size) {
         os_deallocate((char*)gc_filtered_pins, pins_alloc_size);
-        // Traceroot can't use the pinned objects in this case
-        // But hopefully you're not relying on traceroot
-        // with thousands of pins. That's not really it's intent
-        // (which is to find retention due to paths in the heap)
         gc_filtered_pins = 0;
         gc_pin_count = 0;
         pins_alloc_size = 0;
@@ -2586,6 +1940,64 @@ static void pin_object(lispobj object)
     }
 }
 
+/* Additional logic for soft marks: any word that is potentially a
+ * tagged pointer to a page being written must preserve the mark regardless
+ * of what update_writeprotection() thinks. That's because the mark is set
+ * prior to storing. If GC occurs in between setting the mark and storing,
+ * then resetting the mark would be wrong if the subsequent store
+ * creates an old->young pointer.
+ * Mark stickiness is checked only once per invocation of collect_garbage(),
+ * when scanning interrupt contexts for generation 0 but not higher gens.
+ * There are two cases:
+ * (1) tagged pointer to a large simple-vector, but we scan card-by-card
+ *     for specifically the marked cards.  This has to be checked first
+ *     so as not to fail to see subsequent cards if the first is marked.
+ * (2) tagged pointer to an object that marks only the page containing
+ *     the object base.
+ * And note a subtle point: only an already-marked card can acquire sticky
+ * status. So we can ignore any unmarked (a/k/a WRITEPROTECTED_P) card
+ * regardless of a context register pointing to it, because if a mark was not
+ * stored, then the pointer was not stored. Without examining the next few
+ * instructions, there's no reason even to suppose that a store occurs.
+ * It seems like the stop-for-GC handler must be enforcing that GC sees things
+ * stored in the correct order for out-of-order memory models */
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+static void impart_mark_stickiness(lispobj word)
+{
+    // This function does not care whether 'word' points to a valid object.
+    // At worst this will spurisouly mark a card as sticky,
+    // which can happen only if it was already marked as dirty.
+    page_index_t page = find_page_index((void*)word);
+    if (page >= 0 && page_boxed_p(page) // stores to raw bytes are uninteresting
+        && (word & (GENCGC_PAGE_BYTES - 1)) < page_bytes_used(page)
+        && page_table[page].gen != 0
+        && lowtag_ok_for_page_type(word, page_table[page].type)
+        && plausible_tag_p(word)) { // "plausible" is good enough
+        /* if 'word' is the correctly-tagged pointer to the base of a SIMPLE-VECTOR,
+         * then set the sticky mark on every marked card. The only other large
+         * objects are CODE (writes to which are pseudo-atomic),
+         * and BIGNUM (which aren't on boxed pages)
+         * I'm not sure if it's inadvertent that this first 'if' is taken
+         * for non-large simple-vectors. It probably can't hurt,
+         * but I think it's not necessary */
+        if (lowtag_of(word) == OTHER_POINTER_LOWTAG &&
+            widetag_of(native_pointer(word)) == SIMPLE_VECTOR_WIDETAG) {
+            generation_index_t gen = page_table[page].gen;
+            while (1) {
+                long card = page_to_card_index(page);
+                int i;
+                for(i=0; i<CARDS_PER_PAGE; ++i)
+                    if (gc_card_mark[card+i]==CARD_MARKED) gc_card_mark[card+i]=STICKY_MARK;
+                if (page_ends_contiguous_block_p(page, gen)) return;
+                ++page;
+            }
+        } else if (gc_card_mark[addr_to_card_index((void*)word)] == CARD_MARKED) {
+            gc_card_mark[addr_to_card_index((void*)word)] = STICKY_MARK;
+        }
+    }
+}
+#endif
+
 #if !GENCGC_IS_PRECISE || defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64
 /* Take a possible pointer to a Lisp object and mark its page in the
  * page_table so that it will not be relocated during a GC.
@@ -2600,31 +2012,17 @@ static void pin_object(lispobj object)
  * It is also assumed that the current gc_alloc() region has been
  * flushed and the tables updated. */
 
-static boolean NO_SANITIZE_MEMORY preserve_pointer(uword_t word, int contextp)
+static void NO_SANITIZE_MEMORY preserve_pointer(os_context_register_t word, void* arg)
 {
-#ifdef LISP_FEATURE_METASPACE
-    extern lispobj valid_metaspace_ptr_p(void* addr);
-#endif
+    int contextp = arg == (void*)1;
     page_index_t page = find_page_index((void*)word);
     if (page < 0) {
         // Though immobile_space_preserve_pointer accepts any pointer,
         // there's a benefit to testing immobile_space_p first
         // because it's inlined. Either is a no-op if no immobile space.
         if (immobile_space_p(word))
-            return immobile_space_preserve_pointer((void*)word);
-#ifdef LISP_FEATURE_METASPACE
-        // Treat layout pointers as transparent - it's possible that no pointer
-        // to a wrapper exists, other than a layout which is in a CPU register.
-        if (word >= METASPACE_START
-            && word < READ_ONLY_SPACE_END
-            && lowtag_of(word) == INSTANCE_POINTER_LOWTAG
-            && valid_metaspace_ptr_p((void*)word)) {
-            lispobj wrapper = LAYOUT(word)->friend;
-            // fprintf(stderr, "stack -> metaspace ptr %p -> %p\n", addr, (void*)wrapper);
-            preserve_pointer((void*)wrapper, contextp);
-        }
-#endif
-        return 0;
+            immobile_space_preserve_pointer((void*)word);
+        return;
     }
 
     // Special case for untagged instance pointers in registers. This might belong in
@@ -2637,10 +2035,10 @@ static boolean NO_SANITIZE_MEMORY preserve_pointer(uword_t word, int contextp)
         word |= INSTANCE_POINTER_LOWTAG;
 
     lispobj object = conservative_root_p(word, page);
-    if (!object) return 0;
+    if (!object) return;
     if (object != AMBIGUOUS_POINTER) {
         pin_object(object);
-        return 1;
+        return;
     }
     // It's a non-large non-code ambiguous pointer.
     if (compacting_p()) {
@@ -2650,69 +2048,20 @@ static boolean NO_SANITIZE_MEMORY preserve_pointer(uword_t word, int contextp)
             // Divide the page into 8 parts, mark that part pinned
             gc_page_pins[page] |= 1 << (addr_lowpart / (GENCGC_PAGE_BYTES/8));
         }
-        return 1;
+        return;
     }
-    // Mark only: search for the object, because the mark bit is stored
-    // in the object. Writing to random addresses would be bad.
+    // Mark only: search for the object, because fullcgc can't handle random pointers
     lispobj* found = search_dynamic_space((void*)word);
     if (found) gc_mark_obj(compute_lispobj(found));
-    return found != 0;
 }
-/* Additional logic for soft marks: any word that is potentially a
- * tagged pointer to a page being written must preserve the mark regardless
- * of what update_writeprotection() thinks. That's because the mark is set
- * prior to storing. If GC occurs in between setting the mark and storing,
- * then resetting the mark would be wrong if the subsequent store
- * creates an old->young pointer.
- * Mark stickiness is checked only once per invocation of collect_garbage(),
- * so it when scanning interrupt contexts for generation 0 but not higher gens.
- * Also note the two scenarios:
- * (1) tagged pointer to a large simple-vector, but we scan card-by-card
- *     for specifically the marked cards.  This has to be checked first
- *     so as not to fail to see subsequent cards if the first is marked.
- * (2) tagged pointer to an object that marks only the page containing
- *     the object base.
- * And note a subtle point: only an already-marked card can acquire stick
- * status. So we can ignore any unmarked (a/k/a WRITEPROTECTED_P) card
- * regardless of a context register pointing to it, because if a mark was not
- * stored, then the pointer was not stored. Without examining the next few
- * instructions, there's no reason even to suppose that a store occurs.
- * It seems like the stop-for-GC handler must be enforcing that GC sees things
- * stored in the correct order for out-of-order memory models */
 #ifdef LISP_FEATURE_SOFT_CARD_MARKS
-// registers can be wider than words. This could accept uword_t as the arg type
-// but I like it to be directly callable with os_context_register.
-static void sticky_preserve_pointer(os_context_register_t register_word, int contextp)
+static void sticky_preserve_pointer(os_context_register_t register_word, void* arg)
 {
+    // registers can be wider than words. This could accept uword_t as the arg type
+    // but I like it to be directly callable with os_context_register.
     uword_t word = register_word;
-    if (is_lisp_pointer(word)) {
-        page_index_t page = find_page_index((void*)word);
-        if (page >= 0 && page_boxed_p(page) // stores to raw bytes are uninteresting
-            && (word & (GENCGC_PAGE_BYTES - 1)) < page_bytes_used(page)
-            && page_table[page].gen != 0
-            && lowtag_ok_for_page_type(word, page_table[page].type)
-            && plausible_tag_p(word)) { // "plausible" is good enough
-            if (lowtag_of(word) == OTHER_POINTER_LOWTAG &&
-                widetag_of(native_pointer(word)) == SIMPLE_VECTOR_WIDETAG) {
-                /* if 'word' is the correctly-tagged pointer to the base of a SIMPLE-VECTOR,
-                 * then set the sticky mark on every marked page. The only other large
-                 * objects are CODE (writes to which are pseudo-atomic),
-                 * and BIGNUM (which aren't on boxed pages) */
-                generation_index_t gen = page_table[page].gen;
-                while (1) {
-                    long card = page_to_card_index(page);
-                    int i;
-                    for(i=0; i<CARDS_PER_PAGE; ++i)
-                        if (gc_card_mark[card+i]==CARD_MARKED) gc_card_mark[card+i]=STICKY_MARK;
-                    if (page_ends_contiguous_block_p(page, gen)) return;
-                    ++page;
-                }
-            } else if (gc_card_mark[addr_to_card_index((void*)word)] == CARD_MARKED) {
-                gc_card_mark[addr_to_card_index((void*)word)] = STICKY_MARK;
-            }
-        }
-    }
-    preserve_pointer(word, contextp);
+    if (is_lisp_pointer(word)) impart_mark_stickiness(word);
+    preserve_pointer(word, arg);
 }
 #endif
 #endif
@@ -2747,7 +2096,8 @@ static void pin_exact_root(lispobj obj)
 #ifdef RETURN_PC_WIDETAG
     case RETURN_PC_WIDETAG:
 #endif
-        obj = make_lispobj(fun_code_header(object_start), OTHER_POINTER_LOWTAG);
+        obj = make_lispobj(fun_code_header((struct simple_fun*)object_start),
+                           OTHER_POINTER_LOWTAG);
     }
     pin_object(obj);
 }
@@ -2758,7 +2108,7 @@ static void pin_exact_root(lispobj obj)
  * Note: 'ptr' is _sometimes_ an ambiguous pointer - we do not utilize the layout bitmap
  * when scanning instances for pointers, so we will occasionally see a raw word for 'ptr'.
  * Also, 'ptr might not have a lowtag (such as lockfree list node successor), */
-static boolean ptr_ok_to_writeprotect(lispobj ptr, generation_index_t gen)
+static bool ptr_ok_to_writeprotect(lispobj ptr, generation_index_t gen)
 {
     page_index_t index;
     lispobj __attribute__((unused)) header;
@@ -2791,7 +2141,7 @@ static boolean ptr_ok_to_writeprotect(lispobj ptr, generation_index_t gen)
             switch (header_widetag(header)) {
             case SIMPLE_FUN_WIDETAG:
                 if (functionp(ptr)) {
-                    lispobj* code = fun_code_header(FUNCTION(ptr));
+                    lispobj* code = (lispobj*)fun_code_header(FUNCTION(ptr));
                     // This is a heuristic, since we're not actually looking for
                     // an object boundary. Precise scanning of 'page' would obviate
                     // the guard conditions here.
@@ -2816,7 +2166,7 @@ static boolean ptr_ok_to_writeprotect(lispobj ptr, generation_index_t gen)
 #ifndef LISP_FEATURE_SOFT_CARD_MARKS
 static inline void protect_page(void* page_addr)
 {
-    os_protect((void *)page_addr, GENCGC_PAGE_BYTES, OS_VM_PROT_JIT_READ);
+    os_protect((void *)page_addr, GENCGC_PAGE_BYTES, OS_VM_PROT_READ);
     gc_card_mark[addr_to_card_index(page_addr)] = CARD_UNMARKED;
 }
 #endif
@@ -2960,7 +2310,7 @@ update_writeprotection(page_index_t first_page, page_index_t last_page,
 
 /* Decide if this single-object page holds a normal simple-vector.
  * "Normal" now includes non-weak address-insensitive k/v vectors */
-static inline boolean large_scannable_vector_p(page_index_t page) {
+static inline bool large_scannable_vector_p(page_index_t page) {
     lispobj header = *(lispobj *)page_address(page);
     if (header_widetag(header) == SIMPLE_VECTOR_WIDETAG) {
         int mask = (flag_VectorWeak | flag_VectorAddrHashing) << ARRAY_FLAGS_POSITION;
@@ -3414,9 +2764,6 @@ static void
 unprotect_oldspace(void)
 {
     page_index_t i;
-    char *region_addr = 0;
-    __attribute__((unused)) char *page_addr = 0;
-    uword_t region_bytes = 0;
 
     /* Gen0 never has protection applied, so we can usually skip the un-protect step,
      * however, in the final GC, because everything got moved to gen0 by brute force
@@ -3424,8 +2771,8 @@ unprotect_oldspace(void)
      * Therefore only skip out if NOT in the final GC */
     if (conservative_stack && from_space == 0) return;
 
-    for (i = 0; i < next_free_page; i++) {
 #ifdef LISP_FEATURE_SOFT_CARD_MARKS
+    for (i = 0; i < next_free_page; i++)
         /* Why does this even matter? Obviously it did for physical protection
          * (storing the forwarding pointers shouldn't fault)
          * but there's no physical protection, so ... why bother?
@@ -3433,6 +2780,10 @@ unprotect_oldspace(void)
         if (page_words_used(i) && page_table[i].gen == from_space)
             assign_page_card_marks(i, CARD_MARKED);
 #else
+    char *page_addr = 0;
+    char *region_addr = 0;
+    uword_t region_bytes = 0;
+    for (i = 0; i < next_free_page; i++) {
         if ((page_words_used(i) != 0)
             && (page_table[i].gen == from_space)) {
 
@@ -3451,7 +2802,7 @@ unprotect_oldspace(void)
                         region_bytes += GENCGC_PAGE_BYTES;
                     } else {
                         /* Unprotect previous region. */
-                        os_protect(region_addr, region_bytes, OS_VM_PROT_JIT_ALL);
+                        os_protect(region_addr, region_bytes, OS_VM_PROT_ALL);
                         /* First page in new region. */
                         region_addr = page_addr;
                         region_bytes = GENCGC_PAGE_BYTES;
@@ -3459,12 +2810,12 @@ unprotect_oldspace(void)
                 }
             }
         }
-#endif
     }
     if (region_addr) {
         /* Unprotect last region. */
-        os_protect(region_addr, region_bytes, OS_VM_PROT_JIT_ALL);
+        os_protect(region_addr, region_bytes, OS_VM_PROT_ALL);
     }
+#endif
 }
 
 /* Work through all the pages and free any in from_space.
@@ -3585,15 +2936,13 @@ write_protect_generation_pages(generation_index_t generation)
         }
 
         n_hw_prot += end - start;
-        os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_JIT_READ);
+        os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_READ);
 
         start = end;
     }
 
     if (gencgc_verbose > 1) {
         printf("HW protected %d, SW protected %d\n", n_hw_prot, n_sw_prot);
-        page_index_t __attribute((unused)) n_total, n_protected;
-        n_total = count_generation_pages(generation, &n_protected);
     }
 #endif
 }
@@ -3623,25 +2972,14 @@ move_pinned_pages_to_newspace()
     }
 }
 
-lispobj *
-dynamic_space_code_from_pc(char *pc)
-{
-    /* Only look at untagged pointers, otherwise they won't be in the PC.
-     * (which is a valid precondition for fixed-length 4-byte instructions,
-     * not variable-length) */
-    if((long)pc % 4 == 0 && is_code(page_table[find_page_index(pc)].type)) {
-        lispobj *object = search_dynamic_space(pc);
-        if (object != NULL && widetag_of(object) == CODE_HEADER_WIDETAG)
-            return object;
-    }
-
-    return NULL;
-}
-
 static void __attribute__((unused)) maybe_pin_code(lispobj addr) {
     page_index_t page = find_page_index((char*)addr);
 
-    if (page < 0) return;
+    if (page < 0) {
+        if (immobile_space_p(addr))
+            immobile_space_preserve_pointer((void*)addr);
+        return;
+    }
     if (immune_set_memberp(page)) return;
 
     struct code* code = (struct code*)dynamic_space_code_from_pc((char *)addr);
@@ -3694,22 +3032,22 @@ static void semiconservative_pin_stack(struct thread* th,
         for(j=1; j<32; ++j) {
             // context registers have more significant bits than lispobj.
             uword_t word = mctx->gregs[j];
-            if (gen == 0) sticky_preserve_pointer(word, 1);
-            else preserve_pointer(word, 1);
+            if (gen == 0) sticky_preserve_pointer(word, (void*)1);
+            else preserve_pointer(word, (void*)1);
         }
 #elif defined LISP_FEATURE_PPC64
         static int boxed_registers[] = BOXED_REGISTERS;
         for (j = (int)(sizeof boxed_registers / sizeof boxed_registers[0])-1; j >= 0; --j) {
             lispobj word = *os_context_register_addr(context, boxed_registers[j]);
-            if (gen == 0) sticky_preserve_pointer(word, 1);
-            else preserve_pointer(word, 1);
+            if (gen == 0) sticky_preserve_pointer(word, (void*)1);
+            else preserve_pointer(word, (void*)1);
         }
         // What kinds of data do we put in the Count register?
         // maybe it's count (raw word), maybe it's a PC. I just don't know.
-        preserve_pointer(*os_context_lr_addr(context), 1);
-        preserve_pointer(*os_context_ctr_addr(context), 1);
+        preserve_pointer(*os_context_lr_addr(context), (void*)1);
+        preserve_pointer(*os_context_ctr_addr(context), (void*)1);
 #endif
-        preserve_pointer(os_context_pc(context), 1);
+        preserve_pointer(os_context_pc(context), (void*)1);
     }
 }
 #endif
@@ -3742,7 +3080,13 @@ static void pin_call_chain_and_boxed_registers(struct thread* th) {
         maybe_pin_code((lispobj)*os_context_register_addr(context, reg_LR));
 
         for (unsigned i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
-            pin_exact_root(*os_context_register_addr(context, boxed_registers[i]));
+            lispobj word = *os_context_register_addr(context, boxed_registers[i]);
+            if (is_lisp_pointer(word)) {
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+                impart_mark_stickiness(word);
+#endif
+                pin_exact_root(word);
+            }
         }
     }
 
@@ -3750,8 +3094,8 @@ static void pin_call_chain_and_boxed_registers(struct thread* th) {
 #endif
 
 #if !GENCGC_IS_PRECISE
-extern void visit_context_registers(void (*proc)(os_context_register_t, int),
-                                    os_context_t *context);
+extern void visit_context_registers(void (*proc)(os_context_register_t, void*),
+                                    os_context_t *context, void*);
 static void NO_SANITIZE_ADDRESS NO_SANITIZE_MEMORY
 conservative_stack_scan(struct thread* th,
                         __attribute__((unused)) generation_index_t gen,
@@ -3771,11 +3115,11 @@ conservative_stack_scan(struct thread* th,
      * sigcontext, though there could, in theory be if it performs
      * GC while handling an interruption */
 
-    __attribute__((unused)) void (*context_method)(os_context_register_t,int) =
+    __attribute__((unused)) void (*context_method)(os_context_register_t,void*) =
 #ifdef LISP_FEATURE_SOFT_CARD_MARKS
-        gen == 0 ? sticky_preserve_pointer : (void (*)(os_context_register_t,int))preserve_pointer;
+        gen == 0 ? sticky_preserve_pointer : preserve_pointer;
 #else
-        (void (*)(os_context_register_t,int))preserve_pointer;
+        preserve_pointer;
 #endif
 
     void* esp = (void*)-1;
@@ -3802,7 +3146,7 @@ conservative_stack_scan(struct thread* th,
         while (k > 0) {
             os_context_t* context = nth_interrupt_context(--k, th);
             if (context)
-                visit_context_registers(context_method, context);
+                visit_context_registers(context_method, context, (void*)1);
         }
     }
 #  endif
@@ -3814,7 +3158,7 @@ conservative_stack_scan(struct thread* th,
             th->control_stack_end - th->control_stack_start); */
     for (i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th))-1; i>=0; i--) {
         os_context_t *c = nth_interrupt_context(i, th);
-        visit_context_registers(context_method, c);
+        visit_context_registers(context_method, c, (void*)1);
         lispobj* esp1 = (lispobj*) *os_context_register_addr(c,reg_SP);
         if (esp1 >= th->control_stack_start && esp1 < th->control_stack_end && (void*)esp1 < esp)
             esp = esp1;
@@ -3899,6 +3243,7 @@ __attribute__((unused)) static void check_contiguity()
       }
 }
 
+static void finish_code_metadata();
 int show_gc_generation_throughput = 0;
 /* Garbage collect a generation. If raise is 0 then the remains of the
  * generation are not raised to the next generation. */
@@ -4032,6 +3377,7 @@ garbage_collect_generation(generation_index_t generation, int raise,
     lispobj pin_list = SYMBOL(STARTING_THREADS)->value;
     for ( ; pin_list != NIL ; pin_list = CONS(pin_list)->cdr ) {
         lispobj thing = CONS(pin_list)->car;
+        if (!thing) continue; // Nothing to worry about when 'thing' is already smashed
         // It might be tempting to say that only the SB-THREAD:THREAD instance
         // requires pinning - because right after we access it to extract the
         // primitive thread, we link into all_threads - but it may be that the code
@@ -4040,17 +3386,16 @@ garbage_collect_generation(generation_index_t generation, int raise,
         // seen as valid lisp pointers by the implicit pinning logic.
         // And the precisely GC'd platforms would not pin anything from C code.
         // The tests in 'threads.impure.lisp' are good at detecting omissions here.
-        if (thing) { // Nothing to worry about when 'thing' is already smashed
-            gc_assert(instancep(thing));
-            struct thread_instance *lispthread = (void*)(thing - INSTANCE_POINTER_LOWTAG);
-            lispobj info = lispthread->startup_info;
-            // INFO gets set to a fixnum when the thread is exiting. I *think* it won't
-            // ever be seen in the starting-threads list, but let's be cautious.
-            if (is_lisp_pointer(info)) {
-                gc_assert(simple_vector_p(info));
-                gc_assert(vector_len(VECTOR(info)) >= 1);
-                lispobj fun = VECTOR(info)->data[0];
-                gc_assert(functionp(fun));
+        gc_assert(instancep(thing));
+        struct thread_instance *lispthread = (void*)(thing - INSTANCE_POINTER_LOWTAG);
+        lispobj info = lispthread->startup_info;
+        // INFO gets set to a fixnum when the thread is exiting. I *think* it won't
+        // ever be seen in the starting-threads list, but let's be cautious.
+        if (is_lisp_pointer(info)) {
+            gc_assert(simple_vector_p(info));
+            gc_assert(vector_len(VECTOR(info)) >= 1);
+            lispobj fun = VECTOR(info)->data[0];
+            gc_assert(functionp(fun));
 #ifdef LISP_FEATURE_X86_64
                 /* FIXME: re. the following remark that pin_exact_root() "does not
                  * work", does it have to be that way? It seems the issue is that
@@ -4062,16 +3407,14 @@ garbage_collect_generation(generation_index_t generation, int raise,
                 // is pseudo-static, but let's use the right pinning function.
                 // (This line of code is so rarely executed that it doesn't
                 // impact performance to search for the object)
-                preserve_pointer(fun, 0);
+            preserve_pointer(fun, 0);
 #else
-                pin_exact_root(fun);
+            pin_exact_root(fun);
 #endif
-                // pin_exact_root is more efficient than preserve_pointer()
-                // because it does not search for the object.
-                pin_exact_root(thing);
-                pin_exact_root(info);
-                pin_exact_root(lispthread->name);
-            }
+            // pin_exact_root is more efficient than preserve_pointer()
+            // because it does not search for the object.
+            pin_exact_root(thing);
+            pin_exact_root(info);
         }
     }
 #endif
@@ -4161,6 +3504,11 @@ garbage_collect_generation(generation_index_t generation, int raise,
     if (GC_LOGGING) fprintf(gc_activitylog(), "begin scavenge static roots\n");
     heap_scavenge((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END);
     heap_scavenge((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer);
+    heap_scavenge((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer);
+#ifndef LISP_FEATURE_IMMOBILE_SPACE
+    // TODO: use an explicit remembered set of modified objects in this range
+    if (TEXT_SPACE_START) heap_scavenge((lispobj*)TEXT_SPACE_START, text_space_highwatermark);
+#endif
 #ifdef LISP_FEATURE_SYSTEM_TLABS
     extern void gc_scavenge_arenas();
     gc_scavenge_arenas();
@@ -4187,7 +3535,6 @@ garbage_collect_generation(generation_index_t generation, int raise,
      * symbol. It is passed to gc_and_save() in this C variable */
     if (lisp_init_function) scavenge(&lisp_init_function, 1);
     if (lisp_package_vector) scavenge(&lisp_package_vector, 1);
-    if (gc_object_watcher)  scavenge(&gc_object_watcher, 1);
     if (alloc_profile_data) scavenge(&alloc_profile_data, 1);
 
     /* If SB-SPROF was used, enliven all pages of code.
@@ -4256,32 +3603,10 @@ garbage_collect_generation(generation_index_t generation, int raise,
     /* Finally scavenge the new_space generation. Keep going until no
      * more objects are moved into the new generation */
     scavenge_newspace(new_space);
+    if (save_lisp_gc_iteration == 2) finish_code_metadata();
 
     scan_binding_stack();
     smash_weak_pointers();
-#ifdef LISP_FEATURE_METASPACE
-    // *PRIMITIVE-OBJECT-LAYOUTS* (in readonly space) is a root, but it only points
-    // to other objects in readonly space; however, those other objects (above
-    // the read_only_space_free_pointer) point weakly to dynamic space.
-    struct slab_header *slab = (void*)METASPACE_START;
-    // This is not maximally efficient, in that it visits all slabs instead of just the
-    // used ones, but it's not so bad, because there are only 1024 slabs.
-    while ((uword_t)slab < READ_ONLY_SPACE_END) {
-        if (slab->sizeclass) {
-            lispobj* chunk = (lispobj*)((char*)slab + METASPACE_SLAB_SIZE);
-            int i;
-            for (i=0; i<slab->capacity; ++i) {
-                chunk = (lispobj*)((char*)chunk - slab->chunksize);
-                if (chunk[1]) { // in-use chunk
-                    // Freeing this layout is more involved than merely zeroing some memory,
-                    // because freelists have to be maintained. A finalizer will do that.
-                    TEST_WEAK_CELL(chunk[1], chunk[1], 0);
-                }
-            }
-        }
-        slab = (void*)((char*)slab + METASPACE_SLAB_SIZE);
-    }
-#endif
     /* Return private-use pages to the general pool so that Lisp can have them */
     gc_dispose_private_pages();
     cull_weak_hash_tables(weak_ht_alivep_funs);
@@ -4372,7 +3697,8 @@ maybe_verify:
     // been on pages that got freed by free_oldspace.
     dynspace_codeblob_tree_snapshot = 0;
     if (generation >= verify_gens)
-        hexdump_and_verify_heap(cur_thread_approx_stackptr, VERIFY_POST_GC | (generation<<16));
+        hexdump_and_verify_heap(cur_thread_approx_stackptr,
+                                VERIFY_POST_GC | (generation<<1) | raise);
 
     extern int n_unboxed_instances;
     n_unboxed_instances = 0;
@@ -4392,89 +3718,9 @@ find_next_free_page(void)
     return last_page + 1;
 }
 
-/*
- * Supposing the OS can only operate on ranges of a certain granularity
- * (which we call 'gencgc_release_granularity'), then given any page rage,
- * align the lower bound up and the upper down to match the granularity.
- *
- *     |-->| OS page | OS page |<--|
- *
- * If the interior of the aligned range is nonempty,
- * perform three operations: unmap/remap, fill before, fill after.
- * Otherwise, just one operation to fill the whole range.
- */
-static void
-remap_page_range (page_index_t from, page_index_t to)
-{
-    /* There's a mysterious Solaris/x86 problem with using mmap
-     * tricks for memory zeroing. See sbcl-devel thread
-     * "Re: patch: standalone executable redux".
-     */
-    /* I have no idea what the issue with Haiku is, but using the simpler
-     * zero_pages() works where the unmap,map technique does not. Yet the
-     * trick plus a post-check that the pages were correctly zeroed finds
-     * no problem at that time. So what's failing later and why??? */
-#if defined LISP_FEATURE_SUNOS || defined LISP_FEATURE_HAIKU
-    zero_pages(from, to);
-#else
-    size_t granularity = gencgc_release_granularity;
-    // page_address "works" even if 'to' == page_table_pages-1
-    char* start = page_address(from);
-    char* end   = page_address(to+1);
-    char* aligned_start = PTR_ALIGN_UP(start, granularity);
-    char* aligned_end   = PTR_ALIGN_DOWN(end, granularity);
-
-    /* NOTE: this is largely pointless because gencgc-release-granularity
-     * is everywhere defined to be EXACTLY +backend-page-bytes+
-     * which by definition is the quantum at which we'll unmap/map.
-     * Maybe we should remove the needless complexity? */
-    if (aligned_start < aligned_end) {
-        zero_range_with_mmap(aligned_start, aligned_end-aligned_start);
-        memset(start, 0, aligned_start - start);
-        memset(aligned_end, 0, end - aligned_end);
-    } else {
-        zero_pages(from, to);
-    }
-#endif
-    page_index_t i;
-    for (i = from; i <= to; i++) set_page_need_to_zero(i, 0);
-}
-
-static void
-remap_free_pages (page_index_t from, page_index_t to)
-{
-    page_index_t first_page, last_page;
-
-    for (first_page = from; first_page <= to; first_page++) {
-        if (!page_free_p(first_page) || !page_need_to_zero(first_page))
-            continue;
-
-        last_page = first_page + 1;
-        while (page_free_p(last_page) &&
-               (last_page <= to) &&
-               (page_need_to_zero(last_page)))
-            last_page++;
-
-        remap_page_range(first_page, last_page-1);
-
-        first_page = last_page;
-    }
-}
-
 generation_index_t small_generation_limit = 1;
 
-// one pair of counters per widetag, though we're only tracking code as yet
-int n_scav_calls[64], n_scav_skipped[64];
 extern int finalizer_thread_runflag;
-
-#ifdef LISP_FEATURE_SB_THREAD
-# define THREAD_ALLOC_REGION(threadvar,slot) &threadvar-> slot ##_tlab
-#else
-# define THREAD_ALLOC_REGION(threadvar,slot) main_thread_ ##slot ##_region
-#define main_thread_mixed_region (struct alloc_region*)STATIC_SPACE_START
-#define main_thread_cons_region (1+main_thread_mixed_region)
-#define main_thread_boxed_region (2+main_thread_mixed_region)
-#endif
 
 /* GC all generations newer than last_gen, raising the objects in each
  * to the next older generation - we finish when all generations below
@@ -4489,9 +3735,9 @@ void NO_SANITIZE_ADDRESS NO_SANITIZE_MEMORY
 collect_garbage(generation_index_t last_gen)
 {
     ++n_gcs;
-    THREAD_JIT(0);
+    THREAD_JIT_WP(0);
     generation_index_t gen = 0, i;
-    boolean gc_mark_only = 0;
+    bool gc_mark_only = 0;
     int raise, more = 0;
     int gen_to_wp;
     /* The largest value of next_free_page seen since the time
@@ -4604,15 +3850,7 @@ collect_garbage(generation_index_t last_gen)
                 generations[gen+1].bytes_allocated;
         }
 
-        memset(n_scav_calls, 0, sizeof n_scav_calls);
-        memset(n_scav_skipped, 0, sizeof n_scav_skipped);
         garbage_collect_generation(gen, raise, cur_thread_approx_stackptr);
-
-        if (gencgc_verbose)
-            fprintf(stderr,
-                    "code scavenged: %d total, %d skipped\n",
-                    n_scav_calls[CODE_HEADER_WIDETAG/4],
-                    n_scav_skipped[CODE_HEADER_WIDETAG/4]);
 
         /* Reset the memory age cum_sum. */
         generations[gen].cum_sum_bytes_allocated = 0;
@@ -4714,18 +3952,6 @@ collect_garbage(generation_index_t last_gen)
     write_protect_immobile_space();
     gc_active_p = 0;
 
-    if (gc_object_watcher) {
-        extern void gc_prove_liveness(void(*)(), lispobj, int, uword_t*, int);
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-        gc_prove_liveness(visit_context_registers,
-                          gc_object_watcher,
-                          gc_pin_count, gc_filtered_pins,
-                          gc_traceroot_criterion);
-#else
-        gc_prove_liveness(0, gc_object_watcher, 0, 0, gc_traceroot_criterion);
-#endif
-    }
-
 #ifdef COLLECT_GC_STATS
     struct timespec t_gc_done;
     clock_gettime(CLOCK_MONOTONIC, &t_gc_done);
@@ -4743,7 +3969,7 @@ collect_garbage(generation_index_t last_gen)
         // as that causes the thread to exit.
         finalizer_thread_runflag = newval ? newval : 1;
     }
-    THREAD_JIT(1);
+    THREAD_JIT_WP(1);
     // Clear all pin bits for the next GC cycle.
     // This could be done in the background somehow maybe.
     page_index_t max_nfp = initial_nfp > next_free_page ? initial_nfp : next_free_page;
@@ -4758,163 +3984,15 @@ collect_garbage(generation_index_t last_gen)
 void
 gc_init(void)
 {
+    hopscotch_create(&pinned_objects, HOPSCOTCH_HASH_FUN_DEFAULT, 0 /* hashset */,
+                     32 /* logical bin count */, 0 /* default range */);
 #ifdef LISP_FEATURE_WIN32
     InitializeCriticalSection(&free_pages_lock);
-#endif
-#if defined(LISP_FEATURE_SB_SAFEPOINT)
-    extern void safepoint_init(void);
-    safepoint_init();
 #endif
 }
 
 int gc_card_table_nbits;
 long gc_card_table_mask;
-
-static void __attribute__((unused)) gcbarrier_patch_code_range(uword_t start, void* limit)
-{
-    extern void gcbarrier_patch_code(void*, int);
-    struct varint_unpacker unpacker;
-    struct code* code;
-    lispobj *where = (lispobj*)start;
-    while (where < (lispobj*)limit) {
-        if (widetag_of(where) == CODE_HEADER_WIDETAG && ((struct code*)where)->fixups) {
-            code = (struct code*)where;
-            varint_unpacker_init(&unpacker, code->fixups);
-            // There are two other data streams preceding the one we want
-            skip_data_stream(&unpacker);
-            skip_data_stream(&unpacker);
-            char* instructions = code_text_start(code);
-            int prev_loc = 0, loc;
-            while (varint_unpack(&unpacker, &loc) && loc != 0) {
-                loc += prev_loc;
-                prev_loc = loc;
-                void* patch_where = instructions + loc;
-                gcbarrier_patch_code(patch_where, gc_card_table_nbits);
-            }
-        }
-        where += object_size(where);
-    }
-}
-void gc_allocate_ptes()
-{
-    page_index_t i;
-
-    /* Compute the number of pages needed for the dynamic space.
-     * Dynamic space size should be aligned on page size. */
-    page_table_pages = dynamic_space_size/GENCGC_PAGE_BYTES;
-    gc_assert(dynamic_space_size == npage_bytes(page_table_pages));
-
-    /* Assert that a cons whose car has MOST-POSITIVE-WORD
-     * can not be considered a valid cons, which is to say, even though
-     * MOST-POSITIVE-WORD seems to satisfy is_lisp_pointer(),
-     * it's OK to use as a filler marker. */
-    if (find_page_index((void*)(uword_t)-1) >= 0)
-        lose("dynamic space too large");
-
-    /* Default nursery size to 5% of the total dynamic space size,
-     * min 1Mb. */
-    bytes_consed_between_gcs = dynamic_space_size/(os_vm_size_t)20;
-    if (bytes_consed_between_gcs < (1024*1024))
-        bytes_consed_between_gcs = 1024*1024;
-
-    /* The page_table is allocated using "calloc" to zero-initialize it.
-     * The C library typically implements this efficiently with mmap() if the
-     * size is large enough.  To further avoid touching each page structure
-     * until first use, FREE_PAGE_FLAG must be 0, statically asserted here:
-     */
-#if FREE_PAGE_FLAG != 0
-#error "FREE_PAGE_FLAG is not 0"
-#endif
-
-    /* An extra 'struct page' exists at each end of the page table acting as
-     * a sentinel.
-     *
-     * For for leading sentinel:
-     * - all fields are zero except that 'gen' has an illegal value
-     *   which makes from_space_p() and new_space_p() both return false
-     *
-     * For the trailing sentinel:
-     * - all fields are zero which makes page_ends_contiguous_block_p()
-     *   return true for the last in-range page index (so the "illegal"
-     *   index at 1+ appears to start a contiguous block even though
-     *   it corresponds to no page)
-     */
-    page_table = calloc(page_table_pages+2, sizeof(struct page));
-    gc_assert(page_table);
-    page_table[0].gen = 9; // an arbitrary never-used value
-    ++page_table;
-    gc_page_pins = calloc(page_table_pages, 1);
-    gc_assert(gc_page_pins);
-
-    // The card table size is a power of 2 at *least* as large
-    // as the number of cards. These are the default values.
-    int nbits = 13;
-    long num_gc_cards = 1L << nbits;
-
-    // Sure there's a fancier way to round up to a power-of-2
-    // but this is executed exactly once, so KISS.
-    while (num_gc_cards < page_table_pages*CARDS_PER_PAGE) { ++nbits; num_gc_cards <<= 1; }
-    // 2 Gigacards should suffice for now. That would span 2TiB of memory
-    // using 1Kb card size, or more if larger card size.
-    gc_assert(nbits < 32);
-    // If the space size is less than or equal to the number of cards
-    // that 'gc_card_table_nbits' cover, we're fine. Otherwise, problem.
-    // 'nbits' is what we need, 'gc_card_table_nbits' is what the core was compiled for.
-    if (nbits > gc_card_table_nbits) {
-        gc_card_table_nbits = nbits;
-#if defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64 \
-  || defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
-        // The value needed based on dynamic space size exceeds the value that the
-        // core was compiled for, so we need to patch all code blobs.
-        gcbarrier_patch_code_range(READ_ONLY_SPACE_START, read_only_space_free_pointer);
-        gcbarrier_patch_code_range(STATIC_SPACE_START, static_space_free_pointer);
-        gcbarrier_patch_code_range(DYNAMIC_SPACE_START, (lispobj*)dynamic_space_highwatermark());
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-        gcbarrier_patch_code_range(TEXT_SPACE_START, text_space_highwatermark);
-#endif
-#endif
-    }
-    // Regardless of the mask implied by space size, it has to be gc_card_table_nbits wide
-    // even if that is excessive - when the core is restarted using a _smaller_ dynamic space
-    // size than saved at - otherwise lisp could overrun the mark table.
-    num_gc_cards = 1L << gc_card_table_nbits;
-
-    gc_card_table_mask =  num_gc_cards - 1;
-    gc_card_mark = successful_malloc(num_gc_cards);
-    /* The mark array used to work "by accident" if the numeric value of CARD_MARKED
-     * is 0 - or equivalently the "WP'ed" state - which is the value that calloc()
-     * fills with. If using malloc() we have to fill with CARD_MARKED,
-     * as I discovered when I changed that to a nonzero value */
-    memset(gc_card_mark, CARD_MARKED, num_gc_cards);
-
-    gc_common_init();
-    hopscotch_create(&pinned_objects, HOPSCOTCH_HASH_FUN_DEFAULT, 0 /* hashset */,
-                     32 /* logical bin count */, 0 /* default range */);
-
-    bytes_allocated = 0;
-
-    /* Initialize the generations. */
-    for (i = 0; i < NUM_GENERATIONS; i++) {
-        struct generation* gen = &generations[i];
-        gen->bytes_allocated = 0;
-        gen->gc_trigger = 2000000;
-        gen->num_gc = 0;
-        gen->cum_sum_bytes_allocated = 0;
-        /* the tune-able parameters */
-        gen->bytes_consed_between_gc
-            = bytes_consed_between_gcs/(os_vm_size_t)HIGHEST_NORMAL_GENERATION;
-        gen->number_of_gcs_before_promotion = 1;
-        gen->minimum_age_before_gc = 0.75;
-    }
-
-    /* Initialize gc_alloc. */
-    gc_alloc_generation = 0;
-    gc_init_region(mixed_region);
-    gc_init_region(boxed_region);
-    gc_init_region(unboxed_region);
-    gc_init_region(code_region);
-    gc_init_region(cons_region);
-}
 
 
 /* alloc() and alloc_list() are external interfaces for memory allocation.
@@ -4930,7 +4008,7 @@ void gc_allocate_ptes()
  * region is full, so in most cases it's not needed. */
 
 int gencgc_alloc_profiler;
-static NO_SANITIZE_MEMORY lispobj*
+NO_SANITIZE_MEMORY lispobj*
 lisp_alloc(int flags, struct alloc_region *region, sword_t nbytes,
            int page_type, struct thread *thread)
 {
@@ -5068,317 +4146,6 @@ lisp_alloc(int flags, struct alloc_region *region, sword_t nbytes,
     return new_obj;
 }
 
-// Code allocation is always serialized
-#ifdef LISP_FEATURE_WIN32
-CRITICAL_SECTION code_allocator_lock; // threads are mandatory for win32
-#elif defined LISP_FEATURE_SB_THREAD
-static pthread_mutex_t code_allocator_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
-
-#ifdef LISP_FEATURE_X86_64
-
-// The asm routines have been modified so that alloc() and alloc_list()
-// each receive the size an a single-bit flag affecting locality of the result.
-#define DEFINE_LISP_ENTRYPOINT(name, largep, TLAB, page_type) \
-NO_SANITIZE_MEMORY lispobj AMD64_SYSV_ABI *name(sword_t nbytes, int sys) { \
-    struct thread *self = get_sb_vm_thread(); \
-    return lisp_alloc(largep | sys, \
-                      sys ? &self->sys_##TLAB##_tlab : THREAD_ALLOC_REGION(self,TLAB), \
-                      nbytes, page_type, self); }
-
-DEFINE_LISP_ENTRYPOINT(alloc, (nbytes >= LARGE_OBJECT_SIZE), mixed, PAGE_TYPE_MIXED)
-DEFINE_LISP_ENTRYPOINT(alloc_list, 0, cons, PAGE_TYPE_CONS)
-
-#else
-
-#define DEFINE_LISP_ENTRYPOINT(name, largep, tlab, page_type) \
-NO_SANITIZE_MEMORY lispobj AMD64_SYSV_ABI *name(sword_t nbytes) { \
-    struct thread *self = get_sb_vm_thread(); \
-    return lisp_alloc(largep, THREAD_ALLOC_REGION(self,tlab), nbytes, page_type, self); }
-
-DEFINE_LISP_ENTRYPOINT(alloc, nbytes >= LARGE_OBJECT_SIZE, mixed, PAGE_TYPE_MIXED)
-#ifdef LISP_FEATURE_USE_CONS_REGION
-// for this variant of alloc_list to work properly, the allocation vops have to know
-// when to use the cons_tlab slot. Otherwise we would inadvertently allocate a CONS page
-// for the mixed_tlab region, which would cause all kinds of problems.
-DEFINE_LISP_ENTRYPOINT(alloc_list, 0, cons, PAGE_TYPE_CONS)
-#else
-// Lists will get moved to CONS pages when copied.
-DEFINE_LISP_ENTRYPOINT(alloc_list, 0, mixed, PAGE_TYPE_MIXED)
-#endif
-
-#endif
-
-lispobj AMD64_SYSV_ABI alloc_code_object(unsigned total_words, unsigned boxed)
-{
-    struct thread *th = get_sb_vm_thread();
-    // x86-64 uses pseudo-atomic. Others should too, but instead use WITHOUT-GCING
-#ifndef LISP_FEATURE_X86_64
-    if (read_TLS(GC_INHIBIT, th) == NIL)
-        lose("alloc_code_object called with GC enabled.");
-#endif
-
-    sword_t nbytes = total_words * N_WORD_BYTES;
-    /* Allocations of code are all serialized. We might also acquire
-     * free_pages_lock depending on availability of space in the region */
-    int result = mutex_acquire(&code_allocator_lock);
-    gc_assert(result);
-    struct code *code =
-        (void*)lisp_alloc(nbytes >= LARGE_OBJECT_SIZE, code_region, nbytes, PAGE_TYPE_CODE, th);
-    result = mutex_release(&code_allocator_lock);
-    gc_assert(result);
-    THREAD_JIT(0);
-
-    code->header = ((uword_t)total_words << CODE_HEADER_SIZE_SHIFT) | CODE_HEADER_WIDETAG;
-    // 'boxed_size' is an untagged word expressing the number of *bytes* in the boxed section
-    // (so CODE-INSTRUCTIONS can simply add rather than shift and add).
-    code->boxed_size = boxed * N_WORD_BYTES;
-    code->debug_info = 0;
-    code->fixups = 0;
-    lispobj* p = &code->constants[0], *end = (lispobj*)code + boxed;
-    /* Must intialize to an arbitrary non-pointer value so that GC doesn't crash after the
-     * size is assigned (at some point prior to storing the constants) */
-    for ( ; p < end ; ++p) *p = 0;
-    *p = 0; // 'p' now points to the jump table count word which must be 0
-    ((lispobj*)code)[total_words-1] = 0; // zeroize the simple-fun table count
-    THREAD_JIT(1);
-
-    return make_lispobj(code, OTHER_POINTER_LOWTAG);
-}
-
-#ifdef LISP_FEATURE_SYSTEM_TLABS
-#define PREPARE_LIST_ALLOCATION() \
-    struct alloc_region *region = sys ? &self->sys_cons_tlab : &self->cons_tlab; \
-    int partial_request = (self->arena && !sys) ? \
-                          nbytes : (char*)region->end_addr - (char*)region->free_pointer; \
-    gc_assert(nbytes >= (sword_t)partial_request); \
-    if (partial_request == 0) partial_request = CONS_PAGE_USABLE_BYTES
-#else /* no system tlabs */
-#define PREPARE_LIST_ALLOCATION() \
-    struct alloc_region *region = THREAD_ALLOC_REGION(self, cons); \
-    int partial_request = (char*)region->end_addr - (char*)region->free_pointer; \
-    gc_assert(nbytes > (sword_t)partial_request); \
-    if (partial_request == 0) partial_request = CONS_PAGE_USABLE_BYTES
-#endif
-
-#ifdef LISP_FEATURE_X86_64
-NO_SANITIZE_MEMORY lispobj AMD64_SYSV_ABI alloc_funinstance(sword_t nbytes)
-{
-    struct thread *th = get_sb_vm_thread();
-    int result = mutex_acquire(&code_allocator_lock);
-    gc_assert(result);
-    void* mem = lisp_alloc(0, code_region, nbytes, PAGE_TYPE_CODE, th);
-    result = mutex_release(&code_allocator_lock);
-    gc_assert(result);
-    memset(mem, 0, nbytes);
-    return (lispobj)mem;
-}
-
-/* Make a list that couldn't be inline-allocated. Break it up into contiguous
- * blocks of conses not to exceed one GC page each. */
-NO_SANITIZE_MEMORY lispobj AMD64_SYSV_ABI
-make_list(lispobj element, sword_t nbytes, int sys) {
-    // Technically this overflow handler could permit garbage collection
-    // between separate allocation. For now the entire thing is pseudo-atomic.
-    struct thread *self = get_sb_vm_thread();
-    PREPARE_LIST_ALLOCATION();
-    lispobj result, *tail = &result;
-    do {
-        if (nbytes < partial_request) partial_request = nbytes;
-        struct cons* c = (void*)lisp_alloc(sys, region, partial_request, PAGE_TYPE_CONS, self);
-        *tail = make_lispobj((void*)c, LIST_POINTER_LOWTAG);
-        int ncells = partial_request >> (1+WORD_SHIFT);
-        nbytes -= N_WORD_BYTES * 2 * ncells;
-        struct cons* limit = c + ncells;
-        while (c < limit) {
-            c->car = element; c->cdr = make_lispobj(c+1, LIST_POINTER_LOWTAG);
-            ++c;
-        }
-        tail = &((c-1)->cdr);
-        partial_request = CONS_PAGE_USABLE_BYTES;
-    } while (nbytes);
-    *tail = NIL;
-    return result;
-}
-#endif
-
-/* Convert a &MORE context to a list. Split it up like make_list if we have to */
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-NO_SANITIZE_MEMORY lispobj AMD64_SYSV_ABI
-listify_rest_arg(lispobj* context, sword_t nbytes, int sys) {
-    // same comment as above in make_list() applies about the scope of pseudo-atomic
-    struct thread *self = get_sb_vm_thread();
-    PREPARE_LIST_ALLOCATION();
-    lispobj result, *tail = &result;
-    do {
-        if (nbytes < partial_request) partial_request = nbytes;
-        struct cons* c = (void*)lisp_alloc(sys, region, partial_request, PAGE_TYPE_CONS, self);
-        *tail = make_lispobj((void*)c, LIST_POINTER_LOWTAG);
-        int ncells = partial_request >> (1+WORD_SHIFT);
-        nbytes -= N_WORD_BYTES * 2 * ncells;
-        // Unroll x 4
-        int n_unrolled_iterations = ncells >> 2;
-        struct cons* limit = c + n_unrolled_iterations * 4;
-        while (c < limit) {
-            c[0].car = context[ 0]; c[0].cdr = make_lispobj(c+1, LIST_POINTER_LOWTAG);
-            c[1].car = context[-1]; c[1].cdr = make_lispobj(c+2, LIST_POINTER_LOWTAG);
-            c[2].car = context[-2]; c[2].cdr = make_lispobj(c+3, LIST_POINTER_LOWTAG);
-            c[3].car = context[-3]; c[3].cdr = make_lispobj(c+4, LIST_POINTER_LOWTAG);
-            c += 4;
-            context -= 4;
-        }
-        ncells -= n_unrolled_iterations * 4;
-        while (ncells--) {
-            c->car = *context--;
-            c->cdr = make_lispobj(c+1, LIST_POINTER_LOWTAG);
-            c++;
-        }
-        tail = &((c-1)->cdr);
-        partial_request = CONS_PAGE_USABLE_BYTES;
-    } while (nbytes);
-    *tail = NIL;
-    return result;
-}
-#else
-/* Let's assume that all the rest of the architectures work similarly.
- * There may be minor variations in how both args get passed */
-NO_SANITIZE_MEMORY lispobj listify_rest_arg(lispobj* context, sword_t context_bytes) {
-    // same comment as above in make_list() applies about the scope of pseudo-atomic
-    struct thread *self = get_sb_vm_thread();
-    sword_t nbytes = context_bytes * CONS_SIZE;
-    struct alloc_region *region = THREAD_ALLOC_REGION(self, cons);
-    int partial_request = (char*)region->end_addr - (char*)region->free_pointer;
-    gc_assert(nbytes > (sword_t)partial_request);
-    if (partial_request == 0) partial_request = CONS_PAGE_USABLE_BYTES;
-    lispobj result, *tail = &result;
-    do {
-        if (nbytes < partial_request) partial_request = nbytes;
-        struct cons* c = (void*)lisp_alloc(0, region, partial_request, PAGE_TYPE_CONS, self);
-        *tail = make_lispobj((void*)c, LIST_POINTER_LOWTAG);
-        int ncells = partial_request >> (1+WORD_SHIFT);
-        nbytes -= N_WORD_BYTES * 2 * ncells;
-        // Unroll x 4
-        int n_unrolled_iterations = ncells >> 2;
-        struct cons* limit = c + n_unrolled_iterations * 4;
-        while (c < limit) {
-            c[0].car = context[ 0]; c[0].cdr = make_lispobj(c+1, LIST_POINTER_LOWTAG);
-            c[1].car = context[ 1]; c[1].cdr = make_lispobj(c+2, LIST_POINTER_LOWTAG);
-            c[2].car = context[ 2]; c[2].cdr = make_lispobj(c+3, LIST_POINTER_LOWTAG);
-            c[3].car = context[ 3]; c[3].cdr = make_lispobj(c+4, LIST_POINTER_LOWTAG);
-            c += 4;
-            context += 4;
-        }
-        ncells -= n_unrolled_iterations * 4;
-        while (ncells--) {
-            c->car = *context++;
-            c->cdr = make_lispobj(c+1, LIST_POINTER_LOWTAG);
-            c++;
-        }
-        tail = &((c-1)->cdr);
-        partial_request = CONS_PAGE_USABLE_BYTES;
-    } while (nbytes);
-    *tail = NIL;
-    return result;
-}
-#endif
-
-typedef struct { struct alloc_region* r; int type; } close_region_arg;
-
-static void sync_close_regions(int block_signals, int options,
-                               close_region_arg* a, int count)
-{
-    sigset_t savedmask;
-    __attribute__((unused)) int result;
-    if (block_signals) block_blockable_signals(&savedmask);
-    if (options & LOCK_CODE_ALLOCATOR) {
-        result = mutex_acquire(&code_allocator_lock);
-        gc_dcheck(result);
-    }
-    if (options & LOCK_PAGE_TABLE) {
-        result = mutex_acquire(&free_pages_lock);
-        gc_dcheck(result);
-    }
-    int i;
-    for (i=0; i<count; ++i) {
-        page_index_t p = find_page_index(a[i].r->start_addr);
-        if (p < 0) continue;
-        /* Potentially use up all remaining bytes in the TLAB before closing.
-         * Pages below the alloc_start for the page type cannot possibly be used,
-         * but we didn't properly account for that space, which has a bad effect
-         * on the GC auto-trigger. Wasting but counting it works better.
-         * But (FIXME) - why does it _NOT_ _WORK_ to include the test of 'p<alloc_start' here?
-         * With that test in, I still see heap exhaustions, but without the test
-         * - so using up the remainder of the TLAB always - we do NOT get exhaustions.
-         * It can't be a race, because we're holding the mutex */
-        if ((options & CONSUME_REMAINDER) /* && p < get_alloc_start_page(a[i].type) */ ) {
-            char* freeptr = a[i].r->free_pointer;
-            char* new_end =
-                (a[i].type == PAGE_TYPE_CONS) ?
-                PTR_ALIGN_DOWN(freeptr, GENCGC_PAGE_BYTES) + CONS_PAGE_USABLE_BYTES
-                : PTR_ALIGN_UP(freeptr, GENCGC_PAGE_BYTES);
-            // fillers may not be needed. This anticipates non-zero-filed pages though.
-            deposit_filler(freeptr, new_end);
-            a[i].r->free_pointer = new_end;
-        }
-        ensure_region_closed(a[i].r, a[i].type);
-    }
-    if (options & LOCK_PAGE_TABLE) {
-        result = mutex_release(&free_pages_lock);
-        gc_dcheck(result);
-    }
-    if (options & LOCK_CODE_ALLOCATOR) {
-        result = mutex_release(&code_allocator_lock);
-        gc_dcheck(result);
-    }
-    if (block_signals) thread_sigmask(SIG_SETMASK, &savedmask, 0);
-}
-
-#define N_THREAD_TLABS(array) sizeof array / sizeof (close_region_arg)
-
-/* These two exported "close_x" functions are called from Lisp prior to
- * heap-walking. They must never get interrupted by STOP_FOR_GC while holding
- * either the free page lock or code allocation lock.
- * Normally this is guaranteed by pseudo-atomic, but in the interest of simplicity,
- * these are plain foreign calls without aid of a vop. */
-void close_current_thread_tlab() {
-    __attribute__((unused)) struct thread *self = get_sb_vm_thread();
-    /* If the compiler doesn't use the cons region, neither will alloc_list().
-     * i.e. we'll never see the cons region used with PAGE_TYPE_MIXED.
-     * Thus the invariants about page type correctness hold when closing */
-    close_region_arg argv[] = {
-      { THREAD_ALLOC_REGION(self,mixed), PAGE_TYPE_MIXED },
-      { THREAD_ALLOC_REGION(self,cons), PAGE_TYPE_CONS },
-#ifdef LISP_FEATURE_SB_THREAD
-      { THREAD_ALLOC_REGION(self,sys_mixed), PAGE_TYPE_MIXED },
-      { THREAD_ALLOC_REGION(self,sys_cons), PAGE_TYPE_CONS }
-#endif
-    };
-    sync_close_regions(1, LOCK_PAGE_TABLE, argv, N_THREAD_TLABS(argv));
-}
-void close_code_region() {
-    close_region_arg argv = { code_region, PAGE_TYPE_CODE };
-    sync_close_regions(1, LOCK_PAGE_TABLE|LOCK_CODE_ALLOCATOR, &argv, 1);
-}
-/* When this is called by unregister_thread() with STOP_FOR_GC blocked,
- * it needs to aquire the page table lock but not the code allocator lock.
- * It is also called at the start of GC to close each non-dead thread's regions,
- * in which case no locks are needed since all other lisp threads are stopped. */
-void gc_close_thread_regions(__attribute__((unused)) struct thread* th,
-                             int locking) {
-    close_region_arg argv[] = {
-#ifdef LISP_FEATURE_SB_THREAD
-      { &th->mixed_tlab, PAGE_TYPE_MIXED },
-      { &th->cons_tlab, PAGE_TYPE_CONS },
-      { &th->sys_mixed_tlab, PAGE_TYPE_MIXED },
-      { &th->sys_cons_tlab, PAGE_TYPE_CONS }
-#else
-      { main_thread_mixed_region, PAGE_TYPE_MIXED },
-      { main_thread_cons_region, PAGE_TYPE_CONS },
-#endif
-    };
-    sync_close_regions(0, locking, argv, N_THREAD_TLABS(argv));
-}
-
 #ifdef LISP_FEATURE_SPARC
 void mixed_region_rollback(sword_t size)
 {
@@ -5410,11 +4177,11 @@ void unhandled_sigmemoryfault(void* addr);
  * on unprotected pages completely, and the second complains to stderr
  * but allows us to continue without losing.
  */
-extern boolean ignore_memoryfaults_on_unprotected_pages;
-boolean ignore_memoryfaults_on_unprotected_pages = 0;
+extern bool ignore_memoryfaults_on_unprotected_pages;
+bool ignore_memoryfaults_on_unprotected_pages = 0;
 
-extern boolean continue_after_memoryfault_on_unprotected_pages;
-boolean continue_after_memoryfault_on_unprotected_pages = 0;
+extern bool continue_after_memoryfault_on_unprotected_pages;
+bool continue_after_memoryfault_on_unprotected_pages = 0;
 
 int gencgc_handle_wp_violation(__attribute__((unused)) void* context, void* fault_addr)
 {
@@ -5437,6 +4204,7 @@ int gencgc_handle_wp_violation(__attribute__((unused)) void* context, void* faul
 
     }
 #ifdef LISP_FEATURE_SOFT_CARD_MARKS
+    fake_foreign_function_call(context);
     lose("misuse of mprotect() on dynamic space @ %p", fault_addr);
 #else
     // Pages of code are never have MMU-based protection, except on darwin,
@@ -5494,8 +4262,7 @@ void
 unhandled_sigmemoryfault(void __attribute__((unused)) *addr)
 {}
 
-static void
-zero_all_free_ranges() /* called only by gc_and_save() */
+void zero_all_free_ranges() /* called only by gc_and_save() */
 {
     page_index_t i;
     for (i = 0; i < next_free_page; i++) {
@@ -5514,361 +4281,6 @@ zero_all_free_ranges() /* called only by gc_and_save() */
 #endif
 }
 
-/* Things to do before doing a final GC before saving a core.
- *
- * + Single-object pages aren't moved by the GC, so we need to
- *   unset that flag from all pages.
- * + Change all pages' generations to 0 so that we can do all the collection
- *   in a single invocation of collect_generation()
- * + Instances on unboxed pages need to have their layout pointer visited,
- *   so all pages have to be turned to boxed.
- */
-static void prepare_dynamic_space_for_final_gc()
-{
-    page_index_t i;
-
-    for (i = 0; i < next_free_page; i++) {
-        // Compaction requires that we permit large objects to be copied henceforth.
-        // Object of size >= LARGE_OBJECT_SIZE get re-allocated to single-object pages.
-        page_table[i].type &= ~SINGLE_OBJECT_FLAG;
-        // Turn every page to boxed so that the layouts of instances
-        // which were relocated to unboxed pages get scanned and fixed.
-        if ((page_table[i].type & PAGE_TYPE_MASK) == PAGE_TYPE_UNBOXED)
-            page_table[i].type = PAGE_TYPE_MIXED;
-        generation_index_t gen = page_table[i].gen;
-        if (gen != 0) {
-            int used = page_bytes_used(i);
-            page_table[i].gen = 0;
-            generations[gen].bytes_allocated -= used;
-            generations[0].bytes_allocated += used;
-        }
-    }
-}
-
-/* Set this switch to 1 for coalescing of strings dumped to fasl,
- * or 2 for coalescing of those,
- * plus literal strings in code compiled to memory. */
-char gc_coalesce_string_literals = 0;
-
-extern void move_rospace_to_dynamic(int), prepare_readonly_space(int,int);
-
-/* Do a non-conservative GC, and then save a core with the initial
- * function being set to the value of 'lisp_init_function' */
-void
-gc_and_save(char *filename, boolean prepend_runtime, boolean purify,
-            boolean save_runtime_options, boolean compressed,
-            int compression_level, int application_type)
-{
-#if defined LISP_FEATURE_SPARC && defined LISP_FEATURE_LINUX
-    /* OS says it'll give you the memory where you want, then it says
-     * it won't map over it from the core file.  That's news to me.
-     * Fragment of output from 'strace -e mmap2 src/runtime/sbcl --core output/sbcl.core':
-     * ...
-     * mmap2(0x2fb58000, 4882432, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) = 0x2fb58000
-     * mmap2(0x2fb58000, 4882432, PROT_READ, MAP_SHARED|MAP_FIXED, 3, 0x2000) = -1 EINVAL (Invalid argument)
-     */
-    purify = 0;
-#endif
-    FILE *file;
-    void *runtime_bytes = NULL;
-    size_t runtime_size;
-    extern void coalesce_similar_objects();
-    boolean verbose = !lisp_startup_options.noinform;
-
-    file = prepare_to_save(filename, prepend_runtime, &runtime_bytes,
-                           &runtime_size);
-    if (file == NULL)
-       return;
-
-    /* The filename might come from Lisp, and be moved by the now
-     * non-conservative GC. */
-    filename = strdup(filename);
-
-    /* We're committed to process death at this point, and interrupts can not
-     * possibly be handled in Lisp. Let the installed handler closures become
-     * garbage, since new ones will be made by ENABLE-INTERRUPT on restart */
-#ifndef LISP_FEATURE_WIN32
-    {
-        int i;
-        for (i=0; i<NSIG; ++i)
-            lisp_sig_handlers[i] = 0;
-    }
-#endif
-
-    /* Collect twice: once into relatively high memory, and then back
-     * into low memory. This compacts the retained data into the lower
-     * pages, minimizing the size of the core file.
-     *
-     * But note: There is no assurance that this technique actually works,
-     * and that the final GC can fit all data below the starting allocation
-     * page in the penultimate GC. If it doesn't fit, things are technically
-     * ok, but horrible in terms of core file size.  Consider:
-     *
-     * Penultimate GC: (moves all objects higher in memory)
-     *   | ... from_space ... |
-     *                        ^--  gencgc_alloc_start_page = next_free_page
-     *                        | ... to_space ... |
-     *                                           ^ new next_free_page
-     *
-     * Utimate GC: (moves all objects lower in memory)
-     *   | ... to_space ...   | ... from_space ...| ... |
-     *                                                  ^ new next_free_page ?
-     * Question:
-     *  In the ultimate GC, can next_free_page actually increase past
-     *  its ending value from the penultimate GC?
-     * Answer:
-     *  Yes- Suppose the sequence of copying is so adversarial to the allocator
-     *  that attempts to fit an object in a region fail often, and require
-     *  frequent opening of new regions. (And/or imagine a particularly bad mix
-     *  of boxed and non-boxed allocations such that the logic for resuming
-     *  at the tail of a partially filled page in gc_find_freeish_pages()
-     *  is seldom applicable)  If this occurs, then some allocation must
-     *  be on a higher page than all of to_space and from_space.
-     *  Then the entire (zeroed) from_space will be present in the saved core
-     *  as empty pages, because we can't represent discontiguous ranges.
-     */
-    conservative_stack = 0;
-    gencgc_oldest_gen_to_gc = 0;
-    // Avoid tenuring of otherwise-dead objects referenced by
-    // dynamic bindings which disappear on image restart.
-    struct thread *thread = get_sb_vm_thread();
-    char *start = (char*)&thread->lisp_thread;
-    char *end = (char*)thread + dynamic_values_bytes;
-    memset(start, 0, end-start);
-    // After zeroing, make sure PINNED_OBJECTS is a list again.
-    write_TLS(PINNED_OBJECTS, NIL, thread);
-    // From here on until exit, there is no chance of continuing
-    // in Lisp if something goes wrong during GC.
-    // Flush regions to ensure heap scan in copy_rospace doesn't miss anything
-    gc_close_thread_regions(thread, 0);
-    gc_close_collector_regions(0);
-    move_rospace_to_dynamic(0);
-    pre_verify_gen_0 = 1;
-    prepare_immobile_space_for_final_gc(); // once is enough
-    prepare_dynamic_space_for_final_gc();
-    unwind_binding_stack();
-#ifdef LISP_FEATURE_SB_THREAD
-    /* During save, if the only pointer to a heap object is from a thread, then that
-     * heap object is effectively dead, because the binding stacks and TLS of the main
-     * thread will be recreated on startup and contain no pointers.
-     * Make it as if that already happened, otherwise excess garbage may be retained
-     * (as can be seen if DEBUG_CORE_LOADING is defined).
-     * non-thread builds do not use TLS */
-    {
-    char* from = (char*)&thread->lisp_thread;
-    char* to = SymbolValue(FREE_TLS_INDEX,0) + (char*)thread;
-    memset(from, 0, to-from);
-    }
-#endif
-    save_lisp_gc_iteration = 1;
-    gencgc_alloc_start_page = next_free_page;
-    collect_garbage(0);
-    verify_heap(0, VERIFY_POST_GC);
-
-    THREAD_JIT(0);
-
-    // We always coalesce copyable numbers. Additional coalescing is done
-    // only on request, in which case a message is shown (unless verbose=0).
-    if (gc_coalesce_string_literals && verbose) {
-        printf("[coalescing similar vectors... ");
-        fflush(stdout);
-    }
-    // Now that we've GC'd to eliminate as much junk as possible...
-    coalesce_similar_objects();
-    if (gc_coalesce_string_literals && verbose)
-        printf("done]\n");
-
-    // Do a non-moving collection so that orphaned strings that result
-    // from coalescing STRING= symbol names do not consume read-only space.
-    collect_garbage(1+PSEUDO_STATIC_GENERATION);
-    prepare_readonly_space(purify, 0);
-    if (verbose) { printf("[performing final GC..."); fflush(stdout); }
-    prepare_dynamic_space_for_final_gc();
-    save_lisp_gc_iteration = 2;
-    gencgc_alloc_start_page = 0;
-    collect_garbage(0);
-    /* All global allocation regions should be empty */
-    ASSERT_REGIONS_CLOSED();
-    // Enforce (rather, warn for lack of) self-containedness of the heap
-    verify_heap(0, VERIFY_FINAL | VERIFY_QUICK);
-    if (verbose)
-        printf(" done]\n");
-
-    THREAD_JIT(0);
-    // Scrub remaining garbage
-    zero_all_free_ranges();
-    // Assert that defrag will not move the init_function
-    gc_assert(!immobile_space_p(lisp_init_function));
-    // Defragment and set all objects' generations to pseudo-static
-    prepare_immobile_space_for_save(verbose);
-
-#ifdef LISP_FEATURE_X86_64
-    untune_asm_routines_for_microarch();
-#endif
-    os_unlink_runtime();
-
-    if (prepend_runtime)
-        save_runtime_to_filehandle(file, runtime_bytes, runtime_size,
-                                   application_type);
-
-    save_to_filehandle(file, filename, lisp_init_function,
-                       prepend_runtime, save_runtime_options,
-                       compressed ? compression_level : COMPRESSION_LEVEL_NONE);
-    /* Oops. Save still managed to fail. Since we've mangled the stack
-     * beyond hope, there's not much we can do.
-     * (beyond FUNCALLing lisp_init_function, but I suspect that's
-     * going to be rather unsatisfactory too... */
-    lose("Attempt to save core after non-conservative GC failed.");
-}
-
-#ifdef LISP_FEATURE_DARWIN_JIT
-/* Inexplicably, an executable page can generate spurious faults if
- * it's not written to after changing its protection flags.
- * Touch every page... */
-void darwin_jit_code_pages_kludge () {
-    THREAD_JIT(0);
-    page_index_t page;
-    for (page = 0; page  < next_free_page; page++) {
-        if(is_code(page_table[page].type)) {
-            char* addr = page_address(page);
-            for (unsigned i = 0; i < GENCGC_PAGE_BYTES; i+=4096) {
-                volatile char* page_start = addr + i;
-                page_start[0] = page_start[0];
-            }
-        }
-    }
-    THREAD_JIT(1);
-}
-#endif
-
-/* Read corefile ptes from 'fd' which has already been positioned
- * and store into the page table */
-void gc_load_corefile_ptes(int card_table_nbits,
-                           core_entry_elt_t n_ptes, core_entry_elt_t total_bytes,
-                           os_vm_offset_t offset, int fd)
-{
-    gc_assert(ALIGN_UP(n_ptes * sizeof (struct corefile_pte), N_WORD_BYTES)
-              == (size_t)total_bytes);
-    if (next_free_page != n_ptes)
-        lose("n_PTEs=%"PAGE_INDEX_FMT" but expected %"PAGE_INDEX_FMT,
-             n_ptes, next_free_page);
-
-    // Allocation of PTEs is delayed 'til now so that calloc() doesn't
-    // consume addresses that would have been taken by a mapped space.
-    gc_card_table_nbits = card_table_nbits;
-    gc_allocate_ptes();
-
-    if (LSEEK(fd, offset, SEEK_SET) != offset) lose("failed seek");
-
-    char data[8192];
-    // Process an integral number of ptes on each read.
-    // Parentheses around sizeof (type) are necessary to suppress a
-    // clang warning (-Wsizeof-array-div) that we're dividing the array size
-    // by a divisor that is not the size of one element in that array.
-    page_index_t max_pages_per_read = sizeof data / (sizeof (struct corefile_pte));
-    page_index_t page = 0;
-    generation_index_t gen = CORE_PAGE_GENERATION;
-    while (page < n_ptes) {
-        page_index_t pages_remaining = n_ptes - page;
-        page_index_t npages =
-            pages_remaining < max_pages_per_read ? pages_remaining : max_pages_per_read;
-        ssize_t bytes = npages * sizeof (struct corefile_pte);
-        if (read(fd, data, bytes) != bytes) lose("failed read");
-        int i;
-        for ( i = 0 ; i < npages ; ++i, ++page ) {
-            struct corefile_pte pte;
-            memcpy(&pte, data+i*sizeof (struct corefile_pte), sizeof pte);
-            // Low 3 bits of the scan_start hold the 'type' flags.
-            // Low bit of words_used indicates a large (a/k/a single) object.
-            char type = ((pte.words_used & 1) ? SINGLE_OBJECT_FLAG : 0)
-                        | (pte.sso & 0x07);
-            page_table[page].type = type;
-            pte.words_used &= ~1;
-            /* It is possible, though rare, for the saved page table
-             * to contain free pages below alloc_ptr. */
-            if (type != FREE_PAGE_FLAG) {
-                gc_assert(pte.words_used);
-                page_table[page].words_used_ = pte.words_used;
-                set_page_scan_start_offset(page, pte.sso & ~0x07);
-                page_table[page].gen = gen;
-            }
-            bytes_allocated += pte.words_used << WORD_SHIFT;
-        }
-    }
-    generations[gen].bytes_allocated = bytes_allocated;
-    gc_assert((ssize_t)bytes_allocated <= (ssize_t)(n_ptes * GENCGC_PAGE_BYTES));
-    if (gen != 0 && ENABLE_PAGE_PROTECTION) {
-#ifdef LISP_FEATURE_SOFT_CARD_MARKS
-        page_index_t p;
-        for (p = 0; p < next_free_page; ++p)
-            if (page_words_used(p)) assign_page_card_marks(p, CARD_UNMARKED);
-#else
-        // coreparse can avoid hundreds to thousands of mprotect() calls by
-        // treating the whole range from the corefile as protectable, except
-        // that soft-marked code pages must NOT be subject to mprotect.
-        // So just watch out for empty pages and code.  Unboxed object pages
-        // will get unprotected on demand.
-#define non_protectable_page_p(x) !page_words_used(x) || is_code(page_table[x].type)
-        page_index_t start = 0, end;
-        // cf. write_protect_generation_pages()
-        while (start  < next_free_page) {
-#ifdef LISP_FEATURE_DARWIN_JIT
-            if(is_code(page_table[start].type)) {
-              SET_PAGE_PROTECTED(start,1);
-                for (end = start + 1; end < next_free_page; end++) {
-                    if (!page_words_used(end) || !is_code(page_table[end].type))
-                        break;
-                    SET_PAGE_PROTECTED(end,1);
-                }
-                os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_ALL);
-                start = end+1;
-                continue;
-            }
-#endif
-            if (non_protectable_page_p(start)) {
-                ++start;
-                continue;
-            }
-            SET_PAGE_PROTECTED(start,1);
-            for (end = start + 1; end < next_free_page; end++) {
-                if (non_protectable_page_p(end))
-                    break;
-                SET_PAGE_PROTECTED(end,1);
-            }
-            os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_JIT_READ);
-            start = end;
-        }
-#endif
-    }
-
-#ifdef LISP_FEATURE_DARWIN_JIT
-    darwin_jit_code_pages_kludge();
-    /* For some reason doing an early pthread_jit_write_protect_np sometimes fails.
-       Which is weird, because it's done many times in arch_write_linkage_table_entry later.
-       Adding the executable bit here avoids calling pthread_jit_write_protect_np */
-    os_protect((os_vm_address_t)STATIC_CODE_SPACE_START, STATIC_CODE_SPACE_SIZE, OS_VM_PROT_ALL);
-#endif
-}
-
-/* Prepare the array of corefile_ptes for save */
-void gc_store_corefile_ptes(struct corefile_pte *ptes)
-{
-    page_index_t i;
-    for (i = 0; i < next_free_page; i++) {
-        /* Thanks to alignment requirements, the two three bits
-         * are always zero, so we can use them to store the
-         * allocation type -- region is always closed, so only
-         * the three low bits of allocation flags matter. */
-        uword_t word = page_scan_start_offset(i);
-        gc_assert((word & 0x07) == 0);
-        ptes[i].sso = word | (0x07 & page_table[i].type);
-        int used = page_table[i].words_used_;
-        gc_assert(!(used & 1));
-        ptes[i].words_used = used | page_single_obj_p(i);
-    }
-}
-
-#define ARTIFICIALLY_HIGH_GEN 8
 generation_index_t gc_gen_of(lispobj obj, int defaultval) {
     int page = find_page_index((void*)obj);
     if (page >= 0) return page_table[page].gen;
@@ -5885,7 +4297,7 @@ generation_index_t gc_gen_of(lispobj obj, int defaultval) {
  * called after scavenging the header. So if something didn't get moved
  * out of from_space, then it must have been pinned.
  * So don't call this for anything except that use-case. */
-static inline boolean obj_gen_lessp(lispobj obj, generation_index_t b)
+static inline bool obj_gen_lessp(lispobj obj, generation_index_t b)
 {
     generation_index_t a = gc_gen_of(obj, ARTIFICIALLY_HIGH_GEN);
     if (a == from_space) {
@@ -5895,13 +4307,49 @@ static inline boolean obj_gen_lessp(lispobj obj, generation_index_t b)
     return ((a==SCRATCH_GENERATION) ? from_space : a) < b;
 }
 
+/* Loosely inspired by the code in 'purify' */
+#define LATERBLOCKSIZE 50000 // arbitrary
+static struct later {
+    struct later *next;
+    struct code *list[LATERBLOCKSIZE];
+    int count;
+} *later_blocks = NULL;
+
+static void delay_code_metadata_scavenge(struct code* code)
+{
+    struct later* block = later_blocks;
+    if (!block || block->count == LATERBLOCKSIZE) {
+        block = calloc(1, sizeof (struct later));
+        block->next = later_blocks;
+        later_blocks = block;
+    }
+    block->list[block->count] = code;
+    ++block->count;
+}
+
+static void finish_code_metadata()
+{
+    struct later *block = later_blocks;
+    int i;
+    save_lisp_gc_iteration = 3; // ensure no more delaying of metadata scavenge
+    for ( ; block ; block = block->next ) {
+        for (i = 0; i < block->count; ++i) {
+            struct code*c = block->list[i];
+            gc_assert(!forwarding_pointer_p((lispobj*)c));
+            // first two words are non-pointer, then come debug_info and fixups
+            // in whatever order they were defined in objdef.
+            scavenge((lispobj*)c + 2, 2);
+            CLEAR_WRITTEN_FLAG((lispobj*)c);
+        }
+    }
+    scavenge_newspace(new_space);
+}
+
 sword_t scav_code_blob(lispobj *object, lispobj header)
 {
     struct code* code = (struct code*)object;
     int nboxed = code_header_words(code);
     if (!nboxed) goto done;
-
-    ++n_scav_calls[CODE_HEADER_WIDETAG/4];
 
     int my_gen = gc_gen_of((lispobj)object, ARTIFICIALLY_HIGH_GEN);
     if (my_gen < ARTIFICIALLY_HIGH_GEN && ((my_gen & 7) == from_space)) {
@@ -5925,34 +4373,45 @@ sword_t scav_code_blob(lispobj *object, lispobj header)
     // of the OR condition. As is, we scavenge "too much" of newspace which
     // is not an issue of correctness but rather efficiency.
     if (header_rememberedp(header) || (my_gen == new_space) ||
+#ifndef LISP_FEATURE_IMMOBILE_SPACE
+        // if NO immobile-space, then text space is equivalent to static space
+        ((uword_t)object >= TEXT_SPACE_START && object < text_space_highwatermark) ||
+#endif
         ((uword_t)object >= STATIC_SPACE_START && object < static_space_free_pointer)) {
         // FIXME: We sometimes scavenge protected pages.
         // This assertion fails, but things work nonetheless.
         // gc_assert(!card_protected_p(object));
 
-        /* Scavenge the boxed section of the code data block. */
-        sword_t n_header_words = code_header_words((struct code *)object);
-        scavenge(object + 2, n_header_words - 2);
+        if (save_lisp_gc_iteration == 2) {
+            // Attempt to place debug-info at end of the heap by not scavenging now
+            scavenge(object + 4, nboxed - 4);
+            delay_code_metadata_scavenge(code);
+        } else {
+            /* Scavenge the boxed section of the code data block. */
+            scavenge(object + 2, nboxed - 2);
+        }
 
 #ifdef LISP_FEATURE_UNTAGGED_FDEFNS
         // Process each untagged fdefn pointer.
         // TODO: assert that the generation of any fdefn is older than that of 'code'.
-        lispobj* fdefns_start = code->constants + code_n_funs(code)
-                                * CODE_SLOTS_PER_SIMPLE_FUN;
+        lispobj* fdefns = code->constants +
+          code_n_funs(code) * CODE_SLOTS_PER_SIMPLE_FUN;
         int n_fdefns = code_n_named_calls(code);
         int i;
         for (i=0; i<n_fdefns; ++i) {
-            lispobj word = fdefns_start[i];
-            if ((word & LOWTAG_MASK) == 0 && word != 0) {
+            lispobj word = fdefns[i];
+            if (word) {
+                gc_assert(!(word & LOWTAG_MASK)); // must not have OTHER_POINTER_LOWTAG
                 lispobj tagged_word = word | OTHER_POINTER_LOWTAG;
                 scavenge(&tagged_word, 1);
                 if (tagged_word - OTHER_POINTER_LOWTAG != word) {
-                    fdefns_start[i] = tagged_word - OTHER_POINTER_LOWTAG;
+                    fdefns[i] = tagged_word - OTHER_POINTER_LOWTAG;
                 }
             }
         }
 #endif
 
+        // What does this have to do with DARWIN_JIT?
 #if defined LISP_FEATURE_64_BIT && !defined LISP_FEATURE_DARWIN_JIT
         /* If any function in this code object redirects to a function outside
          * the object, then scavenge all entry points. Otherwise there is no need,
@@ -5973,35 +4432,22 @@ sword_t scav_code_blob(lispobj *object, lispobj header)
             })
         }
 
+        if (save_lisp_gc_iteration == 2) goto done;
+
         /* If my_gen is other than newspace, then scan for old->young
          * pointers. If my_gen is newspace, there can be no such pointers
          * because newspace is the lowest numbered generation post-GC
          * (regardless of whether this is a promotion cycle) */
         if (my_gen != new_space) {
-            lispobj *where, *end = object + n_header_words, ptr;
+            lispobj *where, *end = object + nboxed, ptr;
             for (where= object + 2; where < end; ++where)
                 if (is_lisp_pointer(ptr = *where) && obj_gen_lessp(ptr, my_gen))
                     goto done;
         }
         CLEAR_WRITTEN_FLAG(object);
-    } else {
-        ++n_scav_skipped[CODE_HEADER_WIDETAG/4];
     }
 done:
     return code_total_nwords(code);
-}
-
-// For the standalone ldb monitor
-void recompute_gen_bytes_allocated() {
-    page_index_t page;
-    int gen;
-    for (gen=0; gen<NUM_GENERATIONS; ++gen)
-        generations[gen].bytes_allocated = 0;
-    for (page=0; page<next_free_page; ++page)
-        generations[page_table[page].gen].bytes_allocated += page_bytes_used(page);
-    bytes_allocated = 0;
-    for (gen=0; gen<NUM_GENERATIONS; ++gen)
-        bytes_allocated += generations[gen].bytes_allocated;
 }
 
 void really_note_transporting(lispobj old,void*new,sword_t nwords)
@@ -6016,4 +4462,687 @@ void really_note_transporting(lispobj old,void*new,sword_t nwords)
                 old, (uword_t)new, (int)nwords);
 }
 
-#include "verify.inc"
+/** heap invariant checker **/
+
+static bool card_markedp(void* addr)
+{
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (immobile_space_p((lispobj)addr))
+        return !immobile_card_protected_p(addr);
+#endif
+    return gc_card_mark[addr_to_card_index(addr)] != CARD_UNMARKED;
+}
+
+// Check a single pointer. Return 1 if we should stop verifying due to too many errors.
+// (Otherwise continue showing errors until then)
+// NOTE: This function can produces false failure indications,
+// usually related to dynamic space pointing to the stack of a
+// dead thread, but there may be other reasons as well.
+static void note_failure(lispobj thing, lispobj *where, struct verify_state *state,
+                         char *str)
+{
+    if (state->flags & VERIFY_PRINT_HEADER_ON_FAILURE) {
+        if (state->flags & VERIFY_PRE_GC) fprintf(stderr, "pre-GC failure\n");
+        if (state->flags & VERIFY_POST_GC) fprintf(stderr, "post-GC failure\n");
+        state->flags &= ~VERIFY_PRINT_HEADER_ON_FAILURE;
+    }
+    if (state->object_addr) {
+        lispobj obj = compute_lispobj(state->object_addr);
+        page_index_t pg = find_page_index(state->object_addr);
+        fprintf(stderr, "Ptr %p @ %"OBJ_FMTX" (lispobj %"OBJ_FMTX",pg%d) sees %s\n",
+                (void*)thing, (uword_t)where, obj, (int)pg, str);
+        // Record this in state->err_objs if possible
+        int i;
+        for(i=0; i<MAX_ERR_OBJS; ++i)
+            if (!state->err_objs[i]) {
+                state->err_objs[i] = (uword_t)state->object_addr;
+                break;
+            }
+    } else {
+        fprintf(stderr, "Ptr %p @ %"OBJ_FMTX" sees %s\n", (void*)thing, (uword_t)where, str);
+    }
+}
+
+static int
+verify_pointer(lispobj thing, lispobj *where, struct verify_state *state)
+{
+    /* Strict containment: no pointer from a heap space may point
+     * to anything outside of a heap space. */
+    // bool strict_containment = state->flags & VERIFY_FINAL;
+
+#define FAIL_IF(cond, why) \
+    if (cond) { if (++state->nerrors > 25) return 1; note_failure(thing,where,state,why); }
+
+    if (!is_lisp_pointer(thing)) {
+        FAIL_IF(!is_lisp_immediate(thing), "strange non-pointer");
+        return 0;
+    }
+    // if (strict_containment && !gc_managed_heap_space_p(thing)) GC_WARN("non-Lisp memory");
+    page_index_t source_page_index = find_page_index(where);
+    page_index_t target_page_index = find_page_index((void*)thing);
+    if (!(target_page_index >= 0 || immobile_space_p(thing))) return 0; // can't do much with it
+    if ((state->flags & VERIFY_TAGS) && target_page_index >= 0) {
+        if (listp(thing)) {
+            FAIL_IF(!(is_cons_half(CONS(thing)->car) && is_cons_half(CONS(thing)->cdr)),
+                    "non-cons");
+        } else {
+            FAIL_IF(LOWTAG_FOR_WIDETAG(widetag_of(native_pointer(thing))) != lowtag_of(thing),
+                    "incompatible widetag");
+        }
+    }
+    generation_index_t to_gen =
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        points_to_asm_code_p((uword_t)thing)?
+        gc_gen_of(make_lispobj((void*)asm_routines_start,OTHER_POINTER_LOWTAG),0):
+#endif
+        gc_gen_of(thing, ARTIFICIALLY_HIGH_GEN);
+    if (to_gen < state->min_pointee_gen) state->min_pointee_gen = to_gen;
+    if (state->flags & VERIFY_QUICK) return 0;
+    if (target_page_index >= 0) {
+        // If it's within the dynamic space it should point to a used page.
+        FAIL_IF(page_free_p(target_page_index), "free page");
+        FAIL_IF(!(page_table[target_page_index].type & OPEN_REGION_PAGE_FLAG)
+                && (thing & (GENCGC_PAGE_BYTES-1)) >= page_bytes_used(target_page_index),
+                "unallocated space");
+    } else {
+        // The object pointed to must not have been discarded as garbage.
+        FAIL_IF(!other_immediate_lowtag_p(*native_pointer(thing)), "trashed object");
+    }
+    // Must not point to a forwarding pointer
+    FAIL_IF(*native_pointer(thing) == FORWARDING_HEADER, "forwarding ptr");
+    // Forbid pointers from R/O space into a GCed space
+    FAIL_IF((READ_ONLY_SPACE_START <= (uword_t)where && where < read_only_space_free_pointer),
+            "dynamic space from RO space");
+    // Card marking invariant check, but only if the source of pointer is a heap object
+    if (header_widetag(state->object_header) == CODE_HEADER_WIDETAG
+        && ! is_in_static_space(state->object_addr)
+        && to_gen < state->object_gen) {
+        // two things must be true:
+        // 1. the card containing the code must be marked
+        FAIL_IF(!card_markedp(state->object_addr), "younger obj from WP'd code header page");
+        // 2. the object header must be marked as written
+        if (!header_rememberedp(state->object_header))
+            lose("code @ %p (g%d). word @ %p -> %"OBJ_FMTX" (g%d)",
+                 state->object_addr, state->object_gen, where, thing, to_gen);
+    } else if ((state->flags & VERIFYING_GENERATIONAL) && to_gen < state->object_gen
+               && source_page_index >= 0) {
+        /* The WP criteria are:
+         *  - CONS marks the exact card since it can't span cards
+         *  - SIMPLE-VECTOR marks the card containing the cell with the old->young pointer.
+         *  - Everything else marks the object header -OR- the card with the pointer.
+         *    (either/or because Lisp marks the header card,
+         *     but the collector marks the cell's card.) */
+        int marked = card_markedp(where)
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+        || (state->object_header
+            && header_widetag(state->object_header) != SIMPLE_VECTOR_WIDETAG
+            && card_markedp(state->object_addr))
+#elif defined LISP_FEATURE_EXECUTABLE_FUNINSTANCES
+        /* #+(and (not soft-card-marks) executable-funinstances) could find the mark
+         * for a page-spanning funinstance on the preceding page, because it uses
+         * logical marking, not physical protection of the page holding the pointer */
+        || (header_widetag(state->object_header) == FUNCALLABLE_INSTANCE_WIDETAG
+            && card_markedp(state->object_addr))
+#endif
+        ;
+        FAIL_IF(!marked, "younger obj from WP page");
+    }
+    int valid;
+    if (state->flags & VERIFY_AGGRESSIVE) // Extreme paranoia mode
+        valid = valid_tagged_pointer_p(thing);
+    else {
+        /* Efficiently decide whether 'thing' is plausible.
+         * This MUST NOT use properly_tagged_descriptor_p() which
+         * assumes a known good object base address, and would
+         * "dangerously" scan a code component for embedded funs. */
+        valid = plausible_tag_p(thing);
+    }
+    /* If 'thing' points to a stack, we can only hope that the stack
+     * frame is ok, or the object at 'where' is unreachable. */
+    FAIL_IF(!valid && !is_in_stack_space(thing), "junk");
+    return 0;
+}
+#define CHECK(pointer, where) if (verify_pointer(pointer, where, state)) return 1
+
+/* Return 0 if good, 1 if bad.
+ * Take extra pains to process weak SOLIST nodes - Finalizer list nodes weakly point
+ * to a referent via an untagged pointer, so the GC doesn't even have to know that
+ * the reference is weak - it simply is ignored as a non-pointer.
+ * This makes invariant verification a little tricky. We want to restore the tagged
+ * pointer, but only if the list is the finalizer list. */
+extern bool finalizer_list_node_p(struct instance*);
+static int verify_headered_object(lispobj* object, sword_t nwords,
+                                  struct verify_state *state)
+{
+    long i;
+    int widetag = widetag_of(object);
+    if (instanceoid_widetag_p(widetag)) {
+        lispobj layout = layout_of(object);
+        if (layout) {
+            CHECK(layout, object);
+            struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
+            if (lockfree_list_node_layout_p(LAYOUT(layout))) {
+                // These objects might have _two_ untagged references -
+                //  1) the 'next' slot may or may not have tag bits
+                //  2) finalizer list node always stores its referent as untagged
+                struct list_node* node = (void*)object;
+                lispobj next = node->_node_next;
+                if (fixnump(next) && next)
+                  CHECK(next | INSTANCE_POINTER_LOWTAG, &node->_node_next);
+                if (finalizer_node_layout_p(LAYOUT(layout))) {
+                    struct solist_node* node = (void*)object;
+                    // !fixnump(next) implies that this node is NOT deleted, nor in
+                    // the process of getting deleted by CANCEL-FINALIZATION
+                    if (node->so_key && !fixnump(next)) {
+                        gc_assert(fixnump(node->so_key));
+                        lispobj key = compute_lispobj((lispobj*)node->so_key);
+                        CHECK(key, &node->so_key);
+                    }
+                }
+            }
+            for (i=0; i<(nwords-1); ++i)
+                if (bitmap_logbitp(i, bitmap)) CHECK(object[1+i], object+1+i);
+        }
+        return 0;
+    }
+    if (widetag == CODE_HEADER_WIDETAG) {
+        struct code *code = (struct code *)object;
+        gc_assert(fixnump(object[1])); // boxed size, needed for code_header_words()
+        sword_t nheader_words = code_header_words(code);
+        /* Verify the boxed section of the code data block */
+        state->min_pointee_gen = ARTIFICIALLY_HIGH_GEN;
+#ifdef LISP_FEATURE_UNTAGGED_FDEFNS
+        {
+        lispobj* pfdefn = code->constants + code_n_funs(code) * CODE_SLOTS_PER_SIMPLE_FUN;
+        lispobj* end = pfdefn + code_n_named_calls(code);
+        for ( ; pfdefn < end ; ++pfdefn)
+            if (*pfdefn) CHECK(*pfdefn | OTHER_POINTER_LOWTAG, pfdefn);
+        }
+#endif
+        for (i=2; i <nheader_words; ++i) CHECK(object[i], object+i);
+#ifndef NDEBUG // avoid "unused" warnings on auto vars of for_each_simple_fun()
+        // Check the SIMPLE-FUN headers
+        for_each_simple_fun(i, fheaderp, code, 1, {
+#if defined LISP_FEATURE_COMPACT_INSTANCE_HEADER
+            lispobj __attribute__((unused)) layout = funinstance_layout((lispobj*)fheaderp);
+            gc_assert(!layout || layout == LAYOUT_OF_FUNCTION);
+#elif defined LISP_FEATURE_64_BIT
+            gc_assert((fheaderp->header >> 32) == 0);
+#endif
+        });
+#endif
+#if 0 // this looks redundant. It's checked with each pointer, no?
+        bool rememberedp = header_rememberedp(code->header);
+        /* The remembered set invariant is that an object is marked "written"
+         * if and only if either it points to a younger object or is pointed
+         * to by a register or stack. (The pointed-to case assumes that the
+         * very next instruction on return from GC would store an old->young
+         * pointer into that object). Non-compacting GC does not have the
+         * "only if" part of that, nor does pre-GC verification because we
+         * don't test the generation of the newval when storing into code. */
+        if (is_in_static_space(object)) { }
+        else if (compacting_p() && (state->flags & VERIFY_POST_GC) ?
+            (state->min_pointee_gen < state->object_gen) != rememberedp :
+            (state->min_pointee_gen < state->object_gen) && !rememberedp)
+            lose("object @ %p is gen%d min_pointee=gen%d %s",
+                 (void*)state->tagged_object, state->object_gen, state->min_pointee_gen,
+                 rememberedp ? "written" : "not written");
+#endif
+        return 0;
+    }
+    if (widetag == SYMBOL_WIDETAG) {
+        struct symbol* s = (void*)object;
+        CHECK(s->value, &s->value);
+        CHECK(s->fdefn, &s->fdefn);
+        CHECK(s->info, &s->info);
+        CHECK(decode_symbol_name(s->name), &s->name);
+        return 0;
+    }
+    if (widetag == FDEFN_WIDETAG) {
+        struct fdefn* f = (void*)object;
+        CHECK(f->name, &f->name);
+        CHECK(f->fun, &f->fun);
+        CHECK(decode_fdefn_rawfun(f), (lispobj*)&f->raw_addr);
+        return 0;
+    }
+    for (i=1; i<nwords; ++i) CHECK(object[i], object+i);
+    return 0;
+}
+
+static __attribute__((unused)) bool acceptable_filler_cons_p(lispobj* where)
+{
+    if (where[0] == 0 && where[1] == 0) return 1;
+    // These "conses" can result from bignum multiplication-
+    // trailing insigificant sign bits which get chopped.
+    if (where[0] == (uword_t)-1 && where[1] == (uword_t)-1) return 1;
+    if (where[0] == (uword_t)-1 && where[1] == 0) return 1;
+    return 0;
+}
+static int verify_range(lispobj* start, lispobj* end, struct verify_state* state)
+{
+    lispobj* where = start;
+    if (state->flags & VERIFYING_GENERATIONAL && find_page_index(start)>=0) {
+        page_index_t page = find_page_index(start);
+        if (page_table[page].type == PAGE_TYPE_CONS)
+            gc_assert(page_words_used(page) <=  MAX_CONSES_PER_PAGE*CONS_SIZE);
+    }
+    if ((state->flags & VERIFYING_UNFORMATTED)) {
+        while (where < end) {
+            if (*where != NO_TLS_VALUE_MARKER) {
+                int result = verify_pointer(*where, where, state);
+                if (result) return result;
+            }
+            ++where;
+        }
+        return 0;
+    }
+    while (where < end) {
+        int widetag = is_header(*where) ? header_widetag(*where) : LIST_POINTER_LOWTAG;
+        /* Technically we should wait until after performing the widetag validity
+         * tests before calling the sizer.  Otherwise the lossage message would
+         * not be as good as it could be. I guess that failure doesn't happen much */
+        sword_t nwords = object_size(where);
+        state->object_addr = where;
+        state->object_header = is_cons_half(*where) ? 0 : *where;
+        if (state->flags & VERIFYING_GENERATIONAL) {
+            page_index_t pg = find_page_index(where);
+            state->object_gen = pg >= 0 ? page_table[pg].gen :
+              gc_gen_of((lispobj)where, ARTIFICIALLY_HIGH_GEN);
+#ifdef LISP_FEATURE_PPC64
+            // Cons fillers (two words of all 1s) cause failure of
+            // the default verification logic, so brute-force skip them
+            // regardless of whether the page type is PAGE_TYPE_CONS.
+            if (*where == (uword_t)-1 && where[1] == (uword_t)-1) {
+                where +=2;
+                continue;
+            }
+#endif
+            if (widetag != FILLER_WIDETAG && pg >= 0) {
+                    // Assert proper page type
+                    if (state->object_header) // is not a cons
+                        gc_assert(page_table[pg].type != PAGE_TYPE_CONS);
+#ifdef LISP_FEATURE_USE_CONS_REGION
+                    else if (page_table[pg].type != PAGE_TYPE_CONS) {
+                      if (is_cons_half(where[0]))
+                          gc_assert(acceptable_filler_cons_p(where));
+                    }
+#endif
+                    if (widetag == CODE_HEADER_WIDETAG) {
+                        if (!is_code(page_table[pg].type))
+                            lose("object @ %p is code on non-code page", where);
+                    } else if (widetag == FUNCALLABLE_INSTANCE_WIDETAG) {
+                        // where these reside depends on the architecture
+                    } else {
+                        if (is_code(page_table[pg].type))
+                            lose("object @ %p is non-code on code page", where);
+                    }
+            }
+        }
+        if (!state->object_header) {
+            if (verify_pointer(where[0], where+0, state) ||
+                verify_pointer(where[1], where+1, state)) break;
+        } else if (widetag == FILLER_WIDETAG) { // do nothing
+        } else if (!(other_immediate_lowtag_p(widetag) && LOWTAG_FOR_WIDETAG(widetag))) {
+            lose("Unhandled widetag %"OBJ_FMTX" @ %p", *where, where);
+        } else if (leaf_obj_widetag_p(widetag)) {
+#ifdef LISP_FEATURE_UBSAN
+            if (specialized_vector_widetag_p(widetag)) {
+                if (is_lisp_pointer(object[1])) {
+                    struct vector* bits = (void*)native_pointer(object[1]);
+                    if (header_widetag(bits->header) != SIMPLE_BIT_VECTOR_WIDETAG)
+                      lose("bad shadow bits for %p", where);
+                    gc_assert(header_widetag(bits->header) == SIMPLE_BIT_VECTOR_WIDETAG);
+                    gc_assert(vector_len(bits) >= vector_len((struct vector*)object));
+                }
+            }
+#endif
+            bool strict_containment = state->flags & VERIFY_FINAL;
+            if (strict_containment && gencgc_verbose && widetag == SAP_WIDETAG && where[1])
+                fprintf(stderr, "\nStrange SAP %p -> %p\n", where, (void*)where[1]);
+        } else {
+            if (verify_headered_object(where, nwords, state)) break;
+        }
+        where += nwords;
+    }
+    return 0;
+}
+
+static int verify(lispobj start, lispobj* end, struct verify_state* state, int flags)
+{
+    int savedflags = state->flags;
+    state->flags |= flags;
+    int result = verify_range((lispobj*)start, end, state);
+    state->flags = savedflags;
+    return result;
+}
+
+extern void save_gc_crashdump(char *, lispobj*);
+/* Return the number of verification errors found.
+ * You might want to use that as a deciding factor for dump the heap
+ * to a file (which takes time, and generally isn't needed).
+ * But if a particular verification fails, then do dump it */
+int verify_heap(__attribute__((unused)) lispobj* cur_thread_approx_stackptr,
+                int flags)
+{
+    int verbose = gencgc_verbose | ((flags & VERIFY_VERBOSE) != 0);
+
+    struct verify_state state;
+    memset(&state, 0, sizeof state);
+    state.flags = flags;
+
+    if (verbose)
+        fprintf(stderr,
+                flags & VERIFY_PRE_GC ? "Verify before GC" :
+                flags & VERIFY_POST_GC ? "Verify after GC(%d,%d)" :
+                "Heap check", // if called at a random time
+                (flags >> 1) & 7, // generation number
+                flags & 1); // 'raise'
+    else
+        state.flags |= VERIFY_PRINT_HEADER_ON_FAILURE;
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#  ifdef __linux__
+    // Try this verification if immobile-space was compiled with extra debugging.
+    // But weak symbols don't work on macOS.
+    extern void __attribute__((weak)) check_text_pages();
+    if (&check_text_pages) check_text_pages();
+#  endif
+    if (verbose)
+        fprintf(stderr, " [immobile]");
+    if (verify(FIXEDOBJ_SPACE_START,
+               fixedobj_free_pointer, &state,
+               flags | VERIFYING_GENERATIONAL)) goto out;
+    if (verify(TEXT_SPACE_START,
+               text_space_highwatermark, &state,
+               flags | VERIFYING_GENERATIONAL)) goto out;
+#endif
+    struct thread *th;
+    if (verbose)
+        fprintf(stderr, " [threads]");
+    state.object_addr = 0;
+    state.object_gen = 0;
+    for_each_thread(th) {
+        if (verify((lispobj)th->binding_stack_start,
+                   (lispobj*)get_binding_stack_pointer(th), &state,
+                   VERIFYING_UNFORMATTED)) goto out;
+        if (verify((lispobj)&th->lisp_thread,
+                   (lispobj*)(SymbolValue(FREE_TLS_INDEX,0) + (char*)th), &state,
+                   VERIFYING_UNFORMATTED))
+            goto out;
+    }
+    if (verbose)
+        fprintf(stderr, " [RO]");
+    if (verify(READ_ONLY_SPACE_START, read_only_space_free_pointer, &state, 0)) goto out;
+    if (verbose)
+        fprintf(stderr, " [static]");
+    // Just don't worry about NIL, it's seldom the problem
+    // if (verify(NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, &state, 0)) goto out;
+    if (verify(STATIC_SPACE_OBJECTS_START, static_space_free_pointer, &state, 0)) goto out;
+    if (verify(PERMGEN_SPACE_START, permgen_space_free_pointer, &state,0)) goto out;
+    if (verbose)
+        fprintf(stderr, " [dynamic]");
+    state.flags |= VERIFYING_GENERATIONAL;
+    walk_generation((uword_t(*)(lispobj*,lispobj*,uword_t))verify_range,
+                    -1, (uword_t)&state);
+    if (verbose && state.nerrors==0) fprintf(stderr, " passed\n");
+ out:
+    if (state.nerrors && !(flags & VERIFY_DONT_LOSE)) {
+        // dump_spaces(&state, "verify failed");
+        lose("Verify failed: %d errors", state.nerrors);
+    }
+    return state.nerrors;
+}
+
+void gc_show_pte(lispobj obj)
+{
+    char marks[1+CARDS_PER_PAGE];
+    page_index_t page = find_page_index((void*)obj);
+    if (page>=0) {
+        printf("page %"PAGE_INDEX_FMT" base %p gen %d type %x ss %p used %x",
+               page, page_address(page), page_table[page].gen, page_table[page].type,
+               page_scan_start(page), page_bytes_used(page));
+        if (page_starts_contiguous_block_p(page)) printf(" startsblock");
+        if (page_ends_contiguous_block_p(page, page_table[page].gen)) printf(" endsblock");
+        printf(" (%s)\n", page_card_mark_string(page, marks));
+        return;
+    }
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    page = find_text_page_index((void*)obj);
+    if (page>=0) {
+        lispobj* text_page_scan_start(low_page_index_t page);
+        int gens = text_page_genmask[page];
+        char genstring[9];
+        int i;
+        for (i=0;i<8;++i) genstring[i] = (gens & (1<<i)) ? '0'+i : '-';
+        genstring[8] = 0;
+        printf("page %d (v) base %p gens %s ss=%p%s\n",
+               (int)page, text_page_address(page), genstring,
+               text_page_scan_start(page),
+               card_markedp((void*)obj)?"":" WP");
+        return;
+    }
+    page = find_fixedobj_page_index((void*)obj);
+    if (page>=0) {
+        printf("page %d (f) align %d gens %x%s\n", (int)page,
+               fixedobj_pages[page].attr.parts.obj_align,
+               fixedobj_pages[page].attr.parts.gens_,
+               card_markedp((void*)obj)?"": " WP");
+        return;
+    }
+#endif
+    printf("not in GC'ed space\n");
+}
+
+static int count_immobile_objects(__attribute__((unused)) int gen, int res[4])
+{
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    lispobj* where = (lispobj*)FIXEDOBJ_SPACE_START;
+    lispobj* end = fixedobj_free_pointer;
+    while (where < end) {
+        if (immobile_obj_generation(where) == gen) {
+            switch (widetag_of(where)) {
+            case INSTANCE_WIDETAG: ++res[0]; break;
+            case FDEFN_WIDETAG: ++res[1]; break;
+            case SYMBOL_WIDETAG: ++res[2]; break;
+            }
+        }
+        where += object_size(where);
+    }
+    where = (lispobj*)TEXT_SPACE_START;
+    end = text_space_highwatermark;
+    while (where < end) {
+        if (widetag_of(where) != FILLER_WIDETAG && immobile_obj_generation(where) == gen)
+            ++res[3];
+        where += object_size(where);
+    }
+#endif
+    return (res[0] | res[1] | res[2] | res[3]) != 0;
+}
+
+/* Count the number of pages in the given generation.
+ * Additionally, if 'n_dirty' is non-NULL, then assign
+ * into *n_dirty the count of marked pages.
+ */
+page_index_t
+count_generation_pages(generation_index_t generation, page_index_t* n_dirty)
+{
+    page_index_t i, total = 0, dirty = 0;
+    int j;
+
+    for (i = 0; i < next_free_page; i++)
+        if (!page_free_p(i) && (page_table[i].gen == generation)) {
+            total++;
+            long card = page_to_card_index(i);
+            for (j=0; j<CARDS_PER_PAGE; ++j, ++card)
+                if (card_dirtyp(card)) ++dirty;
+        }
+    // divide by cards per page rounding up
+    if (n_dirty) *n_dirty = (dirty + (CARDS_PER_PAGE-1)) / CARDS_PER_PAGE;
+    return total;
+}
+
+// You can call this with 0 and NULL to perform its assertions silently
+void gc_gen_report_to_file(int filedes, FILE *file)
+{
+#ifdef LISP_FEATURE_X86
+    extern void fpu_save(void *), fpu_restore(void *);
+    int fpu_state[27];
+
+    /* Can end up here after calling alloc_tramp which doesn't prepare
+     * the x87 state, and the C ABI uses a different mode */
+    fpu_save(fpu_state);
+#endif
+
+#define OUTPUT(str, len) \
+    {if (file) fwrite(str, 1, len, file); if (filedes>=0) ignore_value(write(filedes, str, len));}
+
+    /* Print the heap stats. */
+    char header1[] =
+            "        Immobile Object Counts\n";
+    OUTPUT(header1, sizeof header1-1);
+    char header2[] =
+            " Gen layout fdefn symbol   code  Boxed   Cons    Raw   Code  SmMix  Mixed  LgRaw LgCode  LgMix"
+            " Waste%       Alloc        Trig   Dirty GCs Mem-age\n";
+    OUTPUT(header2, sizeof header2-1);
+
+    generation_index_t gen_num, begin, end;
+    int immobile_matrix[8][4], have_immobile_obj = 0;
+    int immobile_totals[4];
+    memset(immobile_matrix, 0, sizeof immobile_matrix);
+    memset(immobile_totals, 0, sizeof immobile_totals);
+    for (gen_num = 0; gen_num <= 6; ++gen_num) {
+        if (count_immobile_objects(gen_num, immobile_matrix[gen_num]))
+            have_immobile_obj |= 1 << gen_num;
+        immobile_totals[0] += immobile_matrix[gen_num][0];
+        immobile_totals[1] += immobile_matrix[gen_num][1];
+        immobile_totals[2] += immobile_matrix[gen_num][2];
+        immobile_totals[3] += immobile_matrix[gen_num][3];
+    }
+    // Print from the lowest gen that has any allocated pages.
+    for (begin = 0; begin <= PSEUDO_STATIC_GENERATION; ++begin)
+        if ((have_immobile_obj>>begin)&1 || generations[begin].bytes_allocated) break;
+    // Print up to and including the highest gen that has any allocated pages.
+    for (end = SCRATCH_GENERATION; end >= 0; --end)
+        if (generations[end].bytes_allocated) break;
+
+    char linebuf[180];
+    page_index_t coltot[9];
+    uword_t eden_words_allocated = 0;
+    page_index_t eden_pages = 0;
+    memset(coltot, 0, sizeof coltot);
+    for (gen_num = begin; gen_num <= end; gen_num++) {
+        page_index_t page;
+        page_index_t pagect[9];
+        int *objct = immobile_matrix[gen_num];
+        memset(pagect, 0, sizeof pagect);
+        if (gen_num == 0) { // Count the eden pages
+            for (page = 0; page < next_free_page; page++)
+                if (page_table[page].gen == 0 && page_table[page].type & THREAD_PAGE_FLAG) {
+                    int column;
+                    switch (page_table[page].type & ~THREAD_PAGE_FLAG) {
+                    case PAGE_TYPE_BOXED:   column = 0; break;
+                    case PAGE_TYPE_CONS:    column = 1; break;
+                    case PAGE_TYPE_CODE:    column = 3; break;
+                    case PAGE_TYPE_MIXED:   column = 5; break;
+                    default: lose("Bad eden page subtype: %x\n", page_table[page].type);
+                    }
+                    pagect[column]++;
+                    coltot[column]++;
+                    ++eden_pages;
+                    eden_words_allocated += page_words_used(page);
+                }
+            uword_t waste = npage_bytes(eden_pages) - (eden_words_allocated<<WORD_SHIFT);
+            double pct_waste = eden_pages > 0 ?
+                               (double)waste / (double)npage_bytes(eden_pages) * 100 : 0.0;
+            if (eden_pages) {
+                int linelen = snprintf(linebuf, sizeof linebuf,
+                        "  E %6d %6d %6d %6d %7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%14"PAGE_INDEX_FMT
+                        "%14"PAGE_INDEX_FMT
+                        "%28.1f %11"OS_VM_SIZE_FMT"\n",
+                        objct[0], objct[1], objct[2], objct[3],
+                        pagect[0], pagect[1], pagect[3], pagect[5],
+                        pct_waste, eden_words_allocated<<WORD_SHIFT);
+                OUTPUT(linebuf, linelen);
+            }
+            memset(pagect, 0, sizeof pagect);
+        }
+        uword_t words_allocated = 0;
+        page_index_t tot_pages = 0;
+        for (page = 0; page < next_free_page; page++)
+            if (!page_free_p(page) && page_table[page].gen == gen_num
+                && !(page_table[page].type & THREAD_PAGE_FLAG)) {
+                int column;
+                switch (page_table[page].type & (SINGLE_OBJECT_FLAG|PAGE_TYPE_MASK)) {
+                case PAGE_TYPE_BOXED:   column = 0; break;
+                case PAGE_TYPE_CONS:    column = 1; break;
+                case PAGE_TYPE_UNBOXED: column = 2; break;
+                case PAGE_TYPE_CODE:    column = 3; break;
+                case PAGE_TYPE_SMALL_MIXED:   column = 4; break;
+                case PAGE_TYPE_MIXED:   column = 5; break;
+                case SINGLE_OBJECT_FLAG|PAGE_TYPE_UNBOXED: column = 6; break;
+                case SINGLE_OBJECT_FLAG|PAGE_TYPE_CODE:    column = 7; break;
+                case SINGLE_OBJECT_FLAG|PAGE_TYPE_MIXED:   column = 8; break;
+                default: lose("Invalid page type %#x (p%"PAGE_INDEX_FMT")", page_table[page].type, page);
+                }
+                pagect[column]++;
+                coltot[column]++;
+                ++tot_pages;
+                words_allocated += page_words_used(page);
+            }
+        struct generation* gen = &generations[gen_num];
+        if (gen_num == 0)
+            gc_assert(gen->bytes_allocated ==
+                      (words_allocated+eden_words_allocated) << WORD_SHIFT);
+        /* private-cons.inc doesn't update bytes_allocated */
+        /*
+        else {
+            gc_assert(gen->bytes_allocated == words_allocated << WORD_SHIFT);
+        }
+        */
+        page_index_t n_dirty;
+        count_generation_pages(gen_num, &n_dirty);
+        uword_t waste = npage_bytes(tot_pages) - (words_allocated<<WORD_SHIFT);
+        double pct_waste = tot_pages > 0 ?
+          (double)waste / (double)npage_bytes(tot_pages) * 100 : 0.0;
+        int linelen =
+            snprintf(linebuf, sizeof linebuf,
+                "  %d %6d %6d %6d %6d"
+                "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
+                "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
+                "%7"PAGE_INDEX_FMT" %6.1f %11"OS_VM_SIZE_FMT" %11"OS_VM_SIZE_FMT,
+                gen_num, objct[0], objct[1], objct[2], objct[3],
+                pagect[0], pagect[1], pagect[2], pagect[3], pagect[4], pagect[5],
+                pagect[6], pagect[7], pagect[8],
+                pct_waste, words_allocated<<WORD_SHIFT,
+                (uintptr_t)gen->gc_trigger);
+        // gen0 pages are never WPed
+        linelen += snprintf(linebuf+linelen, sizeof linebuf-linelen,
+                            gen_num==0?"       -" : " %7"PAGE_INDEX_FMT, n_dirty);
+        linelen += snprintf(linebuf+linelen, sizeof linebuf-linelen,
+                            " %3d %7.4f\n", gen->num_gc, generation_average_age(gen_num));
+        OUTPUT(linebuf, linelen);
+    }
+    page_index_t tot_pages = coltot[0] + coltot[1] + coltot[2] + coltot[3] + coltot[4] +
+                             coltot[5] + coltot[6] + coltot[7] + coltot[8];
+    uword_t waste = npage_bytes(tot_pages) - bytes_allocated;
+    double pct_waste = (double)waste / (double)npage_bytes(tot_pages) * 100;
+    double heap_use_frac = 100 * (double)bytes_allocated / (double)dynamic_space_size;
+    int *objct = immobile_totals;
+    int linelen =
+        snprintf(linebuf, sizeof linebuf,
+            "Tot %6d %6d %6d %6d"
+            "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
+            "%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT"%7"PAGE_INDEX_FMT
+            "%7"PAGE_INDEX_FMT" %6.1f%12"OS_VM_SIZE_FMT
+            " [%.1f%% of %"OS_VM_SIZE_FMT" max]\n",
+            objct[0], objct[1], objct[2], objct[3],
+            coltot[0], coltot[1], coltot[2], coltot[3], coltot[4], coltot[5], coltot[6],
+            coltot[7], coltot[8], pct_waste,
+            (uintptr_t)bytes_allocated, heap_use_frac, (uintptr_t)dynamic_space_size);
+    OUTPUT(linebuf, linelen);
+#undef OUTPUT
+
+#ifdef LISP_FEATURE_X86
+    fpu_restore(fpu_state);
+#endif
+}

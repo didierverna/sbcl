@@ -340,14 +340,6 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                           (double-float $0d0))
                 %random-double-float))
 
-;;; 32-bit version
-#+nil
-(defun %random-double-float (arg state)
-  (declare (type (double-float ($0d0)) arg)
-           (type random-state state))
-  (* (float (random-chunk state) $1d0) (/ $1d0 (expt 2 32))))
-
-;;; 53-bit version
 #-x86
 (defun %random-double-float (arg state)
   (declare (type (double-float ($0d0)) arg)
@@ -357,7 +349,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
              (- (sb-impl::make-double-float
                  (dpb (ash (random-chunk state)
                            (- sb-vm:double-float-digits n-random-chunk-bits 32))
-                      sb-vm:double-float-significand-byte
+                      sb-vm:double-float-hi-significand-byte
                       (sb-impl::double-float-high-bits $1d0))
                  (random-chunk state))
                 $1d0))
@@ -376,7 +368,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                    (dpb (ash (sb-vm::random-mt19937 state-vector)
                              (- sb-vm:double-float-digits n-random-chunk-bits
                                 sb-vm:n-word-bits))
-                        sb-vm:double-float-significand-byte
+                        sb-vm:double-float-hi-significand-byte
                         (sb-impl::double-float-high-bits $1d0))
                    (sb-vm::random-mt19937 state-vector))
                   $1d0))

@@ -86,6 +86,7 @@ interface stability.")
    "ST-RDEV" "ST-SIZE" "ST-UID" "STAT" "TIME-T"
    "TIMEVAL" "TIMEZONE"
    "TIOCGPGRP"
+   #-avoid-clock-gettime
    "CLOCK-GETTIME" "TV-SEC" "TV-USEC"
    "TZ-DSTTIME" "TZ-MINUTESWEST" "UID-T" "UNIX-CLOSE"
    "UNIX-CLOSEDIR" "UNIX-DIRENT-NAME" "UNIX-DUP"
@@ -104,8 +105,11 @@ interface stability.")
    "W_OK" "X_OK"
    "SC-NPROCESSORS-ONLN"
    "VOID-SYSCALL"
+   #-avoid-clock-gettime
    "CLOCK-THREAD-CPUTIME-ID"
+   #-avoid-clock-gettime
    "CLOCK-PROCESS-CPUTIME-ID"
+   #-avoid-clock-gettime
    "CLOCK-REALTIME"
 
    ;; signals
@@ -191,8 +195,8 @@ SBCL itself")
            #+bignum-assertions "%%BIGNUM-SET"
            "%BIGNUM-SET-LENGTH" "%DIGIT-0-OR-PLUSP"
            "%DIGIT-LOGICAL-SHIFT-RIGHT"
-           "%FIXNUM-DIGIT-WITH-CORRECT-SIGN" "%FIXNUM-TO-DIGIT"
-           "%BIGFLOOR" "%LOGAND" "%LOGIOR" "%LOGNOT" "%LOGXOR"
+           "%FIXNUM-DIGIT-WITH-CORRECT-SIGN"
+           "%BIGFLOOR"
            "%MULTIPLY" "%MULTIPLY-AND-ADD"
            "%SUBTRACT-WITH-BORROW" "ADD-BIGNUMS" "ADD-BIGNUM-FIXNUM"
            "BIGNUM-ASHIFT-LEFT" "BIGNUM-ASHIFT-LEFT-FIXNUM"
@@ -205,7 +209,8 @@ SBCL itself")
            "BIGNUM-LOGCOUNT" "BIGNUM-LOGICAL-AND"
            "BIGNUM-LOGICAL-IOR" "BIGNUM-LOGICAL-NOT"
            "BIGNUM-LOGICAL-XOR" "BIGNUM-PLUS-P"
-           "BIGNUM-TO-FLOAT" "BIGNUM-TRUNCATE" "BIGNUM-TRUNCATE-SINGLE-DIGIT"
+           "BIGNUM-TO-SINGLE-FLOAT" "BIGNUM-TO-DOUBLE-FLOAT"
+           "BIGNUM-TRUNCATE" "BIGNUM-TRUNCATE-SINGLE-DIGIT"
            "MAKE-SMALL-BIGNUM"
            "MULTIPLY-BIGNUM-AND-FIXNUM" "MULTIPLY-BIGNUMS"
            "MULTIPLY-FIXNUMS" "NEGATE-BIGNUM"
@@ -366,6 +371,7 @@ structure representations")
            "CLOSURE-INFO-OFFSET"
            "CODE-BOXED-SIZE-SLOT"
            "CODE-CONSTANTS-OFFSET" "CODE-SLOTS-PER-SIMPLE-FUN"
+           "CODE-FIXUPS-SLOT"
            "CODE-DEBUG-INFO-SLOT"
            "CODE-HEADER-SIZE-SHIFT"
            "CODE-HEADER-WIDETAG" "COMPLEX-ARRAY-WIDETAG"
@@ -387,7 +393,7 @@ structure representations")
            "COMPLEX-SINGLE-REG-SC-NUMBER" "COMPLEX-SINGLE-STACK-SC-NUMBER"
            "COMPLEX-SIZE" "COMPLEX-BASE-STRING-WIDETAG"
            #+sb-unicode "COMPLEX-CHARACTER-STRING-WIDETAG"
-           "COMPLEX-WIDETAG"
+           "COMPLEX-RATIONAL-WIDETAG"
            "COMPLEX-VECTOR-WIDETAG" "CONS-CAR-SLOT" "CONS-CDR-SLOT"
            "CONS-SIZE" "CONSTANT-SC-NUMBER"
            "CONTEXT-FLOATING-POINT-MODES" "CONTEXT-FLOAT-REGISTER"
@@ -401,6 +407,7 @@ structure representations")
            "DO-REFERENCED-OBJECT"
            "DOUBLE-FLOAT-BIAS"
            "DOUBLE-FLOAT-DIGITS" "DOUBLE-FLOAT-EXPONENT-BYTE"
+           "DOUBLE-FLOAT-HI-EXPONENT-BYTE" "DOUBLE-FLOAT-HI-SIGNIFICAND-BYTE"
            "DOUBLE-FLOAT-HIDDEN-BIT"
            "DOUBLE-FLOAT-NORMAL-EXPONENT-MAX"
            "DOUBLE-FLOAT-NORMAL-EXPONENT-MIN" "DOUBLE-FLOAT-SIGNIFICAND-BYTE"
@@ -441,7 +448,6 @@ structure representations")
            "GENCGC-CARD-BYTES"
            "GENCGC-PAGE-BYTES"
            "GENCGC-ALLOC-GRANULARITY"
-           "GENCGC-RELEASE-GRANULARITY"
            #+(or arm64 ppc ppc64 sparc riscv) "PSEUDO-ATOMIC-INTERRUPTED-FLAG"
            #+(or arm64 ppc ppc64 sparc riscv) "PSEUDO-ATOMIC-FLAG"
            #+sb-safepoint "GLOBAL-SAFEPOINT-TRAP"
@@ -457,8 +463,7 @@ structure representations")
            "INSTANCE-SLOTS-OFFSET" "INSTANCE-USAGE"
            "INTERIOR-REG-SC-NUMBER" "INTERNAL-ERROR-ARGS"
            "IS-LISP-POINTER"
-           #+gencgc "LARGE-OBJECT-SIZE"
-           "LAYOUT"
+           "LARGE-OBJECT-SIZE"
            "LDB-MONITOR"
            "LIST-ALLOCATED-OBJECTS" "LIST-POINTER-LOWTAG"
            ;; FIXME: Possibly these other parameters (see
@@ -481,7 +486,6 @@ structure representations")
            "MAX-INTERRUPTS"
            #+c-stack-is-control-stack "MEMORY-FAULT-EMULATION-TRAP"
            "UNINITIALIZED-LOAD-TRAP"
-           "METASPACE-SLAB-SIZE"
            "MEMORY-USAGE"
            "N-LOWTAG-BITS"
            "N-FIXNUM-TAG-BITS"
@@ -587,19 +591,16 @@ structure representations")
            "*CONTROL-STACK-START*" "*CONTROL-STACK-END*"
            "CONTROL-STACK-POINTER-VALID-P"
            "DYNAMIC-SPACE-START"
-           #+gencgc "MAX-DYNAMIC-SPACE-END"
-           #+gencgc "PAGE-TABLE"
-           #+gencgc "FIND-PAGE-INDEX"
-           #+gencgc "NEXT-FREE-PAGE"
-           #-gencgc "DYNAMIC-0-SPACE-START"
-           #-gencgc "DYNAMIC-0-SPACE-END"
+           "MAX-DYNAMIC-SPACE-END"
+           "PAGE-TABLE"
+           "FIND-PAGE-INDEX"
+           "NEXT-FREE-PAGE"
            "READ-ONLY-SPACE-START" "READ-ONLY-SPACE-END"
            "STATIC-SPACE-START" "STATIC-SPACE-END" "*STATIC-SPACE-FREE-POINTER*"
            "STATIC-CODE-SPACE-START" "STATIC-CODE-SPACE-END" "*STATIC-CODE-SPACE-FREE-POINTER*"
            "ALIEN-LINKAGE-TABLE-SPACE-START"
            "ALIEN-LINKAGE-TABLE-SPACE-SIZE"
            "ALIEN-LINKAGE-TABLE-ENTRY-SIZE"
-           #+sb-safepoint "GC-SAFEPOINT-PAGE-ADDR"
            #+sb-safepoint "GC-SAFEPOINT-TRAP-OFFSET"
            "THREAD-STATE-WORD-SLOT"
            "THREAD-SPROF-DATA-SLOT"
@@ -614,6 +615,7 @@ structure representations")
            "UNWIND-BLOCK-UWP-SLOT" "UNWIND-BLOCK-ENTRY-PC-SLOT"
            "UNWIND-BLOCK-SIZE" "VALUE-CELL-WIDETAG" "VALUE-CELL-SIZE"
            "VALUE-CELL-VALUE-SLOT" "VECTOR-DATA-OFFSET" "VECTOR-LENGTH-SLOT"
+           "+VECTOR-ALLOC-MIXED-REGION-BIT+"
            "VECTOR-WEAK-FLAG"
            "VECTOR-WEAK-VISITED-FLAG"
            "VECTOR-HASHING-FLAG"
@@ -623,19 +625,21 @@ structure representations")
            "WEAK-POINTER-SIZE" "WEAK-POINTER-WIDETAG"
            "WEAK-POINTER-VALUE-SLOT"
            "N-WORD-BITS" "N-WORD-BYTES" "N-MACHINE-WORD-BITS" "N-MACHINE-WORD-BYTES"
+           "WITH-PSEUDO-ATOMIC-FOREIGN-CALLS"
            "WITH-ARENA" "WITHOUT-ARENA" "FIND-CONTAINING-ARENA"
            "WORD" "WORD-REG-SC-NUMBER" "WORD-SHIFT"
            #+win32 "CONTEXT-RESTORE-TRAP"
            "ZERO-SC-NUMBER")
+  (:export "TEXT-SPACE-START" "*TEXT-SPACE-FREE-POINTER*")
+  #+permgen
+  (:export "*PERMGEN-SPACE-FREE-POINTER*" "PERMGEN-SPACE-START" "PERMGEN-SPACE-SIZE")
   #+immobile-space
   (:export
    "IMMOBILE-CARD-BYTES"
    "FIXEDOBJ-SPACE-START"
    "FIXEDOBJ-SPACE-SIZE"
-   "TEXT-SPACE-START"
    "TEXT-SPACE-SIZE"
-   "*FIXEDOBJ-SPACE-FREE-POINTER*"
-   "*TEXT-SPACE-FREE-POINTER*")
+   "*FIXEDOBJ-SPACE-FREE-POINTER*")
   #+sb-simd-pack
   (:export
    "SIMD-PACK-TAG-SLOT"
@@ -792,6 +796,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
    "BYTES-CONSED-BETWEEN-GCS"
    "GC" "GET-BYTES-CONSED"
    "*GC-RUN-TIME*"
+   "*GC-REAL-TIME*"
    "PURIFY"
    "DYNAMIC-SPACE-SIZE"
    ;; Gencgc only, but symbols exist for manual building
@@ -1003,6 +1008,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
    "WEAK-POINTER-VALUE"
    "MAKE-WEAK-VECTOR"
    "WEAK-VECTOR-P"
+   ;; todo: add WEAK-VECTOR-REF here once it's actually not the same as SVREF
+   ;; (currently WEAK-VECTOR-REF is in SB-INT:)
 
    ;; Hash table extensions
 
@@ -1318,6 +1325,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "DEFINE-MOVE-FUN"
            "DEFINE-MOVE-VOP" "!DEFINE-STORAGE-BASES"
            "!DEFINE-STORAGE-CLASS" "DEFINE-VOP"
+           "DEFINE-COND-SC"
            "DEFKNOWN" "DEFOPTIMIZER"
            "DEFTRANSFORM" "DERIVE-TYPE"
            "DIS"
@@ -1356,6 +1364,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "MAKE-CLOSURE" "MAKE-CONSTANT-TN"
            "MAKE-FIXUP-NOTE"
            "MAKE-LOAD-TIME-CONSTANT-TN" "MAKE-N-TNS" "MAKE-NORMAL-TN"
+           "MAKE-PERFECT-HASH-LAMBDA"
            "MAKE-RANDOM-TN"
            "MAKE-REPRESENTATION-TN" "MAKE-RESTRICTED-TN"
            "MAKE-STACK-POINTER-TN" "MAKE-TN-REF" "MAKE-UNWIND-BLOCK"
@@ -1426,7 +1435,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "EMIT-NOP"
            "DEF-SETTER"
            "FIXED-ALLOC"
-           "MAKE-FUNCALLABLE-INSTANCE-TRAMP"
            "RETURN-SINGLE"
            "NOTE-NEXT-INSTRUCTION"
            "SET-SLOT"
@@ -1489,7 +1497,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
         "SB-KERNEL" "SB-SYS"
         "SB-C")
   (:import-from "SB-C"
-                "*LOOP-ANALYZE*"
                 "BLOCK-INFO" "BLOCK-LAST" "BLOCK-LOOP" "BLOCK-NEXT"
                 "CLEAR-BIT-VECTOR" "COMPONENT-HEAD" "COMPONENT-TAIL"
                 "DEFEVENT" "DELETE-VOP" "DO-IR2-BLOCKS" "DO-LIVE-TNS"
@@ -1548,7 +1555,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
 (defpackage* "SB-PRETTY"
   (:documentation "private: implementation of pretty-printing")
   (:use "CL" "SB-EXT" "SB-INT" "SB-KERNEL")
-  (:export "OUTPUT-PRETTY-OBJECT"
+  (:export "NOTE-SIGNIFICANT-SPACE"
+           "OUTPUT-PRETTY-OBJECT"
            "PRETTY-STREAM" "PRETTY-STREAM-P"
            "PPRINT-DISPATCH-TABLE"
            "*PPRINT-QUOTE-WITH-SYNTACTIC-SUGAR*"
@@ -1677,7 +1685,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)")
            "DEREF" "DOUBLE-FLOAT" "DOUBLE" "ENUM" "EXTERN-ALIEN"
            "FLOAT" "FREE-ALIEN" "FUNCTION"
            "LONG-FLOAT"
-           "GET-ERRNO"
+           "GET-ERRNO" "SET-ERRNO"
            "INT"
            "INTEGER"
            "LOAD-1-FOREIGN" "LOAD-FOREIGN" "LOAD-SHARED-OBJECT" "LONG" "LONG-LONG"
@@ -1860,14 +1868,15 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%COMPARE-AND-SWAP-CDR"
            "%COMPARE-AND-SWAP-SVREF"
            "%COMPARE-AND-SWAP-SYMBOL-VALUE"
-           "%CONCATENATE-TO-BASE-STRING"
-           "%CONCATENATE-TO-STRING"
-           "%CONCATENATE-TO-SIMPLE-VECTOR"
-           "%CONCATENATE-TO-LIST" "%CONCATENATE-TO-VECTOR"
-           "CONTAINS-UNKNOWN-TYPE-P"
+           "%CONCATENATE-TO-BASE-STRING" "%CONCATENATE-TO-BASE-STRING-SUBSEQ"
+           "%CONCATENATE-TO-STRING" "%CONCATENATE-TO-STRING-SUBSEQ"
+           "%CONCATENATE-TO-SIMPLE-VECTOR" "%CONCATENATE-TO-SIMPLE-VECTOR-SUBSEQ"
+           "%CONCATENATE-TO-LIST" "%CONCATENATE-TO-LIST-SUBSEQ"
+           "%CONCATENATE-TO-VECTOR" "%CONCATENATE-TO-VECTOR-SUBSEQ"
+           "CONTAINS-HAIRY-TYPE-P" "CONTAINS-UNKNOWN-TYPE-P"
            "%COS" "%COS-QUICK"
            "%COSH" "%DATA-VECTOR-AND-INDEX" "%DEPOSIT-FIELD"
-           "%DOUBLE-FLOAT" "%DPB" "%EQL" "%EQL/INTEGER"
+           "%DOUBLE-FLOAT" "%DPB" "%EQL"
            "%EXIT"
            "%EXP" "%EXPM1"
            "%FIND-POSITION"
@@ -2070,7 +2079,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "FLOAT-WAIT" "DYNAMIC-SPACE-FREE-POINTER" "DYNAMIC-USAGE"
            "EFFECTIVE-FIND-POSITION-TEST"
            "EFFECTIVE-FIND-POSITION-KEY"
-           "ENSURE-SYMBOL-HASH"
            "ENSURE-SYMBOL-TLS-INDEX"
            "ERROR-NUMBER-OR-LOSE"
            "EXTERNAL-FORMAT-DESIGNATOR"
@@ -2081,7 +2089,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "FIND-DEFSTRUCT-DESCRIPTION"
            "FIND-OR-CREATE-FDEFN"
            "FLOAT-EXPONENT"
-           "FLOAT-FORMAT-DIGITS" "FLOAT-FORMAT-NAME"
+           "FLOAT-FORMAT-NAME"
            "FLOAT-FORMAT-MAX" "FLOAT-INT-EXPONENT"
            "FLOAT-INFINITY-OR-NAN-P"
            "FLOAT-SIGN-BIT"
@@ -2104,6 +2112,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "HAIRY-DATA-VECTOR-REF"
            "HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS"  "HAIRY-DATA-VECTOR-SET"
            "HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS"
+           "VECTOR-HAIRY-DATA-VECTOR-REF"
+           "VECTOR-HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS" "VECTOR-HAIRY-DATA-VECTOR-SET"
+           "VECTOR-HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS"
            "HAIRY-TYPE" "HAIRY-TYPE-P" "HAIRY-TYPE-SPECIFIER"
            "HANDLE-CIRCULARITY" "HOST" "ILL-BIN"
            "ILL-BOUT" "ILL-IN" "ILL-OUT" "INDEX-OR-MINUS-1"
@@ -2122,21 +2133,22 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "INVALID-UNWIND-ERROR"
            "IRRATIONAL" "KEY-INFO"
            "KEY-INFO-NAME" "KEY-INFO-P" "KEY-INFO-TYPE"
+           "LAYOUT-BITMAP"
+           "LAYOUT-CLASSOID-NAME"
+           "LAYOUT-DEPTHOID"
+           "LAYOUT-SLOT-TABLE"
+           "LAYOUT-EQUALP-IMPL"
            "BITMAP-NWORDS"
            "LAYOUT-DEPTHOID"
            "LAYOUT-ID"
            "LAYOUT-FOR-PCL-OBJ-P"
-           "WRAPPER-BITMAP"
-           "WRAPPER-CLASSOID-NAME"
-           "WRAPPER-DEPTHOID" "WRAPPER-EQUALP-IMPL"
-           "WRAPPER-SLOT-TABLE"
-           "WRAPPER-FRIEND" "LAYOUT-FRIEND"
            #+(or x86-64 x86) "%LEA"
            "LEXENV" "LEXENV-DESIGNATOR" "LINE-LENGTH"
            "LIST-ABSTRACT-TYPE-FUNCTION"
            "LIST-COPY-SEQ*"
            "LIST-FILL*"
            "LIST-SUBSEQ*"
+           "LIST-REVERSE-INTO-VECTOR"
            "ANSI-STREAM"
            "ANSI-STREAM-BIN" "ANSI-STREAM-BOUT"
            "ANSI-STREAM-IN"
@@ -2167,10 +2179,10 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "MEMBER-TYPE" "MEMBER-TYPE-MEMBERS" "MEMBER-TYPE-P"
            "MEMBER-TYPE-SIZE"
            "MODIFIED-NUMERIC-TYPE"
-           "MOST-NEGATIVE-EXACTLY-DOUBLE-FLOAT-FIXNUM"
-           "MOST-NEGATIVE-EXACTLY-SINGLE-FLOAT-FIXNUM"
-           "MOST-POSITIVE-EXACTLY-DOUBLE-FLOAT-FIXNUM"
-           "MOST-POSITIVE-EXACTLY-SINGLE-FLOAT-FIXNUM"
+           "MOST-NEGATIVE-EXACTLY-DOUBLE-FLOAT-INTEGER"
+           "MOST-NEGATIVE-EXACTLY-SINGLE-FLOAT-INTEGER"
+           "MOST-POSITIVE-EXACTLY-DOUBLE-FLOAT-INTEGER"
+           "MOST-POSITIVE-EXACTLY-SINGLE-FLOAT-INTEGER"
            "NAMED-TYPE" "NAMED-TYPE-NAME" "NAMED-TYPE-P"
            "NEGATE" "NEGATION-TYPE" "NEGATION-TYPE-TYPE"
            "NIL-ARRAY-ACCESSED-ERROR"
@@ -2262,6 +2274,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "OBJECT-NOT-VECTOR-NIL-ERROR"
            "OBJECT-NOT-WEAK-POINTER-ERROR"
            "ODD-KEY-ARGS-ERROR" "OUTPUT-OBJECT" "OUTPUT-UGLY-OBJECT"
+           "OVERFLOW*" "OVERFLOW+" "OVERFLOW-"
+           "OVERFLOW-ASH" "OVERFLOW-NEGATE"
            "PACKAGE-DESIGNATOR" "PACKAGE-DOC-STRING"
            "PACKAGE-INTERNAL-SYMBOLS" "PACKAGE-EXTERNAL-SYMBOLS"
            "PARSE-UNKNOWN-TYPE"
@@ -2284,6 +2298,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "SEQUENCEP" "SEQUENCE-COUNT" "SEQUENCE-END"
            "SEQUENCE-OF-CHECKED-LENGTH-GIVEN-TYPE"
            "SET-ARRAY-HEADER" "SET-HEADER-DATA"
+           "STACK-ALLOCATED-OBJECT-OVERFLOWS-STACK-ERROR"
            "ASSIGN-VECTOR-FLAGS" "LOGIOR-HEADER-BITS" "RESET-HEADER-BITS"
            "LOGIOR-ARRAY-FLAGS" "RESET-ARRAY-FLAGS"
            "TEST-HEADER-DATA-BIT"
@@ -2346,6 +2361,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "TWO-ARG-STRING/=" "TWO-ARG-STRING-LESSP" "TWO-ARG-STRING-GREATERP"
            "TWO-ARG-STRING-NOT-LESSP" "TWO-ARG-STRING-NOT-GREATERP" "TWO-ARG-STRING-NOT-EQUAL"
            "RANGE<" "RANGE<=" "RANGE<<=" "RANGE<=<"
+           "CHECK-RANGE<" "CHECK-RANGE<=" "CHECK-RANGE<<=" "CHECK-RANGE<=<"
            "TYPE-*-TO-T"
            "TYPE-DIFFERENCE" "TYPE-INTERSECTION"
            "TYPE-INTERSECTION2" "TYPE-APPROX-INTERSECTION2"
@@ -2482,7 +2498,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "SET-SYMBOL-GLOBAL-VALUE"
            "OUTPUT-SYMBOL" "%COERCE-NAME-TO-FUN"
            "DEFAULT-STRUCTURE-PRINT"
-           "WRAPPER" "WRAPPER-LENGTH"
+           "LAYOUT" "LAYOUT-LENGTH"
            "DEFSTRUCT-DESCRIPTION" "UNDECLARE-STRUCTURE"
            "UNDEFINE-FUN-NAME" "DD-TYPE" "CLASSOID-STATE" "INSTANCE"
            "*TYPE-SYSTEM-INITIALIZED*" "FIND-LAYOUT"
@@ -2495,25 +2511,22 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "DD-SLOTS" "DD-HAS-RAW-SLOT-P" "DD-INCLUDE"
            "SLOT-ACCESS-TRANSFORM"
            "%IMAGPART" "%CODE-DEBUG-INFO"
-           "WRAPPER-CLASSOID" "WRAPPER-INVALID"
-           "WRAPPER-FLAGS"
+           "LAYOUT-CLASSOID" "LAYOUT-INVALID"
            "LAYOUT-FLAGS"
            "%INSTANCEP" "DEFSTRUCT-SLOT-DESCRIPTION"
            "DD-PREDICATE-NAME"
-           "CLASSOID-PROPER-NAME" "%NOTE-TYPE-DEFINED" "WRAPPER-INFO"
-           "WRAPPER-DD"
+           "CLASSOID-PROPER-NAME" "%NOTE-TYPE-DEFINED" "LAYOUT-INFO"
+           "LAYOUT-DD"
            "%SET-INSTANCE-LAYOUT"
            "DD-CONSTRUCTORS" "DD-DEFAULT-CONSTRUCTOR"
-           "WRAPPER-OF"
+           "LAYOUT-OF"
            "%REALPART"
            "STRUCTURE-CLASSOID" "STRUCTURE-CLASSOID-P"
            "GET-DSD-INDEX"
            "%INSTANCE-LAYOUT" "LAYOUT-CLOS-HASH" "%INSTANCEOID-LAYOUT"
-           "WRAPPER-CLOS-HASH"
-           "%INSTANCE-WRAPPER" "%FUN-WRAPPER"
            "PROCLAIM-AS-FUN-NAME" "BECOME-DEFINED-FUN-NAME"
            "%NUMERATOR" "CLASSOID-TYPEP"
-           "WRAPPER-INHERITS" "DD-LENGTH"
+           "LAYOUT-INHERITS" "DD-LENGTH"
            "SET-LAYOUT-INHERITS"
            "%CODE-ENTRY-POINT"
            "%CODE-FUN-OFFSET"
@@ -2937,9 +2950,6 @@ possibly temporarily, because it might be used internally.")
             ;; Advice to the compiler that it doesn't need to assert types.
 
            "EXPLICIT-CHECK"
-            ;; Stack allocation without any questions asked
-
-           "TRULY-DYNAMIC-EXTENT"
 
            "WITH-SYSTEM-MUTEX"
            "HASH-TABLE-LOCK"
@@ -3088,8 +3098,8 @@ possibly temporarily, because it might be used internally.")
            "TWO-ARG-CHAR-LESSP" "TWO-ARG-CHAR-NOT-LESSP"
            "TWO-ARG-CHAR-GREATERP" "TWO-ARG-CHAR-NOT-GREATERP"
            "CHAR-CASE-INFO"
-            ;; FIXME: potential SB-EXT exports
 
+           ;; FIXME: potential SB-EXT exports
            "CHARACTER-CODING-ERROR"
            "CHARACTER-DECODING-ERROR" "CHARACTER-DECODING-ERROR-OCTETS"
            "CHARACTER-ENCODING-ERROR" "CHARACTER-ENCODING-ERROR-CODE"
@@ -3097,6 +3107,10 @@ possibly temporarily, because it might be used internally.")
            "C-STRING-ENCODING-ERROR"
            "C-STRING-DECODING-ERROR"
            "ATTEMPT-RESYNC" "FORCE-END-OF-FILE"
+
+           ;; not potential SB-EXT exports
+           "GET-EXTERNAL-FORMAT" "GET-EXTERNAL-FORMAT-OR-LOSE"
+           "MAYBE-DEFAULTED-EXTERNAL-FORMAT"
 
             ;; bootstrapping magic, to make things happen both in
             ;; the cross-compilation host compiler's environment and
@@ -3167,6 +3181,7 @@ possibly temporarily, because it might be used internally.")
            "CONSTANTLY-T" "CONSTANTLY-NIL" "CONSTANTLY-0"
            "PSXHASH"
            "%BREAK"
+           "%SIMPLE-ERROR" "%SIMPLE-TYPE-ERROR"
            "BIT-VECTOR-="
            "PATHNAME="
            "%HASH-TABLE-ALIST"
@@ -3251,7 +3266,6 @@ possibly temporarily, because it might be used internally.")
            "DOUBLE-FLOAT-P"
            "LOGICAL-PATHNAME-P"
            "LONG-FLOAT-P"
-           "SHORT-FLOAT-P"
            "SINGLE-FLOAT-P"
            "FIXNUMP"
            "BIGNUMP"
@@ -3266,6 +3280,7 @@ possibly temporarily, because it might be used internally.")
 
             ;; various CHAR-CODEs
 
+           "%CHAR-CODE" ; the type formerly known as CHAR-CODE
            "BACKSPACE-CHAR-CODE" "BELL-CHAR-CODE" "ESCAPE-CHAR-CODE"
            "FORM-FEED-CHAR-CODE" "LINE-FEED-CHAR-CODE"
            "RETURN-CHAR-CODE" "RUBOUT-CHAR-CODE" "TAB-CHAR-CODE"
@@ -3328,6 +3343,7 @@ possibly temporarily, because it might be used internally.")
             ;; alien interface utilities
 
            "C-STRINGS->STRING-LIST"
+           "NEWCHARSTAR-STRING"
 
             ;; misc. utilities used internally
 
@@ -3373,6 +3389,9 @@ possibly temporarily, because it might be used internally.")
            "PACK-CLOSURE-EXTRA-VALUES"
            "SET-CLOSURE-EXTRA-VALUES"
            "+CLOSURE-NAME-INDEX+"
+           "WEAK-VECTOR"
+           "WEAK-VECTOR-LEN"
+           "WEAK-VECTOR-REF"
 
             ;; These could be moved back into SB-EXT if someone has
             ;; compelling reasons, but hopefully we can get by
@@ -3603,7 +3622,10 @@ package is deprecated in favour of SB-MOP.")
            "METHOD-COMBINATION-OPTIONS"
            "METHOD-COMBINATION-LAMBDA-LIST"
            "SHORT-METHOD-COMBINATION-OPERATOR"
-           "SHORT-METHOD-COMBINATION-IDENTITY-WITH-ONE-ARGUMENT"))
+           "SHORT-METHOD-COMBINATION-IDENTITY-WITH-ONE-ARGUMENT"
+
+           "NO-PRIMARY-METHOD"))
+
 
 (defpackage* "SB-BROTHERTREE"
   (:use "CL" "SB-EXT" "SB-INT")

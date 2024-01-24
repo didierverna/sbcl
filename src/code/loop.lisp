@@ -94,7 +94,7 @@
     ((head-var tail-var &optional user-head-var) &body body)
   (let ((l (and user-head-var (list (list user-head-var nil)))))
     `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
-       (declare (truly-dynamic-extent ,head-var)
+       (declare (dynamic-extent ,head-var)
                 ,@(and user-head-var `((list ,user-head-var))))
        ,@body)))
 
@@ -121,8 +121,10 @@
                  (setq ncdrs (- (length (cdr form)) 2))))))
       (let ((answer
               (cond ((null ncdrs)
-                     `(when (setf (cdr ,tail-var) ,tail-form)
-                        (setq ,tail-var (last (cdr ,tail-var)))))
+                     (if (typep tail-form '(cons (eql copy-list)))
+                         `(setf ,tail-var (sb-impl::copy-list-to ,(second tail-form)  ,tail-var))
+                         `(when (setf (cdr ,tail-var) ,tail-form)
+                            (setq ,tail-var (last (cdr ,tail-var))))))
                     ((< ncdrs 0) (return-from loop-collect-rplacd nil))
                     ((= ncdrs 0)
                      ;; @@@@ Here we have a choice of two idioms:
@@ -1435,24 +1437,28 @@ code to be loaded.
                               `(,first-endtest ,step () ,pseudo)))))))))))
 
 (defun loop-for-in (var val data-type)
-  (multiple-value-bind (list constantp list-value)
-      (loop-constant-fold-if-possible val)
-    (let ((listvar (gensym "LOOP-LIST-")))
-      (loop-make-var var nil data-type)
-      (loop-make-var listvar
-                     ;; Don't want to assert the type, as ENDP will do that
-                     `(the* (list :use-annotations t :source-form ,list) ,list)
-                     t)
-      (let ((list-step (loop-list-step listvar)))
-        (let* ((first-endtest `(endp ,listvar))
-               (other-endtest first-endtest)
-               (step `(,var (car ,listvar)))
-               (pseudo-step `(,listvar ,list-step)))
-          (when (and constantp (listp list-value))
-            (setq first-endtest (null list-value)))
-          `(,other-endtest ,step () ,pseudo-step
-            ,@(and (neq first-endtest other-endtest)
-                   `(,first-endtest ,step () ,pseudo-step))))))))
+  (if (and (typep val '(cons (eql reverse) (cons t null)))
+           (not (sb-c::fun-lexically-notinline-p 'reverse
+                                                 (macro-environment *loop*))))
+      (loop-for-across var `(list-reverse-into-vector ,(second val)) data-type)
+      (multiple-value-bind (list constantp list-value)
+          (loop-constant-fold-if-possible val)
+        (let ((listvar (gensym "LOOP-LIST-")))
+          (loop-make-var var nil data-type)
+          (loop-make-var listvar
+                         ;; Don't want to assert the type, as ENDP will do that
+                         `(the* (list :use-annotations t :source-form ,list) ,list)
+                         t)
+          (let ((list-step (loop-list-step listvar)))
+            (let* ((first-endtest `(endp ,listvar))
+                   (other-endtest first-endtest)
+                   (step `(,var (car ,listvar)))
+                   (pseudo-step `(,listvar ,list-step)))
+              (when (and constantp (listp list-value))
+                (setq first-endtest (null list-value)))
+              `(,other-endtest ,step () ,pseudo-step
+                               ,@(and (neq first-endtest other-endtest)
+                                      `(,first-endtest ,step () ,pseudo-step)))))))))
 
 ;;;; iteration paths
 

@@ -22,14 +22,15 @@
     (setf (info :variable :wired-tls (slot-special slot))
           (ash (slot-offset slot) word-shift))))
 
-#+gencgc
 (progn
 ;;; don't change allocation granularity
 (assert (= gencgc-alloc-granularity 0))
 ;;; cards are not larger than pages
 (assert (<= gencgc-page-bytes +backend-page-bytes+))
 ;;; largeness does not depend on the hardware page size
-(defconstant large-object-size (* 4 gencgc-page-bytes)))
+(defconstant large-object-size #-mark-region-gc (* 4 gencgc-page-bytes)
+                               #+mark-region-gc (* 3/4 gencgc-page-bytes))
+(assert (integerp large-object-size)))
 
 ;;; Keep this (mostly) lined up with 'early-objdef' for sanity's sake!
 ;;; The "transport" function is used only if the object is an OTHER-POINTER
@@ -44,7 +45,7 @@
     (ratio "boxed" "ratio_or_complex" "boxed")
     (single-float ,(or #+64-bit "immediate" "unboxed"))
     (double-float "unboxed")
-    (complex "boxed" "ratio_or_complex" "boxed")
+    (complex-rational "boxed" "ratio_or_complex" "boxed")
     (complex-single-float "unboxed")
     (complex-double-float "unboxed")
 
@@ -143,10 +144,6 @@
   return (bit<32 ? 0x~XU >> bit : 0x~XU >> (bit-32)) & 1;"
                       (ldb (byte 32 0) bits) (ldb (byte 32 32) bits))
     (format stream "~%}~%"))
-
-  (format stream "extern unsigned char widetag_lowtag[256];
-static inline lispobj compute_lispobj(lispobj* base_addr) {
-  return make_lispobj(base_addr, LOWTAG_FOR_WIDETAG(*base_addr & WIDETAG_MASK));~%}~%")
 
   (format stream "~%#ifdef WANT_SCAV_TRANS_SIZE_TABLES~%")
   (let ((lowtag-tbl (make-array 256 :initial-element 0)))
@@ -278,14 +275,3 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
   ;; It is 0 until added to the global chain so we can tell the difference between
   ;; an arena that was made but never used, and one that was used at some point.
   (link 0))
-
-;;; AVLNODE is primitive-object-like because it is needed by C code that looks up
-;;; entries in the tree of lisp threads.  But objdef doesn't have SB-XC:DEFSTRUCT
-;;; working, and I'm reluctant to create yet another 'something-thread' file to
-;;; put this in, not to mention that SB-THREAD is the wrong package anyway.
-(in-package "SB-THREAD")
-(sb-xc:defstruct (avlnode (:constructor avlnode (key data left right)))
-  (left  nil :read-only t)
-  (right nil :read-only t)
-  (key   0   :read-only t :type sb-vm:word)
-  data)

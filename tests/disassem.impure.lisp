@@ -1,7 +1,7 @@
 
 ;;; Assert that save-lisp-and-die didn't accidentally recreate the inst space.
 ;;; Fails in parallel-exec which uses PURE-RUNNER which performs ENCAPSULATE
-;;; which calls REMOVE-STATIC-LINKS which invokes the disassembler
+;;; which calls UNDO-STATIC-LINKAGE which invokes the disassembler
 ;;; which constructs the inst-space.
 (with-test (:name :inst-space-jit-constructed
                   :fails-on :parallel-test-runner)
@@ -116,7 +116,8 @@
                       ;; Only the x86-64 disassembler is able to disassemble
                       ;; with output into the dstate rather than a stream.
                       ;; The others choke with "NIL is not of type STREAM"
-                            :skipped-on (:not :x86-64))
+                      :skipped-on (:not :x86-64)
+                      :broken-on :gc-stress)
   (let ((code (list-all-code)) ;; Avoid counting bytes consed in the list
         (discount (list 0)))
     (install-counting-wrapper discount)

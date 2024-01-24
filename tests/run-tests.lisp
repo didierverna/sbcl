@@ -1,7 +1,5 @@
-#+(and linux sb-thread 64-bit)
-(sb-alien:alien-funcall (sb-alien:extern-alien
-                         "reset_gc_stats"
-                         (function sb-alien:void)))
+(when (member "--gc-stress" *posix-argv* :test #'equal)
+  (push :gc-stress *features*))
 
 (load "test-util.lisp")
 (load "assertoid.lisp")
@@ -24,47 +22,71 @@
 (load "test-funs")
 
 (defun run-all (&aux (start-time (get-internal-real-time)))
-  (loop :with remainder = (rest *posix-argv*)
-        :for arg = (car remainder)
-        :while remainder
-        :do
-           (pop remainder)
-           (cond
-             ((string= arg "--evaluator-mode")
-              (let ((mode (pop remainder)))
-                (cond
-                  ((string= mode "interpret")
-                   (setf *test-evaluator-mode* :interpret))
-                  ((string= mode "compile")
-                   (setf *test-evaluator-mode* :compile))
-                  (t
-                   (error "~@<Invalid evaluator mode: ~A. Must be one ~
+  (let (skip-to)
+    (loop :with remainder = (rest *posix-argv*)
+          :for arg = (car remainder)
+          :while remainder
+          :do
+          (pop remainder)
+          (cond
+            ((string= arg "--evaluator-mode")
+             (let ((mode (pop remainder)))
+               (cond
+                 ((string= mode "interpret")
+                  (setf *test-evaluator-mode* :interpret))
+                 ((string= mode "compile")
+                  (setf *test-evaluator-mode* :compile))
+                 (t
+                  (error "~@<Invalid evaluator mode: ~A. Must be one ~
                            of interpret, compile.~@:>"
-                          mode)))))
-             ((string= arg "--break-on-failure")
-              (setf *break-on-error* t)
-              (setf test-util:*break-on-failure* t))
-             ((string= arg "--break-on-expected-failure")
-              (setf test-util:*break-on-expected-failure* t))
-             ((string= arg "--report-skipped-tests")
-              (setf *report-skipped-tests* t))
-             ((string= arg "--no-color"))
-             ((string= arg "--slow")
-              (push :slow *features*))
-             (t
-              (push (merge-pathnames (parse-namestring arg)) *explicit-test-files*))))
-  (setf *explicit-test-files* (nreverse *explicit-test-files*))
-  (with-open-file (log "test.log" :direction :output
-                       :if-exists :supersede
-                       :if-does-not-exist :create)
-    (pure-runner (pure-load-files) 'load-test log)
-    (pure-runner (pure-cload-files) 'cload-test log)
-    (impure-runner (impure-load-files) 'load-test log)
-    (impure-runner (impure-cload-files) 'cload-test log)
-    (impure-runner (sh-files) 'sh-test log)
-    (log-file-elapsed-time "GRAND TOTAL" start-time log))
-  (report)
-  (sb-ext:exit :code (if (unexpected-failures) 1 104)))
+                         mode)))))
+            ((string= arg "--break-on-failure")
+             (setf *break-on-error* t)
+             (setf test-util:*break-on-failure* t))
+            ((string= arg "--break-on-expected-failure")
+             (setf test-util:*break-on-expected-failure* t))
+            ((string= arg "--report-skipped-tests")
+             (setf *report-skipped-tests* t))
+            ((string= arg "--no-color"))
+            ((string= arg "--slow")
+             (push :slow *features*))
+            ((string= arg "--gc-stress"))
+            ((string= arg "--skip-to")
+             (setf skip-to (pop remainder)))
+            (t
+             (push (merge-pathnames (parse-namestring arg)) *explicit-test-files*))))
+   (setf *explicit-test-files* (nreverse *explicit-test-files*))
+   ;; FIXME: randomizing the order tests are run in, especially the "pure" ones,
+   ;; might help detect accidental side-effects by inducing failures elsewhere.
+   ;; And/or try all permutations using an infinite number of machines.
+   (with-open-file (log "test.log" :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create)
+     (let ((pure-load (pure-load-files))
+           (pure-cload (pure-cload-files))
+           (impure-load (impure-load-files))
+           (impure-cload (impure-cload-files))
+           (sh (sh-files)))
+       (when skip-to
+         (cond ((equal skip-to "impure")
+                (setf pure-load nil
+                      pure-cload nil))
+               (t
+                (flet ((skip (files)
+                         (member skip-to files :key #'file-namestring :test #'equal)))
+                  (or (setf pure-load (skip pure-load))
+                      (setf pure-cload (skip pure-cload))
+                      (setf impure-load (skip impure-load))
+                      (setf impure-cload (skip impure-cload))
+                      (setf sh (skip sh)))))))
+       (pure-runner pure-load 'load-test log)
+       (pure-runner pure-cload 'cload-test log)
+       (impure-runner impure-load 'load-test log)
+       (impure-runner impure-cload 'cload-test log)
+       (impure-runner sh 'sh-test log))
+     (log-file-elapsed-time "GRAND TOTAL" start-time log))
+   (report)
+   (sb-ext:exit :code (if (unexpected-failures) 1 104))))
 
 (defun report ()
   (terpri)
@@ -200,6 +222,7 @@
     `(sb-c::*code-serialno*
       sb-c::*compile-elapsed-time*
       sb-c::*compile-file-elapsed-time*
+      sb-impl::**finalizer-store**
       sb-impl::*finalizer-rehashlist*
       sb-impl::*finalizers-triggered*
       sb-impl::*all-packages*
@@ -214,8 +237,10 @@
       ,(maybe "SB-KERNEL" "*EVAL-CALLS*")
       sb-kernel::*type-cache-nonce*
       sb-ext:*gc-run-time*
+      sb-ext:*gc-real-time*
       sb-kernel::*gc-epoch*
       sb-int:*n-bytes-freed-or-purified*
+      ,(maybe "SB-APROF" "*ALLOCATION-PROFILE-METADATA*")
       ,(maybe "SB-VM" "*BINDING-STACK-POINTER*")
       ,(maybe "SB-VM" "*CONTROL-STACK-POINTER*")
       ,(maybe "SB-THREAD" "*JOINABLE-THREADS*")
@@ -324,8 +349,8 @@
           (list (sb-impl::info-env-count sb-int:*info-environment*)))))
 
 (defun structureish-classoid-ancestors (classoid)
-  (map 'list 'sb-kernel:wrapper-classoid
-       (sb-kernel:wrapper-inherits (sb-kernel:classoid-wrapper classoid))))
+  (map 'list 'sb-kernel:layout-classoid
+       (sb-kernel:layout-inherits (sb-kernel:classoid-layout classoid))))
 
 (defun globaldb-cleanup (initial-packages globaldb-summary)
   ;; Package deletion suffices to undo DEFVAR,DEFTYPE,DEFSETF,DEFUN,DEFMACRO
@@ -503,28 +528,6 @@
                             sb-kernel::%compiler-defclass))
             (sb-int:unencapsulate symbol 'defblah-guard)))))
     (makunbound '*allowed-inputs*)
-    (let* ((mutexes
-            (remove-if (lambda (x)
-                         (or (eq x sb-impl::*active-processes-lock*)
-                             (eq x sb-impl::*finalizer-lock*)
-                             #+nil (eq x sb-vm::*allocator-mutex*)))
-                       (sb-vm:list-allocated-objects :all :test #'sb-thread::mutex-p)))
-           (contended (remove-if
-                       (lambda (x)
-                         (or (atom (sb-thread::mutex-%name x))
-                             (zerop (cdr (sb-thread::mutex-%name x)))
-                             ;; finalizer thread is started and stopped often for tests.
-                             ;; No only is it annoying to see it in here, to be correct
-                             ;; we'd need to sum the times of all same-named mutexes.
-                             (string= (sb-thread:mutex-name x) "finalizer")))
-                       mutexes)))
-      (when contended
-        (format t "~&Most-contended mutexes:~%")
-        (dolist (x (sort contended #'> :key (lambda (x) (cdr (sb-thread::mutex-%name x)))))
-          (format t "~12d ~s ~S~%"
-                  (cdr (sb-thread::mutex-%name x))
-                  x
-                  (sb-kernel:generation-of x)))))
     ;; after all the files are done
     (append-failures)))
 
@@ -533,11 +536,13 @@
    (sb-ext:run-program
     (first *POSIX-ARGV*)
     (list "--core" SB-INT:*CORE-STRING*
+          "--lose-on-corruption"
            "--noinform"
            "--no-sysinit"
            "--no-userinit"
            "--noprint"
            "--disable-debugger"
+           #+gc-stress "--eval" #+gc-stress "(push :gc-stress *features*)"
            "--load" load
            "--eval" (write-to-string eval
                                      :right-margin 1000))

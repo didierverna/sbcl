@@ -81,7 +81,7 @@
                               scratch-tn)
                     :disp
                     #+sb-thread (* n-word-bytes thread-mixed-tlab-slot)
-                    #-sb-thread mixed-region))
+                    #-sb-thread (+ static-space-start mixed-region-offset)))
          (end-addr
             ;; thread->mixed_tlab.end_addr
            (make-ea :dword
@@ -89,7 +89,7 @@
                               scratch-tn)
                     :disp
                     #+sb-thread (* n-word-bytes (1+ thread-mixed-tlab-slot))
-                    #-sb-thread (+ mixed-region n-word-bytes))))
+                    #-sb-thread (+ static-space-start mixed-region-offset n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
     #+(and sb-thread win32)
@@ -285,6 +285,8 @@
   (:temporary (:sc any-reg :offset ecx-offset :from (:argument 2)) ecx)
   (:temporary (:sc any-reg :offset eax-offset :from :eval) zero)
   (:temporary (:sc any-reg :offset edi-offset) res)
+  (:node-var node)
+  (:vop-var vop)
   (:results (result :scs (descriptor-reg) :from :load))
   (:arg-types positive-fixnum
               positive-fixnum
@@ -295,9 +297,20 @@
                               (+ (1- (ash 1 n-lowtag-bits))
                                  (* vector-data-offset n-word-bytes))))
     (inst and result (lognot lowtag-mask))
-    ;; FIXME: It would be good to check for stack overflow here.
     (move ecx words)
     (inst shr ecx n-fixnum-tag-bits)
+    (when (sb-c::make-vector-check-overflow-p node)
+      (let ((overflow (generate-error-code vop 'stack-allocated-object-overflows-stack-error result)))
+        (inst sub esp-tn result)
+        (inst cmp esp-tn
+              #-sb-thread
+              (make-ea-for-symbol-value *control-stack-start* :dword)
+              #+sb-thread
+              (make-ea :dword :disp (* 4 thread-control-stack-start-slot))
+              #+sb-thread :fs)
+        ;; avoid clearing condition codes
+        (inst lea esp-tn (make-ea :dword :base esp-tn :index result))
+        (inst jmp :be overflow)))
     (stack-allocation result result other-pointer-lowtag)
     (inst cld)
     (inst lea res
@@ -364,12 +377,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst mov result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
 
 (define-vop (fixed-alloc)
   (:info name words type lowtag stack-allocate-p)

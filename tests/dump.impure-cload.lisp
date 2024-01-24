@@ -223,7 +223,7 @@
         (setf (s1-kids b) (list k1 (make-s2 :id 'b-kid2 :parent b))
               (s1-kids c) (list k2)
               (s1-friends a) (list* b c (circular-list a))
-              (s1-friends b) (list a c)
+              (s1-friends b) (list c a)
               (s1-friends c) (list a b))
         (list a b c))))
 
@@ -551,3 +551,27 @@
 ;;; But thankfully we trap the read of the ID slot.
 (with-test (:name :illegal-typed-slot-value)
   (assert-error (spy-id *agent*)))
+
+(defun eq-cdr-constants-coalescing ()
+  (values
+   '(a (x . #1=(c)) #1# a)
+   '(b (x . #2=(c)) #2# b)))
+
+(with-test (:name :eq-cdr-constants-coalescing)
+  (multiple-value-bind (a b)
+      (funcall 'eq-cdr-constants-coalescing)
+    (assert (eq (cdadr a) (caddr a)))
+    (assert (eq (cdadr b) (caddr b)))))
+
+(with-test (:name :circularity-within-non-simple-array)
+  (let ((a #.(make-array 2 :adjustable t
+                           :initial-element '#1=(#1#))))
+    (assert (eq (aref (opaque-identity a) 0)
+                (car (aref (opaque-identity a) 0))))
+    (assert (eq (aref (opaque-identity a) 0)
+                (aref (opaque-identity a) 1)))))
+
+(with-test (:name :non-simple-array-constant-folding)
+  (let ((x #.(make-array 10 :fill-pointer 5)))
+    (assert (= (array-total-size x)
+               (array-total-size (opaque-identity x))))))

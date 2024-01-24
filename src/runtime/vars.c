@@ -14,7 +14,7 @@
 #include <sys/types.h>
 #include <stdlib.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "vars.h"
 #include "os.h"
@@ -30,7 +30,7 @@ struct var {
     lispobj (*update_fn)(struct var *var);
     char *name;
     sword_t clock;
-    boolean map_back, permanent;
+    bool map_back, permanent;
 
     struct var *nnext; /* Next in name list */
     struct var *onext; /* Next in object list */
@@ -111,7 +111,7 @@ struct var *lookup_by_obj(lispobj obj)
     return NULL;
 }
 
-static struct var *make_var(char *name, boolean perm)
+static struct var *make_var(char *name, bool perm)
 {
     struct var *var = (struct var *)malloc(sizeof(struct var));
     char buffer[256];
@@ -134,7 +134,7 @@ static struct var *make_var(char *name, boolean perm)
     return var;
 }
 
-struct var *define_var(char *name, lispobj obj, boolean perm)
+struct var *define_var(char *name, lispobj obj, bool perm)
 {
     struct var *var = make_var(name, perm);
     int index;
@@ -148,16 +148,6 @@ struct var *define_var(char *name, lispobj obj, boolean perm)
         var->onext = ObjHash[index];
         ObjHash[index] = var;
     }
-
-    return var;
-}
-
-struct var *define_dynamic_var(char *name, lispobj updatefn(struct var *),
-                               boolean perm)
-{
-    struct var *var = make_var(name, perm);
-
-    var->update_fn = updatefn;
 
     return var;
 }

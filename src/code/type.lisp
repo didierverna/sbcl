@@ -215,10 +215,10 @@
                                                         (specifier-type guard)))))
                      (return
                        (or (eq type2 (car x))
-                           (let ((inherits (wrapper-inherits
-                                            (classoid-wrapper (car x)))))
+                           (let ((inherits (layout-inherits
+                                            (classoid-layout (car x)))))
                              (dotimes (i (length inherits) nil)
-                               (when (eq type2 (wrapper-classoid (svref inherits i)))
+                               (when (eq type2 (layout-classoid (svref inherits i)))
                                  (return t))))))))))
           t))))
 
@@ -1149,7 +1149,7 @@
   (declare (type ctype type1 type2))
   (macrolet ((quick-fail-simple-=-mask ()
                ;; The set of type-classes for which not EQ implies not TYPE=.
-               (loop for class in '(character-set classoid member named
+               (loop for class in '(character-set classoid member named number
                                     #+sb-simd-pack simd-pack
                                     #+sb-simd-pack-256 simd-pack-256)
                      sum (ash 1 (type-class-name->id class))))
@@ -1168,9 +1168,6 @@
                      (memoize (invoke-type-method :none :complex-= type1 type2))))
                 ((logbitp id1 (quick-fail-simple-=-mask))
                  (values nil t))
-                ((= id1 #.(type-class-name->id 'number)) ; do not cache
-                 ;; At most 2 EQL tests, which are as fast as memoization, if not faster.
-                 (number-simple-=-type-method type1 type2))
                 (t ; use the SIMPLE-= method
                  ;; A cached answer for swapped args is the same, so always put the smaller
                  ;; hash first, and we might win with a previous answer.
@@ -1416,7 +1413,7 @@
 #-sb-xc-host
 (progn (declaim (inline class-classoid))
        (defun class-classoid (class)
-         (wrapper-classoid (sb-pcl::class-wrapper class))))
+         (layout-classoid (sb-pcl::class-wrapper class))))
 
 ;;; HAIRY type-class has to be defined prior to defining %PARSE-TYPE.
 ;; ENUMERABLE-P is T because a hairy type could be equivalent to a MEMBER type.
@@ -1536,8 +1533,8 @@
               ;; See https://sourceforge.net/p/sbcl/mailman/message/11217378/
               ;; We rely on caching of singleton EQL types to make this efficient.
               (make-eql-type (sb-mop::eql-specializer-object type-specifier)))
-             ((wrapper-p type-specifier)
-              (wrapper-classoid type-specifier))
+             ((layout-p type-specifier)
+              (layout-classoid type-specifier))
              (t (fail type-specifier))))))
   (when (atom type-specifier)
     ;; Try to bypass the cache, which avoids using a cache line for standard
@@ -2499,23 +2496,6 @@ expansion happened."
 
 (define-type-class number :enumerable #'numeric-type-enumerable :might-contain-other-types nil)
 
-(define-type-method (number :simple-=) (type1 type2)
-  ;; If NUMERIC-TYPE-CLASS is FLOAT, then we have to compare the bounds using EQUALP
-  ;; which equates signed zeros of the same precision.
-  ;; In particular all the following are different, but TYPE= to each other:
-  ;;  (specifier-type '(single-float -0s0 -0s0))
-  ;;  (specifier-type '(single-float -0s0 +0s0))
-  ;;  (specifier-type '(single-float +0s0 -0s0))
-  ;;  (specifier-type '(single-float +0s0 +0s0))
-  ;; If not a FLOAT class, then thanks to hash-consing, two instances can be TYPE=
-  ;; only if EQ. Therefore, since this method was invoked, the arguments are not TYPE=
-  ;; if the class is other than FLOAT.
-  (values (and (eq (numeric-type-class type1) 'float)
-               (numtype-aspects-eq type1 type2)
-               (equalp (numeric-type-low type1) (numeric-type-low type2))
-               (equalp (numeric-type-high type1) (numeric-type-high type2)))
-          t))
-
 (declaim (inline bounds-unbounded-p))
 (defun bounds-unbounded-p (low high)
   (and (null low) (eq high low)))
@@ -2612,29 +2592,39 @@ expansion happened."
 ;;; exclusive bounds.
 (defun coerce-numeric-bound (bound type)
   (flet ((c (thing)
-           #+sb-xc-host (declare (ignore thing))
            (case type
              (rational
-              #+sb-xc-host (return-from coerce-numeric-bound)
-              #-sb-xc-host (if (and (floatp thing) (float-infinity-p thing))
-                               (return-from coerce-numeric-bound nil)
-                               (rational thing)))
+              (cond ((and (floatp thing) (float-infinity-p thing))
+                     (return-from coerce-numeric-bound nil))
+                    ((or (eql thing $-0d0)
+                         (eql thing $-0f0))
+                     0)
+                    (t
+                     (rational thing))))
              ((float single-float)
-              (cond #-sb-xc-host
-                    ((<= most-negative-single-float thing most-positive-single-float)
+              (cond ((or (eql thing $-0d0)
+                         (eql thing $-0f0))
+                     $0f0)
+                    ((sb-xc:<= most-negative-single-float thing most-positive-single-float)
                      (coerce thing 'single-float))
                     (t
                      (return-from coerce-numeric-bound nil))))
              (double-float
-              (cond #-sb-xc-host
-                    ((<= most-negative-double-float thing most-positive-double-float)
+              (cond ((or (eql thing $-0d0)
+                         (eql thing $-0f0))
+                     $0d0)
+                    ((sb-xc:<= most-negative-double-float thing most-positive-double-float)
                      (coerce thing 'double-float))
                     (t
                      (return-from coerce-numeric-bound nil)))))))
     (when bound
-      (if (consp bound)
-          (list (c (car bound)))
-          (c bound)))))
+      (handler-case
+          (if (consp bound)
+              (list (c (car bound)))
+              (c bound))
+        #+sb-xc-host
+        (error ()
+          (return-from coerce-numeric-bound nil))))))
 
 (defun %make-union-numeric-type (class format complexp low high)
   (declare (type (member integer rational float nil) class))
@@ -2719,7 +2709,17 @@ expansion happened."
       (return-from make-numeric-type *empty-type*))
     (when (and (eq class 'rational) (integerp low) (eql low high))
       (setf class 'integer))
-    (new-ctype numeric-type 0 (get-numtype-aspects complexp class format) low high)))
+    (flet ((normalize-zero (x)
+             (cond
+               ((eql x $-0d0) $0d0)
+               ((eql x $-0f0) $0f0)
+               ((equal x '($-0d0)) '($0d0))
+               ((equal x '($-0f0)) '($0f0))
+               (t x))))
+      (declare (inline normalize-zero))
+     (new-ctype numeric-type 0 (get-numtype-aspects complexp class format)
+                (normalize-zero low)
+                (normalize-zero high)))))
 
 (defun modified-numeric-type (base
                               &key
@@ -3362,56 +3362,75 @@ used for a COMPLEX component.~:@>"
 ;;; but not a NUMERIC-TYPE.
 (defun numeric-contagion (type1 type2 &key (rational t)
                                            unsigned)
-  (if (and (numeric-type-p type1) (numeric-type-p type2))
-      (let ((class1 (numeric-type-class type1))
-            (class2 (numeric-type-class type2))
-            (format1 (numeric-type-format type1))
-            (format2 (numeric-type-format type2))
-            (complexp1 (numeric-type-complexp type1))
-            (complexp2 (numeric-type-complexp type2)))
-        (cond ((eq class1 'float)
-               (make-numeric-type
-                :class 'float
-                :format (ecase class2
-                          (float (float-format-max format1 format2))
-                          ((integer rational) format1)
-                          ((nil)
-                           ;; A double-float with any real number is a
-                           ;; double-float.
-                           #-long-float
-                           (if (eq format1 'double-float)
-                             'double-float
-                             nil)
-                           ;; A long-float with any real number is a
-                           ;; long-float.
-                           #+long-float
-                           (if (eq format1 'long-float)
-                             'long-float
-                             nil)))
-                :complexp (cond ((and (eq complexp1 :real)
-                                      (eq complexp2 :real))
-                                 :real)
-                                ((or (null complexp1) (null complexp2))
-                                 nil)
-                                (t :complex))))
-              ((eq class2 'float) (numeric-contagion type2 type1))
-              ((and (eq complexp1 :real) (eq complexp2 :real))
-               (if (or rational
-                       (or (neq class1 'integer)
-                           (neq class2 'integer)))
-                   (make-numeric-type
-                    :class (and class1 class2 'rational)
-                    :complexp :real)
-                   (make-numeric-type
-                    :class 'integer
-                    :complexp :real
-                    :low (and unsigned
-                              (typep (numeric-type-low type1) 'unsigned-byte)
-                              (typep (numeric-type-low type2) 'unsigned-byte)
-                              0))))
-              (t
-               (specifier-type 'number))))
-      (specifier-type 'number)))
+  (cond ((and (numeric-type-p type1) (numeric-type-p type2))
+         (let ((class1 (numeric-type-class type1))
+               (class2 (numeric-type-class type2))
+               (format1 (numeric-type-format type1))
+               (format2 (numeric-type-format type2))
+               (complexp1 (numeric-type-complexp type1))
+               (complexp2 (numeric-type-complexp type2)))
+           (cond ((eq class1 'float)
+                  (make-numeric-type
+                   :class 'float
+                   :format (ecase class2
+                             (float (float-format-max format1 format2))
+                             ((integer rational) format1)
+                             ((nil)
+                              ;; A double-float with any real number is a
+                              ;; double-float.
+                              #-long-float
+                              (if (eq format1 'double-float)
+                                  'double-float
+                                  nil)
+                              ;; A long-float with any real number is a
+                              ;; long-float.
+                              #+long-float
+                              (if (eq format1 'long-float)
+                                  'long-float
+                                  nil)))
+                   :complexp (cond ((and (eq complexp1 :real)
+                                         (eq complexp2 :real))
+                                    :real)
+                                   ((or (null complexp1) (null complexp2))
+                                    nil)
+                                   (t :complex))))
+                 ((eq class2 'float) (numeric-contagion type2 type1))
+                 ((and (eq complexp1 :real) (eq complexp2 :real))
+                  (if (or rational
+                          (or (neq class1 'integer)
+                              (neq class2 'integer)))
+                      (make-numeric-type
+                       :class (and class1 class2 'rational)
+                       :complexp :real)
+                      (make-numeric-type
+                       :class 'integer
+                       :complexp :real
+                       :low (and unsigned
+                                 (typep (numeric-type-low type1) 'unsigned-byte)
+                                 (typep (numeric-type-low type2) 'unsigned-byte)
+                                 0))))
+                 (t
+                  (specifier-type 'number)))))
+        ((eq type1 (specifier-type 'ratio))
+         (numeric-contagion (specifier-type 'rational) type2))
+        ((eq type2 (specifier-type 'ratio))
+         (numeric-contagion type1 (specifier-type 'rational)))
+        (t
+         (flet ((try-union (a b)
+                  (let (union)
+                    (loop for type in (union-type-types a)
+                          for contagion = (numeric-contagion type b :rational rational :unsigned unsigned)
+                          do (setf union (if union
+                                             (type-union union contagion)
+                                             contagion))
+                          until (eq union (specifier-type 'number)))
+                    union)))
+           (cond ((union-type-p type1)
+                  (try-union type1 type2))
+                 ((union-type-p type2)
+                  (try-union type2 type1))
+                 (t
+                  (specifier-type 'number)))))))
 
 ;;;; array types
 
@@ -3431,17 +3450,21 @@ used for a COMPLEX component.~:@>"
   ;; aver that the cars of the list elements are sorted into increasing order
   (do ((p pairs (cdr p)))
       ((null (cdr p)))
-    (aver (<= (caar p) (caadr p))))
+    (aver (<= (the %char-code (caar p)) (the %char-code (caadr p)))))
   (let ((pairs
-         (if (and (singleton-p pairs) (eql (caar pairs) (cdar pairs)))
+         (if (and (singleton-p pairs)
+                  (eql (truly-the %char-code (caar pairs))
+                       ;; only the CARs were checked above
+                       (the %char-code (cdar pairs))))
              pairs ; don't need to preprocess the pairs
              (let (result)
                 (do ((pairs pairs (cdr pairs)))
                     ((null pairs) (nreverse result))
                   (destructuring-bind (low . high) (car pairs)
+                    (declare (%char-code low high))
                     (loop for (low1 . high1) in (cdr pairs)
-                          if (<= low1 (1+ high))
-                          do (progn (setf high (max high high1))
+                          if (<= (the %char-code low1) (1+ high))
+                          do (progn (setf high (max high (the %char-code high1)))
                                     (setf pairs (cdr pairs)))
                           else do (return nil))
                     (cond
@@ -4127,7 +4150,7 @@ used for a COMPLEX component.~:@>"
          (let* ((codepoint (sb-xc:char-code elt))
                 (pairs (list (cons codepoint codepoint))))
            ;; PAIRS will get copied if needed, but not for the host
-           #-sb-xc-host (declare (truly-dynamic-extent pairs))
+           #-sb-xc-host (declare (dynamic-extent pairs))
            (make-character-set-type pairs)))
         (real
          (unless (fp-zero-p elt)
@@ -4384,6 +4407,18 @@ used for a COMPLEX component.~:@>"
                 (process-compound-type (intersection-type-types type))))))
     (determine type)))
 
+(defun ctype-array-union-dimensions (type)
+  (if (union-type-p type)
+      (loop with dims
+            for type in (union-type-types type)
+            for dim = (ctype-array-dimensions type)
+            do
+            (when (eq dim '*)
+              (return '(*)))
+            (pushnew dim dims :test #'equal)
+            finally (return dims))
+      (list (ctype-array-dimensions type))))
+
 (defun ctype-array-specialized-element-types (type)
   (let (types)
     (labels ((process-compound-type (types)
@@ -4500,6 +4535,64 @@ used for a COMPLEX component.~:@>"
                                      string-type)))
                    (rplaca tail nil) ; We'll delete these list elements later
                    (rplaca peer nil))))
+      (let (double
+            single
+            rational
+            integer)
+        (loop for x in remainder
+              when (and (numeric-type-p x)
+                        (eq (numeric-type-complexp x) :real))
+              do (case (numeric-type-class x)
+                   (rational
+                    (setf rational x))
+                   (integer
+                    (setf integer x))
+                   (float
+                    (case (numeric-type-format x)
+                      (double-float
+                       (setf double x))
+                      (single-float
+                       (setf single x))))))
+        (when (and double single)
+          (let ((low (numeric-type-low single))
+                (high (numeric-type-high single)))
+            (labels ((n= (x y)
+                       (and (not (float-infinity-or-nan-p x))
+                            (sb-xc:= x y)))
+                     (match (x y)
+                       ;; equalp doesn't work on floats in sb-xc-host
+                       (cond ((null x)
+                              (null y))
+                             ((consp x)
+                              (and (consp y)
+                                   (n= (car x)
+                                       (car y))))
+                             ((numberp y)
+                              (n= x y)))))
+              (when (and (match low (numeric-type-low double))
+                         (match high (numeric-type-high double)))
+                (setf remainder (delq1 double (delq1 single remainder)))
+                (cond ((or (and rational
+                                (match low (numeric-type-low rational))
+                                (match high (numeric-type-high rational)))
+                           (and (setf rational integer)
+                                (numberp (numeric-type-low rational))
+                                (eql (numeric-type-low rational)
+                                     (numeric-type-high rational)) ;; (rational 1 1) is an integer.
+                                (match low (numeric-type-low rational))
+                                (match high (numeric-type-high rational))))
+                       (setf remainder (delq1 rational remainder))
+                       (let ((low (numeric-type-low rational))
+                             (high (numeric-type-high rational)))
+                         (recognized (cond (high
+                                            `(real ,(or low '*) ,high))
+                                           (low
+                                            `(real ,low))))))
+                      (t
+                       (recognized (cond (high
+                                          `(float ,(or low '*) ,high))
+                                         (low
+                                          `(float ,low)))))))))))
       (let ((list (nconc (recognized)
                          (type-unparse flags (delete nil remainder)))))
         (if (cdr list) `(or ,@list) (car list))))))

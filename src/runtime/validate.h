@@ -12,11 +12,6 @@
 #if !defined(_INCLUDE_VALIDATE_H_)
 #define _INCLUDE_VALIDATE_H_
 
-#ifndef LISP_FEATURE_GENCGC
-/* FIXME: genesis/constants.h also defines this with a constant value */
-#define DYNAMIC_SPACE_START current_dynamic_space
-#endif
-
 #define BINDING_STACK_SIZE (1024*1024)   /* chosen at random */
 #define ALIEN_STACK_SIZE (1024*1024)     /* chosen at random */
 
@@ -28,6 +23,9 @@
 /* constants derived from the fundamental constants in passed by GENESIS */
 #define READ_ONLY_SPACE_SIZE (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START)
 #define STATIC_SPACE_SIZE (STATIC_SPACE_END - STATIC_SPACE_START)
+#define NIL_SYMBOL_SLOTS_START (STATIC_SPACE_START + NIL_SYMBOL_SLOTS_OFFSET)
+#define NIL_SYMBOL_SLOTS_END (STATIC_SPACE_START + NIL_SYMBOL_SLOTS_END_OFFSET)
+#define STATIC_SPACE_OBJECTS_START (STATIC_SPACE_START + STATIC_SPACE_OBJECTS_OFFSET)
 
 #ifdef LISP_FEATURE_DARWIN_JIT
 #define STATIC_CODE_SPACE_SIZE (STATIC_CODE_SPACE_END - STATIC_CODE_SPACE_START)
@@ -37,6 +35,7 @@
     (ALIEN_LINKAGE_TABLE_SPACE_START + ALIEN_LINKAGE_TABLE_SPACE_SIZE)
 
 #if !defined(__ASSEMBLER__)
+#include <stdbool.h>
 #include "thread.h"
 
 #if defined(LISP_FEATURE_WIN32)
@@ -95,8 +94,8 @@
 #define BINDING_STACK_RETURN_GUARD_PAGE(th) \
     (BINDING_STACK_GUARD_PAGE(th) - os_vm_page_size)
 
-extern void allocate_lisp_dynamic_space(boolean);
-extern boolean allocate_hardwired_spaces(boolean);
+extern void allocate_lisp_dynamic_space(bool);
+extern bool allocate_hardwired_spaces(bool);
 
 extern void
 protect_control_stack_hard_guard_page(int protect_p, struct thread *thread);

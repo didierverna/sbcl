@@ -12,19 +12,61 @@
 
 (in-package "SB-C")
 
+;;; An entry point is reachable if:
+;;;   - Its home lambda is of KIND :TOPLEVEL.
+;;;   - Its home lambda is LAMBDA-HAS-EXTERNAL-REFERENCES-P true (from
+;;;     COMPILE or possibly other causes).
+;;;   - Its home lambda is either referenced from a reachable block in
+;;;     the same component or referenced from a different component.
+(defun entry-point-reached-p (ep)
+  (declare (type cblock ep))
+  (let ((start-node (block-start-node ep)))
+    (if (bind-p start-node)
+        (let ((fun (bind-lambda start-node)))
+          (or (eq (functional-kind fun) :toplevel)
+              (lambda-has-external-references-p fun)
+              (let ((component (block-component ep)))
+                (some (lambda (ref)
+                        ;; The REF could have been deleted, in which
+                        ;; case we don't count that as an external
+                        ;; reference from another component.
+                        (and (not (node-to-be-deleted-p ref))
+                             (or (block-flag (node-block ref))
+                                 (not (eq (node-component ref) component)))))
+                      (leaf-refs fun)))
+              (and (eq (functional-kind fun) :optional)
+                   (flet ((reachable-p (fun)
+                            (some (lambda (ref)
+                                    (and (not (node-to-be-deleted-p ref))
+                                         (block-flag (node-block ref))))
+                                  (leaf-refs fun))))
+                     (let ((optional-dispatch (lambda-optional-dispatch fun)))
+                       (or (reachable-p optional-dispatch)
+                           (reachable-p
+                            (optional-dispatch-main-entry optional-dispatch))))))))
+        (let ((cleanup (block-start-cleanup ep)))
+          (aver cleanup)
+          (block-flag (node-block (cleanup-mess-up cleanup)))))))
+
+(defun number-blocks (component)
+  (let ((num 0))
+    (declare (fixnum num))
+    (do-blocks-backwards (block component :both)
+      (setf (block-number block) (incf num)))))
+
 ;;; Find the DFO for a component, deleting any unreached blocks and
 ;;; merging any other components we reach. We repeatedly iterate over
 ;;; the entry points, since new ones may show up during the walk.
-(declaim (ftype (function (component) (values)) find-dfo))
-(defun find-dfo (component)
+(defun find-dfo (component &optional clean-only)
   (clear-flags component)
   (setf (component-reanalyze component) nil)
   (let ((head (component-head component)))
     (do ()
         ((dolist (ep (block-succ head) t)
            (unless (or (block-flag ep)
-                       (block-to-be-deleted-p ep))
-             (find-dfo-aux ep head component)
+                       (block-to-be-deleted-p ep)
+                       (not (entry-point-reached-p ep)))
+             (find-dfo-aux ep head component clean-only)
              (return nil))))))
   (let ((num 0))
     (declare (fixnum num))
@@ -82,18 +124,15 @@
   (values))
 
 ;;; Do a depth-first walk from BLOCK, inserting ourself in the DFO
-;;; after HEAD. If we somehow find ourselves in another component,
-;;; then we join that component to our component.
-(declaim (ftype (function (cblock cblock component) (values)) find-dfo-aux))
-(defun find-dfo-aux (block head component)
-  (unless (eq (block-component block) component)
-    (join-components component (block-component block)))
+;;; after HEAD.
+(defun find-dfo-aux (block head component &optional mark-only)
   (unless (or (block-flag block) (block-delete-p block))
     (setf (block-flag block) t)
     (dolist (succ (block-succ block))
       (find-dfo-aux succ head component))
-    (remove-from-dfo block)
-    (add-to-dfo block head))
+    (unless mark-only
+      (remove-from-dfo block)
+      (add-to-dfo block head)))
   (values))
 
 ;;; This function is called on each block by FIND-INITIAL-DFO-AUX
@@ -384,11 +423,7 @@
           (delete-component initial-component))))
 
     ;; When we are done, we assign DFNs.
-    (dolist (component (components))
-      (let ((num 0))
-        (declare (fixnum num))
-        (do-blocks-backwards (block component :both)
-          (setf (block-number block) (incf num)))))
+    (mapc #'number-blocks (components))
 
     ;; Pull out top-level-ish code.
     (separate-toplevelish-components (components))))

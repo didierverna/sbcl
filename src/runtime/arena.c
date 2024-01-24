@@ -3,20 +3,17 @@
 #include <errno.h>
 #include <string.h>
 #include <inttypes.h>
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "gc.h"
-#include "gc-internal.h"
-#include "gc-private.h"
-#include "gencgc-private.h"
 #include "lispregs.h"
 #include "genesis/arena.h"
 #include "genesis/gc-tables.h"
 #include "thread.h"
+#include "genesis/instance.h"
 #include "graphvisit.h"
 
-extern void acquire_gc_page_table_lock(), release_gc_page_table_lock();
 extern lispobj * component_ptr_from_pc(char *pc);
 
 // Arena memory block. At least one is associated with each arena,
@@ -25,7 +22,10 @@ struct arena_memblk {
     char* freeptr;
     char* limit;
     struct arena_memblk* next;
-    uword_t padding; // always 0
+    // The first memblk contains a 'struct arena' and a pthread mutex
+    // and the arena_memblk itself. Other memblks only have the memblk.
+    // Either way, Lisp objects commence at the 'allocator_base'.
+    char* allocator_base;
 };
 
 #if 1
@@ -80,20 +80,18 @@ lispobj sbcl_new_arena(size_t size)
     // all user allocations instead of having to skip the first batch
     // so that the arena struct always remains accessible.
     char* aligned_mem_base = PTR_ALIGN_UP(mem_base, CHUNK_ALIGN);
-    memset(mem_base, 0xCC, aligned_mem_base - mem_base);
-    block->freeptr = aligned_mem_base;
+    block->freeptr = block->allocator_base = aligned_mem_base;
     char *limit = (char*)arena + size;
     char *aligned_limit = PTR_ALIGN_DOWN(limit, CHUNK_ALIGN);
     block->limit = aligned_limit;
     block->next = NULL;
-    block->padding = 0;
     arena->uw_original_size = size;
     arena->uw_length = size;
     arena->uw_current_block = arena->uw_first_block = (uword_t)block;
     return make_lispobj(arena, INSTANCE_POINTER_LOWTAG);
 }
 
-static inline void* arena_mutex(struct arena* a) {
+static __attribute__((unused)) inline void* arena_mutex(struct arena* a) {
     return (void*)((char*)a + ALIGN_UP(sizeof (struct arena), 2*N_WORD_BYTES));
 }
 
@@ -119,8 +117,7 @@ void arena_release_memblks(lispobj arena_taggedptr)
         block = next;
     }
     arena->uw_current_block = arena->uw_first_block;
-    char* mem_base = (char*)first + sizeof (struct arena_memblk);
-    first->freeptr = PTR_ALIGN_UP(mem_base, CHUNK_ALIGN);
+    first->freeptr = first->allocator_base;
     first->next = NULL;
     // Release huge-object blocks
     block = (void*)arena->uw_huge_objects;
@@ -135,7 +132,7 @@ void arena_release_memblks(lispobj arena_taggedptr)
     ARENA_MUTEX_RELEASE(arena);
 }
 
-void AMD64_SYSV_ABI sbcl_delete_arena(lispobj arena_taggedptr)
+void sbcl_delete_arena(lispobj arena_taggedptr)
 {
     arena_release_memblks(arena_taggedptr);
     struct arena* arena = (void*)native_pointer(arena_taggedptr);
@@ -173,19 +170,10 @@ static page_index_t close_heap_region(struct alloc_region* r, int page_type) {
     return result;
 }
 
-void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
-                     __attribute__((unused)) lispobj* ra) // return address
+void switch_to_arena(lispobj arena_taggedptr)
 {
     struct arena* arena = (void*)native_pointer(arena_taggedptr);
     struct thread* th = get_sb_vm_thread();
-#if 0
-    struct code* c = (void*)component_ptr_from_pc((void*)ra);
-    int id = c ? code_serialno(c) : 0;
-    fprintf(stderr, "arena switch %s %p. caller=(PC=%lx ID=#x%x)\n",
-            (arena ? "to" : "from"),
-            (arena ? arena : (void*)th->arena),
-            (uword_t)ra, id);
-#endif
     struct extra_thread_data *extra_data = thread_extra_data(th);
     if (arena) { // switching from the dynamic space to an arena
         if (th->arena)
@@ -200,10 +188,8 @@ void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
             arena_chain = arena_taggedptr;
         }
         // Close only the non-system regions
-        thread_extra_data(th)->mixed_page_hint =
-            close_heap_region(&th->mixed_tlab, PAGE_TYPE_MIXED);
-        thread_extra_data(th)->cons_page_hint =
-            close_heap_region(&th->cons_tlab, PAGE_TYPE_CONS);
+        extra_data->mixed_page_hint = close_heap_region(&th->mixed_tlab, PAGE_TYPE_MIXED);
+        extra_data->cons_page_hint = close_heap_region(&th->cons_tlab, PAGE_TYPE_CONS);
         release_gc_page_table_lock();
 #if 0 // this causes a data race, the very thing it's trying to avoid
         int arena_index = fixnum_value(arena->index);
@@ -221,6 +207,7 @@ void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
 #endif
     } else { // finished with the arena
         gc_assert(th->arena); // must have been an arena in use
+#if 0
         struct arena* old_arena = (void*)native_pointer(th->arena);
         int arena_index = fixnum_value(old_arena->index);
         // Ensure that this thread has enough space in its save area for the arena index.
@@ -241,6 +228,7 @@ void AMD64_SYSV_ABI switch_to_arena(lispobj arena_taggedptr,
         state->token = old_arena->uw_token;
         state->mixed = th->mixed_tlab;
         state->cons  = th->cons_tlab;
+#endif
         // Indicate that the tlabs have no space remaining.
         gc_set_region_empty(&th->mixed_tlab);
         gc_set_region_empty(&th->cons_tlab);
@@ -270,7 +258,7 @@ static void* memblk_claim_subrange(struct arena* a, struct arena_memblk* mem,
                     ARENA_MUTEX_RELEASE(a);
                     lose("Fatal: won't add arena %s block. Length=%lx request=%lx max=%lx",
                          oversized ? "huge-object" : "extension",
-                         a->uw_length, request, a->uw_size_limit);
+                         (long)a->uw_length, (long)request, (long)a->uw_size_limit);
                 }
                 // For a huge object, ensure that there will be adequate space after aligning
                 // the bounds. Don't worry about it for a regular extension block though
@@ -296,12 +284,11 @@ static void* memblk_claim_subrange(struct arena* a, struct arena_memblk* mem,
                 // Alignment serves the needs of hide/unhide because mprotect()
                 // operates only on boundaries as dictated by the OS and/or CPU.
                 char* aligned_mem_base = PTR_ALIGN_UP(mem_base, CHUNK_ALIGN);
-                extension->freeptr = aligned_mem_base;
+                extension->freeptr = extension->allocator_base = aligned_mem_base;
                 char* limit = new_mem + actual_request;
                 char* aligned_limit = PTR_ALIGN_DOWN(limit, CHUNK_ALIGN);
                 extension->limit = aligned_limit;
                 extension->next = NULL;
-                extension->padding = 0;
                 // tally up the total length
                 // For huge objects, count only the directly requested space,
                 // not the "bookends" (alignment chunks)
@@ -351,7 +338,18 @@ lispobj* handle_arena_alloc(struct thread* th, struct alloc_region* region,
      */
     int avail = (char*)region->end_addr - (char*)region->free_pointer;
     int min_keep = (page_type == PAGE_TYPE_CONS) ? 4*CONS_SIZE*N_WORD_BYTES : 128;
+    /* What's the point of a different filler for CONS? Well, once upon a time
+     * I figured that an ambiguous pointer having LIST-POINTER-LOWTAG could be excluded
+     * if it points to (uword_t)-1 because no valid cons can hold those bits in the CAR.
+     * However, mark-region always zero-fills unused lines, and so the compiler takes
+     * advantage of that by using a :DWORD operand when storing NIL to the CDR of a
+     * fresh cons. Since the two GCs have different behaviors here, as does the compiler,
+     * any unused ranges in an arenas must resemble an unused range in the heap */
+#ifdef LISP_FEATURE_MARK_REGION_GC
+    int filler = 0;
+#else
     int filler = (page_type == PAGE_TYPE_CONS) ? 255 : 0;
+#endif
     /* Precondition: free space in the TLAB was not enough to satisfy the request.
      * We want to do exactly one claim_new_subrange operation. There are 2 cases:
      *
@@ -389,8 +387,11 @@ long arena_bytes_used(lispobj arena_taggedptr)
     ARENA_MUTEX_ACQUIRE(arena);
     struct arena_memblk* block = (void*)arena->uw_first_block;
     do {
-        sum += block->freeptr - (char*)block;
+        sum += block->freeptr - block->allocator_base;
     } while ((block = block->next) != NULL);
+    for ( block = (void*)arena->uw_huge_objects ; block ; block = block->next) {
+        sum += block->limit - block->allocator_base;
+    }
     ARENA_MUTEX_RELEASE(arena);
     return sum;
 }
@@ -416,13 +417,27 @@ void gc_scavenge_arenas()
             if (a->hidden == NIL) {
                 struct arena_memblk* block = (void*)a->uw_first_block;
                 do {
-                    // The block is its own lower bound for scavenge.
-                    // Its first 4 words look like fixnums, so no need to skip 'em.
                     if (gencgc_verbose)
                         fprintf(stderr, "Arena @ %p: scavenging %p..%p\n",
-                                a, block, block->freeptr);
-                    heap_scavenge((lispobj*)block, (lispobj*)block->freeptr);
+                                a, block->allocator_base, block->freeptr);
+#ifdef LISP_FEATURE_MARK_REGION_GC
+                    mr_trace_bump_range((lispobj*)block->allocator_base, (lispobj*)block->freeptr);
+#else
+                    heap_scavenge((lispobj*)block->allocator_base, (lispobj*)block->freeptr);
+#endif
                 } while ((block = block->next) != NULL);
+                for ( block = (void*)a->uw_huge_objects ; block ; block = block->next ) {
+                    lispobj* obj = (lispobj*)block->allocator_base;
+#ifdef LISP_FEATURE_MARK_REGION_GC
+                    // fprintf(stderr, "arena huge object @ %p: %lx %lx\n", obj, obj[0], obj[1]);
+                    // probably could call trace_other_object directly here?
+                    lispobj* end = obj + object_size(obj);
+                    mr_trace_bump_range(obj, end);
+#else
+                    lispobj header = *obj;
+                    scavtab[header_widetag(header)](obj, header);
+#endif
+                }
             }
             chain = a->link;
         } while (chain != NIL);
@@ -449,7 +464,7 @@ lispobj find_containing_arena(lispobj ptr) {
 }
 
 static lispobj target_arena;
-static inline boolean interesting_arena_pointer_p(lispobj ptr)
+static inline int interesting_arena_pointer_p(lispobj ptr)
 {
     lispobj arena = is_lisp_pointer(ptr) ? find_containing_arena(ptr) : 0;
     if (!arena) return 0; // uninteresting
@@ -644,7 +659,7 @@ int diagnose_arena_fault(os_context_t* context, char *addr)
     lispobj arena = find_containing_arena((lispobj)addr);
     struct thread* th = get_sb_vm_thread();
     struct thread_instance* instance = (void*)native_pointer(th->lisp_thread);
-    lispobj name = instance->name;
+    lispobj name = instance->_name;
     char *c_string = 0;
     if (name != NIL) {
         struct vector* string = (void*)native_pointer(name);

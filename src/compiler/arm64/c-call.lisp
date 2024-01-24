@@ -207,7 +207,7 @@
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
-    (load-inline-constant res `(:fixup ,foreign-symbol :foreign))))
+    (load-foreign-symbol res foreign-symbol)))
 
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
@@ -218,19 +218,15 @@
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
-    (load-inline-constant res `(:fixup ,foreign-symbol :foreign-dataref))
-    (inst ldr res (@ res))))
+    (load-foreign-symbol res foreign-symbol :dataref t)))
+
+#+sb-safepoint
+(defconstant thread-saved-csp-slot (- (1+ sb-vm::thread-header-slots)))
 
 (defun emit-c-call (vop nfp-save temp temp2 cfunc function)
   (let ((cur-nfp (current-nfp-tn vop)))
     (when cur-nfp
       (store-stack-tn nfp-save cur-nfp))
-    (if (stringp function)
-        (load-inline-constant cfunc `(:fixup ,function :foreign))
-        (sc-case function
-          (sap-reg (move cfunc function))
-          (sap-stack
-           (load-stack-offset cfunc cur-nfp function))))
     (assemble ()
       #+sb-thread
       (progn
@@ -240,8 +236,18 @@
         (inst adr temp2 return)
         (inst stp cfp-tn temp2 (@ csp-tn))
         (storew-pair csp-tn thread-control-frame-pointer-slot temp thread-control-stack-pointer-slot thread-tn)
-        (inst blr cfunc)
-
+        ;; OK to run GC without stopping this thread from this point
+        ;; on.
+        #+sb-safepoint
+        (storew csp-tn thread-tn thread-saved-csp-slot)
+        (cond ((stringp function)
+               (invoke-foreign-routine function cfunc))
+              (t
+               (sc-case function
+                 (sap-reg (move cfunc function))
+                 (sap-stack
+                  (load-stack-offset cfunc cur-nfp function)))
+               (inst blr cfunc)))
         (loop for reg in (list r0-offset r1-offset r2-offset r3-offset
                                r4-offset r5-offset r6-offset r7-offset
                                #-darwin r8-offset)
@@ -252,20 +258,28 @@
                      :sc (sc-or-lose 'descriptor-reg)
                      :offset reg)
                     0))
+        ;; No longer OK to run GC except at safepoints.
+        #+sb-safepoint
+        (storew zr-tn thread-tn thread-saved-csp-slot)
         (storew zr-tn thread-tn thread-control-stack-pointer-slot))
       return
       #-sb-thread
       (progn
         temp2
-        (load-inline-constant temp '(:fixup "call_into_c" :foreign))
-        (inst blr temp))
+        (if (stringp function)
+            (load-foreign-symbol cfunc function)
+            (sc-case function
+              (sap-reg (move cfunc function))
+              (sap-stack
+              (load-stack-offset cfunc cur-nfp function))))
+        (invoke-foreign-routine "call_into_c" temp))
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun destroyed-c-registers ()
     (let ((gprs (list nl0-offset nl1-offset nl2-offset nl3-offset
-                      nl4-offset nl5-offset nl6-offset nl7-offset nl8-offset nl9-offset
+                      nl4-offset nl5-offset nl6-offset nl7-offset nl8-offset #| tmp-offset |#
                       r0-offset r1-offset r2-offset r3-offset
                       r4-offset r5-offset r6-offset r7-offset
                       #-darwin r8-offset
@@ -323,76 +337,6 @@
       (let ((delta (logandc2 (+ amount +number-stack-alignment-mask+)
                              +number-stack-alignment-mask+)))
         (inst add nsp-tn nsp-tn (add-sub-immediate delta))))))
-
-;;; long-long support
-;; (deftransform %alien-funcall ((function type &rest args) * * :node node)
-;;   (aver (sb-c:constant-lvar-p type))
-;;   (let* ((type (sb-c:lvar-value type))
-;;          (env (sb-c::node-lexenv node))
-;;          (arg-types (alien-fun-type-arg-types type))
-;;          (result-type (alien-fun-type-result-type type)))
-;;     (aver (= (length arg-types) (length args)))
-;;     (if (or (some (lambda (type)
-;;                     (and (alien-integer-type-p type)
-;;                          (> (sb-alien::alien-integer-type-bits type) 64)))
-;;                   arg-types)
-;;             (and (alien-integer-type-p result-type)
-;;                  (> (sb-alien::alien-integer-type-bits result-type) 64)))
-;;         (collect ((new-args) (lambda-vars) (new-arg-types))
-;;                  (loop with i = 0
-;;                        for type in arg-types
-;;                        for arg = (gensym)
-;;                        do
-;;                        (lambda-vars arg)
-;;                        (cond ((and (alien-integer-type-p type)
-;;                                    (> (sb-alien::alien-integer-type-bits type) 64))
-;;                               (when (oddp i)
-;;                                 ;; long-long is only passed in pairs of r0-r1 and r2-r3,
-;;                                 ;; and the stack is double-word aligned
-;;                                 (incf i)
-;;                                 (new-args 0)
-;;                                 (new-arg-types (parse-alien-type '(signed 8) env)))
-;;                               (incf i 2)
-;;                               (new-args `(logand ,arg #xffffffffffffffff))
-;;                               (new-args `(ash ,arg -64))
-;;                               (new-arg-types (parse-alien-type '(unsigned 64) env))
-;;                               (if (alien-integer-type-signed type)
-;;                                   (new-arg-types (parse-alien-type '(signed 64) env))
-;;                                   (new-arg-types (parse-alien-type '(unsigned 64) env))))
-;;                              (t
-;;                               (incf i (cond ((alien-double-float-type-p type)
-;;                                              0)
-;;                                             (t
-;;                                              1)))
-;;                               (new-args arg)
-;;                               (new-arg-types type))))
-;;                  (cond ((and (alien-integer-type-p result-type)
-;;                              (> (sb-alien::alien-integer-type-bits result-type) 64))
-;;                         (let ((new-result-type
-;;                                 (let ((sb-alien::*values-type-okay* t))
-;;                                   (parse-alien-type
-;;                                    (if (alien-integer-type-signed result-type)
-;;                                        '(values (unsigned 64) (signed 64))
-;;                                        '(values (unsigned 64) (unsigned 64)))
-;;                                    env))))
-;;                           `(lambda (function type ,@(lambda-vars))
-;;                              (declare (ignore type))
-;;                              (multiple-value-bind (low high)
-;;                                  (%alien-funcall function
-;;                                                  ',(make-alien-fun-type
-;;                                                     :arg-types (new-arg-types)
-;;                                                     :result-type new-result-type)
-;;                                                  ,@(new-args))
-;;                                (logior low (ash high 64))))))
-;;                        (t
-;;                         `(lambda (function type ,@(lambda-vars))
-;;                            (declare (ignore type))
-;;                            (%alien-funcall function
-;;                                            ',(make-alien-fun-type
-;;                                               :arg-types (new-arg-types)
-;;                                               :result-type result-type)
-;;                                            ,@(new-args))))))
-;;         (sb-c::give-up-ir1-transform))))
 
 ;;; Callback
 #-sb-xc-host

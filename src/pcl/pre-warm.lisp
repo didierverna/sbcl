@@ -61,9 +61,11 @@
   :metaclass-name static-classoid
   :metaclass-constructor make-static-classoid
   :dd-type funcallable-structure)
-;; for x86-64 with compact-instance-header, generic functions are 6 words:
-;;  header, entrypoint, raw (x2), implementation function, slot vector
-;; and the hash goes in 4 unused bytes of the second raw slot.
+;; For #+executable-funinstances the hash code occupies 4 unused bytes in
+;; the 2nd of the raw words containing the builtin trampoline instructions.
+;; I don't know why it was ever important to save a whopping 1 word per function.
+;; Maybe it forced alignment of machine instructions to a 16-byte boundary
+;; when the builtin trampoline followed the CLOS slots?
 (sb-kernel:!defstruct-with-alternate-metaclass standard-funcallable-instance
   :slot-names (clos-slots #-executable-funinstances hash-code)
   :constructor %make-standard-funcallable-instance
@@ -125,7 +127,7 @@
                              :length (+ sb-vm:instance-data-start 1)
                              :flags +condition-layout-flag+
                              :invalid nil)))
-  (setf (classoid-wrapper classoid) layout
+  (setf (classoid-layout classoid) layout
         (info :type :classoid-cell name) cell
         (info :type :kind name) :instance))
 
@@ -141,7 +143,7 @@
                                               (cons t (if fun-p '(function))))
                                :length 0 ; don't care
                                :invalid nil)))
-           (setf (classoid-wrapper classoid) layout
+           (setf (classoid-layout classoid) layout
                  (info :type :classoid-cell name) cell
                  (info :type :kind name) :instance))))
   ;; Because we don't wire into %INSTANCE-TYPEP any assumptions about

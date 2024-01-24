@@ -958,7 +958,6 @@
     (assert (equal (compile-file-pathname "a/b/srcfile.lsp")
                    #P"a/b/srcfile.fasl"))))
 
-(load "compiler-test-util.lisp")
 (with-test (:name :intern-pathname-non-consy
             :skipped-on :interpreter)
   (ctu:assert-no-consing (make-pathname :name "hi" :type "txt")))
@@ -973,3 +972,16 @@
 
 (with-test (:name :dx-pathname-parts-dont-crash)
   (prin1 (pathname-peristence-test)))
+
+(with-test (:name :internal-pathname-hash-incorporates-version)
+  (opaque-identity
+   (loop for i below 1000
+         collect (make-pathname :host "SYS" :name "FOO" :type "LISP" :version i))))
+
+(with-test (:name :pathname-hash-more-strongly)
+  ;; examples from xof's email
+  (assert (/= (sxhash #P"APPVA") (sxhash #P"APPKZ")))
+  (assert (/= (sxhash #P"AVERA") (sxhash #P"AVEQR")))
+  (assert (/= (sxhash #P"AVERB") (sxhash #P"AVEQS")))
+  ;; still more
+  (assert (/= (sxhash #P"a[bc]d?x") (sxhash #P"a[bc]d?z"))))

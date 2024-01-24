@@ -17,9 +17,8 @@
   compute-applicable-methods
   slot-makunbound
   make-load-form-saving-slots
-  sb-vm:map-allocated-objects
-  sb-ext:primitive-object-size
-  sb-vm::remove-static-links)
+  sb-vm:symbol-from-tls-index
+  sb-ext:primitive-object-size)
  ;; CLOS implementation
  (sb-mop:class-finalized-p
   sb-mop:class-prototype
@@ -175,8 +174,12 @@
   sb-int:symbolicate
   sb-kernel::preinform-compiler-about-accessors
   sb-kernel::preinform-compiler-about-slot-functions
+  ;; the next four could probably be removed by replacing a lexical
+  ;; closure with a use of LOAD-TIME-VALUE
   sb-impl::bytes-per-utf8-character-aref
   sb-impl::bytes-per-utf8-character-sap-ref-8
+  sb-impl::bytes-per-utf8-character/crlf-aref
+  sb-impl::bytes-per-utf8-character/crlf-sap-ref-8
   sb-impl::user-homedir-namestring
   sb-lockless:make-so-map/addr
   sb-c::apply-core-fixups

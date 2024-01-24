@@ -27,38 +27,19 @@
 ;;; compete for a mutex, the pthread code seems to do a better job at reducing
 ;;; cycles spent in the OS.
 
-(sb-xc:defstruct (mutex (:constructor !make-mutex (%name))
+(sb-xc:defstruct (mutex (:constructor make-mutex (&key name))
                         (:copier nil))
   "Mutex type."
   #+sb-futex (state 0 :type sb-vm:word)
   ;; If adding slots between STATE and NAME, please see futex_name() in linux_os.c
   ;; which attempts to divine a string from a futex word address.
-  (%name  nil :type (or list simple-string))
+  (name   nil :type (or null simple-string))
   ;; The owner is a non-pointer so that GC pages containing mutexes do not get dirtied
   ;; with mutex ownership change. The natural representation of this is SB-VM:WORD
   ;; but the "funny fixnum" representation - i.e. N_WORD_BITS bits of significance, but
   ;; cast as fixnum when read - avoids consing on 32-bit builds, and also not all of them
   ;; implement RAW-INSTANCE-CAS which would be otherwise needed.
   (%owner 0 :type fixnum))
-#-sb-xc-host
-(progn
-(declaim (sb-ext:maybe-inline make-mutex))
-(defun make-mutex (&key name)
-  (declare (type (or null simple-string) name))
-  (declare (inline !make-mutex))
-  (!make-mutex name))
-(defun mutex-name (mutex)
-  ;; The %NAME slot can be replaced with a cons of a string and a fixnum,
-  ;; where the fixnum records the time elapsed in futex_wait.
-  ;; Mutexes that are never used or never have contention incur no space overhead,
-  ;; and mutexes that have contention cost 2 words more of space.
-  (let ((name (mutex-%name mutex)))
-    (if (listp name) (car name) name)))
-(defun (setf mutex-name) (newval mutex)
-  (let ((name (mutex-%name mutex)))
-    (if (listp name)
-        (setf (car name) newval)
-        (setf (mutex-%name mutex) newval)))))
 
 (sb-xc:defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
   "Waitqueue type."
@@ -91,11 +72,11 @@ future."
 (sb-ext:define-load-time-global *profiled-threads* :all)
 (declaim (type (or (eql :all) list) *profiled-threads*))
 
-(sb-xc:defstruct (thread (:constructor %make-thread (name %ephemeral-p semaphore))
+(sb-xc:defstruct (thread (:constructor %make-thread (%name %ephemeral-p semaphore))
                          (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
-  (name          nil :type (or null simple-string)) ; C code could read this
+  (%name         nil :type (or null simple-string)) ; C code could read this
   (%ephemeral-p  nil :type boolean :read-only t)
   ;; This is one of a few different views of a lisp thread:
   ;;  1. the memory space (thread->os_addr in C)
@@ -164,6 +145,10 @@ in future versions."
             :type sb-vm:signed-word)
   #-64-bit (internal-real-time)
 
+  (max-stw-pause 0 :type sb-vm:word) ; microseconds
+  (sum-stw-pause 0 :type sb-vm:word) ; "
+  (ct-stw-pauses 0 :type sb-vm:word) ; to compute the avg
+
   ;; On succesful execution of the thread's lambda, a list of values.
   (result 0)
   ;; The completion condition _could_ be manifested as a condition var, but a difficulty
@@ -178,7 +163,7 @@ in future versions."
 
 (sb-xc:defstruct (foreign-thread
                   (:copier nil)
-                  (:include thread (name "callback"))
+                  (:include thread (%name "callback"))
                   (:constructor make-foreign-thread ())
                   (:conc-name "THREAD-"))
   "Type of native threads which are attached to the runtime as Lisp threads

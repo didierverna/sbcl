@@ -231,6 +231,8 @@ constrained to be used only within the dynamic extent of the TAGBODY."
                                     tag)))
          (entry (first found))
          (exit (make-exit :entry entry)))
+    (when (ctran-deleted-p (second found))
+      (throw 'locall-already-let-converted (second found)))
     (push exit (entry-exits entry))
     (link-node-to-previous-ctran exit start)
     (let ((home-lambda (ctran-home-lambda-or-null start)))
@@ -337,7 +339,13 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
 
 (defun funcall-in-macrolet-lexenv (definitions fun context)
   (%funcall-in-foomacrolet-lexenv
-   (macrolet-definitionize-fun context (make-restricted-lexenv *lexenv*))
+   (macrolet-definitionize-fun
+    context
+    (make-restricted-lexenv *lexenv*
+                            ;; Avoid efficiency notes
+                            ;; and in general there's no need to optimizes macrolets
+                            (augment-policy speed 1
+                                            (lexenv-policy *lexenv*))))
    :funs
    definitions
    fun))
@@ -427,7 +435,10 @@ body, references to a NAME will effectively be replaced with the EXPANSION."
   (declare (type symbol name))
   (let* ((template (or (gethash name *backend-template-names*)
                        (bug "undefined primitive ~A" name)))
-         (required (length (template-arg-types template)))
+         (required (- (vop-info-num-args  template)
+                      (if (template-more-args-type template)
+                          1
+                          0)))
          (info (template-info-arg-count template))
          (min (+ required info))
          (nargs (length args)))
@@ -452,11 +463,7 @@ body, references to a NAME will effectively be replaced with the EXPANSION."
       (bug "%PRIMITIVE was used with an unknown values template."))
 
     (ir1-convert start next result
-                 `(%%primitive ',template
-                               ',(eval-info-args
-                                  (subseq args required min))
-                               ,@(subseq args 0 required)
-                               ,@(subseq args min)))))
+                 `(%%primitive ',template ,@args))))
 
 (defmacro inline-%primitive (template &rest args)
   (let* ((required (length (template-arg-types template)))
@@ -481,11 +488,7 @@ body, references to a NAME will effectively be replaced with the EXPANSION."
     (when (template-more-results-type template)
       (bug "%PRIMITIVE was used with an unknown values template."))
 
-    `(%%primitive ',template
-                  ',(eval-info-args
-                     (subseq args required min))
-                  ,@(subseq args 0 required)
-                  ,@(subseq args min))))
+    `(%%primitive ',template ,@args)))
 
 ;;;; QUOTE
 
@@ -933,13 +936,18 @@ also processed as top level forms."
     (cond ((some #'leaf-dynamic-extent funs)
            (ctran-starts-block next)
            (let* ((enclose (ctran-use enclose-ctran))
+                  (dynamic-extent (make-dynamic-extent))
                   (cleanup (make-cleanup :kind :dynamic-extent
-                                         :mess-up enclose))
-                  (cleanup-ctran (make-ctran)))
-             (setf (enclose-cleanup enclose) cleanup)
+                                         :mess-up dynamic-extent))
+                  (dynamic-extent-ctran (make-ctran)))
+             (setf (enclose-dynamic-extent enclose) dynamic-extent)
+             (setf (dynamic-extent-cleanup dynamic-extent) cleanup)
+             (link-node-to-previous-ctran dynamic-extent enclose-ctran)
+             (use-ctran dynamic-extent dynamic-extent-ctran)
+             (push dynamic-extent
+                   (lambda-dynamic-extents (node-home-lambda dynamic-extent)))
              (let ((*lexenv* (make-lexenv :cleanup cleanup)))
-               (ir1-convert enclose-ctran cleanup-ctran nil '(%cleanup-point))
-               (ir1-convert-progn-body cleanup-ctran next result body))))
+               (ir1-convert-progn-body dynamic-extent-ctran next result body))))
           (t
            (ir1-convert-progn-body enclose-ctran next result body)))))
 
@@ -1118,13 +1126,12 @@ care."
                ;; Would be great for IR1-CONVERT to return the uses it creates
                (let ((new-uses (lvar-uses result)))
                  (derive-node-type (cond ((consp new-uses)
-                                          ;; Handle just a single use for now,
-                                          ;; doubt it'll be useful for multiple uses.
-                                          (aver (= (1- (length new-uses))
-                                                   (if (consp before-uses)
-                                                       (length before-uses)
-                                                       1)))
-                                          (car new-uses))
+                                          (loop for other in (cdr new-uses)
+                                                do (aver (or (exit-p other)
+                                                             (eq before-uses other)
+                                                             (and (consp before-uses)
+                                                                  (memq other before-uses)))))
+                                          (the (not exit) (car new-uses)))
                                          (t
                                           new-uses))
                                    value-type)))))
@@ -1159,6 +1166,11 @@ care."
   (let ((*current-path* (if source-form
                             (ensure-source-path source-form)
                             *current-path*)))
+    (ir1-convert start next result form)))
+
+(def-ir1-translator with-source-path ((source-path form)
+                                      start next result)
+  (let ((*current-path* source-path))
     (ir1-convert start next result form)))
 
 (def-ir1-translator bound-cast ((array bound index) start next result)
@@ -1532,8 +1544,8 @@ values from the first VALUES-FORM making up the first argument, etc."
 ;;; to interpose a DELAY node using RESULT immediately so that the
 ;;; result continuation can assume that it is immediately used. This
 ;;; is important here because MULTIPLE-VALUE-PROG1 is the only special
-;;; form which receives unknown values with multiple uses, some (in
-;;; this case one) of which are not immediate.
+;;; form that produces code where lvar substitution is potentially
+;;; incorrect.
 (def-ir1-translator multiple-value-prog1
     ((values-form &rest forms) start next result)
   "MULTIPLE-VALUE-PROG1 values-form form*

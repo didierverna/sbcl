@@ -180,8 +180,8 @@
   '(or list symbol classoid class))
 
 ;;; array rank, total size...
-(sb-xc:deftype array-rank () `(integer 0 (,array-rank-limit)))
-(sb-xc:deftype array-total-size ()
+(sb-xc:deftype %array-rank () `(integer 0 (,array-rank-limit)))
+(sb-xc:deftype %array-total-size ()
   `(integer 0 (,array-total-size-limit)))
 
 ;;; The range returned by SXHASH and PSXHASH
@@ -218,8 +218,8 @@
 (sb-xc:deftype irrational ()
   '(or float (complex float)))
 
-;;; character components
-(sb-xc:deftype char-code () `(integer 0 (,char-code-limit)))
+;;; this corresponds to the CLHS glossary entry for "character code"
+(sb-xc:deftype %char-code () `(integer 0 (,char-code-limit)))
 
 ;;; a consed sequence result. If a vector, is a simple array.
 (sb-xc:deftype consed-sequence ()
@@ -273,6 +273,11 @@
 (sb-xc:deftype extended-function-designator ()
                '(satisfies extended-function-designator-p))
 
-#-metaspace (sb-xc:deftype sb-vm:layout () 'wrapper)
+(sb-xc:deftype weak-vector ()
+  #-weak-vector-readbarrier 'simple-vector
+  ;; New way: A weak vector is a weak-pointer with more than one payload word.
+  ;; So an array of weak words is the lower-level primitive, and a weak-pointer
+  ;; of the old kind is a weak-pointer with only 1 word of payload.
+  #+weak-vector-readbarrier 'weak-pointer)
 
 (/show0 "deftypes-for-target.lisp end of file")

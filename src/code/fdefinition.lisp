@@ -18,20 +18,26 @@
 ;;;; fdefinition (fdefn) objects
 
 (defun make-fdefn (name)
-  #-immobile-space (make-fdefn name)
-  #+immobile-space
+  #-(and x86-64 immobile-space) (make-fdefn name)
+  #+(and x86-64 immobile-space)
   (let ((fdefn (truly-the (values fdefn &optional)
                           (sb-vm::alloc-immobile-fdefn))))
-    (sb-vm::%set-fdefn-name fdefn name)
+    (%primitive sb-vm::set-slot fdefn name 'make-fdefn
+                sb-vm:fdefn-name-slot sb-vm:other-pointer-lowtag)
     (fdefn-makunbound fdefn)
     fdefn))
 
+(defun undo-static-linkage (fdefn) (declare (ignore fdefn)))
+
 (defun (setf fdefn-fun) (fun fdefn)
   (declare (type function fun)
-           (type fdefn fdefn)
-           (values function))
-  #+immobile-code (sb-vm::%set-fdefn-fun fdefn fun)
-  #-immobile-code (setf (fdefn-fun fdefn) fun))
+           (type fdefn fdefn))
+  (undo-static-linkage fdefn)
+  (sb-c::when-vop-existsp (:named sb-vm::set-fdefn-fun)
+    (%primitive sb-vm::set-fdefn-fun fun fdefn))
+  (sb-c::unless-vop-existsp (:named sb-vm::set-fdefn-fun)
+    (sb-vm::set-fdefn-fun fun fdefn))
+  fun)
 
 ;;; Return the FDEFN object for NAME, or NIL if there is no fdefn.
 ;;; Signal an error if name isn't valid.
@@ -421,9 +427,7 @@
       (:symbol name "removing the function or macro definition of ~A")
     (let ((fdefn (find-fdefn name)))
       (when fdefn
-        #+immobile-code
-        (when (sb-vm::fdefn-has-static-callers fdefn)
-          (sb-vm::remove-static-links fdefn))
+        (undo-static-linkage fdefn)
         (fdefn-makunbound fdefn)))
     (undefine-fun-name name)
     name))

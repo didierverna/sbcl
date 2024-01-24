@@ -297,8 +297,7 @@ fractional bits."
 ;; This test is skipped on x86; as to why see the comment at the test
 ;; (:range-reduction :x87) above.
 (with-test (:name (:range-reduction :precise-pi)
-            :skipped-on :x86
-            :fails-on (and :openbsd :x86-64))
+            :skipped-on :x86)
   (let ((rational-pi-half (/ (pi-gauss-legendre 2200) 2)))
     (labels ((round-pi-half (x)
                "Return two values as if (ROUND X (/ PI 2)) was called
@@ -355,8 +354,6 @@ fractional bits."
                                ;; Some libm's might internally cause an *expected* overflow on
                                ;; certain inputs. So instead of computing an answer for
                                ;; (EXPT 1.7976931348623157d308 4/5) it would trap.
-                               ;; I'll bet that's why we disabled the test on openbsd,
-                               ;; but I don't care to find out.
                                then (sb-int:with-float-traps-masked (:overflow) (expt v 4/5))
                                while (> v (expt 2 50))
                                collect v)
@@ -397,3 +394,67 @@ fractional bits."
              (test (- (expt 2 i)))
              (test (1+ (expt 2 i)))
              (test (- (expt 2 i))))))
+
+(with-test (:name :scale-float-unboxed)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (declare (single-float x))
+         (locally (declare (optimize (space 0)))
+           (scale-float x 1)))
+    ((1.0) 2.0)))
+
+(with-test (:name :complex-division)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c d)
+      (declare ((complex double-float) b)
+               (double-float a))
+      (= (/ a b)
+         (/ c d)))
+   ((1.0d0 #C(10000.1d0 1.3d0) 1.0d0 #C(10000.1d0 1.3d0)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c d)
+      (declare ((complex double-float) a b))
+      (= (/ a b)
+         (/ c d)))
+   ((#C(1.0d0 0.0d0) #C(10000.1d0 1.3d0) #C(1.0d0 0.0d0) #C(10000.1d0 1.3d0)) t))
+  #-x86
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c d)
+      (declare ((complex single-float) b)
+               (single-float a))
+      (= (/ a b)
+         (/ c d)))
+   ((1.0f0 #C(10000.1f0 1.3f0) 1.0f0 #C(10000.1f0 1.3f0)) t))
+  #-x86
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c d)
+      (declare ((complex single-float) a b))
+      (= (/ a b)
+         (/ c d)))
+   ((#C(1.0f0 0.0f0) #C(10000.1f0 1.3f0) #C(1.0f0 0.0f0) #C(10000.1f0 1.3f0)) t)))
+
+(with-test (:name :rational-derive-type-nan)
+  (checked-compile `(lambda () (rationalize #.sb-ext:single-float-positive-infinity))
+                   :allow-style-warnings t)
+  (checked-compile `(lambda () (rational #.sb-ext:single-float-positive-infinity))
+                   :allow-style-warnings t))
+
+(with-test (:name :log-derive-type)
+  (assert-type (lambda (y)
+                 (declare (integer y))
+                 (log y 2.0d0))
+               (or double-float (complex double-float)))
+  (assert-type (lambda (y)
+                 (declare (double-float y))
+                 (log y 2.0d0))
+               (or double-float (complex double-float)))
+  (assert-type (lambda (d)
+                 (declare ((double-float 0d0) d))
+                 (when (< d 1.0d0)
+                   (log d)))
+               (or null (double-float * 0.0d0))))

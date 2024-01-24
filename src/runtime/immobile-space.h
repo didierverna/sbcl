@@ -12,17 +12,19 @@
 #ifndef _IMMOBILE_SPACE_H_
 #define _IMMOBILE_SPACE_H_
 
+#include <stdbool.h>
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-#include <limits.h>
-#include "core.h"
+#include <limits.h> // why?
+#include "globals.h" // for FIXEDOBJ_SPACE_START and TEXT_SPACE_START
+#include "gc-assert.h"
 
 // 1 page is reserved for some constant arrays.
 // Right now it is just the array that maps widetag to layout
 #define FIXEDOBJ_RESERVED_PAGES 1
 
 extern void prepare_immobile_space_for_final_gc(void);
-extern void prepare_immobile_space_for_save(boolean verbose);
-extern boolean immobile_space_preserve_pointer(void*);
+extern void prepare_immobile_space_for_save(bool verbose);
+extern bool immobile_space_preserve_pointer(void*);
 extern void scavenge_immobile_roots(generation_index_t,generation_index_t);
 extern void scavenge_immobile_newspace(void);
 extern void sweep_immobile_space(int raise);
@@ -72,7 +74,7 @@ static inline low_page_index_t find_text_page_index(void *addr)
   return -1;
 }
 
-static inline boolean immobile_space_p(lispobj obj)
+static inline bool immobile_space_p(lispobj obj)
 {
 /* To test the two immobile ranges, we first check that a pointer is within
  * the outer bounds, and then that is not in the excluded middle (if any).
@@ -85,15 +87,78 @@ static inline boolean immobile_space_p(lispobj obj)
              && offset < immobile_range_2_min_offset);
 }
 
-extern boolean immobile_card_protected_p(void*);
+extern bool immobile_card_protected_p(void*);
+
+extern void enliven_immobile_obj(lispobj*,int);
+
+#define IMMOBILE_OBJ_VISITED_FLAG    0x10
+
+// Immobile object header word:
+//                 generation byte --|    |-- widetag
+//                                   v    v
+//                       0xzzzzzzzz GGzzzzww
+//         arbitrary data  --------   ---- length in words
+//
+// An an exception to the above, FDEFNs omit the length:
+//                       0xzzzzzzzz zzzzGGww
+//         arbitrary data  -------- ----
+// so that there are 6 consecutive bytes of arbitrary data.
+// The length of an FDEFN is implicitly fixed at 4 words.
+
+// There is a hard constraint on NUM_GENERATIONS, which is currently 8.
+// (0..5=normal, 6=pseudostatic, 7=scratch)
+// Shifting a 1 bit left by the contents of the generation byte
+// must not overflow a register.
+
+// Mask off the VISITED flag to get the generation number
+#define immobile_obj_generation(x) (immobile_obj_gen_bits(x) & 0xf)
+
+#ifdef LISP_FEATURE_LITTLE_ENDIAN
+// Return the generation bits which means the generation number
+// in the 4 low bits (there's 1 excess bit) and the VISITED flag.
+static inline int immobile_obj_gen_bits(lispobj* obj) // native pointer
+{
+    // When debugging, assert that we're called only on a headered object
+    // whose header contains a generation byte.
+    gc_dcheck(!embedded_obj_p(widetag_of(obj)));
+    char gen;
+    switch (widetag_of(obj)) {
+    default:
+        gen = ((generation_index_t*)obj)[3]; break;
+    case FDEFN_WIDETAG:
+        gen = ((generation_index_t*)obj)[1]; break;
+    }
+    return gen & 0x1F;
+}
+// Turn a grey node black.
+static inline void set_visited(lispobj* obj)
+{
+    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
+    gc_dcheck(immobile_obj_gen_bits(obj) == new_space);
+    int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
+    ((generation_index_t*)obj)[byte] |= IMMOBILE_OBJ_VISITED_FLAG;
+}
+static inline void assign_generation(lispobj* obj, generation_index_t gen)
+{
+    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
+    int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
+    generation_index_t* ptr = (generation_index_t*)obj + byte;
+    // Clear the VISITED flag, assign a new generation, preserving the three
+    // high bits which include the OBJ_WRITTEN flag as well as two
+    // opaque flag bits for use by Lisp.
+    *ptr = (*ptr & 0xE0) | gen;
+}
+#else
+#error "Need to define immobile_obj_gen_bits() for big-endian"
+#endif /* little-endian */
 
 #else
 
-static inline boolean immobile_space_p(lispobj __attribute__((unused)) obj) { return 0; }
+static inline bool immobile_space_p(lispobj __attribute__((unused)) obj) { return 0; }
 #define immobile_obj_gen_bits(dummy) 0
 #define prepare_immobile_space_for_final_gc()
 #define prepare_immobile_space_for_save(dummy)
-#define immobile_space_preserve_pointer(dummy) 0
+static inline int immobile_space_preserve_pointer(__attribute__((unused)) void* p) { return  0; }
 #define scavenge_immobile_roots(dummy1,dummy2)
 #define scavenge_immobile_newspace(dummy)
 #define sweep_immobile_space(dummy)

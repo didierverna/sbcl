@@ -35,7 +35,7 @@
   (values chunk 0))
 
 (defmethod print-object ((reg reg) stream)
-  (if *print-readably*
+  (if (or *print-escape* *print-readably*)
       ;; cross-compiled DEFMETHOD can't use call-next-method
       (default-structure-print reg stream *current-level-in-print*)
       (write-string (reg-name reg) stream)))
@@ -195,7 +195,7 @@
                  (let ((target (sap-ref-word (int-sap (machine-ea-disp value)) 0)))
                    (maybe-note-assembler-routine target t dstate)))))))
         ((null stream) (operand value dstate))
-        (t (write value :stream stream))))
+        (t (write value :stream stream :escape nil))))
 
 (defun print-sized-byte-reg/mem (value stream dstate)
   (print-reg/mem-with-width value :byte t stream dstate))
@@ -425,7 +425,10 @@
              ;; absolute address as would be used for asm routines and static symbols.
              ;; FIRSTP implies lack of a base and index register.
              (unless (minusp disp)
-               (maybe-note-assembler-routine disp nil dstate)))
+               (or (maybe-note-static-symbol (+ disp (- other-pointer-lowtag
+                                                        (* n-word-bytes sb-vm:symbol-value-slot)))
+                                             dstate)
+                   (maybe-note-assembler-routine disp nil dstate))))
             (t
              (princ disp stream))))
     (write-char #\] stream)
@@ -433,6 +436,10 @@
     ;; Always try to add an end-of-line comment about the EA.
     ;; Assembler routines were already handled above (not really sure why)
     ;; so now we have to figure out everything else.
+    #+sb-safepoint
+    (when (and (eql (machine-ea-base value) sb-vm::card-table-reg)
+               (eql (machine-ea-disp value) -8))
+      (return-from print-mem-ref (note "safepoint" dstate)))
 
     (when (and (eq (machine-ea-base value) :rip) (neq mode :compute))
       (block nil
@@ -543,7 +550,10 @@
   ;; If VALUE should be regarded as a label, return the address.
   ;; If not, just return VALUE.
   (if (and (typep value 'machine-ea) (eq (machine-ea-base value) :rip))
-      (+ (dstate-next-addr dstate) (machine-ea-disp value))
+      (let ((addr (+ (dstate-next-addr dstate) (machine-ea-disp value))))
+        (if (= (logand addr lowtag-mask) fun-pointer-lowtag)
+            (- addr fun-pointer-lowtag)
+            addr))
       value))
 
 ;; Figure out whether LEA should print its EA with just the stuff in brackets,
@@ -551,38 +561,56 @@
 (defun lea-print-ea (value stream dstate)
   (let*
       ((width (inst-operand-size dstate))
+       (ea)
        (addr
-        (etypecase value
-          (machine-ea
-           ;; Indicate to PRINT-MEM-REF that this is not a memory access.
-           (print-mem-ref :compute value width stream dstate)
-           (when (eq (machine-ea-base value) :rip)
-             (+ (dstate-next-addr dstate) (machine-ea-disp value))))
+         (etypecase value
+           (machine-ea
+            ;; Indicate to PRINT-MEM-REF that this is not a memory access.
+            (print-mem-ref :compute value width stream dstate)
+            (when (eq (machine-ea-base value) :rip)
+              (+ (dstate-next-addr dstate) (machine-ea-disp value))))
 
-          ((or string integer)
-           ;; A label for the EA should not print as itself, but as the decomposed
-           ;; addressing mode so that [ADDR] and [RIP+disp] are unmistakable.
-           ;; We can see an INTEGER here because LEA-COMPUTE-LABEL is always called
-           ;; on the operand to LEA, and it will compute an absolute address based
-           ;; off RIP when possible. If :use-labels NIL was specified, there is
-           ;; no hashtable of address to string, so we get the address.
-           ;; But ordinarily we get the string. Either way, the r/m arg reveals the
-           ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
-           ;; because the EA was computed in a prefilter.
-           ;; (the instruction format is known because LEA has exactly one format)
-           (print-mem-ref :compute (regrm-inst-r/m dchunk-zero dstate)
-                          width stream dstate)
-           value)
+           ((or string integer)
+            ;; A label for the EA should not print as itself, but as the decomposed
+            ;; addressing mode so that [ADDR] and [RIP+disp] are unmistakable.
+            ;; We can see an INTEGER here because LEA-COMPUTE-LABEL is always called
+            ;; on the operand to LEA, and it will compute an absolute address based
+            ;; off RIP when possible. If :use-labels NIL was specified, there is
+            ;; no hashtable of address to string, so we get the address.
+            ;; But ordinarily we get the string. Either way, the r/m arg reveals the
+            ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
+            ;; because the EA was computed in a prefilter.
+            ;; (the instruction format is known because LEA has exactly one format)
+            (print-mem-ref :compute (setf ea
+                                          (regrm-inst-r/m dchunk-zero dstate))
+                           width stream dstate)
+            value)
 
-         ;; LEA Rx,Ry is an illegal encoding, but we'll show it as-is.
-         ;; When we used integers instead of REG to represent registers, this case
-         ;; overlapped with the preceding. It's nice that it no longer does.
-         (reg
-          (print-reg-with-width value width stream dstate)
-          nil))))
+           ;; LEA Rx,Ry is an illegal encoding, but we'll show it as-is.
+           ;; When we used integers instead of REG to represent registers, this case
+           ;; overlapped with the preceding. It's nice that it no longer does.
+           (reg
+            (print-reg-with-width value width stream dstate)
+            nil))))
     (when stream
-      (cond ((stringp addr) ; label
+      (cond ((stringp addr)             ; label
              (note (lambda (s) (format s "= ~A" addr)) dstate))
+            ;; Local function
+            ((and ea
+                  (= (logand (+ (dstate-next-addr dstate) (machine-ea-disp ea))
+                             lowtag-mask)
+                      fun-pointer-lowtag)
+                  (let* ((seg (dstate-segment dstate))
+                         (code (seg-code seg))
+                         (offset (+ (sb-disassem::seg-initial-offset seg)
+                                    (dstate-next-offs dstate)
+                                    (- (machine-ea-disp ea)
+                                       fun-pointer-lowtag))))
+                    (loop for n below (code-n-entries code)
+                          do (when (= (%code-fun-offset code n) offset)
+                               (let ((fun (%code-entry-point code n)))
+                                 (note (lambda (stream) (prin1-quoted-short fun stream)) dstate))
+                               (return t))))))
             (addr
              (note (lambda (s) (format s "= #x~x" addr)) dstate))))))
 
@@ -671,8 +699,7 @@
                              operand inst))))
                ((or (eq inst lea-inst)
                     (and (eq inst mov-inst) (eql opcode #x8B)))
-                ;; Computing the address of UNDEFINED-FDEFN and
-                ;; FUNCALLABLE-INSTANCE-TRAMP is done with LEA.
+                ;; Computing the address of UNDEFINED-FDEFN is done with LEA.
                 ;; Load from the alien linkage table can be done with MOV Rnn,[RIP-k].
                 (let ((modrm (sap-ref-8 sap (1+ (dstate-cur-offs dstate)))))
                   (when (= (logand modrm #b11000111) #b00000101) ; RIP-relative mode

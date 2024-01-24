@@ -43,7 +43,7 @@
   (let ((fun-type (global-ftype caller)))
     (collect ((lvars))
       (let ((arg-position -1)
-            (positional-count (fun-type-positional-count fun-type)))
+            (optional-args (nthcdr (fun-type-positional-count fun-type) lvars)))
         (labels ((record-lvar (lvar)
                    (lvars lvar)
                    (incf arg-position))
@@ -51,9 +51,18 @@
                    (loop for (key value*) on options by #'cddr
                          for value = (if (or (eq key :key)
                                              (eq key :value))
-                                         (let ((lvar (getf (nthcdr positional-count lvars) value*)))
-                                           (and lvar
-                                                (record-lvar lvar)))
+                                         (if (consp value*)
+                                             (let ((value-lvar (getf optional-args (car value*))))
+                                               (when value-lvar
+                                                 (let ((if (getf optional-args (second value*))))
+                                                   (cond (if
+                                                          (list (record-lvar value-lvar)
+                                                                (record-lvar if) (third value*)))
+                                                         ((null (third value*))
+                                                          (record-lvar value-lvar))))))
+                                             (let ((lvar (getf optional-args value*)))
+                                               (and lvar
+                                                    (record-lvar lvar))))
                                          value*)
                          when value
                          collect key
@@ -66,7 +75,7 @@
                        (list* (record-lvar (nth (cadr arg) lvars))
                               (handle-keys (cddr arg)))))
                      (rest-args
-                      (loop for lvar in (nthcdr positional-count lvars)
+                      (loop for lvar in optional-args
                             collect
                             (list* (record-lvar lvar)
                                    (handle-keys (cdr arg)))))
@@ -150,7 +159,7 @@
                   (when lvar
                     (call lvar annotation)))))))))
 
-(defun lvar-fun-type (lvar &optional defined-here declared-only)
+(defun lvar-fun-type (lvar &optional defined-here asserted-type)
   ;; Handle #'function,  'function and (lambda (x y))
   (let* ((use (principal-lvar-use lvar))
          (lvar-type (lvar-type lvar))
@@ -163,20 +172,30 @@
                                 (node-source-form use))
                                (t
                                 '.anonymous.))))))
+         (asserted t)
          (defined-type (and (global-var-p leaf)
                             (case (leaf-where-from leaf)
                               (:declared
                                (leaf-type leaf))
-                              ((:defined :defined-here)
-                               (if (or (and (defined-fun-p leaf)
-                                            (eq (defined-fun-inlinep leaf) 'notinline))
-                                       declared-only
-                                       (and defined-here
-                                            (eq (leaf-where-from leaf) :defined))
-                                       (fun-lexically-notinline-p (leaf-%source-name leaf)
-                                                                  (node-lexenv (lvar-dest lvar))))
-                                   lvar-type
-                                   (global-ftype (leaf-%source-name leaf))))
+                              (:defined
+                               (cond ((or defined-here
+                                          asserted-type
+                                          (and (defined-fun-p leaf)
+                                               (eq (defined-fun-inlinep leaf) 'notinline))
+                                          (fun-lexically-notinline-p (leaf-%source-name leaf)
+                                                                     (node-lexenv (lvar-dest lvar))))
+                                      (setf asserted nil)
+                                      lvar-type)
+                                     (t
+                                      (global-ftype (leaf-%source-name leaf)))))
+                              ((:defined-here :declared-verify)
+                               (cond ((or (and (defined-fun-p leaf)
+                                               (eq (defined-fun-inlinep leaf) 'notinline))
+                                          (fun-lexically-notinline-p (leaf-%source-name leaf)
+                                                                     (node-lexenv (lvar-dest lvar))))
+                                      lvar-type)
+                                     (t
+                                      (global-ftype (leaf-%source-name leaf)))))
                               (t
                                (global-var-defined-type leaf)))))
          (entry-fun (if (and (functional-p leaf)
@@ -196,7 +215,15 @@
                            (make-fun-type :wild-args t
                                           :returns
                                           (tail-set-type (lambda-tail-set entry-fun))))
+                          ((and asserted-type
+                                (not (or (constant-lvar-p lvar)
+                                         (constant-p leaf))))
+                           (setf asserted nil)
+                           ;; Don't trust FUNCTION type declarations,
+                           ;; they perform no runtime assertions.
+                           (specifier-type 'function))
                           (t
+                           (setf asserted nil)
                            lvar-type)))
          (fun-name (cond ((or (fun-type-p lvar-type)
                               (functional-p leaf)
@@ -223,10 +250,10 @@
          (type (cond ((fun-type-p lvar-type)
                       lvar-type)
                      ((symbolp fun-name)
-                      (if (or defined-here
-                              declared-only
-                              (fun-lexically-notinline-p fun-name
-                                                         (node-lexenv (lvar-dest lvar))))
+                      (if (or (fun-lexically-notinline-p fun-name
+                                                         (node-lexenv (lvar-dest lvar)))
+                              (and (neq (info :function :where-from fun-name) :declared)
+                                   asserted-type))
                           lvar-type
                           (global-ftype fun-name)))
                      ((functional-p leaf)
@@ -236,11 +263,11 @@
                             lvar-type)))
                      (t
                       lvar-type))))
-    (values type fun-name leaf)))
+    (values type fun-name leaf asserted)))
 
 (defun callable-argument-lossage-kind (fun-name leaf soft hard)
   (if (or (not leaf)
-          (and (neq (leaf-where-from leaf) :defined-here)
+          (and (not (memq (leaf-where-from leaf) '(:defined-here :declared-verify)))
                (not (and (functional-p leaf)
                          (or (lambda-p leaf)
                              (member (functional-kind leaf)
@@ -300,13 +327,12 @@
                           (value-nth (getf options :value))
                           (key-nth (getf options :key))
                           (value (and value-nth
-                                      (nth value-nth deps)))
+                                      (nth (if (consp value-nth)
+                                               (car value-nth)
+                                               value-nth)
+                                           deps)))
                           (key (and key-nth (nth key-nth deps)))
-                          (key-return-type (cond (value-nth
-                                                  (if (lvar-p value)
-                                                      (lvar-type value)
-                                                      *universal-type*))
-                                                 ((not key)
+                          (key-return-type (cond ((not key)
                                                   nil)
                                                  ((lvar-p key)
                                                   (multiple-value-bind (type name) (lvar-fun-type key)
@@ -317,23 +343,46 @@
                                                           (t
                                                            *universal-type*))))
                                                  (t
-                                                  *universal-type*))))
-                     (cond (key-return-type)
-                           ((getf options :sequence)
-                            (sequence-element-type (arg-type arg)))
-                           ((getf options :sequence-type)
-                            (or (let* ((value (cond ((constant-p arg)
-                                                     (constant-value arg))
-                                                    ((and (lvar-p arg)
-                                                          (constant-lvar-p arg))
-                                                     (lvar-value arg))))
-                                       (type (and value
-                                                  (careful-specifier-type value))))
-                                  (and type
-                                       (sequence-element-type type)))
-                                *universal-type*))
+                                                  *universal-type*)))
+                          (type (cond (key-return-type)
+                                      ((getf options :sequence)
+                                       (sequence-element-type (arg-type arg)))
+                                      ((getf options :sequence-type)
+                                       (or (let* ((value (cond ((constant-p arg)
+                                                                (constant-value arg))
+                                                               ((and (lvar-p arg)
+                                                                     (constant-lvar-p arg))
+                                                                (lvar-value arg))))
+                                                  (type (and value
+                                                             (careful-specifier-type value))))
+                                             (and type
+                                                  (sequence-element-type type)))
+                                           *universal-type*))
+                                      (t
+                                       (arg-type arg)))))
+                     (cond (value-nth
+                            (if (consp value-nth)
+                                (let* ((option (nth (second value-nth) deps))
+                                       (option-p (third value-nth))
+                                       (false (or (not option)
+                                                  (csubtypep (lvar-type option) (specifier-type 'null))))
+                                       (true (and option
+                                                  (csubtypep (lvar-type option) (specifier-type '(not null)))))
+                                       (unknown (not (or true false))))
+                                  (cond (unknown
+                                         (type-union (lvar-type value)
+                                                     type))
+                                        ((and true option-p)
+                                         (lvar-type value))
+                                        ((and false (not option-p))
+                                         (lvar-type value))
+                                        (t
+                                         type)))
+                                (if (lvar-p value)
+                                    (lvar-type value)
+                                    *universal-type*)))
                            (t
-                            (arg-type arg))))))
+                            type)))))
                (process-arg (spec)
                  (if (eq (car spec) 'or)
                      (cons 'or (mapcar #'%process-arg (cdr spec)))

@@ -101,9 +101,6 @@
 
 ;;;; Fdefinition (fdefn) objects.
 
-(define-vop (fdefn-fun cell-ref)
-  (:variant fdefn-fun-slot other-pointer-lowtag))
-
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
   (:policy :fast-safe)
@@ -121,12 +118,10 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((closure-tramp-fixup (gen-label)))
       (assemble (:elsewhere)
@@ -137,8 +132,7 @@
       (inst mov :eq lip function)
       (inst load-from-label :ne lip lip closure-tramp-fixup)
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-      (move result function))))
+      (storew function fdefn fdefn-fun-slot other-pointer-lowtag))))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -254,9 +248,6 @@
     (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; Value Cell hackery.
-
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))

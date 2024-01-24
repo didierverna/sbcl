@@ -27,13 +27,13 @@
   (or #+c-stack-is-control-stack t
       (not (dd-has-raw-slot-p (lvar-value defstruct-description)))))
 
-(defoptimizer (%make-instance stack-allocate-result) ((n) node dx)
-  (eq dx 'truly-dynamic-extent))
-#+(and gencgc c-stack-is-control-stack)
-(defoptimizer (%make-instance/mixed stack-allocate-result) ((n) node dx)
-  (eq dx 'truly-dynamic-extent))
-(defoptimizer (%make-funcallable-instance stack-allocate-result) ((n) node dx)
-  (eq dx 'truly-dynamic-extent))
+(defoptimizer (%make-instance stack-allocate-result) ((n) node)
+  t)
+#+c-stack-is-control-stack
+(defoptimizer (%make-instance/mixed stack-allocate-result) ((n) node)
+  t)
+(defoptimizer (%make-funcallable-instance stack-allocate-result) ((n) node)
+  t)
 
 (defoptimizer ir2-convert-reffer ((object) node block name offset lowtag)
   (let* ((lvar (node-lvar node))
@@ -75,7 +75,6 @@
 
 (defun emit-inits (node block object lowtag inits args)
   (let ((unbound-marker-tn nil)
-        (funcallable-instance-tramp-tn nil)
         (dx-p (node-stack-allocate-p node)))
     (flet ((zero-init-p (x)
              ;; dynamic-space is already zeroed
@@ -136,14 +135,7 @@
                                     (vop make-unbound-marker node block tn)
                                     tn))))
                        (:null
-                        (emit-constant nil))
-                       (:funcallable-instance-tramp
-                        (or funcallable-instance-tramp-tn
-                            (setf funcallable-instance-tramp-tn
-                                  (let ((tn (make-restricted-tn
-                                             nil sb-vm:any-reg-sc-number)))
-                                    (vop make-funcallable-instance-tramp node block tn)
-                                    tn)))))
+                        (emit-constant nil)))
                      :allocator slot lowtag))))))))
   (unless (null args)
     (bug "Leftover args: ~S" args))
@@ -156,21 +148,17 @@
          (let ((vop (tn-ref-vop writes)))
            (and vop (eq (vop-name vop) 'make-unbound-marker))))))
 
-(defun emit-fixed-alloc (node block name words type lowtag result lvar)
-  (let ((stack-allocate-p (lvar-dynamic-extent lvar)))
-    (cond (stack-allocate-p
-           (vop current-stack-pointer node block
-                (ir2-lvar-stack-pointer (lvar-info lvar)))
-           (vop fixed-alloc-to-stack node block name words type lowtag t result))
-          (t
-           (vop fixed-alloc node block name words type lowtag nil result)))))
+(defun emit-fixed-alloc (node block name words type lowtag result)
+  (if (node-stack-allocate-p node)
+      (vop fixed-alloc-to-stack node block name words type lowtag t result)
+      (vop fixed-alloc node block name words type lowtag nil result)))
 
-(defun link-allocator-to-inits (allocator-vop last-init-vop lvar)
-  (declare (ignorable allocator-vop last-init-vop lvar))
+(defun link-allocator-to-inits (allocator-vop last-init-vop node)
+  (declare (ignorable allocator-vop last-init-vop node))
   ;; This can easily enough be changed to any set of platforms for which it is
   ;; desirable to assign structure slots within pseudo-atomic in a constructor
   #+x86-64
-  (unless (or (lvar-dynamic-extent lvar) (eq last-init-vop allocator-vop))
+  (unless (or (node-stack-allocate-p node) (eq last-init-vop allocator-vop))
     ;; extra codegen info is OK
     (setf (vop-codegen-info allocator-vop)
           (append (vop-codegen-info allocator-vop) (list last-init-vop)))))
@@ -180,10 +168,10 @@
   (let* ((lvar (the (not null) (node-lvar node)))
          (locs (lvar-result-tns lvar (list *universal-type*)))
          (result (first locs)))
-    (emit-fixed-alloc node block name words type lowtag result lvar)
+    (emit-fixed-alloc node block name words type lowtag result)
     (let ((allocator-vop (ir2-block-last-vop block))
           (last-init-vop (emit-inits node block result lowtag inits args)))
-      (link-allocator-to-inits allocator-vop last-init-vop lvar))
+      (link-allocator-to-inits allocator-vop last-init-vop node))
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-variable-allocation
@@ -193,16 +181,12 @@
          (result (first locs)))
     (if (constant-lvar-p extra)
         (let ((words (+ (lvar-value extra) words)))
-          (emit-fixed-alloc node block name words type lowtag result lvar))
-        (let ((stack-allocate-p (and lvar (lvar-dynamic-extent lvar))))
-          (when stack-allocate-p
-            (vop current-stack-pointer node block
-                 (ir2-lvar-stack-pointer (lvar-info lvar))))
-          (vop var-alloc node block (lvar-tn node block extra) name words
-               type lowtag stack-allocate-p result)))
+          (emit-fixed-alloc node block name words type lowtag result))
+        (vop var-alloc node block (lvar-tn node block extra) name words
+             type lowtag (node-stack-allocate-p node) result))
     (let ((allocator-vop (ir2-block-last-vop block))
           (last-init-vop (emit-inits node block result lowtag inits args)))
-      (link-allocator-to-inits allocator-vop last-init-vop lvar))
+      (link-allocator-to-inits allocator-vop last-init-vop node))
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-structure-allocation
@@ -221,17 +205,14 @@
                         layout)
                       #-compact-instance-header
                       c-dd))
-        (emit-fixed-alloc node block name words metadata lowtag result lvar))
+        (emit-fixed-alloc node block name words metadata lowtag result))
       (let ((allocator-vop (ir2-block-last-vop block))
             (last-init-vop
              (emit-inits node block result lowtag
                          `(#-compact-instance-header (:dd . ,c-dd) ,@c-slot-specs) args)))
-        (link-allocator-to-inits allocator-vop last-init-vop lvar))
+        (link-allocator-to-inits allocator-vop last-init-vop node))
       (move-lvar-result node block locs lvar))))
 
-;;; FIXME: this causes emission of GC store barriers, but it should not.
-;;; The vector is freshly consed, so anything being stored into it
-;;; is at least as old.
 (defoptimizer (initialize-vector ir2-convert)
     ((vector &rest initial-contents) node block)
   (let* ((vector-ctype (lvar-type vector))
@@ -290,8 +271,7 @@
                  index)))
       (let ((setter (compute-setter))
             (length (length initial-contents))
-            (dx-p (and lvar
-                       (lvar-dynamic-extent lvar)))
+            (dx-p (node-stack-allocate-p node))
             (character (eq (primitive-type-name elt-ptype)
                            'character)))
         (dotimes (i length)
@@ -362,7 +342,7 @@
 (defoptimizer (make-array-header* stack-allocate-result) ((&rest args))
   t)
 (defoptimizer (allocate-vector stack-allocate-result)
-    ((#+ubsan poisoned type length words) node dx)
+    ((#+ubsan poisoned type length words) node)
   (and
    ;; Can't put unboxed data on the stack unless we scavenge it
    ;; conservatively.
@@ -371,22 +351,7 @@
    #-c-stack-is-control-stack
    (member (lvar-value type)
            '#.(list (sb-vm:saetp-typecode (find-saetp 't))
-                    (sb-vm:saetp-typecode (find-saetp 'fixnum))))
-   (cond ((or (eq dx 'truly-dynamic-extent)
-              (zerop (policy node safety))
-              ;; a vector object should fit in one page -- otherwise it might go past
-              ;; stack guard pages.
-              (values-subtypep (lvar-derived-type words)
-                               (specifier-type
-                                `(integer 0 ,(- (/ +backend-page-bytes+ sb-vm:n-word-bytes)
-                                                sb-vm:vector-data-offset)))))
-          t)
-         (t
-          (compiler-notify "~@<Could~2:I not safely stack allocate the result of ~S, as it might ~
-                               silently overflow the stack. The vector ~
-                               must fit in a page of memory.~:@>"
-                           (find-original-source (node-source-path node)))
-          nil))))
+                    (sb-vm:saetp-typecode (find-saetp 'fixnum))))))
 (defoptimizer (allocate-vector ltn-annotate)
     ((#+ubsan poisoned type length words) call ltn-policy)
   (vectorish-ltn-annotate-helper call ltn-policy
@@ -395,20 +360,30 @@
                                      'sb-vm::allocate-vector-on-stack)
                                  'sb-vm::allocate-vector-on-heap))
 
+(defun make-vector-check-overflow-p (node)
+  (not (or (zerop (policy node safety))
+           ;; If the vector object fits in one page, no overflow checking is needed since it will hit the guard page.
+           (let ((words #-ubsan (third (combination-args node))
+                        #+ubsan (fourth (combination-args node))))
+             (values-subtypep (lvar-derived-type words)
+                              (specifier-type
+                               `(integer 0 ,(- (/ +backend-page-bytes+ sb-vm:n-word-bytes)
+                                               sb-vm:vector-data-offset))))))))
+
 (defun vectorish-ltn-annotate-helper (call ltn-policy dx-template not-dx-template)
-    (let* ((args (basic-combination-args call))
-           (template-name (if (node-stack-allocate-p call)
-                              dx-template
-                              not-dx-template))
-           (template (template-or-lose template-name)))
-      (dolist (arg args)
-        (setf (lvar-info arg)
-              (make-ir2-lvar (primitive-type (lvar-type arg)))))
-      (aver (is-ok-template-use template call (ltn-policy-safe-p ltn-policy)))
-      (setf (basic-combination-info call) template)
-      (setf (node-tail-p call) nil)
-      (dolist (arg args)
-        (annotate-1-value-lvar arg))))
+  (let* ((args (basic-combination-args call))
+         (template-name (if (node-stack-allocate-p call)
+                            dx-template
+                            not-dx-template))
+         (template (template-or-lose template-name)))
+    (dolist (arg args)
+      (setf (lvar-info arg)
+            (make-ir2-lvar (primitive-type (lvar-type arg)))))
+    (aver (is-ok-template-use template call (ltn-policy-safe-p ltn-policy)))
+    (setf (basic-combination-info call) template)
+    (setf (node-tail-p call) nil)
+    (dolist (arg args)
+      (annotate-1-value-lvar arg))))
 
 ;;; ...lists
 
@@ -428,28 +403,21 @@
 ;;; MAKE-LIST optimizations
 #+x86-64
 (progn
-  (defoptimizer (%make-list stack-allocate-result) ((length element) node dx)
-    (cond ((or (eq dx 'truly-dynamic-extent)
-               (zerop (policy node safety))
-               ;; At most one page (this is more paranoid than %listify-rest-args).
-               ;; Really what you want to do is decrement the stack pointer by one page
-               ;; at a time, filling in CDR pointers downward. Then this restriction
-               ;; could be removed, because allocation would never miss the guard page
-               ;; if it tries to consume too much stack space.
-               (values-subtypep (lvar-derived-type length)
-                                (specifier-type
-                                 `(integer 0 ,(/ +backend-page-bytes+ sb-vm:n-word-bytes 2)))))
-           t)
-          (t
-           (compiler-notify "~@<Could~2:I not safely stack allocate the result of ~S, as it might ~
-                                silently overflow the stack. The list ~
-                                must fit in a page of memory.~:@>"
-                            (find-original-source (node-source-path node)))
-           nil)))
+  (defoptimizer (%make-list stack-allocate-result) ((length element) node)
+    t)
   (defoptimizer (%make-list ltn-annotate) ((length element) call ltn-policy)
     (vectorish-ltn-annotate-helper call ltn-policy
                                    'sb-vm::allocate-list-on-stack
                                    'sb-vm::allocate-list-on-heap)))
+
+(defun make-list-check-overflow-p (node)
+  (not (or (zerop (policy node safety))
+           ;; If the list object fits in one page, no overflow checking is needed since it will hit the guard page.
+           (let ((length (first (combination-args node))))
+             (values-subtypep (lvar-derived-type length)
+                              (specifier-type
+                               `(integer 0 ,(- (/ +backend-page-bytes+ sb-vm:n-word-bytes)
+                                               sb-vm:vector-data-offset))))))))
 
 ;;; Return the vop that wrote the TN referenced by TN-REF,
 ;;; but look through MOVEs.

@@ -68,6 +68,12 @@
           (let ((segment (assemble-sections
                           asmstream nil
                           (make-segment :run-scheduler nil))))
+            (unless (= (length (remove-duplicates (mapcar 'car *entry-points*)))
+                       (length *entry-points*))
+              (error "Duplicate asm routine: ~S"
+                     (loop for (this . rest) on *entry-points*
+                           when (assoc (car this) rest)
+                           collect (car this))))
             (dump-assembler-routines segment
                                      (segment-buffer segment)
                                      (sb-assem::segment-fixup-notes segment)
@@ -103,7 +109,7 @@
     (ecase kind
       (:temp)
       ((:arg :res)
-       (setf (reg-spec-temp reg) (make-symbol (symbol-name name)))))
+       (setf (reg-spec-temp reg) (symbolicate (symbol-name name) '-arg-temp))))
     reg))
 
 (defun expand-one-export-spec (export)

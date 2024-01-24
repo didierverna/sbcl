@@ -10,30 +10,25 @@
  */
 
 #include "gc.h"
-#include "gc-internal.h"
-#include "gc-private.h"
-#include "gencgc-private.h"
 #include "genesis/gc-tables.h"
 #include "genesis/closure.h"
 #include "genesis/instance.h"
 #include "genesis/vector.h"
-#include "genesis/layout.h"
 #include "genesis/hash-table.h"
-#include "genesis/list-node.h"
+#include "genesis/static-symbols.h"
+#include "genesis/symbol.h"
+#include "genesis/fdefn.h"
 #include "code.h"
 #include "immobile-space.h"
 #include "queue.h"
 #include "os.h"
+#include "validate.h"
 
 #include <stdio.h>
 #ifndef LISP_FEATURE_WIN32
 #define HAVE_GETRUSAGE 1
-#endif
-#if HAVE_GETRUSAGE
 #include <sys/resource.h> // for getrusage()
 #endif
-
-extern lispobj lisp_init_function, gc_object_watcher;
 
 struct unbounded_queue {
   struct Qblock* head_block;
@@ -50,18 +45,13 @@ static page_index_t free_page;
  * If it collides with 'next_free_page', then you lose.
  * TODO: It would be reasonably simple to have this request more memory from
  * the OS instead of failing on overflow */
-static void* get_free_page(boolean prezero) {
+static void* get_free_page() {
     --free_page;
     if (free_page < next_free_page)
         lose("Needed more space to GC");
-    page_table[free_page].type = PAGE_TYPE_UNBOXED;
+    set_page_type(page_table[free_page], PAGE_TYPE_UNBOXED);
     char* mem = page_address(free_page);
-#ifdef LISP_FEATURE_DARWIN_JIT
-    prezero = 1; // Might need to alter MMU-based protection
-#elif defined LISP_FEATURE_WIN32
-    os_commit_memory(page_address(free_page), GENCGC_PAGE_BYTES);
-#endif
-    if (prezero) zeroize_pages_if_needed(free_page, free_page, 0);
+    prepare_pages(1, free_page, free_page, PAGE_TYPE_UNBOXED, -1);
     return mem;
 }
 
@@ -76,7 +66,7 @@ static void gc_enqueue(lispobj object)
         if (next) {
             scav_queue.recycler = next->next;
         } else {
-            next = (struct Qblock*)get_free_page(0);
+            next = (struct Qblock*)get_free_page();
         }
         block = block->next = next;
         block->next = 0;
@@ -145,14 +135,14 @@ static inline sword_t ptr_to_bit_index(lispobj pointer) {
 #define interesting_pointer_p(x) ptr_to_bit_index(x)>=0
 
 /* Return true if OBJ has already survived the current GC. */
-static inline int pointer_survived_gc_yet(lispobj pointer)
+static inline bool pointer_survived_gc_yet(lispobj pointer)
 {
     sword_t mark_index = ptr_to_bit_index(canonical_ptr(pointer));
     if (mark_index < 0) return 1; // "uninteresting" objects always survive GC
     return (fullcgcmarks[mark_index / N_WORD_BITS] >> (mark_index % N_WORD_BITS)) & 1;
 }
 
-int fullcgc_lispobj_livep(lispobj pointer) {
+bool fullcgc_lispobj_livep(lispobj pointer) {
     return pointer_survived_gc_yet(pointer);
 }
 
@@ -197,8 +187,8 @@ static void __mark_obj(lispobj pointer)
     uword_t bit = (uword_t)1 << (mark_index % N_WORD_BITS);
     if (fullcgcmarks[wordindex] & bit) return; // already marked
     if (lowtag_of(pointer) == FUN_POINTER_LOWTAG
-        && embedded_obj_p(widetag_of(FUNCTION(pointer)))) {
-        lispobj* code = fun_code_header(FUNCTION(pointer));
+        && embedded_obj_p(widetag_of((lispobj*)FUNCTION(pointer)))) {
+        lispobj* code = (void*)fun_code_header(FUNCTION(pointer));
         mark_index -= ((char*)FUNCTION(pointer) - (char*)code) >> (1+WORD_SHIFT);
         pointer = make_lispobj(code, OTHER_POINTER_LOWTAG);
         base = code;
@@ -238,135 +228,16 @@ void gc_mark_range(lispobj* where, long count) {
     for(i=0; i<count; ++i) gc_mark_obj(where[i]);
 }
 
+#define TRACE_NAME trace_object
+#define ACTION(x, dummy1, dummy2) gc_mark_obj(x)
+#define STRENGTHEN_WEAK_REFS stray_pointer_detector_fn
 #define HT_ENTRY_LIVENESS_FUN_ARRAY_NAME alivep_funs
-#include "weak-hash-pred.inc"
-
-static void trace_using_layout(lispobj layout, lispobj* where, int nslots)
-{
-    // Apart from the allowance for untagged pointers in lockfree list nodes,
-    // this contains almost none of the special cases that gencgc does.
-    if (!layout) return;
-#ifdef LISP_FEATURE_METASPACE
-    gc_mark_obj(LAYOUT(layout)->friend);
-#else
-    gc_mark_obj(layout);
-#endif
-    if (lockfree_list_node_layout_p(LAYOUT(layout))) { // allow untagged 'next'
-        struct list_node* node = (void*)where;
-        lispobj next = node->_node_next;
-        // ignore if 0
-        if (fixnump(next) && next) __mark_obj(next|INSTANCE_POINTER_LOWTAG);
-    }
-    struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
-    int i;
-    lispobj* slots = where+1;
-    for (i=0; i<nslots; ++i)
-        if (bitmap_logbitp(i, bitmap)) gc_mark_obj(slots[i]);
-}
-
-static void trace_object(lispobj* where)
-{
-    lispobj header = *where;
-    int widetag = header_widetag(header);
-
-    if (instanceoid_widetag_p(widetag))
-        return trace_using_layout(layout_of(where), where,
-                                  instanceoid_length(header));
-    sword_t scan_from = 1;
-    sword_t scan_to = sizetab[widetag](where);
-    sword_t i;
-    switch (widetag) {
-    case SIMPLE_VECTOR_WIDETAG:
-#ifdef LISP_FEATURE_UBSAN
-        if (is_lisp_pointer(where[1])) gc_mark_obj(where[1]);
-#endif
-        // non-weak hashtable kv vectors are trivial in fullcgc. Keys don't move
-        // so the table will not need rehash as a result of gc.
-        // Ergo, those may be treated just like ordinary simple vectors.
-        // However, weakness remains as a special case.
-        if (!stray_pointer_detector_fn && vector_flagp(header, VectorWeak)) {
-            if (!vector_flagp(header, VectorHashing)) {
-                add_to_weak_vector_list(where, header);
-                return;
-            }
-            // Ok, we're looking at a weak hash-table.
-            struct vector* v = (struct vector*)where;
-            lispobj lhash_table = v->data[vector_len(v)-1];
-            gc_dcheck(instancep(lhash_table));
-            __mark_obj(lhash_table);
-            struct hash_table* hash_table
-              = (struct hash_table *)native_pointer(lhash_table);
-            gc_assert(hashtable_weakp(hash_table));
-            // An object can only be removed from the queue once.
-            // Therefore the 'next' pointer has got to be nil.
-            gc_assert(hash_table->next_weak_hash_table == NIL);
-            int weakness = hashtable_weakness(hash_table);
-            boolean defer = 1;
-            if (weakness != WEAKNESS_KEY_AND_VALUE)
-                defer = scan_weak_hashtable(hash_table, alivep_funs[weakness],
-                                            mark_pair);
-            if (defer) {
-                hash_table->next_weak_hash_table = (lispobj)weak_hash_tables;
-                weak_hash_tables = hash_table;
-            }
-            return;
-        }
-        break;
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined (LISP_FEATURE_ARM64)
-    /* on x86[-64], closure->fun is a fixnum-qua-pointer. Convert it to a lisp
-     * pointer to mark it, but not on platforms where it's already a descriptor */
-    case CLOSURE_WIDETAG:
-        gc_mark_obj(fun_taggedptr_from_self(((struct closure*)where)->fun));
-        scan_from = 2;
-        break; // scan slots normally
-#endif
-    case CODE_HEADER_WIDETAG:
-        scan_to = code_header_words((struct code*)where);
-#ifdef LISP_FEATURE_UNTAGGED_FDEFNS
-        struct code* code = (struct code*)where;
-        lispobj* fdefns_start = code->constants
-                                + code_n_funs(code) * CODE_SLOTS_PER_SIMPLE_FUN;
-        lispobj* fdefns_end  = fdefns_start + code_n_named_calls(code);
-        lispobj* limit = where + scan_to;
-        where = where + scan_from;
-        while (where < limit) {
-            lispobj word = *where;
-            if (where >= fdefns_start && where < fdefns_end) word |= OTHER_POINTER_LOWTAG;
-            gc_mark_obj(word);
-            ++where;
-        }
-        return;
-#endif
-        break;
-    case SYMBOL_WIDETAG:
-        {
-        struct symbol* s = (void*)where;
-        gc_mark_obj(decode_symbol_name(s->name));
-        gc_mark_range(&s->value, 3);
-        }
-        return;
-    case FDEFN_WIDETAG:
-        gc_mark_obj(decode_fdefn_rawfun((struct fdefn*)where));
-        scan_to = 3;
-        break;
-    case WEAK_POINTER_WIDETAG:
-        {
-        struct weak_pointer *weakptr = (void*)where;
-        if (stray_pointer_detector_fn) gc_mark_obj(weakptr->value);
-        else if (is_lisp_pointer(weakptr->value) && interesting_pointer_p(weakptr->value))
-            add_to_weak_pointer_chain(weakptr);
-        }
-        return;
-    default:
-        if (leaf_obj_widetag_p(widetag)) return;
-    }
-    for (i=scan_from; i<scan_to; ++i) gc_mark_obj(where[i]);
-}
+#include "trace-object.inc"
 
 void prepare_for_full_mark_phase()
 {
     free_page = page_table_pages;
-    struct Qblock* block = (struct Qblock*)get_free_page(0);
+    struct Qblock* block = (struct Qblock*)get_free_page();
     scav_queue.head_block = block;
     scav_queue.tail_block = block;
     scav_queue.recycler   = 0;
@@ -396,32 +267,30 @@ void prepare_for_full_mark_phase()
     fullcgcmarks = (void*)os_allocate(markbits_size);
 }
 
+void scav_static_range(lispobj* where, lispobj* end)
+{
+    while (where < end) {
+        lispobj obj = compute_lispobj(where);
+        gc_enqueue(obj);
+        where += listp(obj) ? 2 : headerobj_size(where);
+    }
+}
+
 void execute_full_mark_phase()
 {
-#if HAVE_GETRUSAGE
+#ifdef HAVE_GETRUSAGE
     struct rusage before, after;
     getrusage(RUSAGE_SELF, &before);
 #endif
     trace_object((lispobj*)NIL_SYMBOL_SLOTS_START);
-    lispobj* where = (lispobj*)STATIC_SPACE_OBJECTS_START;
-    lispobj* end = static_space_free_pointer;
-    while (where < end) {
-        lispobj obj = compute_lispobj(where);
-        gc_enqueue(obj);
-        where += listp(obj) ? 2 : headerobj_size(where);
-    }
-#ifdef LISP_FEATURE_METASPACE
-    where = (lispobj*)METASPACE_START;
-    end = (lispobj*)READ_ONLY_SPACE_END;
-    while (where < end) {
-        lispobj obj = compute_lispobj(where);
-        gc_enqueue(obj);
-        where += listp(obj) ? 2 : headerobj_size(where);
-    }
+    scav_static_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer);
+    scav_static_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer);
+#ifndef LISP_FEATURE_IMMOBILE_SPACE
+    // if NO immobile-space, then text space is equivalent to static space
+    scav_static_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark);
 #endif
     gc_mark_obj(lisp_package_vector);
     gc_mark_obj(lisp_init_function);
-    gc_mark_obj(gc_object_watcher);
     gc_mark_obj(alloc_profile_data);
     do {
         lispobj ptr = gc_dequeue();
@@ -436,7 +305,7 @@ void execute_full_mark_phase()
               scav_queue.head_block->count));
     stray_pointer_source_obj = 0;
 
-#if HAVE_GETRUSAGE
+#ifdef HAVE_GETRUSAGE
     getrusage(RUSAGE_SELF, &after);
 #define timediff(b,a,field) \
     (double)((a.field.tv_sec-b.field.tv_sec)*1000000 + \
@@ -583,7 +452,7 @@ void dispose_markbits() {
         gc_assert((page_table[page].type & PAGE_TYPE_MASK) == PAGE_TYPE_UNBOXED);
         gc_assert(!page_bytes_used(page));
         set_page_need_to_zero(page, 1);
-        page_table[page].type = FREE_PAGE_FLAG;
+        set_page_type(page_table[page], FREE_PAGE_FLAG);
       }
 }
 

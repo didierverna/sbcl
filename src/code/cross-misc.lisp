@@ -242,6 +242,9 @@
   (declare (ignore depth))
   (write structure :stream stream :circle t))
 
+(defun unreachable ()
+  (bug "Unreachable reached"))
+
 (in-package "SB-KERNEL")
 
 ;;; These functions are required to emulate SBCL kernel functions
@@ -256,18 +259,14 @@
 ;;   - DEBUG-SOURCE, COMPILED-DEBUG-INFO, COMPILED-DEBUG-FUN-{something}
 ;;   - HEAP-ALIEN-INFO and ALIEN-{something}-TYPE
 ;;   - COMMA
-#-metaspace (defmacro wrapper-friend (x) x)
-(defun %instance-wrapper (instance)
-  (declare (notinline classoid-wrapper))
-  (classoid-wrapper (find-classoid (type-of instance))))
+(defun %instance-layout (instance)
+  (declare (notinline classoid-layout))
+  (classoid-layout (find-classoid (type-of instance))))
 (defun %instance-length (instance)
-  (declare (notinline wrapper-length))
+  (declare (notinline layout-length))
   ;; In the target, it is theoretically possible to have %INSTANCE-LENGTH
   ;; exceeed layout length, but in the cross-compiler they're the same.
-  (wrapper-length (%instance-wrapper instance)))
-(defun layout-id (x)
-  (declare (notinline sb-kernel::wrapper-id))
-  (sb-kernel::wrapper-id x))
+  (layout-length (%instance-layout instance)))
 
 (defun %find-position (item seq from-end start end key test)
   (let ((position (position item seq :from-end from-end
@@ -403,3 +402,4 @@
 (defun range<= (l x h) (<= l x h))
 (defun range<<= (l x h) (and (< l x) (<= x h)))
 (defun range<=< (l x h) (and (<= l x) (< x h)))
+

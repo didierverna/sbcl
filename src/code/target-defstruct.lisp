@@ -13,6 +13,23 @@
 
 ;;;; structure frobbing primitives
 
+#+permgen
+(defun allocate-permgen-layout (nwords)
+  (flet ((thunk ()
+           (let ((freeptr sb-vm:*permgen-space-free-pointer*))
+             (setf sb-vm:*permgen-space-free-pointer*
+                   ;; round-to-odd, add the header word
+                   (sap+ freeptr (ash (1+ (logior nwords 1)) sb-vm:word-shift)))
+             (aver (<= (sap-int sb-vm:*permgen-space-free-pointer*)
+                       (+ sb-vm:permgen-space-start sb-vm:permgen-space-size)))
+             (setf (sap-ref-word freeptr 0)
+                   (logior (ash nwords sb-vm:instance-length-shift)
+                           sb-vm:instance-widetag))
+             (%make-lisp-obj (sap-int (sap+ freeptr sb-vm:instance-pointer-lowtag))))))
+    (if (sb-thread::mutex-p sb-vm::*allocator-mutex*)
+        (with-system-mutex (sb-vm::*allocator-mutex* :without-gcing t) (thunk))
+        (thunk))))
+
 ;;; For lack of any better to place to write up some detail surrounding
 ;;; layout creation for structure types, I'm putting here.
 ;;; When you issue a DEFSTRUCT at the REPL, there are *three* instances
@@ -28,20 +45,13 @@
 ;;; which contains copies of the length/depthoid/inherits etc
 ;;; that we compare against the installed one to make sure they match.
 ;;; The third one also gets thrown away.
-(define-load-time-global *layout-id-generator* (cons 0 nil))
-(declaim (type (cons fixnum) *layout-id-generator*))
-;;; NB: for #+metaspace this returns a WRAPPER, not a LAYOUT.
 (defun make-layout (clos-hash classoid
                     &key (depthoid -1) (length 0) (flags 0)
                          (inherits #())
                          (info nil)
                          (bitmap (if info (dd-bitmap info) 0))
-                         (invalid :uninitialized)
-                    &aux (id (or (atomic-pop (cdr *layout-id-generator*))
-                                 (atomic-incf (car *layout-id-generator*)))))
-  (unless (typep id '(and layout-id (not (eql 0))))
-    (error "Layout ID limit reached"))
-  (let* ((fixed-words (type-dd-length sb-vm:layout))
+                         (invalid :uninitialized))
+  (let* ((fixed-words (type-dd-length layout))
          (extra-id-words ; count of additional words needed to store ancestors
           (if (logtest flags +structure-layout-flag+)
               (calculate-extra-id-words depthoid)
@@ -49,80 +59,86 @@
          (bitmap-words (ceiling (1+ (integer-length bitmap)) sb-vm:n-word-bits))
          (nwords (+ fixed-words extra-id-words bitmap-words))
          (layout
-          (truly-the sb-vm:layout
+          (truly-the layout
                      #+compact-instance-header
-                     (sb-vm::alloc-immobile-fixedobj
-                      (1+ nwords)
-                      (logior (ash nwords sb-vm:instance-length-shift)
-                              sb-vm:instance-widetag))
+                     (progn
+                       #+permgen (allocate-permgen-layout nwords)
+                       #+immobile-space
+                       (sb-vm::alloc-immobile-fixedobj
+                        (1+ nwords)
+                        (logior (ash nwords sb-vm:instance-length-shift)
+                                sb-vm:instance-widetag)))
                      #-compact-instance-header
-                     (%make-instance/mixed nwords)))
-         (wrapper #-metaspace layout))
-    (%set-instance-layout layout
-          (wrapper-friend #.(find-layout #+metaspace 'sb-vm:layout
-                                         #-metaspace 'wrapper)))
-    #+metaspace
-    (setf wrapper (%make-wrapper :clos-hash clos-hash :classoid classoid
-                                 :%info info :invalid invalid :friend layout)
-          (layout-friend layout) wrapper)
+                     (%make-instance/mixed nwords))))
+    (%set-instance-layout layout #.(find-layout 'layout))
     (setf (layout-flags layout) #+64-bit (pack-layout-flags depthoid length flags)
                                 #-64-bit flags)
     (setf (layout-clos-hash layout) clos-hash
-          (wrapper-classoid wrapper) classoid
-          (wrapper-invalid wrapper) invalid)
-    #-64-bit (setf (wrapper-depthoid wrapper) depthoid
-                   (wrapper-length wrapper) length)
-    #-metaspace (setf (wrapper-%info wrapper) info ; already set if #+metaspace
-                      (wrapper-slot-table wrapper) #(1 nil))
-    (set-layout-inherits wrapper inherits (logtest flags +structure-layout-flag+) id)
+          (layout-classoid layout) classoid
+          (layout-invalid layout) invalid)
+    #-64-bit (setf (layout-depthoid layout) depthoid
+                   (layout-length layout) length)
+    (setf (layout-%info layout) info
+          (layout-slot-table layout) #(1 nil))
+    ;; All layouts initially have an ID of 0. The ID is assigned on demand
+    ;; for the layouts that actually get registered, and only those.
+    ;; We do not need to or want to recycle IDs, because:
+    ;; - assembly code can use layout-ID fixups without reference to the layout.
+    ;;   So GCing a layout should *not* allow reuse of its ID because we have no
+    ;;   way of knowing where it was wired in.
+    ;; - only subtypes of STRUCTURE-OBJECT need an ID for TYPEP, and structures
+    ;;   are not redefinable, so you'd have to define 2^32 different structure
+    ;;   types to exhaust the space of IDS.
+    (set-layout-inherits layout inherits (logtest flags +structure-layout-flag+) 0)
     (let ((bitmap-base (+ fixed-words extra-id-words)))
       (dotimes (i bitmap-words)
         (%raw-instance-set/word layout (+ bitmap-base i)
               (ldb (byte sb-vm:n-word-bits (* i sb-vm:n-word-bits)) bitmap))))
     (aver (= (%layout-bitmap layout) bitmap)) ; verify it reads back the same
-    ;; It's not terribly important that we recycle layout IDs, but I have some other
-    ;; changes planned that warrant a finalizer per layout.
-    ;; FIXME: structure IDs should never be recycled because code blobs referencing
-    ;; th ID do not reference the layout, and so the layout could be GCd allowing
-    ;; reuse of an old ID for a new type.
-    (unless (built-in-classoid-p classoid)
-      (let ((layout-addr (- (get-lisp-obj-address layout) sb-vm:instance-pointer-lowtag)))
-        (declare (ignorable layout-addr))
-        (declare (sb-c::tlab :system))
-        (finalize wrapper
-                  (lambda ()
-                    #+metaspace (sb-vm::unallocate-metaspace-chunk layout-addr)
-                    (atomic-push id (cdr *layout-id-generator*)))
-                :dont-save t)))
-    ;; Rather than add and delete this line of debugging which I've done so many times,
-    ;; let's instead keep it but commented out.
-    #+nil
-    (alien-funcall (extern-alien "printf" (function void system-area-pointer unsigned unsigned
-                                                    unsigned system-area-pointer))
-                   (vector-sap #.(format nil "New wrapper ID=%d %p %p '%s'~%"))
-                   id (get-lisp-obj-address layout) (get-lisp-obj-address wrapper)
-                   (vector-sap (string (classoid-name classoid))))
-    wrapper))
+    layout))
 
-#+metaspace
-(defun make-temporary-wrapper (clos-hash classoid inherits)
-  (let* ((layout (%make-temporary-layout #.(find-layout t) clos-hash))
-         (wrapper (%make-wrapper :clos-hash clos-hash :classoid classoid
-                                 :inherits inherits :invalid nil
-                                 :friend layout)))
-    (setf (layout-friend layout) wrapper)
-    wrapper))
+;;; Extract the bitmap from 1 or more words of bits that have the same format
+;;; as a BIGNUM - least-significant word first, native bit order within each word,
+;;; all but the last are unsigned, and the last is signed.
+(defun %layout-bitmap (layout &aux (nwords (bitmap-nwords layout))
+                                   (start (bitmap-start layout)))
+  (declare (type layout layout))
+  (if (and (= nwords 1) (fixnump (%raw-instance-ref/signed-word layout start)))
+      (the fixnum (%raw-instance-ref/signed-word layout start))
+      (do* ((res (sb-bignum:%allocate-bignum nwords))
+            (i 0 (1+ i))
+            (j start (1+ j)))
+           ((= i nwords)
+            ;; not sure if this NORMALIZE call is needed, but it can't hurt
+            (sb-bignum::%normalize-bignum res nwords))
+       (setf (sb-bignum:%bignum-ref res i) (%raw-instance-ref/word layout j)))))
+
+(defun layout-bitmap (layout)
+  (declare (type layout layout))
+  ;; Whenever we call LAYOUT-BITMAP on a structure-object subtype,
+  ;; it's supposed to have the INFO slot populated, linking it to a defstruct-description.
+  (acond ((layout-info layout) (dd-bitmap it))
+         ;; Instances lacking DD-INFO are CLOS objects, which can't generally have
+         ;; raw slots, except that funcallable-instances may have 2 raw slots -
+         ;; the trampoline and the layout. The trampoline can have a tag, depending
+         ;; on the platform, and the layout is tagged but a special case.
+         ;; In any event, the bitmap is always 1 word, and there are no "extra ID"
+         ;; words preceding it.
+         (t
+          (aver (not (logtest +structure-layout-flag+ (layout-flags layout))))
+          (the fixnum
+               (%raw-instance-ref/signed-word layout (type-dd-length layout))))))
 
 ;;; This allocator is used by the expansion of MAKE-LOAD-FORM-SAVING-SLOTS
 ;;; when given a STRUCTURE-OBJECT.
 (defun allocate-struct (type)
-  (let* ((wrapper (classoid-wrapper (the structure-classoid (find-classoid type))))
-         (dd (wrapper-dd wrapper))
-         (structure (let ((len (wrapper-length wrapper)))
+  (let* ((layout (classoid-layout (the structure-classoid (find-classoid type))))
+         (dd (layout-dd layout))
+         (structure (let ((len (layout-length layout)))
                       (if (dd-has-raw-slot-p dd)
                           (%make-instance/mixed len)
                           (%make-instance len)))))
-    (%set-instance-layout structure wrapper)
+    (%set-instance-layout structure layout)
     (dolist (dsd (dd-slots dd) structure)
       (when (eq (dsd-raw-type dsd) 't)
         (%instance-set structure (dsd-index dsd) (make-unbound-marker))))))
@@ -159,32 +175,46 @@
                        sb-kernel::*raw-slot-data*))))
   (define-raw-slot-accessors))
 
+(define-load-time-global *layout-id-generator* (cons 0  nil))
+(declaim (type (cons fixnum) *layout-id-generator*))
+(define-load-time-global *layout-id-mutex* (sb-thread:make-mutex :name "LAYOUT-ID"))
 (macrolet ((id-bits-sap ()
              `(sap+ (int-sap (get-lisp-obj-address layout))
-                    ,(- (sb-vm::id-bits-offset) sb-vm:instance-pointer-lowtag))))
-(defun layout-id (layout)
+                    ,(- (sb-vm::id-bits-offset) sb-vm:instance-pointer-lowtag)))
+           (access-it ()
+             #-64-bit `(%raw-instance-ref/signed-word
+                        layout (+ (get-dsd-index layout id-word0) index))
+             ;; use SAP-ref, for lack of half-sized slots
+             #+64-bit `(signed-sap-ref-32 (id-bits-sap) (ash index 2))))
+(defun layout-id (layout &optional (assign t))
   ;; If a structure type at depthoid >= 2, then fetch the INDEXth id
   ;; where INDEX is depthoid - 2. Otherwise fetch the 0th id.
   ;; There are a few non-structure types at positive depthoid; those do not store
   ;; their ancestors in the vector; they only store self-id at index 0.
   ;; This isn't performance-critical. If it were, then we should store self-ID
   ;; at a fixed index. Using it for type-based dispatch remains a possibility.
-  (let* ((layout (cond #+metaspace ((typep layout 'wrapper) (wrapper-friend layout))
-                       (t layout)))
-         (depth (- (sb-vm::layout-depthoid layout) 2))
+  (let* ((depth (- (sb-vm::layout-depthoid layout) 2))
          (index (if (or (< depth 0) (not (logtest (layout-flags layout)
                                                   +structure-layout-flag+)))
-                    0 depth)))
-    (truly-the layout-id
-              #-64-bit (%raw-instance-ref/signed-word
-                        layout (+ (get-dsd-index sb-vm:layout id-word0) index))
-              #+64-bit ; use SAP-ref for lack of half-sized slots
-              (with-pinned-objects (layout)
-                (signed-sap-ref-32 (id-bits-sap) (ash index 2))))))
+                    0 depth))
+         (id (with-pinned-objects (layout)
+               (access-it))))
+    (truly-the
+     (or null layout-id)
+     (cond ((not (zerop id)) id)
+           (assign
+            (aver (logior +structure-layout-flag+ (layout-flags layout)))
+            (with-system-mutex (*layout-id-mutex*)
+              (let ((id (truly-the layout-id (access-it)))) ; double-check
+                (if (zerop id)
+                    (with-pinned-objects (layout)
+                      (setf (access-it)
+                            ;; doesn't really need ATOMIC- any moren
+                            (atomic-incf (car *layout-id-generator*))))
+                    id))))))))
 
-(defun set-layout-inherits (wrapper inherits structurep this-id
-                            &aux (layout (wrapper-friend wrapper)))
-  (setf (wrapper-inherits wrapper) inherits)
+(defun set-layout-inherits (layout inherits structurep this-id)
+  (setf (layout-inherits layout) inherits)
   ;;; If structurep, and *only* if, store all the inherited layout IDs.
   ;;; It looks enticing to try to always store "something", but that goes wrong,
   ;;; because only structure-object layouts are growable, and only structure-object
@@ -247,11 +277,11 @@
 
 ;;; the part of %DEFSTRUCT which makes sense only on the target SBCL
 ;;;
-(defmacro set-wrapper-equalp-impl (wrapper newval)
-  `(%instance-set ,wrapper (get-dsd-index wrapper equalp-impl) ,newval))
+(defmacro set-layout-equalp-impl (layout newval)
+  `(%instance-set ,layout (get-dsd-index layout equalp-impl) ,newval))
 
 (defun assign-equalp-impl (type-name function)
-  (set-wrapper-equalp-impl (find-layout type-name) function))
+  (set-layout-equalp-impl (find-layout type-name) function))
 
 ;;; This variable is just a somewhat hokey way to pass additional
 ;;; arguments to the defstruct hook (which renders the structure definition
@@ -276,8 +306,8 @@
     (setf (documentation (dd-name dd) 'structure) (dd-doc dd)))
 
   (let ((classoid (find-classoid (dd-name dd))))
-    (let ((layout (classoid-wrapper classoid)))
-      (set-wrapper-equalp-impl
+    (let ((layout (classoid-layout classoid)))
+      (set-layout-equalp-impl
           layout
           (cond ((compiled-function-p equalp) equalp)
                 ((eql (dd-bitmap dd) +layout-all-tagged+) #'sb-impl::instance-equalp)
@@ -380,11 +410,11 @@
   (loop for i from sb-vm:instance-data-start below (%instance-length to)
         do (%instance-set to i (%instance-ref from i)))
   to)
-(defun (setf %instance-wrapper) (newval x)
-  (%set-instance-layout x (wrapper-friend newval))
+(defun (setf %instance-layout) (newval x)
+  (%set-instance-layout x newval)
   newval)
-(defun (setf %fun-wrapper) (newval x)
-  (%set-fun-layout x (wrapper-friend newval))
+(defun (setf %fun-layout) (newval x)
+  (%set-fun-layout x newval)
   newval)
 
 ;;; default PRINT-OBJECT method
@@ -443,9 +473,9 @@
   (declare (ignore depth))
   (if (funcallable-instance-p structure)
       (print-unreadable-object (structure stream :identity t :type t))
-      (let* ((wrapper (%instance-wrapper structure))
-             (dd (wrapper-info wrapper))
-             (name (wrapper-classoid-name wrapper)))
+      (let* ((layout (%instance-layout structure))
+             (dd (layout-info layout))
+             (name (layout-classoid-name layout)))
         (cond ((not dd)
                ;; FIXME? this branch may be unnecessary as a consequence
                ;; of change f02bee325920166b69070e4735a8a3f295f8edfd which
@@ -496,22 +526,16 @@
                  (* (+ sb-vm:instance-slots-offset index)
                     sb-vm:n-word-bytes))))))))
 
-#+metaspace
-(defmethod print-object ((self sb-vm:layout) stream)
-  (print-unreadable-object (self stream :type t :identity t)
-    (write (layout-id self) :stream stream)))
-
 (defun id-to-layout (id)
   (maphash (lambda (k v)
              (declare (ignore k))
              (when (eql (layout-id v) id)
-               (return-from id-to-layout (wrapper-friend v))))
+               (return-from id-to-layout v)))
            (classoid-subclasses (find-classoid 't))))
 (export 'id-to-layout)
 
 (defun summarize-layouts ()
-  (flet ((flag-bits (x) (logand (layout-flags (wrapper-friend x))
-                                layout-flags-mask)))
+  (flet ((flag-bits (x) (logand (layout-flags x) layout-flags-mask)))
      (let ((prev -1))
        (dolist (layout (sort (loop for v being each hash-value
                                 of (classoid-subclasses (find-classoid 't))
@@ -522,5 +546,83 @@
              (format t "Layout flags = #b~10,'0b~%" flags)
              (setq prev flags)))
          (format t "  ~a~%" layout)))))
+
+(defconstant fast-slot-table-fixed-cells 3)
+
+;;; Optimizations to speed up slot-value on structure-object
+;;;  1. try to generate fewer collisions in the symbol -> index map
+;;;  2. use the fastrem-32 algorithm to compute FLOOR
+;;;  3. specialized function which doesn't check slot-unbound or whether the
+;;;     slot has :CLASS allocation (which it can't)
+;;; If "flexible" defstructs (multiple inheritance, standard-object ancestors) are ever
+;;; brought to life, these might be inadmissible. Probably we would not store the
+;;; fast map in such situations.
+(defun best-slot-map-parameters (names)
+  (let* ((raw-hashes (mapcar (lambda (x) (symbol-hash (the symbol x))) names))
+         (n-names (length names))
+         (n-cells (logior n-names 1)) ; round to odd if not already
+         ;; remember the best N-COLLISIONS N-CELLS MASK C
+         (best))
+    (declare (type (unsigned-byte 32) n-cells))
+    ;; Unlike with package symbol tables, a slot table has a fixed set of symbols.
+    ;; Therefore we can try to produce the best hashing for that particular set.
+    (loop ; over increasing value of N-CELLS
+     (multiple-value-bind (mask c) (sb-impl::optimized-symtbl-remainder-params n-cells)
+       (loop for shift from 0 to 31
+             do
+             (let* ((indices
+                     (mapcar (lambda (hash)
+                               (let ((masked-hash (logand (ash hash (- shift)) mask)))
+                                 (sb-vm::fastrem-32 masked-hash c n-cells)))
+                             raw-hashes))
+                    (badness (- n-names (length (remove-duplicates indices)))))
+               (when (= badness 0)
+                 (return-from best-slot-map-parameters
+                   (list 0 n-cells shift mask c)))
+               (when (or (not best) (< badness (car best)))
+                 (setf best
+                       (list badness n-cells shift mask c))))))
+     (when (> n-cells (* 2 n-names))
+       (return best))
+     (incf n-cells 2))))
+
+;; The result is a vector:
+;;  #(SHIFT MASK C symbol .. symbol ... index .. index ...)
+;; The length of the vector implies the divisor.
+(defun make-struct-slot-map (dd)
+  (destructuring-bind (n-cells shift mask c)
+      (cdr (best-slot-map-parameters
+            (mapcar 'dsd-name (dd-slots dd))))
+    (let ((map (make-array (+ (* n-cells 2) fast-slot-table-fixed-cells)
+                           :initial-element 0)))
+      (setf (aref map 0) shift
+            (aref map 1) mask
+            (aref map 2) c)
+      (fill map nil :start (+ fast-slot-table-fixed-cells n-cells))
+      (dolist (dsd (dd-slots dd) map)
+          (binding*
+           ((hash (symbol-hash (dsd-name dsd)))
+            (masked-hash (logand (ash hash (- shift)) mask))
+            (bin (truly-the index
+                            (+ (sb-vm::fastrem-32 masked-hash c n-cells)
+                               fast-slot-table-fixed-cells)))
+            (dsd-bits (dsd-bits dsd))
+            (name (dsd-name dsd))
+            ((key value)
+             (cond ((eql (svref map bin) 0) ; empty, just store the name and dsd-index
+                    (values name dsd-bits))
+                   ;; A bin with a collision is upgraded to a vector of the two entries
+                   ((symbolp (svref map bin))
+                    (values (vector (svref map bin) name)
+                            (vector (svref map (+ bin n-cells)) dsd-bits)))
+                   ;; Multiple collisions
+                   (t
+                    (values (concatenate 'vector (svref map bin) (list name))
+                            (concatenate 'vector
+                                         (svref map (+ bin n-cells))
+                                         (list dsd-bits)))))))
+           (setf (svref map bin) key
+                 (svref map (+ bin n-cells)) value))))))
+
 
 (/show0 "target-defstruct.lisp end of file")

@@ -16,7 +16,7 @@
     (assert (eq (sb-kernel::dd-%element-type
                  (sb-kernel:find-defstruct-description type))
                 '*))
-    (assert (not (logtest (sb-kernel:wrapper-flags (find-layout type))
+    (assert (not (logtest (sb-kernel:layout-flags (find-layout type))
                           sb-kernel::+strictly-boxed-flag+)))))
 
 
@@ -117,7 +117,7 @@
     (when show (show (list-head *lfl*) #'get-next "del "))))
 
 ;; Enable heap validity tester
-#+gencgc (setf (sb-alien:extern-alien "verify_gens" char) 0)
+#+(and generational (not gc-stress)) (setf (sb-alien:extern-alien "verify_gens" char) 0)
 
 (test-util:with-test (:name :lockfree-list-gc-correctness)
   ;; Create a small list and perform logical deletion of 2 nodes
@@ -249,10 +249,12 @@
 
 ;; Show that nodes which are referenced only via a "fixnum" pointer
 ;; can and do actually move via GC, which adjusts the fixnum accordingly.
-(test-util:with-test (:name :lfl-not-pinned)
+(test-util:with-test (:name :lfl-not-pinned
+                      :skipped-on :gc-stress)
   (gc)
   (assert (= (sb-kernel:generation-of *5*) 0))
   (assert (= (sb-kernel:generation-of *10*) 0))
+  #-mark-region-gc
   (assert (not (eql (get-lisp-obj-address *10*)
                     *addr-of-10*))))
 
@@ -367,8 +369,8 @@
   ;; is a dummy node, so head->next is "ANT" and head->next->next is "BAT"
   ;; which can be construed as the CDR and not the CDDR of the list.
   (let ((cdr
-       (sb-lockless::get-next
-        (sb-lockless::get-next
+       (sb-lockless:get-next
+        (sb-lockless:get-next
          (sb-lockless::list-head lflist)))))
     (assert (sb-lockless:lfl-find lflist "BAT"))
     ;; starting at CDR you can't find "ANT"

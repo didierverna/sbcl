@@ -16,6 +16,10 @@
 #ifndef PSEUDO_ATOMIC_H
 #define PSEUDO_ATOMIC_H
 
+#include "genesis/thread.h"
+#include "genesis/static-symbols.h"
+#include "genesis/symbol.h"
+
 #if defined LISP_FEATURE_SPARC || defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
 
 /* These architectures make no distinction between +/- sb-thread.
@@ -37,6 +41,7 @@
 
 #elif defined LISP_FEATURE_ARM || defined LISP_FEATURE_ARM64 \
   || defined LISP_FEATURE_MIPS || defined LISP_FEATURE_RISCV
+#include "thread.h" // for SymbolValue
 
 /* These architectures use a thread slot if #+sb-thread,
  * or else two static symbols if #-sb-thread.

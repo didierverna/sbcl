@@ -164,14 +164,28 @@
                          (logand-derive-unsigned-bounds x y)
                        (specifier-type `(integer ,low ,high)))))
               ;; X is positive, but Y might be negative.
-              (cond (x-high
+              (cond ((and x-len y-low y-high (< y-high 0))
+                     (multiple-value-bind (low high)
+                         (let ((len (max x-len y-len)))
+                           (logand-derive-unsigned-bounds x (make-numeric-type :class 'integer
+                                                                               :low (ldb (byte len 0) y-low)
+                                                                               :high (ldb (byte len 0) y-high))))
+                       (specifier-type `(integer ,low ,high))))
+                    (x-high
                      (specifier-type `(integer 0 ,x-high)))
                     (t
                      (specifier-type 'unsigned-byte))))
           ;; X might be negative.
           (if (not y-neg)
               ;; Y must be positive.
-              (cond (y-high
+              (cond ((and y-len x-low x-high (< x-high 0))
+                     (multiple-value-bind (low high)
+                         (let ((len (max x-len y-len)))
+                           (logand-derive-unsigned-bounds y (make-numeric-type :class 'integer
+                                                                               :low (ldb (byte len 0) x-low)
+                                                                               :high (ldb (byte len 0) x-high))))
+                       (specifier-type `(integer ,low ,high))))
+                    (y-high
                      (specifier-type `(integer 0 ,y-high)))
                     (t
                      (specifier-type 'unsigned-byte)))
@@ -221,11 +235,12 @@
       (cond
        ((and (not x-neg) (not y-neg))
         ;; Both are positive.
-        (if (and x-len y-len)
-            (multiple-value-bind (low high)
-                (logior-derive-unsigned-bounds x y)
-              (specifier-type `(integer ,low ,high)))
-            (specifier-type `(unsigned-byte* *))))
+        (cond ((and x-len y-len)
+               (multiple-value-bind (low high)
+                   (logior-derive-unsigned-bounds x y)
+                 (specifier-type `(integer ,low ,high))))
+              (t
+               (specifier-type `(integer ,(max y-low x-low))))))
        ((not x-pos)
         ;; X must be negative.
         (if (not y-pos)
@@ -243,18 +258,52 @@
                        -1))))
        (t
         ;; X might be either positive or negative.
-        (if (not y-pos)
-            ;; But Y is negative. The result will be negative.
-            (specifier-type
-             `(integer ,(or y-low '*)
-                       -1))
-            (cond ((and x-len y-len)
-                   (specifier-type `(integer ,(min x-low y-low)
-                                             ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
-                  ((and x-high y-high)
-                   (specifier-type `(integer * ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
-                  (t
-                   (specifier-type 'integer)))))))))
+        (cond ((not y-pos)
+               ;; But Y is negative. The result will be negative.
+               (specifier-type
+                `(integer ,(or y-low '*)
+                          -1)))
+              ((and y-low
+                    (> y-low 0))
+               (specifier-type `(or (integer ,(or x-low '*) -1)
+                                    ,(if (and x-high
+                                              y-len)
+                                         (multiple-value-bind (low high)
+                                             (logior-derive-unsigned-bounds (specifier-type `(integer 0 ,x-high))
+                                                                            y)
+                                           `(integer ,low ,high))
+                                         `(integer ,y-low)))))
+              ((and x-low
+                    (> x-low 0))
+               (specifier-type `(or (integer ,(or y-low '*) -1)
+                                    ,(if (and y-high
+                                              x-len)
+                                         (multiple-value-bind (low high)
+                                             (logior-derive-unsigned-bounds (specifier-type `(integer 0 ,y-high))
+                                                                            x)
+                                           `(integer ,low ,high))
+                                         `(integer ,x-low)))))
+              (t
+               (let ((type
+                       (cond ((and x-len y-len)
+                              (specifier-type `(integer ,(min x-low y-low)
+                                                        ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
+                             ((and x-high y-high)
+                              (specifier-type `(integer * ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
+                             (t
+                              (specifier-type 'integer)))))
+                 (flet ((contains-zero (low high)
+                          (cond ((and low high)
+                                 (<= low 0 high))
+                                (low
+                                 (<= low 0))
+                                (high
+                                 (>= high 0))
+                                (t))))
+                   (if (and (contains-zero x-low x-high)
+                            (contains-zero y-low y-high))
+                       type
+                       (type-intersection type (specifier-type '(and integer (not (eql 0)))))))))))))))
 
 (defun logxor-derive-unsigned-bounds (x y)
   (let* ((a (numeric-type-low x))

@@ -11,8 +11,8 @@
 
 (in-package "SB-VM")
 
-(defconstant-eqx +fixup-kinds+ #(:absolute :cond-branch :uncond-branch :layout-id
-                                 :ldr-str :move-wide)
+(defconstant-eqx +fixup-kinds+ #(:absolute :cond-branch :uncond-branch :layout-id :ubfm-imms
+                                 :pc-relative :pc-relative-ldr-str :ldr-str :move-wide)
   #'equalp)
 
 
@@ -41,7 +41,7 @@
   (defreg nl6 6)
   (defreg nl7 7)
   (defreg nl8 8)
-  (defreg nl9 9)
+  (defreg tmp 9)
 
   (defreg r0 10)
   (defreg r1 11)
@@ -67,7 +67,7 @@
   (defreg ocfp 25)
   (defreg cfp 26)
   (defreg csp 27)
-  (defreg tmp 28)
+  (defreg cardtable 28) ; preserved across C calls
   (defreg null 29)
   (defreg lr 30)
   (defreg nsp 31)
@@ -79,12 +79,13 @@
   (defregset descriptor-regs
       r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 #-darwin r10 #-sb-thread r11 lexenv)
 
+  ;; nl9 can't be selected by PACK as it is a freely usable temp reg
   (defregset non-descriptor-regs
-      nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nl9 nargs nfp ocfp lr)
+      nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nargs nfp ocfp lr)
 
   (defregset boxed-regs
       r0 r1 r2 r3 r4 r5 r6
-      r7 r8 r9 #-darwin r10 #-sb-thread r11 #+sb-thread thread lexenv)
+      r7 r8 r9 #-darwin r10 #-sb-thread r11 lexenv)
 
   ;; registers used to pass arguments
   ;;
@@ -94,7 +95,7 @@
   (defregset *register-arg-offsets*  r0 r1 r2 r3)
   (defparameter *register-arg-names* '(r0 r1 r2 r3))
   (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 r8 r9)
-  (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nl9)
+  (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8)
   (defglobal *float-regs* (loop for i below 32 collect i)))
 
 
@@ -232,6 +233,7 @@
   (defregtn null descriptor-reg)
   (defregtn lexenv descriptor-reg)
   (defregtn tmp any-reg)
+  (defregtn cardtable any-reg)
 
   (defregtn nargs any-reg)
   (defregtn ocfp any-reg)
@@ -322,15 +324,16 @@
     (case (sb-c::combination-fun-source-name node)
       (logtest
        (if (or (valid-funtype '(signed-word signed-word) '*)
-               (valid-funtype '(word word) '*))
+               (valid-funtype '(word word) '*)
+               (valid-funtype '(signed-word word) '*)
+               (valid-funtype '(word signed-word) '*))
            (values :maybe nil)
            (values :default nil)))
       (logbitp
        (cond
          ((or (valid-funtype `((constant-arg (mod ,n-word-bits)) signed-word) '*)
               (valid-funtype `((constant-arg (mod ,n-word-bits)) word) '*))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
+          (values :direct nil))
          (t (values :default nil))))
       (%ldb
        (flet ((validp (type)
@@ -348,8 +351,7 @@
                                     n-word-bits)))))))
          (if (or (validp 'word)
                  (validp 'signed-word))
-             (values :transform '(lambda (size posn integer)
-                                  (%%ldb integer size posn)))
+             (values :direct nil)
              (values :default nil))))
       (%dpb
        (flet ((validp (type result-type)
@@ -358,16 +360,31 @@
                                  (constant-arg (mod ,n-word-bits))
                                  ,type)
                                result-type)))
-         (if (or (validp 'signed-word 'signed-word)
-                 (validp 'word 'word))
-             (values :transform '(lambda (newbyte size posn integer)
-                                  (%%dpb newbyte size posn integer)))
+         (if (and (or (validp 'signed-word 'signed-word)
+                      (validp 'word 'word))
+                  (not (destructuring-bind (new size posn integer) (sb-c::basic-combination-args node)
+                         (declare (ignore posn integer))
+                         (and (constant-lvar-p new)
+                              (let* ((size (lvar-value size))
+                                     (new (ldb (byte size 0) (lvar-value new))))
+                                (or (zerop new)
+                                    (= (logcount new) size)))))))
+             (values :direct nil)
              (values :default nil))))
       (signum
        (if (or (valid-funtype '(signed-word) '*)
                (valid-funtype '(word) '*))
            (values :direct nil)
            (values :default nil)))
+      (truncate
+       (destructuring-bind (n &optional d) (sb-c::basic-combination-args node)
+         (if (and d
+                  (constant-lvar-p d)
+                  (power-of-two-p (lvar-value d))
+                  (and (csubtypep (sb-c::lvar-type n) (specifier-type 'signed-word))
+                       (not (csubtypep (sb-c::lvar-type n) (specifier-type 'word)))))
+             (values :maybe nil)
+             (values :default nil))))
       (t (values :default nil)))))
 
 (defun primitive-type-indirect-cell-type (ptype)
@@ -399,4 +416,5 @@
         bic-encode-immediate
         bic-fixnum-encode-immediate
         logical-immediate-or-word-mask
-        sb-arm64-asm::ldr-str-offset-encodable))
+        sb-arm64-asm::ldr-str-offset-encodable
+        power-of-two-p))

@@ -116,22 +116,14 @@
        (2 (weaken-values-type type))
        (3 type)))))
 
-;;; LVAR is an lvar we are doing a type check on and TYPES is a list
-;;; of types that we are checking its values against. If we have
-;;; proven that LVAR generates a fixed number of values, then for each
-;;; value, we check whether it is cheaper to then difference between
-;;; the proven type and the corresponding type in TYPES.
-(defun lvar-types-to-check (lvar types original-types n-required)
-  (declare (type lvar lvar) (list types original-types))
-  (let ((ptypes (values-type-out (lvar-derived-type lvar) (length types))))
-    (loop for p in ptypes
-          and c in types
-          and a in original-types
-          and i from 0
-          collect (list (if (>= i n-required)
-                            (type-union c (specifier-type 'null))
-                            c)
-                        a))))
+(defun lvar-types-to-check (types original-types n-required)
+  (loop for type in types
+        for original in original-types
+        for i from 0
+        collect (list (if (>= i n-required)
+                          (type-union original (specifier-type 'null))
+                          original)
+                      type)))
 
 ;;; Determine if CAST can be checked.
 ;;; We may check only fixed number of values; in any case the number
@@ -158,7 +150,6 @@
   (let* ((ctype (coerce-to-values (cast-type-to-check cast)))
          (atype (coerce-to-values (cast-asserted-type cast)))
          (dtype (node-derived-type cast))
-         (value (cast-value cast))
          (lvar (node-lvar cast))
          (dest (and lvar (lvar-dest lvar)))
          (n-consumed (cond ((not lvar)
@@ -171,35 +162,34 @@
                                  (singleton-p (mv-combination-args dest)))
                             (let ((fun-ref (lvar-use (mv-combination-fun dest))))
                               (length (lambda-vars (ref-leaf fun-ref)))))))
-         (n-required (length (values-type-required dtype))))
+         (n-required (if (eq dtype *wild-type*)
+                         (return-from cast-check-types (values :too-hairy nil))
+                         (length (values-type-required dtype)))))
     (aver (not (eq ctype *wild-type*)))
     (cond ((and (null (values-type-optional dtype))
                 (not (values-type-rest dtype)))
            ;; we [almost] know how many values are produced
            (values :simple
-                   (lvar-types-to-check value
-                                        (values-type-out ctype n-required)
+                   (lvar-types-to-check (values-type-out ctype n-required)
                                         (values-type-out atype n-required)
                                         n-required)))
           ((lvar-single-value-p lvar)
            ;; exactly one value is consumed
            (principal-lvar-single-valuify lvar)
-           (values :simple (lvar-types-to-check value
-                                               (list (single-value-type ctype))
-                                               (list (single-value-type atype))
-                                               n-required)))
+           (values :simple (lvar-types-to-check (list (single-value-type ctype))
+                                                (list (single-value-type atype))
+                                                n-required)))
           ((and (mv-combination-p dest)
                 (eq (mv-combination-kind dest) :local)
                 (singleton-p (mv-combination-args dest)))
            ;; we know the number of consumed values
-           (values :simple (lvar-types-to-check value
-                                               (adjust-list (values-type-types ctype)
-                                                            n-consumed
-                                                            *universal-type*)
-                                               (adjust-list (values-type-types atype)
-                                                            n-consumed
-                                                            *universal-type*)
-                                               n-required)))
+           (values :simple (lvar-types-to-check (adjust-list (values-type-types ctype)
+                                                             n-consumed
+                                                             *universal-type*)
+                                                (adjust-list (values-type-types atype)
+                                                             n-consumed
+                                                             *universal-type*)
+                                                n-required)))
           (t
            (values :too-hairy nil)))))
 
@@ -207,54 +197,86 @@
 ;;; and should be checked externally -- that is, by the callee and not the caller.
 (defun cast-externally-checkable-p (cast)
   (declare (type cast cast))
-  (let* ((lvar (node-lvar cast))
-         (dest (and lvar (lvar-dest lvar))))
-    (and (combination-p dest)
-         (or (not (combination-fun-info dest))
-             ;; fixed-args functions do not check their arguments.
-             (not (ir1-attributep (fun-info-attributes (combination-fun-info dest))
-                                  fixed-args
-                                  always-translatable)))
-         ;; The theory is that the type assertion is from a declaration on the
-         ;; callee, so the callee should be able to do the check. We want to
-         ;; let the callee do the check, because it is possible that by the
-         ;; time of call that declaration will be changed and we do not want
-         ;; to make people recompile all calls to a function when they were
-         ;; originally compiled with a bad declaration.
-         ;;
-         ;; ALMOST-IMMEDIATELY-USED-P ensures that we don't delegate casts
-         ;; that occur before nodes that can cause observable side effects --
-         ;; most commonly other non-external casts: so the order in which
-         ;; possible type errors are signalled matches with the evaluation
-         ;; order.
-         ;;
-         ;; FIXME: We should let more cases be handled by the callee then we
-         ;; currently do, see: https://bugs.launchpad.net/sbcl/+bug/309104
-         ;; This is not fixable quite here, though, because flow-analysis has
-         ;; deleted the LVAR of the cast by the time we get here, so there is
-         ;; no destination. Perhaps we should mark cases inserted by
-         ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
-         ;; deemed unreachable?
-         (and
-          (almost-immediately-used-p lvar cast)
-
-          (cond ((and (lvar-fun-is (combination-fun dest)
-                                   '(hairy-data-vector-set/check-bounds
-                                     hairy-data-vector-ref/check-bounds
-                                     hairy-data-vector-ref
-                                     hairy-data-vector-set))
-                      (eql (car (combination-args dest))
-                           lvar))
-                 ;; These functions work on all arrays, but the error
-                 ;; message is about vectors, which is used more frequently.
-                 (csubtypep (specifier-type 'vector)
-                            (single-value-type (cast-type-to-check cast))))
-                #+(or arm64 x86-64)
-                ((lvar-fun-is (combination-fun dest)
-                              '(values-list)))
-                (t
-                 (values-subtypep (lvar-externally-checkable-type lvar)
-                                  (cast-type-to-check cast))))))))
+  (let ((lvar (node-lvar cast)))
+    (multiple-value-bind (dest lvar) (and lvar (immediately-used-let-dest lvar cast))
+      (cond ((and (combination-p dest)
+                  (or (not (combination-fun-info dest))
+                      ;; fixed-args functions do not check their arguments.
+                      (not (ir1-attributep (fun-info-attributes (combination-fun-info dest))
+                                           fixed-args
+                                           always-translatable)))
+                  ;; The theory is that the type assertion is from a declaration on the
+                  ;; callee, so the callee should be able to do the check. We want to
+                  ;; let the callee do the check, because it is possible that by the
+                  ;; time of call that declaration will be changed and we do not want
+                  ;; to make people recompile all calls to a function when they were
+                  ;; originally compiled with a bad declaration.
+                  ;;
+                  ;; ALMOST-IMMEDIATELY-USED-P ensures that we don't delegate casts
+                  ;; that occur before nodes that can cause observable side effects --
+                  ;; most commonly other non-external casts: so the order in which
+                  ;; possible type errors are signalled matches with the evaluation
+                  ;; order.
+                  ;;
+                  ;; FIXME: We should let more cases be handled by the callee then we
+                  ;; currently do, see: https://bugs.launchpad.net/sbcl/+bug/309104
+                  ;; This is not fixable quite here, though, because flow-analysis has
+                  ;; deleted the LVAR of the cast by the time we get here, so there is
+                  ;; no destination. Perhaps we should mark cases inserted by
+                  ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
+                  ;; deemed unreachable?
+                  (cond ((and (lvar-fun-is (combination-fun dest)
+                                           '(hairy-data-vector-set/check-bounds
+                                             hairy-data-vector-ref/check-bounds
+                                             hairy-data-vector-ref
+                                             hairy-data-vector-set))
+                              (eq (car (combination-args dest)) lvar)
+                              (type= (specifier-type 'vector)
+                                     (single-value-type (cast-type-to-check cast))))
+                         (change-full-call dest
+                                           (getf '(hairy-data-vector-set/check-bounds vector-hairy-data-vector-set/check-bounds
+                                                   hairy-data-vector-ref/check-bounds vector-hairy-data-vector-ref/check-bounds
+                                                   hairy-data-vector-ref vector-hairy-data-vector-ref
+                                                   hairy-data-vector-set vector-hairy-data-vector-set)
+                                                 (lvar-fun-name (combination-fun dest) t))))
+                        #+(or arm64 x86-64)
+                        ((lvar-fun-is (combination-fun dest) '(values-list)))
+                        ;; Not great
+                        ((lvar-fun-is (combination-fun dest) '(%%primitive))
+                         (destructuring-bind (vop &rest args) (combination-args dest)
+                           (and (constant-lvar-p vop)
+                                (let ((name (vop-info-name (lvar-value vop))))
+                                  (or (and (memq name '(sb-vm::overflow+t
+                                                        sb-vm::overflow-t
+                                                        sb-vm::overflow*t))
+                                           (eq lvar (car args)))
+                                      (and (memq name '(sb-vm::overflow-t-y))
+                                           (eq lvar (cadr args))))))))
+                        ((and (policy dest (= debug 3))
+                              (let ((leaf (nth-value 2 (lvar-fun-type (combination-fun dest)))))
+                                (and leaf
+                                     (memq (leaf-where-from leaf) '(:declared-verify :defined-here)))))
+                         nil)
+                        (t
+                         (values-subtypep (lvar-externally-checkable-type lvar)
+                                          (cast-type-to-check cast))))))
+            ((and (cast-p dest)
+                  (cast-type-check dest)
+                  (atom (lvar-uses (node-lvar cast)))
+                  (atom (lvar-uses (cast-value dest)))
+                  (lvar-single-value-p (node-lvar cast))
+                  (cond ((and (values-type-p (cast-asserted-type dest))
+                              (values-type-p (cast-asserted-type cast)))
+                         (values-subtypep (cast-asserted-type dest)
+                                          (cast-asserted-type cast)))
+                        ((not (or (values-type-p (cast-asserted-type dest))
+                                  (values-type-p (cast-asserted-type cast))))
+                         (csubtypep (cast-asserted-type dest)
+                                    (cast-asserted-type cast)))))
+             (setf (cast-asserted-type cast) (cast-asserted-type dest)
+                   (cast-type-to-check cast) (cast-type-to-check dest)
+                   (cast-%type-check dest) nil)
+             nil)))))
 
 ;; Type specifiers handled by the general-purpose MAKE-TYPE-CHECK-FORM are often
 ;; trivial enough to have an internal error number assigned to them that can be
@@ -483,16 +505,19 @@
             (when (and (cast-p node)
                        (cast-type-check node))
               (cast-check-uses node)
-              (cond ((cast-externally-checkable-p node)
-                     (setf (cast-%type-check node) :external))
-                    (t
-                     ;; it is possible that NODE was marked :EXTERNAL by
-                     ;; the previous pass
-                     (setf (cast-%type-check node) t)
-                     (casts node)))))
+              (let ((external (cast-externally-checkable-p node)))
+                (cond (external
+                       (setf (cast-%type-check node) :external))
+                      (t
+                       ;; it is possible that NODE was marked :EXTERNAL by
+                       ;; the previous pass
+                       (setf (cast-%type-check node) t)
+                       (casts node))))))
           (setf (block-type-check block) nil)))
       (dolist (cast (casts))
-        (unless (bound-cast-p cast)
+        (unless (or (bound-cast-p cast)
+                    ;; Disabled by cast-externally-checkable-p of a different cast.
+                    (not (cast-type-check cast)))
           (multiple-value-bind (check types) (cast-check-types cast)
             (ecase check
               (:simple
@@ -501,8 +526,8 @@
               (:too-hairy
                (when (policy cast (>= safety inhibit-warnings))
                  (let* ((*compiler-error-context* cast)
-                       (type (cast-asserted-type cast))
-                       (value-type (coerce-to-values type)))
+                        (type (cast-asserted-type cast))
+                        (value-type (coerce-to-values type)))
                    (compiler-notify
                     "Type assertion too complex to check:~@
                     ~/sb-impl:print-type/.~a"
@@ -520,6 +545,8 @@
                                    (make-values-type (append (values-type-required value-type)
                                                              (values-type-optional value-type)))))
                           ("")))))
+
                (setf (cast-type-to-check cast) *wild-type*)
                (setf (cast-%type-check cast) nil)))))))
     generated))
+

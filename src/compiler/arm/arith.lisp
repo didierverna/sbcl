@@ -167,10 +167,14 @@
 (define-binop + 4 add :neg-op sub)
 (define-binop - 4 sub :neg-op add)
 (define-binop logand 2 and :cop bic :invert-y t :try-single-op t)
-(define-binop logandc1 2 bic :cop orr :arg-swap t :invert-y t :invert-r t)
 (define-binop logandc2 2 bic)
 (define-binop logior 2 orr)
 (define-binop logxor 2 eor)
+
+(define-vop (fast-logandc2/unsigned-signed=>unsigned fast-logandc2/unsigned=>unsigned)
+  (:args (x :scs (unsigned-reg))
+         (y :scs (signed-reg)))
+  (:arg-types unsigned-num signed-num))
 
 (define-vop (fast-logior-unsigned-signed=>signed fast-safe-arith-op)
   (:args (x :scs (unsigned-reg))
@@ -236,8 +240,14 @@
 (define-vop (fast-logand/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
   (:args (x :scs (signed-reg) :target r)
          (y :scs (unsigned-reg) :target r))
-  (:arg-types signed-num unsigned-num)
-  (:translate logand))
+  (:arg-types signed-num unsigned-num))
+
+(define-vop (fast-logand-c/signed-unsigned=>unsigned fast-logand-c/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r))
+  (:arg-types signed-num (:constant (eql #.most-positive-word)))
+  (:ignore y)
+  (:generator 1
+    (move r x)))
 
 (define-source-transform logeqv (&rest args)
   (if (oddp (length args))
@@ -531,7 +541,6 @@
   ;; (define-modular-backend logeqv)
   ;; (define-modular-backend lognand)
   ;; (define-modular-backend lognor)
-  (define-modular-backend logandc1)
   (define-modular-backend logandc2)
   ;; (define-modular-backend logorc1)
   ;; (define-modular-backend logorc2)
@@ -885,9 +894,6 @@
     (inst umull lo temp x y)
     (inst bic hi temp fixnum-tag-mask)))
 
-(define-vop (bignum-lognot lognot-mod32/unsigned=>unsigned)
-  (:translate sb-bignum:%lognot))
-
 (define-vop (bignum-floor)
   (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
@@ -940,3 +946,17 @@
   (:translate sb-bignum:%ashl)
   (:generator 1
     (inst mov result (lsl digit count))))
+
+(define-vop ()
+  (:translate fastrem-32)
+  (:policy :fast-safe)
+  (:args (dividend :scs (unsigned-reg))
+         (c :scs (unsigned-reg))
+         (divisor :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num unsigned-num)
+  (:results (remainder :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 10
+    (inst mul temp dividend c) ; keep only the low 32 bits
+    (inst umull temp remainder temp divisor))) ; keep only the high 32 bits

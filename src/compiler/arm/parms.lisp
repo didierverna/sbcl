@@ -30,9 +30,6 @@
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 32)
@@ -72,17 +69,17 @@
 
 (progn
   #+(or linux netbsd)
-  (!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
+  (gc-space-setup #x04000000 :dynamic-space-start #x4f000000)
   #+openbsd
-  (!gencgc-space-setup #x04000000 :dynamic-space-start #x10000000))
+  (gc-space-setup #x04000000 :dynamic-space-start #x10000000))
 
 (defconstant alien-linkage-table-growth-direction :down)
 (defconstant alien-linkage-table-entry-size 16)
 ;;; Link these as data entries so that we store only the address of the
-;;; handwritten assembly code in the linkage able, and not a trampoline
+;;; handwritten assembly code in the alien linkage table, and not a trampoline
 ;;; to the trampoline. The ALLOCATION macro just wants an address.
-(setq *linkage-space-predefined-entries* '(("alloc_tramp" t)
-                                           ("list_alloc_tramp" t)))
+(setq *alien-linkage-table-predefined-entries* '(("alloc_tramp" t)
+                                                 ("list_alloc_tramp" t)))
 
 
 ;;;; other miscellaneous constants

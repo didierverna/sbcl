@@ -18,7 +18,7 @@
  * more information.
  */
 
-#include "genesis/config.h"
+#include "genesis/sbcl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,11 +71,18 @@
 #endif
 
 #include "wrap.h"
-#include "gc.h"
+#include "gc-typedefs.h" // for page_index_t
+#include "os.h" // for os_vm_size_t
+
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_64_BIT
+# define CAST_SIZEOF (unsigned long)
+#else
+# define CAST_SIZEOF
+#endif
 
 #define DEFTYPE(lispname,cname) { cname foo; \
     printf("(define-alien-type " lispname " (%s %lu))\n", \
-           (((foo=-1)<0) ? "signed" : "unsigned"), (8LU * (sizeof foo))); }
+           (((foo=-1)<0) ? "signed" : "unsigned"), (8LU * CAST_SIZEOF (sizeof foo))); }
 
 #define DEFSTRUCT(lispname,cname,body) { cname bar; \
     printf("(define-alien-type nil\n  (struct %s", #lispname); \
@@ -85,7 +92,7 @@
     printf("\n          (%s (%s %lu))", \
            #lispname, \
            (((bar.cname=-1)<0) ? "signed" : "unsigned"), \
-           (8LU * (sizeof bar.cname)))
+           (8LU * CAST_SIZEOF (sizeof bar.cname)))
 
 #define DEFCONSTANT(lispname,cname) \
   if (cname<0) defconstant_neg(lispname, cname); else defconstant(lispname,cname)
@@ -344,6 +351,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 #endif // !WIN32
     printf("\n");
 
+#if !defined(LISP_FEATURE_AVOID_CLOCK_GETTIME)
 #ifdef LISP_FEATURE_UNIX
     DEFCONSTANT("clock-realtime", CLOCK_REALTIME);
     DEFCONSTANT("clock-monotonic", CLOCK_MONOTONIC);
@@ -366,6 +374,7 @@ main(int argc, char __attribute__((unused)) *argv[])
     defconstant("clock-boottime-alarn", CLOCK_BOOTTIME_ALARM);
 #endif
     DEFCONSTANT("clock-thread-cputime-id", CLOCK_THREAD_CPUTIME_ID);
+#endif
 #endif
     printf(";;; structures\n");
     DEFSTRUCT(timeval, struct timeval,
@@ -397,7 +406,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 #endif
 
     printf("(in-package \"SB-KERNEL\")\n\n");
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
     printf(";;; GENCGC related\n");
     DEFTYPE("page-index-t", page_index_t);
     DEFTYPE("generation-index-t", generation_index_t);

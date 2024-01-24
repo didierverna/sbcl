@@ -34,6 +34,12 @@
 
   (values))
 
+(defun var-unused-before-sets-p (var)
+  (when (lambda-var-sets var)
+    (loop for ref in (leaf-refs var)
+          always (loop for set in (lambda-var-sets var)
+                       thereis (node-dominates-p set ref)))))
+
 ;;; We have to allocate the home TNs for variables before we can call
 ;;; ASSIGN-IR2-ENVIRONMENT so that we can close over TNs that haven't
 ;;; had their home environment assigned yet. Here we evaluate the
@@ -45,44 +51,62 @@
   (declare (type clambda fun))
   (dolist (var (lambda-vars fun))
     (when (leaf-refs var)
-      (let* (ptype-info
-             (type (if (lambda-var-indirect var)
-                       (if (lambda-var-explicit-value-cell var)
-                           *backend-t-primitive-type*
-                           (or (first
-                                (setf ptype-info
-                                      (primitive-type-indirect-cell-type
-                                       (primitive-type (leaf-type var)))))
-                               *backend-t-primitive-type*))
-                       (primitive-type (leaf-type var))))
-             (res (make-normal-tn type))
-             (node (lambda-bind fun))
+      (let* ((node (lambda-bind fun))
              (debug-variable-p (not (or (and let-p (policy node (< debug 3)))
                                         (policy node (zerop debug))
                                         (policy node (= speed 3))))))
-        (cond
-          ((and (lambda-var-indirect var)
-                (not (lambda-var-explicit-value-cell var)))
-           ;; Force closed-over indirect LAMBDA-VARs without explicit
-           ;; VALUE-CELLs to the stack, and make sure that they are
-           ;; live over the dynamic contour of the environment.
-           (setf (tn-sc res) (if ptype-info
-                                 (second ptype-info)
-                                 (sc-or-lose 'sb-vm::control-stack)))
-           (environment-live-tn res (lambda-environment fun)))
+        (if (and let-p
+                 (not debug-variable-p)
+                 (not (lambda-var-indirect var))
+                 (var-unused-before-sets-p var))
+            (let* ((type (loop with union
+                               for set in (lambda-var-sets var)
+                               for type = (lvar-type (set-value set))
+                               do (setf union
+                                        (if union
+                                            (type-union union type)
+                                            type))
+                               finally (return union)))
+                   (ptype (primitive-type type))
+                   (res (make-normal-tn ptype)))
+              (setf (tn-leaf res) var)
+              (setf (tn-type res) type)
+              (setf (leaf-info var) res
+                    (leaf-ever-used var) 'initial-unused))
+            (let* (ptype-info
+                   (type (if (lambda-var-indirect var)
+                             (if (lambda-var-explicit-value-cell var)
+                                 *backend-t-primitive-type*
+                                 (or (first
+                                      (setf ptype-info
+                                            (primitive-type-indirect-cell-type
+                                             (primitive-type (leaf-type var)))))
+                                     *backend-t-primitive-type*))
+                             (primitive-type (leaf-type var))))
+                   (res (make-normal-tn type)))
+              (cond
+                ((and (lambda-var-indirect var)
+                      (not (lambda-var-explicit-value-cell var)))
+                 ;; Force closed-over indirect LAMBDA-VARs without explicit
+                 ;; VALUE-CELLs to the stack, and make sure that they are
+                 ;; live over the dynamic contour of the environment.
+                 (setf (tn-sc res) (if ptype-info
+                                       (second ptype-info)
+                                       (sc-or-lose 'sb-vm::control-stack)))
+                 (environment-live-tn res (lambda-environment fun)))
 
-          (debug-variable-p
-           ;; If it's a constant it may end up being never read,
-           ;; replaced by COERCE-FROM-CONSTANT.
-           ;; Yet it might get saved on the stack, but since it's
-           ;; never read no stack space is allocated for it in the
-           ;; callee frame.
-           (unless (type-singleton-p (leaf-type var))
-             (environment-debug-live-tn res (lambda-environment fun)))))
+                (debug-variable-p
+                 ;; If it's a constant it may end up being never read,
+                 ;; replaced by COERCE-FROM-CONSTANT.
+                 ;; Yet it might get saved on the stack, but since it's
+                 ;; never read no stack space is allocated for it in the
+                 ;; callee frame.
+                 (unless (type-singleton-p (leaf-type var))
+                   (environment-debug-live-tn res (lambda-environment fun)))))
 
-        (setf (tn-leaf res) var)
-        (setf (tn-type res) (leaf-type var))
-        (setf (leaf-info var) res))))
+              (setf (tn-leaf res) var)
+              (setf (tn-type res) (leaf-type var))
+              (setf (leaf-info var) res))))))
   (values))
 
 ;;; Give CLAMBDA an IR2-ENVIRONMENT structure. (And in order to
@@ -153,7 +177,14 @@
 (defun use-standard-returns (tails)
   (declare (type tail-set tails))
   (let ((funs (tail-set-funs tails)))
-    (or (find-if #'xep-p funs)
+    (or (loop for fun in funs
+              for fun-info = (info :function :info (functional-%source-name fun))
+              when
+              (and fun-info
+                   (ir1-attributep (fun-info-attributes fun-info) unboxed-return)
+                   (not (lambda-inline-expanded fun)))
+              return :unboxed)
+        (find-if #'xep-p funs)
         (some (lambda (fun) (policy fun (>= insert-debug-catch 2))) funs)
         (block punt
           (dolist (fun funs t)
@@ -168,12 +199,12 @@
                                (unless (and (basic-combination-p node)
                                             (eq (basic-combination-info node) :full))
                                  (return)))))))
-                 (when (and (basic-combination-p dest)
-                            (not (node-tail-p dest))
-                            (eq (basic-combination-fun dest) lvar)
-                            (eq (basic-combination-kind dest) :local)
-                            (not (all-returns-tail-calls-p dest)))
-                   (return-from punt nil))))))))))
+                  (when (and (basic-combination-p dest)
+                             (not (node-tail-p dest))
+                             (eq (basic-combination-fun dest) lvar)
+                             (eq (basic-combination-kind dest) :local)
+                             (not (all-returns-tail-calls-p dest)))
+                    (return-from punt nil))))))))))
 
 ;;; If policy indicates, give an efficiency note about our inability to
 ;;; use the known return convention. We try to find a function in the
@@ -220,16 +251,26 @@
       (when (and (eq count :unknown) (not use-standard)
                  (not (eq (tail-set-type tails) *empty-type*)))
         (return-value-efficiency-note tails))
-      (if (or (eq count :unknown) use-standard)
-          (make-return-info :kind :unknown
-                            :count count
-                            :primitive-types ptypes
-                            :types types)
-          (make-return-info :kind :fixed
-                            :count count
-                            :primitive-types ptypes
-                            :types types
-                            :locations (mapcar #'make-normal-tn ptypes))))))
+      (cond ((eq use-standard :unboxed)
+             (make-return-info :kind :unboxed
+                               :count count
+                               :primitive-types ptypes
+                               :types types
+                               :locations
+                               (let ((state (sb-vm::make-fixed-call-args-state)))
+                                 (loop for type in ptypes
+                                       collect (sb-vm::fixed-call-arg-location type state)))))
+            ((or (eq count :unknown) use-standard)
+             (make-return-info :kind :unknown
+                               :count count
+                               :primitive-types ptypes
+                               :types types))
+            (t
+             (make-return-info :kind :fixed
+                               :count count
+                               :primitive-types ptypes
+                               :types types
+                               :locations (mapcar #'make-normal-tn ptypes)))))))
 
 ;;; If TAIL-SET doesn't have any INFO, then make a RETURN-INFO for it.
 (defun assign-return-locations (fun)
@@ -241,7 +282,7 @@
          (return (lambda-return fun)))
     (when (and return
                (xep-p fun))
-      (aver (eq (return-info-kind returns) :unknown))))
+      (aver (memq (return-info-kind returns) '(:unknown :unboxed)))))
   (values))
 
 ;;; Make an IR2-NLX-INFO structure for each NLX entry point recorded.

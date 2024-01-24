@@ -11,29 +11,59 @@
 
 (in-package "SB-IMPL")
 
+;;; If loading a weak ref requires a read barrier (as per #+weak-vector-readbarrier)
+;;; then the finalizer table based on a split-ordered-list does not work as-is.
+;;; It could be made to via a few approaches of varying levels of difficulty:
+;;; * make the split-ordered-list contains keys which are weak pointers
+;;;   so that _only_ SB-VM:WEAK-POINTER-WIDETAG can weakly reference things.
+;;;   Also make the solist hash on the thing inside the weak-pointer
+;;;   rather than the address of the weak pointer. Similarly, detect
+;;;   address movement if the thing inside the weak pointer moves.
+;;; * turn SO-NODE into something that is not STRUCURE-OBJECT so that at least
+;;;   we can't accidentally use %INSTANCE-REF to circumvent a read barrier.
+;;; * put a read barrier on SO-NODE-KEY, but only for the finalizer table.
+;;;   %INSTANCE-REF with an index that is (GET-DSD-INDEX SO-DATA-NODE SO-KEY)
+;;;   has to not only re-tag an untagged pointer, but also ensure that a concurrent
+;;;   sweep phase isn't in the midst of smashing weak pointers whose referent is
+;;;   dead. But there's no good way to do that on arbitrary structure-object slots.
+;;;   The vop translator for instance-ref could potentially do the right thing on
+;;;   a known structure type, but I would worry that interpreted instance-ref would
+;;;   either do the wrong thing, or pessimize _every_ call. And even then,
+;;;   compile-time instance-ref could also do the wrong thing unless we make
+;;;   the general case of instance-ref assume the worst, namely that it has to
+;;;   check whether the slot is weak.
+;;; Though the first is conceptually easy, I don't feel like doing anything yet.
+;;; Therefore, if #+weak-vector-readbarrier is enabled, simply fall back upon the
+;;; old alist of (weakptr . action) which should be adequate for the time being.
+#+weak-vector-readbarrier
+(progn
+  (define-load-time-global **finalizer-store** nil)
+  (declaim (list **finalizer-store**)))
+
 ;;; Finalizer table keys are fixnums - NOT objects or SB-VM:WORD - representing
 ;;; the aligned base address of a lisp object. This is purposely opaque to GC
 ;;; so that we don't need a special variant of lockfree list that adds weakness.
 ;;; GC understands the untagged pointer nature of the keys in this table
 ;;; in exactly the one place that it needs to.
-(define-load-time-global **finalizer-store** (sb-lockless:make-so-map/addr))
-(declaim (type sb-lockless::split-ordered-list **finalizer-store**))
+#-weak-vector-readbarrier
+(progn
+  (define-load-time-global **finalizer-store** (sb-lockless:make-so-map/addr))
+  (declaim (type sb-lockless::split-ordered-list **finalizer-store**)))
 
 ;;; A mutex is used during rehash due to key movement, but NOT if rehashing
 ;;; due to table growth. (If growing organically, hashes are valid, so you'll
 ;;; find what you're looking for if it's there. Invalid hashes are trickier)
-(define-load-time-global *finalizer-lock*
-    ;; disambiguate this lock name from the finalizer _thread's_ lock name
-    (sb-thread:make-mutex :name "**FINALIZER-STORE**"))
+(define-load-time-global *finalizer-lock* (sb-thread:make-mutex :name "finalizer"))
 (declaim (type sb-thread:mutex *finalizer-lock*))
 
 ;;; List of nodes removed from the split-ordered list due to key movement.
 ;;; These get reinserted when searching the table.
-;;; It is built of lockfree list nodes without using the full algorithm of Harris,
-;;; and has _two_ possible empty list markers: +TAIL+ indicates that rehashing
-;;; reached the last worklist item and is nominally still processing; while NIL
-;;; indicates no work to be done at all.
-(declaim (type (or null sb-lockless::list-node) *finalizer-rehashlist*))
+;;; The value of *FINALIZER-REHASHLIST* has to always be non-nil
+;;; when rehashing is in progress. FINALIZE and CANCEL-FINALIZATION
+;;; use the double-checked lock pattern to decide whether there
+;;; might be any in-flight keys based on the list being non-nil.
+;;; It can only be reset to NIL while holding the mutex.
+(declaim (type (or list (eql 0)) *finalizer-rehashlist*))
 (define-load-time-global *finalizer-rehashlist* nil)
 
 ;;; List of all nodes whose finalizer(s) should be invoked.
@@ -65,12 +95,30 @@
 ;;; both try to rehash, and presumably one will have no work to do. (Unless GC moves
 ;;; even more things after the first thread to rehash leaves its mutex scope)
 (macrolet
-    ((base-pointer (k) ; Cast K to fixnum in the DESCRIPTOR-SAP representation.
-       `(%make-lisp-obj (logandc2 (get-lisp-obj-address ,k) sb-vm:lowtag-mask)))
+    ((base-pointer (object) ; Cast OBJECT to fixnum in the DESCRIPTOR-SAP representation.
+       `(let* ((o ,object)
+               (address
+                (get-lisp-obj-address
+                 (if (simple-fun-p o) (fun-code-header o) o))))
+          (%make-lisp-obj (logandc2 address sb-vm:lowtag-mask))))
      (insert (k v)
        `(with-pinned-objects (,k)
-          (prog1 (sb-lockless:so-insert table (base-pointer ,k) ,v)
+          (prog1 (let ((node (sb-lockless:so-insert table (base-pointer ,k) ,v)))
+                   ;; I didn't feel like changing INSERT to return a FINALIZER-NODE, though I should.
+                   ;; Having the right type enables an extra verification in GC but it's not critical
+                   ;; for correctness.
+                   (%set-instance-layout node ,(sb-kernel:find-layout 'sb-lockless::finalizer-node))
+                   node)
             (sb-thread:barrier (:write)))))
+     (update (accessor)
+       ;; Decide how to represent NEW-DATA
+       ;;   choice (a) FUNCTION | VALUE-CELL = just one finalizer
+       ;;   choice (b) LIST of (OR FUNCTION VALUE-CELL) = more than one
+       `(let ((old-data (,accessor node)))
+          (loop
+           (let ((new-data (if old-data (cons action (ensure-list old-data)) action)))
+             (when (eq old-data (setf old-data (cas (,accessor node) old-data new-data)))
+               (return object))))))
      (get-table ()
        ;; The global var itself is actually invariant, but I suspect that lookups
        ;; need to ensure that writes became visible.
@@ -86,50 +134,48 @@
             (with-system-mutex (*finalizer-lock*)
               (let* ((found (%finalizers-rehash object table))
                      (result ,result-expression))
-                ;; Regardless of what %finalizers-rehash did, try to change +TAIL+ to NIL
-                ;; so that threads don't attempt to acquire the mutex until after next GC.
-                (cas *finalizer-rehashlist* sb-lockless:+tail+ nil)
+                ;; Change 0 to NIL as an optimization which avoids acquiring the mutex
+                ;; until some keys get moved again.
+                (cas *finalizer-rehashlist* 0 nil)
                 result))))))
 
-;;; Scan the rehashlist looking for KEY, stopping and returning its list node if found.
-;;; Each node seen prior to stopping will be reinserted into either the triggered
-;;; list or the finalizer store.
+;;; Insert everything from *finalizer-rehashlist* into TABLE.
 ;;; There's no race with other threads now, except for a GCing thread.
 ;;; Thus we need atomic operations despite the mutex.
 ;;; Possible TODO: 'target-hash-table' uses WITH-PINNED-OBJECT-ITERATOR
 ;;; which on the precise stack platforms is slightly preferable
 ;;; to repeated binds and unbinds of *PINNED-OBJECTS.
 (defun %finalizers-rehash (key table)
-  (let ((node *finalizer-rehashlist*))
-    (loop
-      ;; Instead of setting *FINALIZER-REHASHLIST* to NIL on the last item,
-      ;; it becomes +TAIL+ which forces other threads to wait on the mutex.
-      ;; Otherwise they have no guarantee that the item of interest
-      ;; to them isn't the one which is currently in flight in this loop.
-      (when (or (eq node sb-lockless:+tail+) (null node))
-        (return))
-      (let* ((next (sb-lockless:%node-next (the sb-lockless::so-data-node node)))
-             (actual (cas *finalizer-rehashlist* node next))) ; like ATOMIC-POP
-        (if (eq node actual)
-            (let* ((weakptr (the weak-pointer (sb-lockless:so-key node)))
-                   (obj (weak-pointer-value weakptr)))
-              (cond ((null obj) ; broken ptr, transfer to triggered list
-                     (atomic-push (sb-lockless:so-data node) *finalizers-triggered*)
-                     (setf (sb-lockless:so-key node) 0)) ; don't need the weak-pointer
-                    ((neq obj key) ; re-insert
-                     ;; GC has a nonzero amount of extra work for each weak-pointer
-                     ;; but not if the value in it is NIL
-                     (%primitive sb-c:set-slot weakptr nil 'setf sb-vm:weak-pointer-value-slot
-                                 sb-vm:other-pointer-lowtag)
-                     (insert obj (sb-lockless:so-data node)))
-                    (t ; This is the _least_ likely case, so test it last
-                     (return node))) ; FOUND
-              (setq node next))
-            (setq node actual))))))
+  (labels ((our-pop (list)
+             (if (or (eq list nil) (eq list 0))
+                 (values nil nil)
+                 (let ((new (or (cdr list) 0)))
+                   (if (eq list (setf list (cas *finalizer-rehashlist* list new)))
+                       (values (car (truly-the list list)) new)
+                       (our-pop list))))))
+    (let ((list *finalizer-rehashlist*)
+          (pair))
+      (loop (multiple-value-setq (pair list) (our-pop list))
+            (cond ((null pair) (return nil))
+                  ((eq (car pair) key) ; no need to finish rehashing
+                   (return pair))
+                  (t (insert (car pair) (cdr pair))))))))
 
 (defun finalizers-rehash ()
-  ;; won't find T in the rehashlist, so this rehashes everything
-  (%finalizers-rehash t (get-table)))
+  (with-system-mutex (*finalizer-lock*)
+    #+weak-vector-readbarrier
+    ;; Scan for broken weak pointers. Doesn't matter that this conses.
+    ;; It's only temporary until I can come up with something better.
+    (setq **finalizer-store**
+          (delete-if
+           (lambda (cell)
+             (cond ((weak-pointer-value (car cell)) nil) ; keep it
+                   (t (atomic-push (cdr cell) *finalizers-triggered*)
+                      t))) ; delete it
+           **finalizer-store**))
+    ;; won't find T in the rehashlist, so this rehashes everything
+    (%finalizers-rehash t (get-table))
+    (cas *finalizer-rehashlist* 0 nil)))
 
 ;;; For debugging/regression testing
 (export '%lookup-finalizer)
@@ -195,45 +241,57 @@ Examples:
       (if (eq space :static)
           (error "Cannot finalize ~S." object)
           ;; silently discard finalizers on file streams in arenas I guess
+          ;; and also silently do nothing on fixnum/character.
           (progn ; (warn "Will not finalize ~S." object)
             (return-from finalize object)))))
-  (let* ((node
-          (with-pinned-objects (object)
-            (let ((table (get-table)))
-              ;; Attempt 1: optimistically look in the solist assuming valid hashes
-              (or (sb-lockless:so-find table (base-pointer object))
-                  ;; Attempt 2: perform rehashing and examine each key while looping
-                  (with-rehashing (when found
-                                    (insert object (sb-lockless:so-data found))))
-                  ;; Attempt 3: another thread could have done all the rehashing and
-                  ;; inserted OBJECT. If not, this will insert a new node.
-                  (insert object nil)))))
-         ;; Conditionally wrapping a VALUE-CELL around FUNCTION is a means to indicate
-         ;; the :DONT-SAVE option without inventing a struct of a function and boolean.
-         ;; I believe that most finalizers will *not* have the :DONT-SAVE flag set.
-         ;; As evidence the https://github.com/trivial-garbage/trivial-garbage portability
-         ;; library does not offer a way to specify :DONT-SAVE.
-         (action
-          (if dont-save (sb-sys:%primitive sb-vm::make-value-cell function nil) function))
-         (old-data (sb-lockless:so-data node)))
-    (loop
-      ;; Decide how to represent NEW-DATA
-      ;;   choice (a) FUNCTION | VALUE-CELL = just one finalizer
-      ;;   choice (b) LIST of (OR FUNCTION VALUE-CELL) = more than one
-      (let ((new-data (if old-data (cons action (ensure-list old-data)) action)))
-        (when (eq old-data
-                  (setf old-data (cas (sb-lockless:so-data node) old-data new-data)))
-          (return object))))))
+  ;; Wrapping a VALUE-CELL around FUNCTION indicates the :DONT-SAVE option without
+  ;; having to invent a struct of a function and boolean.
+  ;; I believe that most finalizers will *not* have the :DONT-SAVE flag set.
+  ;; As evidence the https://github.com/trivial-garbage/trivial-garbage portability
+  ;; library does not offer a way to specify :DONT-SAVE.
+  (let ((action
+         (if dont-save (sb-sys:%primitive sb-vm::make-value-cell function nil) function)))
+    (with-pinned-objects (object)
+      #+weak-vector-readbarrier
+      (with-system-mutex (*finalizer-lock*)
+        (let* ((table **finalizer-store**)
+               (node (assoc object table :key #'weak-pointer-value :test #'eq)))
+          (unless node
+            (setq node (cons (make-weak-pointer object) nil))
+            (push node **finalizer-store**))
+          (update cdr)))
+      #-weak-vector-readbarrier
+      (let* ((node
+              (let ((table (get-table)))
+                ;; Attempt 1: optimistically look in the solist assuming valid hashes
+                (or (sb-lockless:so-find table (base-pointer object))
+                    ;; Attempt 2: perform rehashing and examine each key while looping
+                    (with-rehashing (when found
+                                      (insert object (cdr found))))
+                    ;; Attempt 3: another thread could have done all the rehashing and
+                    ;; inserted OBJECT. If not, this will insert a new node.
+                    (insert object nil)))))
+        (update sb-lockless:so-data)))))
 
 (defun cancel-finalization (object)
   "Cancel all finalizations for OBJECT, returning T if it had a finalizer."
-  (when (and object (heap-allocated-p object))
+  (when (and object (sb-vm:is-lisp-pointer (get-lisp-obj-address object)))
     (with-pinned-objects (object)
+      #+weak-vector-readbarrier
+      (with-system-mutex (*finalizer-lock*)
+        (let* ((table **finalizer-store**)
+               (node (assoc object table :key #'weak-pointer-value :test #'eq)))
+          (when node
+            (setf **finalizer-store** (setq table (delq1 node table)))
+            t)))
+      #-weak-vector-readbarrier
       (let ((table (get-table)))
         ;; Attempt 1: optimistically look in the solist assuming valid hashes
         (or (sb-lockless:so-delete table (base-pointer object))
             ;; Attempt 2: perform rehashing and examine each key while looping
-            (with-rehashing found) ; implies no re-insert, so we're done
+            (with-rehashing
+                (when found
+                  t)) ; implies no re-insert, so we're done
             ;; Attempt 3: Give it another chance. Third time's a charm?
             ;; (Technically do not need this if current thread rehashed? not sure)
             (sb-lockless:so-delete table (base-pointer object)))))))
@@ -244,83 +302,100 @@ Examples:
 ;;; So for now: MUST be wrapped in WITHOUT-GCING by calling code
 (export 'finalizer-object) ; for regression test
 (defun finalizer-object (node)
-  (sb-vm::reconstitute-object (sb-lockless:so-key node)))
+  ;; if no lowtag on NEXT, then NODE is deleted, or is on its way to being deleted
+  (if (fixnump (sb-lockless:%node-next node))
+      (bug "can't reconstitute key of deleted finalizer node")
+      (sb-vm::reconstitute-object (sb-lockless:so-key node))))
 
-(defun finalizers-deinit ()
-  (when (null *finalizer-rehashlist*)
-    (setq *finalizer-rehashlist* sb-lockless:+tail+))
-  ;; invalidate fd-streams
-  (flet ((flameout (object)
-           (push (list object
-                       (ansi-stream-in object)
-                       (ansi-stream-bin object)
-                       (ansi-stream-n-bin object)
-                       (ansi-stream-cout object)
-                       (ansi-stream-bout object)
-                       (ansi-stream-sout object)
-                       (ansi-stream-misc object))
-                 *streams-closed-by-slad*)
-           ;; Nobody asked us to actually close the fd,
-           ;; so just make it unusable.
-           (set-closed-flame-by-slad object)))
-    (do ((node *finalizer-rehashlist* (sb-lockless:%node-next node)))
-        ((eq node sb-lockless:+tail+))
-      (let ((object (weak-pointer-value (sb-lockless:so-key node))))
-        (when (fd-stream-p object)
-          (flameout object))))
-    (let* ((table **finalizer-store**)
-           ;; Avoid consing inside SO-MAPLIST
-           (array (make-array (sb-lockless::so-count table)))
-           (n 0))
-      (without-gcing
-       (sb-lockless:so-maplist
-        (lambda (node)
-          (let ((object (finalizer-object node)))
-            (when (fd-stream-p object)
-              (setf (aref array n) object)
-              (incf n))))
-        table))
-      (dotimes (i n)
-        (flameout (aref array i)))))
-  ;; remove :dont-save finalizers
-  (flet ((filter-actions (node &aux (actions (sb-lockless:so-data node)))
-           (cond ((listp actions)
-                  ;; (NOT FUNCTIONP) implies :DONT-SAVE
-                  (let ((new (delete-if-not #'functionp actions)))
-                    ;; If SINGLETON-P then just store the one. NIL stays as-is
-                    (setf (sb-lockless:so-data node) (if (cdr new) new (car new)))))
-                 ((functionp actions) actions))))
-    ;; Process the need-rehash items, leaving them in that list if applicable.
-    ;; Nodes already in rehashlist might actually be subject to removal
-    ;; either because the object died, or all its actions are :DONT-SAVE.
-    (do ((prev nil) ; no dummy node, you dummy
-         (this *finalizer-rehashlist*))
-        ((eq this sb-lockless:+tail+))
-      (let ((next (sb-lockless:%node-next this)))
-        (cond ((and (filter-actions this)
-                    (weak-pointer-value (sb-lockless:so-key this)))
-               (setf prev this this next)) ; keep
-              (t ; discard
-               (setf this next)
-               (if prev
-                   (setf (sb-lockless:%node-next prev) this)
-                   (setf *finalizer-rehashlist* this))))))
-    ;; Process the hashed items, moving them to the rehash list if applicable.
-    ;; Safely resurrecting objects by their address requires WITHOUT-GCING.
+;;; Perform various cleanups around finalizers
+(defglobal *saved-finalizers* nil)
+(defun finalizers-deinit (&aux save)
+  (labels
+      ((filter-actions (object actions)
+         (when (fd-stream-p object)
+           (flameout object)
+           ;; Never save a finalizer on an fd-stream. If it runs, it might close
+           ;; a file descriptor open to something else. Too bad if a user adds a finalizer
+           ;; on an fd-stream- we'll drop it. It's possible to figure out whether this
+           ;; is a closure made by fd-stream, but saving finalizers seems like such a
+           ;; generally bad idea anyway to be honest.
+           (return-from filter-actions))
+         ;; Remove any finalizer created with the DONT-SAVE option. The rest are saved
+         ;; but that's actually somewhat bogus anyway for two reasons: (1) there's no
+         ;; guarantee that finalizers on objects killed in the last GC of save-lisp-and-die
+         ;; will be executed; and (2) dumped objects are immortal.
+         ;; Therefore saved finalizers are best avoided.
+         (let ((list
+                (cond ((functionp actions) (list actions)) ; FUNCTIONP implies save it
+                      ((listp actions) (delete-if-not #'functionp actions)))))
+           ;; FINALIZERS-REINIT employs FINALIZE to reinstall saved finalizers. That
+           ;; function does not accept a list of actions, so insert each action
+           ;; individually if there is more than one, which there probably isn't.
+           (dolist (action list)
+             (push (cons (make-weak-pointer object) action) save))))
+       (flameout (object)
+         (push (list object
+                     (ansi-stream-in object)
+                     (ansi-stream-bin object)
+                     (ansi-stream-n-bin object)
+                     (ansi-stream-cout object)
+                     (ansi-stream-bout object)
+                     (ansi-stream-sout object)
+                     (ansi-stream-misc object))
+               *streams-closed-by-slad*)
+         ;; Nobody asked us to actually close the fd,
+         ;; so just make it unusable.
+         (set-closed-flame-by-slad object)))
+    #+weak-vector-readbarrier
     (without-gcing
-     (sb-lockless:so-maplist
-      (lambda (node)
-        (when (filter-actions node)
-          ;; re-use the node
-          (setf (sb-lockless:so-key node) (make-weak-pointer (finalizer-object node))
-                (sb-lockless:%node-next node) *finalizer-rehashlist*
-                *finalizer-rehashlist* node)))
-       **finalizer-store**)))
-  ;; We don't promise to execute pending actions on save-lisp-and-die.
-  ;; Could we? Should we?
+        (dolist (x **finalizer-store** (setq **finalizer-store** nil))
+          (awhen (weak-pointer-value (car x))
+            (filter-actions it (cdr x)))))
+    #-weak-vector-readbarrier
+    ;; Create a unified collection of finalized objects. Use a plain list of
+    ;; weak pointers for this purpose.
+    (let* ((table **finalizer-store**)
+           (count (sb-lockless::so-count table))
+           ;; Preallocate to avoid consing inside WITHOUT-GCING
+           (keys (make-array count))
+           (values (make-array count))
+           (n 0))
+      ;; As much as we should eschew WITHOUT-GCING in system internals, this code is
+      ;; single-threaded and preparing to exit, so it's kind of excusable.
+      (without-gcing
+       ;; SO-MAPLIST skips deleted nodes
+       (sb-lockless:so-maplist (lambda (node)
+                                 (setf (aref keys n) (finalizer-object node)
+                                       (aref values n) (sb-lockless:so-data node))
+                                 (incf n))
+                               table)
+        ;; Clobber the split-ordered list so we don't run any finalizer twice
+        (setf **finalizer-store** (sb-lockless::make-so-map/addr)))
+      (dotimes (i n) (filter-actions (aref keys i) (aref values i)))
+      ;; Add in the items in need of rehash
+      (do ((tail *finalizer-rehashlist* (cdr tail)))
+          ((atom tail)) ; could be terminated by either 0 or NIL
+        (let ((pair (car tail)))
+          (filter-actions (car pair) (cdr pair))))))
+  ;; Clobber the rehashlist
+  (setf *finalizer-rehashlist* nil)
+  ;; Drop any triggered actions, becaused the system is in a state where
+  ;; executing random user code is probably undesirable if not impossible
+  ;; given that OS-DEINIT and CLOSE-SHARED-OBJECTS were already invoked.
   (setq *finalizers-triggered* nil)
-  ;; Create an empty table. FINALIZE will reinsert things when next called.
-  (setf **finalizer-store** (sb-lockless::make-so-map/addr)))
+  (setq *saved-finalizers* save))
+
+(defun finalizers-reinit ()
+  (dolist (pair (prog1 *saved-finalizers* (setq *saved-finalizers* nil)))
+    (let ((key (weak-pointer-value (car pair))))
+      (if key
+          (finalize key (cdr pair))
+          ;; Objects that died in the final GC do ** NOT ** get their finalizer
+          ;; run. Consider: some object that dies which acquired an OS resource
+          ;; identified by a file-descriptor that might now be open to
+          ;; some other descriptor.
+          ;; (atomic-push (cdr pair) *finalizers-triggered*)
+          ))))
 
 (defvar *in-a-finalizer* nil)
 (define-load-time-global *user-finalizer-runcount* 0)
@@ -328,7 +403,7 @@ Examples:
   (let* ((data (atomic-pop *finalizers-triggered*))
          (data-list (list data)))
     ;; DATA could already be a list. This is basically a no-consing ENSURE-LIST
-    (declare (truly-dynamic-extent data-list))
+    (declare (dynamic-extent data-list))
     (dolist (finalizer (if (listp data) data data-list) (not (null data)))
       ;; :DONT-SAVE finalizers are wrapped in value-cells. Unwrap as necessary
       (let ((fun (the function (if (functionp finalizer)
@@ -346,7 +421,7 @@ Examples:
 ;;; See the trace at the bottom of this file.
 (define-load-time-global *bg-compiler-function* nil)
 (defun run-pending-finalizers (&aux (system-finalizer-scratchpad (list 0)))
-  (declare (truly-dynamic-extent system-finalizer-scratchpad))
+  (declare (dynamic-extent system-finalizer-scratchpad))
   (finalizers-rehash)
   (loop
    ;; Perform no further work if trying to stop the thread, even if there is work.
@@ -424,6 +499,7 @@ Examples:
       (display (weak-pointer-value (sb-lockless:so-key node))))
     (format t "~&Hashed:~%")
     (sb-lockless:so-maplist (lambda (node)
+                              ;; For debugging only; caveat emptor.
                               (display (without-gcing (finalizer-object node))))
                             **finalizer-store**)))
 

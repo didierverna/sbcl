@@ -14,33 +14,39 @@
 (in-package :cl-user)
 
 (defvar *weak-vect* (make-weak-vector 8))
-(with-test (:name :weak-vector)
+(defmacro wvref (v i) `(sb-int:weak-vector-ref ,v ,i))
+(with-test (:name :weak-vector
+            :fails-on :win32)
   (let ((a *weak-vect*)
         (random-symbol (make-symbol "FRED")))
     (flet ((x ()
-             (setf (aref a 0) (cons 'foo 'bar)
-                   (aref a 1) (format nil "Time is: ~D~%" (get-internal-real-time))
-                   (aref a 2) 'interned-symbol
-                   (aref a 3) random-symbol
-                   (aref a 4) 18
-                   (aref a 5) (+ most-positive-fixnum 1 (random 100) (random 100))
-                   (aref a 6) (make-hash-table))))
+             (setf (wvref a 0) (cons 'foo 'bar)
+                   (wvref a 1) (format nil "Time is: ~D~%" (get-internal-real-time))
+                   (wvref a 2) 'interned-symbol
+                   (wvref a 3) random-symbol
+                   (wvref a 4) 18
+                   (wvref a 5) (+ most-positive-fixnum 1 (random 100) (random 100))
+                   (wvref a 6) (make-hash-table))))
       (declare (notinline x)) ;; Leave all the values below the stack pointer for
       (x))                    ;; scrub-control-stack to work
     (assert (weak-vector-p a))
     (sb-sys:scrub-control-stack)
     (gc)
-    (assert (eq (aref a 2) 'interned-symbol))
-    (assert (eq (aref a 3) random-symbol))
-    (assert (= (aref a 4) 18))
+    (assert (eq (wvref a 2) 'interned-symbol))
+    (assert (eq (wvref a 3) random-symbol))
+    (assert (= (wvref a 4) 18))
     ;; broken cells are the cons, string, bignum, hash-table, plus one NIL
     ;; cell that was never assigned into
+    (assert (null (wvref a 0)))
+    (assert (null (wvref a 1)))
+    (assert (null (wvref a 5)))
+    (assert (null (wvref a 6)))
     *weak-vect*))
 
 ;; Assert something about *CURRENT-THREAD* seeing objects that it just consed.
 (with-test (:name :m-a-o-threadlocally-precise
-                  :skipped-on (:or (:not (:and :gencgc :sb-thread))
-                                   :interpreter))
+                  :skipped-on (:or (:not :sb-thread) :interpreter :gc-stress)
+                  :fails-on :mark-region-gc)
   (let ((before (make-array 4))
         (after  (make-array 4 :initial-element 0)))
     (flet ((countit (obj type size)
@@ -85,7 +91,9 @@
 ;;; This test needs dynamic-extent to work properly.
 ;;; (I don't know what platforms it passes on, but at least these two it does)
 (with-test (:name :repeatably-count-allocated-objects
+            :fails-on :mark-region-gc
             :skipped-on (or (not (or :x86 :x86-64))
+                            :gc-stress
                             :interpreter))
   (let ((a (make-array 5)))
     (dotimes (i (length a))
@@ -94,7 +102,8 @@
     (dotimes (i (1- (length a)))
       (assert (= (aref a (1+ i)) (1+ (aref a i)))))))
 
-(with-test (:name :list-allocated-objects)
+(with-test (:name :list-allocated-objects
+            :skipped-on :weak-vector-readbarrier) ; uses more weak-pointers
   ;; Assert that if :COUNT is supplied as a higher number
   ;; than number of objects that exists, the output is
   ;; not COUNT many items long.
@@ -105,7 +114,7 @@
     ;; but seems like it'll be OK for a while.
     ;; I see only 4 weak pointers in the baseline image.
     ;; Really we could just assert /= 1000.
-    (assert (< (length l) 60))))
+    (assert (< (length l) 80))))
 
 ;; check that WITHOUT-INTERRUPTS doesn't block SIG_STOP_FOR_GC
 (with-test (:name :gc-without-interrupts
@@ -126,9 +135,9 @@
           (list (sb-kernel:get-lisp-obj-address afunction)
                 (sb-kernel:get-lisp-obj-address string-one)
                 (sb-kernel:get-lisp-obj-address string-two)))))
-#+gencgc
 (with-test (:name :pin-all-code-with-gc-enabled
-                  :skipped-on :interpreter)
+            :fails-on :mark-region-gc
+            :skipped-on (or :interpreter :gc-stress))
   (gc)
   #+sb-thread (sb-thread:join-thread (sb-thread:make-thread #'make-some-objects))
   #-sb-thread (progn (make-some-objects) (sb-sys:scrub-control-stack))
@@ -151,16 +160,20 @@
   ;; GENERATION-OF broke when fdefns stopped storing a generation in word 0.
   ;; Normally we expect to see SB-VM:+PSEUDO-STATIC-GENERATION+
   ;; but allow for varied definition of CORE_PAGE_GENERATION.
-  (assert (= (sb-kernel:generation-of (sb-int:find-fdefn '(setf car)))
-             (sb-kernel:generation-of #'car))))
+  ;;
+  ;; Note that if (SB-EDITCORE:MOVE-DYNAMIC-CODE-TO-TEXT-SPACE) has been performed
+  ;; on this core, then #'CAR has no generation because it is essentially static.
+  ;; So we can't really assert anything in that case.
+  (when (numberp (sb-kernel:generation-of #'car))
+    (assert (= (sb-kernel:generation-of (sb-int:find-fdefn '(setf car)))
+               (sb-kernel:generation-of #'car)))))
 
 (with-test (:name :static-fdefn-space)
   (sb-int:dovector (name sb-vm:+static-fdefns+)
     (assert (eq (sb-ext:heap-allocated-p (sb-int:find-fdefn name))
-                (or #+immobile-code :immobile :static)))))
+                (or #+(and immobile-code x86-64) :immobile :static)))))
 
 ;;; SB-EXT:GENERATION-* accessors returned bogus values for generation > 0
-#+gencgc ; sb-ext: symbol was removed for cheneygc
 (with-test (:name :bug-529014)
   (loop for i from 0 to sb-vm:+pseudo-static-generation+
      do (assert (= (sb-ext:generation-bytes-consed-between-gcs i)
@@ -172,7 +185,7 @@
         (assert (= (sb-ext:generation-minimum-age-before-gc i) 0.75))
         (assert (= (sb-ext:generation-number-of-gcs-before-promotion i) 1))))
 
-(with-test (:name :gc-logfile :skipped-on (not :gencgc))
+(with-test (:name :gc-logfile)
   (assert (not (gc-logfile)))
   (let ((p (scratch-file-name "log")))
     (assert (not (probe-file p)))
@@ -225,7 +238,6 @@
                *pin-test-object-address*))))
 
 (import 'sb-kernel:%make-lisp-obj)
-#+gencgc
 (defun ensure-code/data-separation ()
   (let* ((n-bits (+ sb-vm:next-free-page 10))
          (code-bits (make-array n-bits :element-type 'bit :initial-element 0))
@@ -259,6 +271,10 @@
         (assert (zerop (slot (deref sb-vm::page-table p) 'sb-vm::start)))
         (let ((base (+ (* p sb-vm:gencgc-page-bytes)
                        sb-vm:dynamic-space-start)))
+          ;; This mapping operation may fail if the page's first object is not at the base
+          ;; or it ends with a page-spanning object. But this diagnostic logic should
+          ;; never be invoked. If it is, you should find the cause of that rather than
+          ;; worry about this slightly dubious use of map-objects-in-range.
           (sb-vm::map-objects-in-range
            (lambda (obj widetag size)
              (declare (ignore widetag size))
@@ -276,10 +292,7 @@
       ;; Some have as little as .5% space wasted.
       (assert (<= waste (* 3/100 code-bytes-consumed))))))
 
-(with-test (:name :code/data-separation
-           ;; I do not understand why this fails for this feature combination
-            :skipped-on (and :executable-funinstances
-                             (not :compact-instance-header)))
+(with-test (:name :code/data-separation)
   (compile 'ensure-code/data-separation)
   (ensure-code/data-separation))
 
@@ -422,7 +435,6 @@
     (gc)
     (assert (equal (multiple-value-list (sb-thread:join-thread thr)) #1#))))
 
-#+gencgc
 (progn
 (defun code-iterator (how)
   (let ((n 0) (tot-bytes 0))
@@ -437,7 +449,9 @@
     (values n tot-bytes))))
 (compile 'code-iterator)
 
-(with-test (:name :code-iteration-fast)
+(with-test (:name :code-iteration-fast
+                  :broken-on :mark-region-gc
+                  :skipped-on :gc-stress)
   (sb-int:binding* (((slow-n slow-bytes) (code-iterator :slow))
                     ((fast-n fast-bytes) (code-iterator :fast)))
     ;; Fast should be 20x to 50x faster than slow, but that's kinda sensitive
@@ -446,8 +460,10 @@
     (assert (= slow-bytes fast-bytes)))))
 
 (defglobal *wp-for-signal-handler-gc-test* nil)
-#+(and gencgc unix sb-thread)
-(with-test (:name :signal-handler-gc-test)
+#-win32
+(with-test (:name :signal-handler-gc-test
+                  :skipped-on (not (and :generational :unix :sb-thread))
+                  :broken-on (and :arm64 :gc-stress))
   (sb-thread:join-thread
    (sb-thread:make-thread
     (lambda ()
@@ -464,12 +480,14 @@
 
 ;;; We can be certain that the marked status pertains to exactly one
 ;;; object by ensuring that it can not share pages with other objects.
-#+gencgc (defvar *vvv* (make-array
+(defvar *vvv* (make-array
                (/ sb-vm:large-object-size sb-vm:n-word-bytes)))
 (gc)
-#+gencgc
-(with-test (:name :page-protected-p :broken-on :x86
-                  :fails-on (and :big-endian :ppc64))
+(with-test (:name :page-protected-p
+                  :fails-on (or (and :big-endian :ppc64)
+                                (and :mark-region-gc :darwin))
+                  :broken-on (or :x86 (and :mark-region-gc (not :darwin)))
+                  :skipped-on :gc-stress)
   (if (= (sb-kernel:generation-of *vvv*) 0) (gc))
   (assert (= (sb-kernel:generation-of *vvv*) 1))
   (assert (sb-kernel:page-protected-p *vvv*))

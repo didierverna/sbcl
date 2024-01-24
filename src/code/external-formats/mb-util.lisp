@@ -45,7 +45,7 @@
            (make-od-name-list 'invalid format 'continuation-byte)))
       `(progn
          ;;(declaim (inline ,name))
-         (defun ,name (array pos end)
+         (defun ,name (array pos end replacement)
            (declare (optimize speed #.*safety-0*)
                     (type ,type array)
                     (type array-range pos end))
@@ -105,18 +105,17 @@
                                           (end-of-input-in-character
                                            end)
                                           (,invalid-mb-continuation-byte
-                                           reject-position)))
-                               (bad-len (- bad-end pos)))
-                          (declare (type array-range bad-end bad-len))
-                          (let ((replacement (decoding-error array pos bad-end ,format reject-reason reject-position)))
-                            (values bad-len replacement))))))))))))
+                                           reject-position))))
+                          (declare (type array-range bad-end))
+                          (let ((replacement (decoding-error array pos bad-end ,format replacement reject-reason reject-position)))
+                            (values 1 replacement))))))))))))
 
   (defun define-simple-get-mb-char-1 (accessor type format mb-to-ucs)
     (let ((name (make-od-name-list 'simple-get format 'char accessor))
           (malformed (make-od-name 'malformed format)))
       `(progn
          (declaim (inline ,name))
-         (defun ,name (array pos bytes)
+         (defun ,name (array pos bytes replacement)
            (declare (optimize speed #.*safety-0*)
                     (type ,type array)
                     (type array-range pos)
@@ -133,7 +132,7 @@
                (if code
                    (code-char code)
                    (decoding-error array pos (+ pos bytes) ,format
-                                   ',malformed pos))))))))
+                                   replacement ',malformed pos))))))))
 
   (defun define-mb->string-1 (accessor type format)
     (let ((name
@@ -143,7 +142,7 @@
           (simple-get-mb-char
            (make-od-name-list 'simple-get format 'char accessor)))
       `(progn
-         (defun ,name (array astart aend)
+         (defun ,name (array astart aend replacement)
            (declare (optimize speed #.*safety-0*)
                     (type ,type array)
                     (type array-range astart aend))
@@ -151,11 +150,11 @@
              (loop with pos = astart
                 while (< pos aend)
                 do (multiple-value-bind (bytes invalid)
-                       (,bytes-per-mb-character array pos aend)
+                       (,bytes-per-mb-character array pos aend replacement)
                      (declare (type (or null string) invalid))
                      (cond
                        ((null invalid)
-                        (let ((thing (,simple-get-mb-char array pos bytes)))
+                        (let ((thing (,simple-get-mb-char array pos bytes replacement)))
                           (typecase thing
                             (character (vector-push-extend thing string))
                             (string
@@ -171,11 +170,11 @@
   (defun mb-char-len (code)
     (declare (optimize speed #.*safety-0*)
              (type fixnum code))
-    (cond ((< code 0) (bug "can't happen"))
+    (cond ((< code 0) (unreachable))
           ((< code #x100) 1)
           ((< code #x10000) 2)
           ((< code #x1000000) 3)
-          (t (bug "can't happen"))))
+          (t (unreachable))))
   )
 
 (defmacro define-multibyte-encoding (format aliases
@@ -199,7 +198,7 @@
            (octet-decoding-error) ())
 
        (declaim (inline ,char->mb))
-       (defun ,char->mb (char dest string pos)
+       (defun ,char->mb (char dest string pos replacement)
          (declare (optimize speed #.*safety-0*)
                   (type (array (unsigned-byte 8) (*)) dest))
          (let ((code (,ucs-to-mb (char-code char))))
@@ -219,9 +218,11 @@
                     (add-byte (ldb (byte 8 16) code))
                     (add-byte (ldb (byte 8 8) code))
                     (add-byte (ldb (byte 8 0) code)))))
-               (encoding-error ,format string pos))))
+               (let ((octets (encoding-error ,format replacement string pos)))
+                 (dotimes (i (length octets))
+                   (vector-push-extend (aref octets i) dest))))))
 
-       (defun ,string->mb (string sstart send additional-space)
+       (defun ,string->mb (string sstart send additional-space replacement)
          (declare (optimize speed #.*safety-0*)
                   (type simple-string string)
                   (type array-range sstart send additional-space))
@@ -230,7 +231,7 @@
                                   :adjustable t
                                   :fill-pointer 0)))
            (loop for i from sstart below send
-              do (,char->mb (char string i) array string i))
+              do (,char->mb (char string i) array string i replacement))
            (dotimes (i additional-space)
              (vector-push-extend 0 array))
            (coerce array '(simple-array (unsigned-byte 8) (*)))))
@@ -291,4 +292,5 @@
                (return-from decode-break-reason 1)
                (code-char ucs)))
          ,(make-od-name format '>string-aref)
-         ,string->mb))))
+         ,string->mb
+         :char-encodable-p (,ucs-to-mb (char-code |ch|))))))

@@ -11,20 +11,21 @@
 
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 
-#include "sbcl.h"
-#include "runtime.h"
+#include "genesis/sbcl.h"
+#include "interr.h"
+#include "lispobj.h"
 #include "os.h"
 #include "search.h"
 #include "thread.h"
-#include "gc-internal.h"
-#include "gc-private.h"
+#include "gc.h"
 #include "genesis/primitive-objects.h"
+#include "genesis/instance.h"
 #include "genesis/hash-table.h"
 #include "genesis/package.h"
 #include "genesis/split-ordered-list.h"
 #include "genesis/brothertree.h"
-#include "forwarding-ptr.h"
 
 lispobj *
 search_read_only_space(void *pointer)
@@ -46,12 +47,31 @@ search_static_space(void *pointer)
     return gc_search_space(start, pointer);
 }
 
+#ifndef LISP_FEATURE_IMMOBILE_SPACE
+lispobj *search_codeblob_offsets(void* pointer) {
+    if ((uword_t)pointer < TEXT_SPACE_START ||
+        (uword_t)pointer >= (uword_t)text_space_highwatermark) return 0;
+    struct vector* v = (void*)TEXT_SPACE_START;
+    uint32_t* data = (void*)v->data;
+    int index = bsearch_lesseql_uint32((char*)pointer - (char*)TEXT_SPACE_START,
+                                       data, vector_len(v));
+    if (index >= 0) {
+        lispobj* base = (lispobj*)(TEXT_SPACE_START + data[index]);
+        gc_assert(widetag_of(base) == CODE_HEADER_WIDETAG);
+        return base;
+    }
+    return 0;
+}
+#endif
+
 lispobj *search_all_gc_spaces(void *pointer)
 {
     lispobj *start;
     if (((start = search_dynamic_space(pointer)) != NULL) ||
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         ((start = search_immobile_space(pointer)) != NULL) ||
+#else
+        ((start = search_codeblob_offsets(pointer)) != NULL) ||
 #endif
         ((start = search_static_space(pointer)) != NULL) ||
         ((start = search_read_only_space(pointer)) != NULL))
@@ -60,7 +80,7 @@ lispobj *search_all_gc_spaces(void *pointer)
 }
 
 static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, unsigned char* b,
-                                                     boolean ignore_case)
+                                                     bool ignore_case)
 {
     int i = 0;
 
@@ -85,20 +105,20 @@ static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, unsigned char*
 
 struct symbol_search {
     char *name;
-    boolean ignore_case;
+    bool ignore_case;
 };
 static uword_t search_symbol_aux(lispobj* start, lispobj* end, uword_t arg)
 {
     struct symbol_search* ss = (struct symbol_search*)arg;
     return (uword_t)search_for_symbol(ss->name, (lispobj)start, (lispobj)end, ss->ignore_case);
 }
-lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean ignore_case)
+lispobj* search_for_symbol(char *name, lispobj start, lispobj end, bool ignore_case)
 {
     lispobj* where = (lispobj*)start;
     lispobj* limit = (lispobj*)end;
     lispobj namelen = make_fixnum(strlen(name));
 
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
     // This function was never safe to use on pages that were dirtied with unboxed words.
     // It has become even less safe now that don't prezero most pages during GC,
     // because we will certainly encounter remnants of forwarding pointers etc.
@@ -158,7 +178,35 @@ struct symbol* lisp_symbol_from_tls_index(lispobj tls_index)
 }
 #endif
 
-static boolean sym_stringeq(lispobj sym, const char *string, int len)
+static uword_t bruteforce_findpkg_by_id(lispobj* where, lispobj* limit, uword_t id)
+{
+    lispobj layout;
+    for ( where = next_object(where, 0, limit) ; where ;
+          where = next_object(where, object_size(where), limit) ) {
+        if (widetag_of(where) == INSTANCE_WIDETAG
+            && (layout = instance_layout(where)) != 0
+            && layout_depth2_id(LAYOUT(layout)) == PACKAGE_LAYOUT_ID
+            && ((struct package*)where)->id == id) {
+            return make_lispobj(where, INSTANCE_POINTER_LOWTAG);
+        }
+    }
+    return 0;
+}
+
+lispobj get_package_by_id(int id) {
+    // lisp_package_vector is a tagged pointer to SIMPLE-VECTOR
+    lispobj vector = barrier_load(&lisp_package_vector);
+    if (!vector) {
+        // Perform a heap walk. This should never occur except in core loading/saving.
+        lispobj result =  walk_generation(bruteforce_findpkg_by_id, -1, make_fixnum(id));
+        if (is_lisp_pointer(result)) return result;
+        lose("get_package_by_id: no package vector");
+    }
+    if (id >= vector_len(VECTOR(vector))) lose("can't decode package ID %d", id);
+    return barrier_load(&VECTOR(vector)->data[id]);
+}
+
+static bool sym_stringeq(lispobj sym, const char *string, int len)
 {
     struct vector* name = symbol_name(SYMBOL(sym));
     return widetag_of(&name->header) == SIMPLE_BASE_STRING_WIDETAG
@@ -166,51 +214,47 @@ static boolean sym_stringeq(lispobj sym, const char *string, int len)
         && !memcmp(name->data, string, len);
 }
 
-static lispobj* search_package_symbols(lispobj package, char* symbol_name,
-                                       unsigned int* hint)
+static lispobj* search_package_symbols(lispobj package, char* symbol_name)
 {
     // Since we don't have Lisp's string hash algorithm in C, we can only
-    // scan linearly, using the 'hint' as a starting point.
-    struct package* pkg = (struct package*)(package - INSTANCE_POINTER_LOWTAG);
-    int table_selector = *hint & 1, iteration;
-    for (iteration = 1; iteration <= 2; ++iteration) {
-        struct instance* table = (struct instance*)
-          native_pointer(table_selector ? pkg->external_symbols : pkg->internal_symbols);
+    // scan linearly.
+    struct package* pkg = (void*)INSTANCE(package);
+    int pass;
+    for (pass = 0; pass <= 1; ++pass) {
+        struct symbol_table* table = (void*)
+          INSTANCE(barrier_load(pass ? &pkg->external_symbols : &pkg->internal_symbols));
         gc_assert(widetag_of(&table->header) == INSTANCE_WIDETAG);
-        gc_assert(listp(table->slots[INSTANCE_DATA_START])); // KLUDGE
-        struct cons* cells = (void*)native_pointer(table->slots[INSTANCE_DATA_START]);
-        gc_assert(simple_vector_p(cells->cdr));
-        struct vector* v = VECTOR(cells->cdr);
+        lispobj cells = barrier_load(&table->_cells);
+        gc_assert(listp(cells));
+        lispobj symbols = barrier_load(&CONS(cells)->cdr);
+        gc_assert(simple_vector_p(symbols));
+        struct vector* v = VECTOR(symbols);
         lispobj namelen = strlen(symbol_name);
-        int vector_length = vector_len(v);
-        int index = *hint >> 1;
-        if (index >= vector_length)
-            index = 0; // safeguard against vector shrinkage
-        int initial_index = index;
-        do {
+        int index;
+        for (index = vector_len(v)-1; index >= 0 ; --index) {
             lispobj thing = v->data[index];
             if (lowtag_of(thing) == OTHER_POINTER_LOWTAG
                 && widetag_of(&SYMBOL(thing)->header) == SYMBOL_WIDETAG
                 && sym_stringeq(thing, symbol_name, namelen)) {
-                *hint = (index << 1) | table_selector;
                 return (lispobj*)SYMBOL(thing);
             }
-            index = (index + 1) % vector_length;
-        } while (index != initial_index);
-        table_selector = table_selector ^ 1;
+        }
     }
     return 0;
 }
 
-lispobj* find_symbol(char* symbol_name, lispobj package, unsigned int* hint)
+lispobj* find_symbol(char* symbol_name, lispobj package)
 {
-    return package ? search_package_symbols(package, symbol_name, hint) : 0;
+    return package ? search_package_symbols(package, symbol_name) : 0;
 }
 
-static inline boolean fringe_node_p(struct binary_node* node)
+static inline bool fringe_node_p(struct binary_node* node)
 {
-    int len = ((unsigned int)node->header >> INSTANCE_LENGTH_SHIFT) & INSTANCE_LENGTH_MASK;
-    return len <= (int)(1+INSTANCE_DATA_START);
+    const int internal_node_payload_words =
+      ((sizeof (struct binary_node) / sizeof (lispobj)) - 1);
+    int payload_words =
+      ((unsigned int)node->header >> INSTANCE_LENGTH_SHIFT) & INSTANCE_LENGTH_MASK;
+    return payload_words < internal_node_payload_words;
 }
 
 /* I anticipate using the brothertree search algorithms to find code
@@ -322,13 +366,21 @@ int bsearch_greatereql_uint32(uint32_t item, uint32_t* array, int nelements)
     if (low < nelements) return low;
     return -1;
 }
+#else
+// these passthru stubs could probably just be linker symbol aliases
+int bsearch_lesseql_uint32(uint32_t item, uint32_t* array, int nelements) {
+    return bsearch_lesseql_uword(item, array, nelements);
+}
+int bsearch_greatereql_uint32(uint32_t item, uint32_t* array, int nelements) {
+    return bsearch_greatereql_uword(item, array, nelements);
+}
 #endif
 
 /* Find in an address-based split-ordered list
  * Unlike the lisp algorithm, this does not "assist" a pending deletion
  * by completing it with compare-and-swap - this loop simply ignores
  * any deleted nodes that haven't been snipped out yet. */
-struct split_ordered_list_node*
+struct solist_node*
 split_ordered_list_find(struct split_ordered_list* solist,
                         lispobj key)
 {
@@ -347,7 +399,7 @@ split_ordered_list_find(struct split_ordered_list* solist,
     while ((nodeptr & WIDETAG_MASK) == UNBOUND_MARKER_WIDETAG) {
         nodeptr = bins->data[--bin_index];
     }
-    struct split_ordered_list_node* node = (void*)native_pointer(nodeptr);
+    struct solist_node* node = (void*)native_pointer(nodeptr);
     lispobj hash_as_fixnum = make_fixnum(full_hash);
     while (1) {
         if (node->node_hash == hash_as_fixnum) { // possible hit

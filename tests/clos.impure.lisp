@@ -49,11 +49,17 @@
 ;;; sbcl-0.6.12.25, the implementation of NO-APPLICABLE-METHOD was
 ;;; broken in such a way that the code here would signal an error.
 (defgeneric zut-n-a-m (a b c))
+(defmethod zut-n-a-m :around (a b (c symbol)) nil)
 (defmethod no-applicable-method ((zut-n-a-m (eql #'zut-n-a-m)) &rest args)
   (declare (ignore args))
   :no-applicable-method)
+(defmethod sb-pcl:no-primary-method ((zut-n-a-m (eql #'zut-n-a-m)) &rest args)
+  (declare (ignore args))
+  :no-primary-method)
 (with-test (:name no-applicable-method)
   (assert (eq :no-applicable-method (zut-n-a-m 1 2 3))))
+(with-test (:name :no-primary-method)
+  (assert (eq :no-primary-method (zut-n-a-m 1 2 t))))
 
 ;;; bug reported and fixed by Alexey Dejneka sbcl-devel 2001-09-10:
 ;;; This DEFGENERIC shouldn't cause an error.
@@ -1289,8 +1295,104 @@
   (assert-error (eqls1760987 3 :k2 5) program-error)
   (assert-error (eqls1760987 3 :k1 2 :k2 5) program-error)
   (assert-error (eqls1760987 3 :k4 2 :k2 5) program-error)
-  (assert-error (eqls1760987 3 :k1 2 :k3 3 :k2 5) program-error)
-  )
+  (assert-error (eqls1760987 3 :k1 2 :k3 3 :k2 5) program-error))
+
+;;; CLHS 7.6.5 should still hold in the presence of auxiliary methods
+(defgeneric gf-with-keys-to-check (a &key b)
+  (:method ((a integer) &key b) (declare (ignore b)) (1+ a))
+  (:method ((a string) &key b) (list a b))
+  (:method ((a symbol) &key b c) (declare (ignore b)) (list a c))
+  (:method :around ((a integer) &key b) (declare (ignore b)) (1+ (call-next-method))))
+
+(with-test (:name (:check-keyword-args :no-error))
+  (assert (= (gf-with-keys-to-check 1) 3))
+  (assert (= (gf-with-keys-to-check 1 :b 2) 3))
+  (assert (equal (gf-with-keys-to-check "a") '("a" nil)))
+  (assert (equal (gf-with-keys-to-check "a" :b 2) '("a" 2)))
+  (assert (equal (gf-with-keys-to-check 'a) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :c 2) '(a 2)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2 :c 3) '(a 3))))
+
+(with-test (:name (:check-keyword-args :allow-other-keys :no-error))
+  (assert (= (gf-with-keys-to-check 1 :z 3 :allow-other-keys t) 3))
+  (assert (= (gf-with-keys-to-check 1 :b 2 :z 3 :allow-other-keys t) 3))
+  (assert (equal (gf-with-keys-to-check "a" :z 3 :allow-other-keys t) '("a" nil)))
+  (assert (equal (gf-with-keys-to-check "a" :b 2 :z 3 :allow-other-keys t) '("a" 2)))
+  (assert (equal (gf-with-keys-to-check 'a :z 3 :allow-other-keys t) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2 :z 3 :allow-other-keys t) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :c 2 :z 3 :allow-other-keys t) '(a 2)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2 :c 3 :allow-other-keys t) '(a 3))))
+
+(with-test (:name (:check-keyword-args :unmatched-keyword :error))
+  (assert-error (gf-with-keys-to-check 1 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 1 :b 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check "a" :z 3) program-error)
+  (assert-error (gf-with-keys-to-check "a" :b 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :c 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :c 3 :z 4) program-error))
+
+(with-test (:name (:check-keyword-args :odd-keyword :error))
+  (assert-error (gf-with-keys-to-check 1 :b) program-error)
+  (assert-error (gf-with-keys-to-check 1 :b 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check "a" :b) program-error)
+  (assert-error (gf-with-keys-to-check "a" :b 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :c 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :c 3 :b) program-error))
+
+;;; verify that we perform these checks for standardized generic
+;;; functions too
+(defclass shared-initialize-keyword-check () ())
+
+(with-test (:name (:check-keyword-args shared-initialize :odd-keyword :error))
+  (assert-error (shared-initialize (make-instance 'shared-initialize-keyword-check) nil :a)
+                program-error))
+
+(with-test (:name (:check-keyword-args shared-initialize :non-keyword :error))
+  (assert-error (shared-initialize (make-instance 'shared-initialize-keyword-check) nil '(abc) 1)
+                program-error))
+
+;;; verify that we can still detect no primary methods and invalid qualifiers
+
+(defmethod gf-with-keys-and-no-primary-method :around ((x integer) &key b)
+  (declare (ignore b))
+  (1+ x))
+
+(with-test (:name (:check-keyword-args :no-primary-method :no-keywords :error))
+  (assert-error (gf-with-keys-and-no-primary-method 3) sb-pcl::no-primary-method-error))
+(with-test (:name (:check-keyword-args :no-primary-method :ok-keyword :error))
+  (assert-error (gf-with-keys-and-no-primary-method 3 :b 2) sb-pcl::no-primary-method-error))
+(with-test (:name (:check-keyword-args :no-primary-method :bad-keyword :error))
+  (assert-error (gf-with-keys-and-no-primary-method 3 :c 2)
+                (or program-error sb-pcl::no-primary-method-error)))
+
+(defgeneric gf-with-keys-and-invalid-qualifier (x &key)
+  (:method-combination progn))
+(defmethod gf-with-keys-and-invalid-qualifier progn ((x integer) &key b)
+  (declare (ignore b))
+  (print (1+ x)))
+;; I'm guessing this is PROGN but spelled wrong purposely, right?
+(defmethod gf-with-keys-and-invalid-qualifier prong ((x fixnum) &key c) (print c))
+
+(with-test (:name (:check-keyword-args :invalid-qualifier :no-keywords :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier 3)))
+(with-test (:name (:check-keyword-args :invalid-qualifier :ok-keyword :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier 3 :b 3)))
+(with-test (:name (:check-keyword-args :invalid-qualifier :bad-keyword :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier 3 :z 4)))
+(with-test (:name (:check-keyword-args :no-applicable-invalid-qualifier :no-keywords :no-error))
+  (assert (= (gf-with-keys-and-invalid-qualifier (1+ most-positive-fixnum))
+             (+ most-positive-fixnum 2))))
+(with-test (:name (:check-keyword-args :no-applicable-invalid-qualifier :ok-keyword :no-error))
+  (assert (= (gf-with-keys-and-invalid-qualifier (1+ most-positive-fixnum) :b 3)
+             (+ most-positive-fixnum 2))))
+(with-test (:name (:check-keyword-args :no-applicable-invalid-qualifier :bad-keyword :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier (1+ most-positive-fixnum) :c 3)))
+
 ;;; class redefinition shouldn't give any warnings, in the usual case
 (defclass about-to-be-redefined () ((some-slot :accessor some-slot)))
 (handler-bind ((warning #'error))
@@ -2664,7 +2766,7 @@
     (eval `(defclass ,class2 (,class1) ()))
     (let ((instance (make-instance class2)))
       (sb-mop:finalize-inheritance (find-class class1))
-      (assert (not (sb-kernel:wrapper-invalid (sb-kernel:wrapper-of instance)))))))
+      (assert (not (sb-kernel:layout-invalid (sb-kernel:layout-of instance)))))))
 
 (with-test (:name (allocate-instance :on symbol))
   (let ((class (gensym "CLASS-")))
@@ -2683,7 +2785,7 @@
                 unbound-slot))
 
 (with-test (:name :layouf-of-nil)
-  (assert (eq (sb-kernel:wrapper-of nil) (sb-kernel:find-layout 'null))))
+  (assert (eq (sb-kernel:layout-of nil) (sb-kernel:find-layout 'null))))
 
 (with-test (:name (defmethod :on-classless-type))
   (handler-bind ((timeout (lambda (condition)

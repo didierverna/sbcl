@@ -141,12 +141,22 @@
 (define-binop logxor 1 3 xor xori)
 (define-binop logand 1 3 and andi)
 
+(define-vop (fast-logand/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r)
+         (y :scs (unsigned-reg) :target r))
+  (:arg-types signed-num unsigned-num))
+
+(define-vop (fast-logand-c/signed-unsigned=>unsigned fast-logand-c/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r))
+  (:arg-types signed-num (:constant (eql #.most-positive-word)))
+  (:ignore y)
+  (:generator 1
+    (move r x)))
+
 (define-source-transform logeqv (&rest args)
   (if (oddp (length args))
       `(logxor ,@args)
       `(lognot (logxor ,@args))))
-(define-source-transform logandc1 (x y)
-  `(logand (lognot ,x) ,y))
 (define-source-transform logandc2 (x y)
   `(logand ,x (lognot ,y)))
 (define-source-transform logorc1 (x y)
@@ -416,7 +426,7 @@
     (inst rem r x y)
     ;; Division by zero check performed after division per the ISA
     ;; documentation recommendation.
-    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x)))
       (inst beq y zero-tn zero))
     (inst slli q temp n-fixnum-tag-bits)))
 
@@ -432,7 +442,7 @@
   (:generator 12
     (inst divu q x y)
     (inst remu r x y)
-    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x)))
       (inst beq y zero-tn zero))))
 
 (define-vop (fast-truncate/signed fast-signed-binop)
@@ -447,7 +457,7 @@
   (:generator 12
     (inst div q x y)
     (inst rem r x y)
-    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x)))
       (inst beq y zero-tn zero))))
 
 
@@ -798,20 +808,6 @@
     (inst mulhu temp x y)
     (inst andi hi temp (lognot fixnum-tag-mask))))
 
-(define-vop (bignum-lognot #-64-bit lognot-mod32/unsigned=>unsigned
-                           #+64-bit lognot-mod64/unsigned=>unsigned)
-  (:translate sb-bignum:%lognot))
-
-(define-vop (fixnum-to-digit)
-  (:translate sb-bignum:%fixnum-to-digit)
-  (:policy :fast-safe)
-  (:args (fixnum :scs (any-reg)))
-  (:arg-types tagged-num)
-  (:results (digit :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 1
-    (inst srai digit fixnum n-fixnum-tag-bits)))
-
 (define-vop (bignum-floor)
   (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
@@ -879,3 +875,35 @@
   (:translate sb-bignum:%ashl)
   (:generator 1
     (inst sll result digit count)))
+
+#+64-bit
+(progn
+(define-vop ()
+  (:translate fastrem-32)
+  (:policy :fast-safe)
+  (:args (dividend :scs (unsigned-reg))
+         (c :scs (unsigned-reg))
+         (divisor :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num unsigned-num)
+  (:results (remainder :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 10
+    (inst mul temp dividend c)
+    (inst slli temp temp 32) ; drop the high 32 bits, keep the low 32 bits
+    (inst srli temp temp 32)
+    (inst mul temp temp divisor)
+    (inst srli remainder temp 32))) ; take the high 32 bits
+(define-vop ()
+  (:translate fastrem-64)
+  (:policy :fast-safe)
+  (:args (dividend :scs (unsigned-reg))
+         (c :scs (unsigned-reg))
+         (divisor :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num unsigned-num)
+  (:results (remainder :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 10
+    (inst mul temp dividend c) ; keep only the low 64 bits
+    (inst mulhu remainder temp divisor)))) ; only the high 64 bits

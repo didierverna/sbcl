@@ -32,9 +32,6 @@
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 64)
@@ -78,7 +75,7 @@
 
 ;;;; Where to put the different spaces.
 
-(!gencgc-space-setup #x04000000
+(gc-space-setup #x04000000
                               :read-only-space-size 0
                               :dynamic-space-start #x1000000000)
 

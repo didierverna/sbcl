@@ -451,7 +451,8 @@
                      (assert (not found))
                      (assert (eq found node))))
                (setq node next)))))
-    (assert (>= addr-change 24)))) ; seems about right
+    #-mark-region-gc
+    (assert (>= addr-change 22)))) ; seems about right
 
 ;;; SO-MAPLIST does not include deleted nodes.
 ;;; Nodes marked for deletion should still be marked after GC

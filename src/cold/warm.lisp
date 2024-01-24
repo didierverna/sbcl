@@ -81,7 +81,7 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
 ;;; Verify that compile-time floating-point math matches load-time.
 (defvar *compile-files-p*)
 (when (or (not (boundp '*compile-files-p*)) *compile-files-p*)
-  (with-open-file (stream "float-math.lisp-expr" :if-does-not-exist nil)
+  (with-open-file (stream "xfloat-math.lisp-expr" :if-does-not-exist nil)
     (when stream
       (format t "; Checking ~S~%" (pathname stream))
       ;; Ensure that we're reading the correct variant of the file
@@ -90,14 +90,17 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
       (sb-kernel::with-float-traps-masked (:overflow :divide-by-zero)
         (let ((*readtable* (copy-readtable))
               (*package* (find-package "SB-KERNEL")))
+          ;; The reasoning behind this limited-use variant of read-time-eval is that
+          ;; since it is too early to actually use EVAL in the interpreted fashion,
+          ;; EVAL would call COMPILE which is just ridiculous because it would mean
+          ;; compiling however many #. expression there are in this file
           (set-dispatch-macro-character
            #\# #\. (lambda (stream subchar arg)
                      (declare (ignore subchar arg))
                      (let ((expr (read stream t nil t)))
                        (ecase (car expr)
-                         (sb-kernel:make-single-float
-                          (sb-kernel:make-single-float (second expr)))
-                         (sb-kernel:make-double-float
+                         (sb-kernel::s (sb-kernel:make-single-float (second expr)))
+                         (sb-kernel::d
                           (sb-kernel:make-double-float (second expr) (third expr)))))))
           (dolist (expr (read stream))
             (destructuring-bind (fun args . result) expr
@@ -254,7 +257,7 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
 
 (sb-c::dump/restore-interesting-types 'write)
 (when (hash-table-p sb-c::*static-vop-usage-counts*)
-  (with-open-file (output "output/warm-vop-usage.txt"
+  (with-open-file (output (merge-pathnames "warm-vop-usage.txt" *objfile-prefix*)
                           :direction :output :if-exists :supersede)
     (let (list)
       (sb-int:dohash ((name vop) sb-c::*backend-parsed-vops*)

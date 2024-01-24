@@ -1,7 +1,9 @@
 #include <signal.h>
-#include "sbcl.h"
+#include <errno.h>
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "thread.h"
+#include "interr.h"
 #include "lispregs.h"
 
 #if defined(LISP_FEATURE_FREEBSD)
@@ -46,17 +48,18 @@
 #define _REG_r15 _REG_R15
 #endif
 
-void visit_context_registers(void (*proc)(os_context_register_t,int), os_context_t *context)
+void visit_context_registers(void (*proc)(os_context_register_t,void*),
+                             os_context_t *context, void* arg)
 {
-    proc(OS_CONTEXT_PC(context), 1);
-    proc(CONTEXT_SLOT(context, rax), 1); proc(CONTEXT_SLOT(context, r8),  1);
-    proc(CONTEXT_SLOT(context, rcx), 1); proc(CONTEXT_SLOT(context, r9),  1);
-    proc(CONTEXT_SLOT(context, rdx), 1); proc(CONTEXT_SLOT(context, r10), 1);
-    proc(CONTEXT_SLOT(context, rbx), 1); proc(CONTEXT_SLOT(context, r11), 1);
-    /* ignore rsp */                     proc(CONTEXT_SLOT(context, r12), 1);
-    /* ignore rbp */                     proc(CONTEXT_SLOT(context, r13), 1);
-    proc(CONTEXT_SLOT(context, rsi), 1); proc(CONTEXT_SLOT(context, r14), 1);
-    proc(CONTEXT_SLOT(context, rdi), 1); proc(CONTEXT_SLOT(context, r15), 1);
+    proc(OS_CONTEXT_PC(context), arg);
+    proc(CONTEXT_SLOT(context, rax), arg); proc(CONTEXT_SLOT(context, r8),  arg);
+    proc(CONTEXT_SLOT(context, rcx), arg); proc(CONTEXT_SLOT(context, r9),  arg);
+    proc(CONTEXT_SLOT(context, rdx), arg); proc(CONTEXT_SLOT(context, r10), arg);
+    proc(CONTEXT_SLOT(context, rbx), arg); proc(CONTEXT_SLOT(context, r11), arg);
+    /* ignore rsp */                       proc(CONTEXT_SLOT(context, r12), arg);
+    /* ignore rbp */                       proc(CONTEXT_SLOT(context, r13), arg);
+    proc(CONTEXT_SLOT(context, rsi), arg); proc(CONTEXT_SLOT(context, r14), arg);
+    proc(CONTEXT_SLOT(context, rdi), arg); proc(CONTEXT_SLOT(context, r15), arg);
 }
 
 os_context_register_t *
@@ -125,7 +128,8 @@ int arch_os_thread_init(struct thread *thread) {
     sigstack.ss_sp    = calc_altstack_base(thread);
     sigstack.ss_flags = 0;
     sigstack.ss_size  = calc_altstack_size(thread);
-    sigaltstack(&sigstack,0);
+    if (sigaltstack(&sigstack,0)<0)
+        lose("Cannot sigaltstack: %s",strerror(errno));
     return 1;                  /* success */
 }
 

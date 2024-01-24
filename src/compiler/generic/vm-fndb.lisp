@@ -16,7 +16,7 @@
 ;;; Simple TYPEP uses that don't have any standard predicate are
 ;;; translated into non-standard unary predicates.
 (defknown (fixnump bignump ratiop
-           short-float-p single-float-p double-float-p long-float-p
+           single-float-p double-float-p long-float-p
            complex-rational-p complex-float-p complex-single-float-p
            complex-double-float-p #+long-float complex-long-float-p
            complex-vector-p
@@ -106,23 +106,16 @@
     (instance) hash-code (flushable))
 ;;; SXHASH values on numbers and strings are predictable, therefore the next batch
 ;;; of functions are flushable. Perhaps not entirely obviously, symbol hashes are
-;;; predictable because we hash by name. And while ENSURE-SYMBOL-HASH is not
-;;; - strictly speaking - a side-effectless operation, it has no effect as far as
-;;; user-written code is concerned. i.e. nothing portably expressed can discern
-;;; whether memoization of the hash occurred. (I feel like we would have a cleaner
-;;; implementation if we just eagerly compute the hash anyway. Practically all
-;;; symbols eventually get hashed)
+;;; predictable because we hash by name.
 (defknown sb-impl::number-sxhash (number) hash-code (foldable flushable))
 (defknown %sxhash-string (string) hash-code (foldable flushable))
 (defknown %sxhash-simple-string (simple-string) hash-code (foldable flushable))
 
 (defknown (%sxhash-simple-substring) (simple-string index index) hash-code
   (foldable flushable))
-(defknown sb-impl::compute-symbol-hash (simple-string index) hash-code
-  (foldable flushable))
+(defknown sb-impl::calc-symbol-name-hash (simple-string index) hash-code ())
 
-(defknown (symbol-hash ensure-symbol-hash) (symbol) hash-code
-  (flushable movable))
+(defknown (symbol-hash) (symbol) hash-code (flushable movable))
 ;;; This unusual accessor will read the word at SYMBOL-HASH-SLOT in any
 ;;; object, not only symbols. The result is meaningful only if the object
 ;;; is a symbol. The second argument indicates a predicate that the first
@@ -162,7 +155,7 @@
 (defknown vector-sap ((simple-unboxed-array (*))) system-area-pointer
   (flushable))
 
-#+gencgc
+#+generational
 (defknown generation-of (t) (or (signed-byte 8) null) (flushable))
 
 ;;; WIDETAG-OF needs extra code to handle LIST and FUNCTION lowtags.
@@ -200,14 +193,14 @@
   (flushable))
 (defknown %set-array-dimension (array index index) (values)
   ())
-(defknown %array-rank (array) array-rank
+(defknown %array-rank (array) %array-rank
   (flushable))
 
 #+(or x86 x86-64 arm64)
 (defknown (%array-rank= widetag=) (t t) boolean
   (flushable))
 
-(defknown simple-array-header-of-rank-p (t array-rank) boolean
+(defknown simple-array-header-of-rank-p (t %array-rank) boolean
   (flushable))
 (defknown sb-kernel::check-array-shape (simple-array list)
   (simple-array)
@@ -220,22 +213,21 @@
   (flushable always-translatable))
 (defknown (%copy-instance %copy-instance-slots) (instance instance) instance
   () :result-arg 0)
-(defknown %instance-layout (instance) sb-vm:layout (foldable flushable))
-(defknown %instance-wrapper (instance) wrapper (foldable flushable))
+(defknown %instance-layout (instance) layout
+  (foldable flushable))
 ;;; %FUN-LAYOUT is to %INSTANCE-LAYOUT as FUN-POINTER-LOWTAG is to INSTANCE-POINTER-LOWTAG
 (defknown %fun-layout (#-compact-instance-header funcallable-instance
                        #+compact-instance-header function)
-  sb-vm:layout (foldable flushable))
-(defknown %fun-wrapper (#-compact-instance-header funcallable-instance
-                        #+compact-instance-header function)
-  wrapper
+  layout
   (foldable flushable))
-(defknown %set-instance-layout (instance sb-vm:layout) (values) ())
+(defknown %set-instance-layout (instance layout) (values)
+  ())
 ;;; %SET-FUN-LAYOUT should only called on FUNCALLABLE-INSTANCE
-(defknown %set-fun-layout (funcallable-instance sb-vm:layout) (values) ())
+(defknown %set-fun-layout (funcallable-instance layout) (values)
+  ())
 ;;; Layout getter that accepts any object, and if it has INSTANCE- or FUN-
 ;;; POINTER-LOWTAG returns the layout, otherwise some agreed-upon layout.
-(defknown %instanceoid-layout (t) sb-vm:layout (flushable))
+(defknown %instanceoid-layout (t) layout (flushable))
 (defknown layout-eq ((or instance function) t (mod 16)) boolean (flushable))
 ;;; Caution: This is not exactly the same as instance_length() in C.
 ;;; The C one is the same as SB-VM::INSTANCE-LENGTH.
@@ -246,7 +238,7 @@
 (defknown (%instance-ref-eq) (instance index t) boolean
   (flushable always-translatable))
 (defknown %instance-set (instance index t) (values) (always-translatable))
-(defknown update-object-layout (t) sb-vm:layout)
+(defknown update-object-layout (t) layout)
 
 #+(or arm64 ppc ppc64 riscv x86 x86-64)
 (defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
@@ -322,12 +314,16 @@
 (defknown make-weak-pointer (t) weak-pointer
   (flushable))
 
+;; This used to have a :derive-type but it can't now. Even though a weak vector
+;; happens to be a simple-vector (by default anyway), I don't plan to enable
+;; the "new" weak vector type (which is not an array) to be operated on by
+;; sequence functions. Maybe LENGTH and ELT but that's about it.
 (defknown make-weak-vector (index &key (:initial-element t)
                                        (:initial-contents t))
-  simple-vector (flushable)
-  :derive-type (lambda (call)
-                 (derive-make-array-type (first (combination-args call))
-                                         't nil nil nil call)))
+  weak-vector
+  (flushable))
+
+(defknown weak-vector-len (weak-vector) index (flushable))
 
 (defknown %make-complex (real real) complex
   (flushable movable))
@@ -607,16 +603,6 @@
     (values bignum-element-type bignum-element-type)
     (foldable flushable movable always-translatable))
 
-(defknown %lognot (bignum-element-type) bignum-element-type
-    (foldable flushable movable always-translatable))
-
-(defknown (%logand %logior %logxor) (bignum-element-type bignum-element-type)
-  bignum-element-type
-  (foldable flushable movable))
-
-(defknown %fixnum-to-digit (fixnum) bignum-element-type
-  (foldable flushable movable #-(or arm arm64) always-translatable))
-
 ;;; This takes three digits and returns the FLOOR'ed result of
 ;;; dividing the first two as a 2*digit-size integer by the third.
 (defknown %bigfloor (bignum-element-type bignum-element-type bignum-element-type)
@@ -736,14 +722,19 @@
 ;;; formerly in 'float-tran'
 
 (defknown %single-float (real) single-float
-  (movable foldable no-verify-arg-count))
+  (movable foldable unboxed-return))
 (defknown %double-float (real) double-float
-  (movable foldable no-verify-arg-count))
+  (movable foldable unboxed-return))
 
-(defknown bignum-to-float (bignum symbol) float
-  (movable foldable no-verify-arg-count))
-(defknown sb-kernel::float-ratio (ratio symbol) float
-  (movable foldable no-verify-arg-count))
+(defknown bignum-to-single-float (bignum) single-float
+  (movable foldable unboxed-return))
+(defknown bignum-to-double-float (bignum) double-float
+  (movable foldable unboxed-return))
+
+(defknown sb-kernel::double-float-ratio (ratio) double-float
+    (movable foldable unboxed-return))
+(defknown sb-kernel::single-float-ratio (ratio) single-float
+  (movable foldable unboxed-return))
 
 (defknown make-single-float ((signed-byte 32)) single-float
   (movable flushable))
@@ -829,8 +820,8 @@
 (defknown (%unary-floor %unary-ceiling) (real) integer
   (movable foldable flushable))
 
-#+(or arm64 x86-64)
-(defknown sb-lockless::get-next (sb-lockless::list-node) (values sb-lockless::list-node t))
+#+(or arm64 ppc x86-64)
+(defknown sb-lockless:get-next (sb-lockless::list-node) (values sb-lockless::list-node t))
 
 (defknown sb-vm::fastrem-32 ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
   (unsigned-byte 32)
@@ -845,3 +836,6 @@
 #+(or arm mips ppc sparc)
 (defknown sb-vm::+-modfx (integer integer) fixnum
           (movable foldable flushable always-translatable))
+
+(defknown sb-vm::%weakvec-ref (weak-pointer index) t (flushable))
+(defknown sb-vm::%weakvec-set (weak-pointer index t) (values) ())

@@ -16,7 +16,6 @@ obj
 local-target-features.lisp-expr
 customize-target-features.*
 customize-backend-subfeatures.*
-whitespace-stamp
 src/assembly/target
 src/compiler/assembly
 src/compiler/target
@@ -25,8 +24,8 @@ src/runtime/TAGS
 src/runtime/genesis
 src/runtime/openbsd-sigcontext.h
 src/runtime/sbcl
+src/runtime/ldb
 src/runtime/sbcl.exe
-src/runtime/sbcl.h
 src/runtime/sbcl.mk
 src/runtime/shrinkwrap-sbcl*
 src/runtime/target-arch-os.h

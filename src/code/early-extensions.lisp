@@ -113,7 +113,7 @@
 ;;; have cycles and isn't too large.
 (defun coalesce-tree-p (x)
   (let ((depth-limit 12)
-        (size-limit (expt 2 25)))
+        (size-limit (expt 2 12)))
     (declare (fixnum size-limit))
     (and (consp x)
          (labels ((safe-cddr (cons)
@@ -265,8 +265,7 @@
           (push `(,name (&rest args) ,macro-body) macros))))
     `(macrolet ,macros
        (let* ,(nreverse binds)
-         ,@(if dx `((declare (#+sb-xc-host dynamic-extent ; maybe host can do
-                              #-sb-xc-host truly-dynamic-extent ,@dx))))
+         ,@(if dx `((declare (dynamic-extent ,@dx))))
          ;; Even if the user reads each collection result,
          ;; reader conditionals might statically eliminate all writes.
          ;; Since we don't know, all the -n-tail variable are ignorable.
@@ -1282,7 +1281,6 @@ NOTE: This interface is experimental and subject to change."
                                 ((or (listp id) ; must be a type-specifier
                                      (memq id '(special ignorable ignore
                                                 dynamic-extent
-                                                truly-dynamic-extent
                                                 sb-c::constant-value
                                                 sb-c::no-constraints))
                                      (info :type :kind id))
@@ -1465,5 +1463,14 @@ NOTE: This interface is experimental and subject to change."
               (eq (symbol-value x) x))))
     (cons nil)
     (t t)))
+
+(declaim (inline first-bit-set))
+(defun first-bit-set (x)
+  #+(and x86-64 (not sb-xc-host))
+  (truly-the (values (mod #.sb-vm:n-word-bits) &optional)
+             (%primitive sb-vm::unsigned-word-find-first-bit (the word x)))
+  #-(and x86-64 (not sb-xc-host))
+  (1- (integer-length (logand x (- x)))))
+
 
 (defvar *top-level-form-p* nil)

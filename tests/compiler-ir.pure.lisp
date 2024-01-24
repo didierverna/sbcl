@@ -68,42 +68,6 @@
     (assert (eql (combination-fun-debug-name combination) '%bit-pos-fwd/1))
     (assert (node-tail-p combination))))
 
-(with-test (:name :bounds-check-constants)
-  (assert (= (count '%check-bound
-                    (ir-calls
-                     `(lambda (v)
-                        (declare (simple-vector v))
-                        (setf (aref v 0) (aref v 1))))
-                    :key (lambda (x) (combination-fun-source-name x nil)))
-             1)))
-
-(with-test (:name :bounds-check-constants-svref)
-  (assert (= (count '%check-bound
-                    (ir-calls
-                     `(lambda (v)
-                        (values (svref v 1)
-                                (svref v 0))))
-                    :key (lambda (x) (combination-fun-source-name x nil)))
-             1)))
-
-(with-test (:name :bounds-check-variable-svref)
-  (assert (= (count '%check-bound
-                    (ir-calls
-                     `(lambda (x i)
-                        (values (svref x i)
-                                (svref x i))))
-                    :key (lambda (x) (combination-fun-source-name x nil)))
-             1)))
-
-(with-test (:name :bounds-check-length)
-  (assert (= (count '%check-bound
-                    (ir-calls
-                     `(lambda (x y)
-                        (when (< x (length y))
-                          (svref y x))))
-                    :key (lambda (x) (combination-fun-source-name x nil)))
-             0)))
-
 (with-test (:name :local-call-tail-call)
   (destructuring-bind (combination)
       (ir-full-calls `(lambda ()
@@ -404,3 +368,68 @@
                      (declare (notinline f))
                      (values (f)))))))
     (assert (not calls))))
+
+(with-test (:name :overflow-arith
+            :skipped-on (not (or :arm64 :x86-64)))
+  (let* ((types '(sb-vm:word sb-vm:signed-word))
+         (the-types `(fixnum (unsigned-byte 16) (signed-byte 16) ,@types)))
+    (loop
+      for op in '(+ - * negate)
+      do
+      (loop
+        for a-type in types
+        do
+        (loop
+          for b-type in types
+          do
+          (loop for the-type in the-types
+                for lambda = (if (eq op 'negate)
+                                 `(lambda (a)
+                                    (declare (,a-type a))
+                                    (the ,the-type (- a)))
+                                 `(lambda (a b)
+                                    (declare (,a-type a)
+                                             (,b-type b))
+                                    (the ,the-type (,op a b))))
+                do (unless (find-if (lambda (x)
+                                      (eql (search "OVERFLOW" (string x)) 0))
+                                    (ir2-vops lambda))
+                     (cerror "" "~s" lambda))))))))
+
+(with-test (:name :type-diff-testing)
+  (assert
+   (= (count 'sb-int:double-float-p
+             (ir2-vops '(lambda (x)
+                         (declare ((or fixnum double-float) x))
+                         (typep x 'double-float))))
+      1))
+  (assert
+   (= (count 'numberp
+             (ir2-vops '(lambda (x)
+                         (declare ((or double-float array) x))
+                         (typep x 'number))))
+      0))
+  (assert
+   (= (count 'integerp
+             (ir2-vops '(lambda (x)
+                         (declare ((or array (signed-byte 8)) x))
+                         (typep x 'integer))))
+      0)))
+
+(with-test (:name :let-no-typecheck)
+  (assert (not (find 'sb-c::%type-check-error/c
+                     (ir-calls
+                      `(lambda (x)
+                         (let ((m (the sequence x)))
+                           (values (length m)
+                                   m))))
+                     :key (lambda (x) (combination-fun-source-name x nil)))))
+  (assert (eql (count 'sb-c::%type-check-error/c
+                      (ir-calls
+                       `(lambda (x l)
+                          (let ((m (the sequence x))
+                                (l (the integer l)))
+                            (values (length m)
+                                    l))))
+                      :key (lambda (x) (combination-fun-source-name x nil)))
+               1)))

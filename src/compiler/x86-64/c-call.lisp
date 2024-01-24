@@ -388,7 +388,8 @@
   ;; the UNDEFINED-ALIEN-TRAMP lisp asm routine to recognize the various shapes
   ;; this instruction sequence can take.
   #-win32
-  (inst call (if (tn-p fun)
+  (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+    (inst call (if (tn-p fun)
                  fun
                  #-immobile-space (ea (make-fixup fun :foreign 8))
                  #+immobile-space
@@ -398,7 +399,7 @@
                         ;; RAX has a designated purpose, and RBX is nonvolatile (not always
                         ;; spilled by Lisp because a C function has to save it if used)
                         (inst mov r10-tn (thread-slot-ea thread-alien-linkage-table-base-slot))
-                        (ea (make-fixup fun :alien-code-linkage-index 8) r10-tn)))))
+                        (ea (make-fixup fun :alien-code-linkage-index 8) r10-tn))))))
 
   ;; On win64, we don't support immobile space (yet) and calls go through one of
   ;; the thunks defined in set_up_win64_seh_data(). If the linkage table is
@@ -550,8 +551,7 @@
           (inst call rax)
 
           ;; Back! Restore frame
-          (inst mov rsp rbp)
-          (inst pop rbp))
+          (inst leave))
 
         #+sb-thread
         (progn
@@ -577,8 +577,7 @@
           #-immobile-space
           (inst call (ea (+ (foreign-symbol-address "callback_wrapper_trampoline") 8)))
           ;; Back! Restore frame
-          (inst mov rsp rbp)
-          (inst pop rbp))
+          (inst leave))
 
         ;; Result now on top of stack, put it in the right register
         (cond

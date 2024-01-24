@@ -1,3 +1,8 @@
+#+gc-stress
+(sb-thread:make-thread (lambda ()
+                         (loop (gc :full t) (sleep 0.001)))
+                       :name "gc stress")
+
 (defpackage :test-util
   (:use :cl :sb-ext)
   (:export #:with-test #:report-test-status #:*failures*
@@ -34,6 +39,7 @@
            #:assemble
            #:get-simple-fun-instruction-model
 
+           #:scratch-dir-name
            #:scratch-file-name
            #:*scratch-file-prefix*
            #:with-scratch-file
@@ -262,7 +268,9 @@
                                    (eql package (find-package "CL"))
                                    (eql package (find-package "KEYWORD")))
                                x (copy-symbol x))))
-                 (integer x))))
+                 (integer x)
+                 (character `(code-char ,(char-code x)))
+                 (string x))))
   (cond
     ((broken-p broken-on)
      `(progn
@@ -640,9 +648,9 @@
   (if (eq args-thunk :return-type)
       (let ((type (sb-kernel:%simple-fun-type function)))
        (unless (or (eq type 'function)
-                   (type-specifiers-equal (caddr type) expected)
                    #.(and (not (member :unwind-to-frame-and-call-vop sb-impl:+internal-features+))
-                          '(member '(debug 3) optimize :test #'equal)))
+                          '(member '(debug 3) optimize :test #'equal))
+                   (type-specifiers-equal (caddr type) expected))
          (error "~@<The derived type of~
                    ~/test-util::print-form-and-optimize/ ~
                    is ~/sb-impl:print-type-specifier/
@@ -894,6 +902,15 @@
 ;;; We can't use any of the interfaces provided in libc because those are inadequate
 ;;; for purposes of COMPILE-FILE. This is not trying to be robust against attacks.
 (defvar *scratch-file-prefix* "sbcl-scratch")
+(defun scratch-dir-name ()
+  (let ((dir (posix-getenv #+win32 "TMP" #+unix "TMPDIR"))
+        (file (format nil "~a~d/" *scratch-file-prefix* (sb-unix:unix-getpid))))
+      (if dir
+          (namestring
+           (merge-pathnames
+            file (parse-native-namestring dir nil *default-pathname-defaults*
+                                          :as-directory t)))
+          (concatenate 'string "/tmp/" file))))
 (defun scratch-file-name (&optional extension)
   (let ((a (make-array 10 :element-type 'character)))
     (dotimes (i 10)
@@ -904,6 +921,7 @@
       (if dir
           (namestring
            (merge-pathnames
+            ;; TRUENAME - wtf ?
             file (truename (parse-native-namestring dir nil *default-pathname-defaults*
                                                     :as-directory t))))
           (concatenate 'string "/tmp/" file)))))
@@ -1018,7 +1036,7 @@
 (defun deep-size (obj &optional (leafp (lambda (x)
                                          (typep x '(or package symbol sb-kernel:fdefn
                                                        function sb-kernel:code-component
-                                                       sb-kernel:wrapper sb-kernel:classoid)))))
+                                                       sb-kernel:layout sb-kernel:classoid)))))
   (let ((worklist (list obj))
         (seen (make-hash-table :test 'eq))
         (tot-bytes 0))
@@ -1038,3 +1056,11 @@
     (values tot-bytes
             (1- (hash-table-count seen))
             seen)))
+
+;;; x86-64 does not permit var-alloc to translate %make-funcallable-instance
+;;; so this case has to be amenable to fixed-alloc.
+(defun make-funcallable-instance (n)
+  (funcall
+   (compile nil
+            `(lambda () (sb-kernel:%make-funcallable-instance ,n)))))
+

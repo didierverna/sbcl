@@ -82,7 +82,7 @@
 (defconstant msan-temp-reg-number 0)
 
 ;;; The encoding anomaly for r12 makes it a perfect choice for the card table base.
-;;; It will never be used with a constant displacement.
+;;; It will seldom be used with a constant displacement.
 (define-symbol-macro card-table-reg 12)
 (define-symbol-macro gc-card-table-reg-tn r12-tn)
 (define-symbol-macro card-index-mask (make-fixup nil :card-table-index-mask))
@@ -476,8 +476,7 @@
                        (locally (declare (notinline sb-c::producing-fasl-file))
                          (not (sb-c::producing-fasl-file))))))
        immediate-sc-number))
-    #+metaspace (sb-vm:layout (bug "Can't reference layout as a constant"))
-    #+(and compact-instance-header (not metaspace)) (wrapper immediate-sc-number)
+    #+compact-instance-header (layout immediate-sc-number)
     (single-float
        (if (eql value $0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
     (double-float
@@ -519,8 +518,8 @@
           (symbol   (if (static-symbol-p val)
                         (+ nil-value (static-symbol-offset val))
                         (make-fixup val :immobile-symbol)))
-          #+(and immobile-space (not metaspace))
-          (wrapper
+          #+(or immobile-space permgen)
+          (layout
            (make-fixup val :layout))
           (character (if tag
                          (logior (ash (char-code val) n-widetag-bits)
@@ -533,7 +532,7 @@
                  bits)))
           (structure-object
            (if (eq val sb-lockless:+tail+)
-               (progn (aver tag) sb-vm::lockfree-list-tail-value)
+               (progn (aver tag) (+ static-space-start lockfree-list-tail-value-offset))
                (bug "immediate structure-object ~S" val)))))
       tn))
 
@@ -611,15 +610,35 @@
        (if (or
             (valid-funtype '((mod 64) word) '*)
             (valid-funtype '((mod 64) signed-word) '*))
-           (values :transform '(lambda (index integer) (%logbitp index integer)))
+           (values :direct nil)
            (values :default nil)))
+      (truncate
+       (destructuring-bind (n &optional d) (sb-c::basic-combination-args node)
+         (if (and d
+                  (constant-lvar-p d)
+                  (power-of-two-p (lvar-value d))
+                  (and (csubtypep (sb-c::lvar-type n) (specifier-type 'signed-word))
+                       (not (csubtypep (sb-c::lvar-type n) (specifier-type 'word)))))
+             (values :maybe nil)
+             (values :default nil))))
+      (%dpb
+       (flet ((validp (type result-type)
+                (valid-funtype `((constant-arg integer)
+                                 (constant-arg (integer 1 1))
+                                 ,type
+                                 ,type)
+                               result-type)))
+         (if (and (or (validp 'signed-word 'signed-word)
+                      (validp 'word 'word))
+                  (not (destructuring-bind (new size posn integer) (sb-c::basic-combination-args node)
+                         (declare (ignore new size integer))
+                         (constant-lvar-p posn))))
+             (values :direct nil)
+             (values :default nil))))
       (t
        (values :default nil)))))
 
 (defvar *register-names* +qword-register-names+)
-
-(defmacro unbound-marker-bits ()
-  (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag))
 
 ;;; See WRITE-FUNINSTANCE-PROLOGUE in x86-64-vm.
 ;;; There are 4 bytes available in the imm32 operand of a dummy MOV instruction.
@@ -636,3 +655,11 @@
     ;; By design they are also (i.e. must be) nonvolatile aross C call.
     (aver (not (logbitp 12 locs)))
     #-gs-seg (aver (not (logbitp 13 locs)))))
+
+#+sb-xc-host
+(setq *backend-cross-foldable-predicates*
+      '(power-of-two-p))
+
+#+nil
+(define-cond-sc 32-bit-immediate immediate
+  (typep (tn-value tn) '(signed-byte 32)))

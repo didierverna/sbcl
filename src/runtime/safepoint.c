@@ -8,7 +8,7 @@
  * provided with absolutely no warranty. See the COPYING and CREDITS
  * files for more information.
  */
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT /* entire file */
 #include <stdlib.h>
@@ -36,8 +36,8 @@
 #include "genesis/cons.h"
 #include "genesis/fdefn.h"
 #include "interr.h"
-#include "alloc.h"
-#include "gc-internal.h"
+#include "genesis/sap.h"
+#include "gc.h"
 #include "interrupt.h"
 #include "lispregs.h"
 #include "print.h"
@@ -106,8 +106,8 @@ const char* gc_phase_names[GC_NPHASES] = {
 #define SET_THREAD_STOP_PENDING(th,state) \
     write_TLS(STOP_FOR_GC_PENDING,state,th)
 #define WITH_ALL_THREADS_LOCK \
-    mutex_acquire(&all_threads_lock); \
-    RUN_BODY_ONCE(all_threads_lock, mutex_release(&all_threads_lock))
+    ignore_value(mutex_acquire(&all_threads_lock)); \
+    RUN_BODY_ONCE(all_threads_lock, ignore_value(mutex_release(&all_threads_lock)))
 
 #if !defined(LISP_FEATURE_WIN32)
 /* win32-os.c covers these, but there is no unixlike-os.c, so the normal
@@ -170,7 +170,8 @@ void safepoint_init()
     for (i=GC_NONE; i<GC_NPHASES; ++i)
         InitializeConditionVariable(&gc_state.phase_cond[i]);
     InitializeCriticalSection(&gc_state.lock);
-#else
+#elif !defined LISP_FEATURE_X86_64 && !defined LISP_FEATURE_RELOCATABLE_STATIC_SPACE
+    // 64-bit already allocated a trap page when the GC card mark table was made
     os_alloc_gc_space(0, NOT_MOVABLE, GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES);
 #endif
     gc_state.phase = GC_NONE;
@@ -180,7 +181,7 @@ void
 gc_state_lock()
 {
     odxprint(safepoints,"GC state to be locked");
-    int result = mutex_acquire(&gc_state.lock);
+    int __attribute__((unused)) result = mutex_acquire(&gc_state.lock);
     gc_assert(result);
     if (gc_state.master) {
         fprintf(stderr,"GC state lock glitch [%p] in thread %p phase %d (%s)\n",
@@ -201,7 +202,7 @@ gc_state_unlock()
              gc_state.phase, gc_phase_names[gc_state.phase]);
     gc_assert(get_sb_vm_thread()==gc_state.master);
     gc_state.master = NULL;
-    int result = mutex_release(&gc_state.lock);
+    int __attribute__((unused)) result = mutex_release(&gc_state.lock);
     gc_assert(result);
     odxprint(safepoints,"%s","GC state unlocked");
 }
@@ -266,7 +267,7 @@ static inline gc_phase_t gc_phase_next(gc_phase_t old) {
     return (old+1) % GC_NPHASES;
 }
 
-static inline boolean
+static inline bool
 thread_blocks_gc(struct thread *thread)
 {
     return read_TLS(GC_INHIBIT,thread)==LISP_T;
@@ -288,8 +289,8 @@ thread_blocks_gc(struct thread *thread)
    There is a full VM page reserved for this word; page permissions
    are switched to read-only for race-free examine + wait + use
    scenarios. */
-static inline boolean
-set_thread_csp_access(struct thread* th, boolean writable)
+static inline bool
+set_thread_csp_access(struct thread* th, bool writable)
 {
     os_protect((char*)th - (THREAD_HEADER_SLOTS*N_WORD_BYTES) - THREAD_CSP_PAGE_SIZE,
                THREAD_CSP_PAGE_SIZE,
@@ -319,7 +320,7 @@ static inline void gc_notify_early()
             if (p==gc_state.collector)
                 continue;
             odxprint(safepoints,"notifying thread %p csp %p",p,csp_around_foreign_call(p));
-            boolean was_in_lisp = !set_thread_csp_access(p,0);
+            bool was_in_lisp = !set_thread_csp_access(p,0);
             if (was_in_lisp) {
                 /* Threads "in-lisp" block leaving GC_MESSAGE, as we
                  * need them to hit their CSP or the GSP, and we unmap
@@ -353,7 +354,7 @@ static inline void gc_notify_final()
             if (p == gc_state.collector)
                 continue;
             odxprint(safepoints,"notifying thread %p csp %p",p,csp_around_foreign_call(p));
-            boolean was_in_lisp = !set_thread_csp_access(p,0);
+            bool was_in_lisp = !set_thread_csp_access(p,0);
             if (was_in_lisp) {
                 gc_state.phase_wait[GC_SETTLED]++;
                 SET_THREAD_STOP_PENDING(p, LISP_T);
@@ -366,7 +367,7 @@ static inline void gc_done()
 {
     CURRENT_THREAD_VAR(self);
     struct thread *p;
-    boolean inhibit = (read_TLS(GC_INHIBIT,self)==LISP_T);
+    bool inhibit = (read_TLS(GC_INHIBIT,self)==LISP_T);
 
     odxprint(safepoints,"%s","global denotification");
     WITH_ALL_THREADS_LOCK {
@@ -601,7 +602,7 @@ assert_on_stack(struct thread *th, void *esp)
 }
 
 /// Similar to the one in gc-common, but without the sigmask test.
-static boolean can_invoke_post_gc(struct thread* th)
+static bool can_invoke_post_gc(struct thread* th)
 {
     lispobj obj = th->lisp_thread;
     if (!obj) return 0;
@@ -611,7 +612,7 @@ static boolean can_invoke_post_gc(struct thread* th)
 }
 
 // returns 0 if skipped, 1 otherwise
-int check_pending_gc(__attribute((unused)) os_context_t *ctx)
+int check_pending_gc()
 {
     odxprint(misc, "check_pending_gc");
     struct thread * self = get_sb_vm_thread();
@@ -650,7 +651,7 @@ int check_pending_gc(__attribute((unused)) os_context_t *ctx)
 void thread_in_lisp_raised(os_context_t *ctxptr)
 {
     struct thread *self = get_sb_vm_thread();
-    boolean check_gc_and_thruptions = 0;
+    bool check_gc_and_thruptions = 0;
     odxprint(safepoints,"%s","thread_in_lisp_raised");
 
     /* Either we just hit the GSP trap, or we took a PIT stop and
@@ -719,7 +720,7 @@ void thread_in_lisp_raised(os_context_t *ctxptr)
     /* If we still need to GC, and it's not inhibited, call into
      * SUB-GC.  Phase is either GC_QUIET or GC_NONE. */
     if (check_gc_and_thruptions) {
-        check_pending_gc(ctxptr);
+        check_pending_gc();
 #ifdef LISP_FEATURE_SB_SAFEPOINT
         while(check_pending_thruptions(ctxptr));
 #endif
@@ -729,7 +730,7 @@ void thread_in_lisp_raised(os_context_t *ctxptr)
 void thread_in_safety_transition(os_context_t *ctxptr)
 {
     struct thread *self = get_sb_vm_thread();
-    boolean was_in_alien;
+    bool was_in_alien;
 
     odxprint(safepoints,"%s","GC safety transition");
     WITH_GC_STATE_LOCK {
@@ -789,7 +790,7 @@ void thread_in_safety_transition(os_context_t *ctxptr)
 void thread_interrupted(os_context_t *ctxptr)
 {
     struct thread *self = get_sb_vm_thread();
-    boolean gc_active, was_in_alien;
+    bool gc_active, was_in_alien;
 
     odxprint(safepoints,"%s","pending interrupt trap");
     WITH_GC_STATE_LOCK {
@@ -805,7 +806,7 @@ void thread_interrupted(os_context_t *ctxptr)
             thread_in_lisp_raised(ctxptr);
         }
     }
-    check_pending_gc(ctxptr);
+    check_pending_gc();
 #ifdef LISP_FEATURE_SB_SAFEPOINT
     while(check_pending_thruptions(ctxptr));
 #endif
@@ -831,6 +832,7 @@ gc_stop_the_world()
         switch(gc_state.phase) {
         case GC_NONE:
             gc_advance(GC_QUIET,gc_state.phase);
+            /* FALLTHRU */
         case GC_FLIGHT:
         case GC_MESSAGE:
         case GC_INVOKED:
@@ -845,6 +847,7 @@ gc_stop_the_world()
             } else {
                 gc_state_wait(GC_QUIET);
             }
+            /* FALLTHRU */
         case GC_QUIET:
             /* Some number of threads were trying to get to GC_QUIET.
              * But this thread is sufficient to be able to leave

@@ -17,8 +17,9 @@
 #define _GNU_SOURCE
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <signal.h>
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "os.h"
@@ -26,7 +27,6 @@
 #include "lispregs.h"
 #include <wchar.h>
 #include "arch.h"
-#include "genesis/compiled-debug-fun.h"
 #include "genesis/compiled-debug-info.h"
 #include "genesis/hash-table.h"
 #include "genesis/package.h"
@@ -36,9 +36,7 @@
 #include "gc.h"
 #include "code.h"
 #include "var-io.h"
-#include "gc-internal.h"
-#include "forwarding-ptr.h"
-#include "lispstring.h"
+#include "search.h"
 
 #ifdef LISP_FEATURE_OS_PROVIDES_DLADDR
 # include <dlfcn.h>
@@ -137,16 +135,12 @@ lispobj symbol_package(struct symbol* s)
         }
         return NIL;
     }
-    struct vector* v = VECTOR(lisp_package_vector);
-    int id = symbol_package_id(s);
-    if (id < vector_len(v)) return v->data[id];
-    lose("can't decode package ID %d", id);
+    return get_package_by_id(symbol_package_id(s));
 }
 
 static void
 print_entry_name (lispobj name, FILE *f)
 {
-    name = follow_maybe_fp(name);
     if (listp(name)) {
         putc('(', f);
         while (name != NIL) {
@@ -155,8 +149,8 @@ print_entry_name (lispobj name, FILE *f)
                        (void*)name);
                 return;
             }
-            print_entry_name(CONS(name)->car, f);
-            name = follow_maybe_fp(CONS(name)->cdr);
+            print_entry_name(barrier_load(&CONS(name)->car), f);
+            name = barrier_load(&CONS(name)->cdr);
             if (name != NIL)
                 putc(' ', f);
         }
@@ -176,8 +170,10 @@ print_entry_name (lispobj name, FILE *f)
             if (prefix) fputs(prefix, f); else {
                 struct package *pkg
                     = (struct package *)native_pointer(symbol_package(symbol));
-                struct vector *pkg_name = VECTOR(follow_maybe_fp(pkg->_name));
-                print_string(pkg_name, f);
+                lispobj name_ptr = barrier_load(&pkg->_name);
+                if (name_ptr) {
+                    print_string(VECTOR(name_ptr), f);
+                }
                 fputs("::", f);
             }
             print_string(symbol_name(symbol), f);
@@ -209,7 +205,8 @@ print_entry_points (struct code *code, FILE *f)
             fprintf(f, "%p: bogus function entry", fun);
             return;
         }
-        print_entry_name(code->constants[CODE_SLOTS_PER_SIMPLE_FUN*index], f);
+        print_entry_name(barrier_load(&code->constants[CODE_SLOTS_PER_SIMPLE_FUN*index]),
+                         f);
         if ((index + 1) < n_funs) fprintf(f, ", ");
     });
 }
@@ -247,7 +244,7 @@ code_pointer(lispobj object)
     return (struct code *) headerp;
 }
 
-static boolean
+static bool
 cs_valid_pointer_p(struct thread *thread, struct call_frame *pointer)
 {
     return (((char *) thread->control_stack_start <= (char *) pointer) &&
@@ -285,7 +282,7 @@ call_info_from_context(struct call_info *info, os_context_t *context)
 #ifdef reg_CODE
             code_pointer(*os_context_register_addr(context, reg_CODE));
 #else
-        (struct code *)dynamic_space_code_from_pc((char *)pc);
+        (struct code *)component_ptr_from_pc((char *)pc);
 #endif
         info->lra = NIL;
 
@@ -331,7 +328,7 @@ int lisp_frame_previous(struct thread *thread, struct call_info *info)
 #ifdef reg_CODE
         (struct code*)native_pointer(this_frame->code);
 #else
-        (struct code *)dynamic_space_code_from_pc((char *)lra);
+        (struct code*)component_ptr_from_pc((char *)lra);
 #endif
 #ifdef reg_LRA
         info->pc = lra;
@@ -414,7 +411,7 @@ lisp_backtrace(int nframes)
             struct compiled_debug_fun *df;
             if (absolute_pc &&
                 (df = debug_function_from_pc((struct code *)info.code, absolute_pc)))
-                print_entry_name(df->name, stdout);
+                print_entry_name(barrier_load(&df->name), stdout);
             else
                 // I can't imagine a scenario where we have info.code
                 // but do not have an absolute_pc, or debug-fun can't be found.
@@ -562,7 +559,7 @@ static void print_backtrace_frame(char *pc, void *fp, int i, FILE *f) {
     if (code) {
         struct compiled_debug_fun *df = debug_function_from_pc(code, pc);
         if (df)
-            print_entry_name(df->name, f);
+            print_entry_name(barrier_load(&df->name), f);
         else if (pc >= (char*)asm_routines_start && pc < (char*)asm_routines_end)
             fprintf(f, "%s (asm)", asm_routine_name(pc));
         else
@@ -612,6 +609,7 @@ log_backtrace_from_fp(struct thread* th, void *fp, int nframes, int start, FILE 
     print_backtrace_frame(ra, next_fp, i, f);
     fp = next_fp;
   }
+  fflush(f);
 }
 void backtrace_from_fp(void *fp, int nframes, int start) {
     log_backtrace_from_fp(get_sb_vm_thread(), fp, nframes, start, stdout);
@@ -658,7 +656,7 @@ int simple_fun_index_from_pc(struct code* code, char *pc)
     return -1;
 }
 
-static boolean __attribute__((unused)) print_lisp_fun_name(char* pc)
+static bool __attribute__((unused)) print_lisp_fun_name(char* pc)
 {
   struct code* code;
   if (gc_managed_heap_space_p((uword_t)pc) &&
@@ -666,7 +664,7 @@ static boolean __attribute__((unused)) print_lisp_fun_name(char* pc)
       struct compiled_debug_fun* df = debug_function_from_pc(code, pc);
       if (df) {
           fprintf(stderr, " %p [", pc);
-          print_entry_name(df->name, stderr);
+          print_entry_name(barrier_load(&df->name), stderr);
           fprintf(stderr, "]\n");
           return 1;
       }
@@ -674,13 +672,30 @@ static boolean __attribute__((unused)) print_lisp_fun_name(char* pc)
   return 0;
 }
 
-#ifdef LISP_FEATURE_BACKTRACE_ON_SIGNAL
-#define UNW_LOCAL_ONLY
 #ifdef HAVE_LIBUNWIND
+#define UNW_LOCAL_ONLY
 #include <libunwind.h>
+int get_sizeof_unw_context() { return sizeof (unw_context_t); }
+int get_sizeof_unw_cursor() { return sizeof (unw_cursor_t); }
+#ifdef LISP_FEATURE_DARWIN // slightly different libunwind. And it doesn't work for me
+int sb_unw_init(void* a, void* b) { return unw_init_local(a, b); }
+int sb_unw_get_pc(void* a, void* b) { return unw_get_reg(a, UNW_REG_IP, b); }
+#else
+int sb_unw_init(void* a, void* b) { return unw_init_local2(a, b, UNW_INIT_SIGNAL_FRAME); }
+int sb_unw_get_pc(void* a, void* b) { return unw_get_reg(a, UNW_TDEP_IP, b); }
 #endif
-#include "genesis/thread-instance.h"
-#include "genesis/mutex.h"
+int sb_unw_get_proc_name(void* a, void* b, int c, unw_word_t* d) { return unw_get_proc_name(a, b, c, d); }
+int sb_unw_step(void* a) { return unw_step(a); }
+#else
+int get_sizeof_unw_context() { return 0; }
+int get_sizeof_unw_cursor() { return 0; }
+int sb_unw_init(void* a, void* b) { lose("unw_init %p %p", a, b); }
+int sb_unw_get_proc_name(void* a, void* b, int c, void* d) { lose("unw_get_proc_name %p %p %d %p", a, b, c, d); }
+int sb_unw_step(void* a) { lose("unw_step %p", a); }
+int sb_unw_get_pc(void* a, void* b) { lose("unw_get_pc %p %p", a, b); }
+#endif
+
+#ifdef LISP_FEATURE_BACKTRACE_ON_SIGNAL
 static __attribute__((unused))int backtrace_completion_pipe[2] = {-1,-1};
 void libunwind_backtrace(struct thread *th, os_context_t *context)
 {
@@ -688,9 +703,9 @@ void libunwind_backtrace(struct thread *th, os_context_t *context)
 #ifdef LISP_FEATURE_SB_THREAD
     // the TLS area is not used if #-sb-thread. And if so, it must be "main thread"
     struct thread_instance* lispthread = (void*)native_pointer(th->lisp_thread);
-    if (lispthread->name != NIL) {
+    if (lispthread->_name != NIL) {
         fprintf(stderr, " (\"");
-        print_string(VECTOR(lispthread->name), stderr);
+        print_string(VECTOR(lispthread->_name), stderr);
         fprintf(stderr, "\")");
     }
     putc('\n', stderr);
@@ -706,7 +721,7 @@ void libunwind_backtrace(struct thread *th, os_context_t *context)
             // and a mutex have a name at the same slot offset (if #+sb-futex).
             // So to reiterate the comment from linux-os.c -
             // "Use this only if you know what you're doing"
-            struct mutex* lispmutex = (void*)native_pointer(lispthread->waiting_for);
+            struct lispmutex* lispmutex = (void*)native_pointer(lispthread->waiting_for);
             if (lispmutex->name != NIL) {
                 fprintf(stderr, " (MUTEX:\"");
                 print_string(VECTOR(lispmutex->name), stderr);

@@ -9,12 +9,15 @@
  * files for more information.
  */
 
-#include "gc-internal.h"
-#include "gc-private.h"
-#include "gencgc-private.h"
+#include "code.h"
+#include "gc.h"
 #include "genesis/gc-tables.h"
+#include "genesis/instance.h"
+#include "genesis/static-symbols.h"
+#include "genesis/symbol.h"
+#include "genesis/vector.h"
 #include "globals.h"
-#include "forwarding-ptr.h"
+#include "validate.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -65,7 +68,9 @@ static void visit_pointer_words(lispobj* object, lispobj (*func)(lispobj, uword_
     } else if (widetag == SYMBOL_WIDETAG) {
         struct symbol*s = (void*)object;
         FIX(s->value);
-        FIX(s->info);
+        FIX(s->info); // how could this ever be readonly ???
+        // name was already reassigned when moving dynamic to R/O, but when moving
+        // R/O back to dynamic it was not done yet.
         lispobj name = decode_symbol_name(s->name);
         gc_assert(is_lisp_pointer(name));
         set_symbol_name(s, func(name, arg));
@@ -82,18 +87,24 @@ static void visit_pointer_words(lispobj* object, lispobj (*func)(lispobj, uword_
 
 static int readonly_unboxed_obj_p(lispobj* obj)
 {
-    if (is_cons_half(*obj)) return 0;
+    if (forwarding_pointer_p(obj) || is_cons_half(*obj)) return 0;
     int widetag = widetag_of(obj);
     switch (widetag) {
+#ifndef LISP_FEATURE_64_BIT
+    case SINGLE_FLOAT_WIDETAG:
+#endif
     case BIGNUM_WIDETAG: case DOUBLE_FLOAT_WIDETAG:
     case COMPLEX_SINGLE_FLOAT_WIDETAG: case COMPLEX_DOUBLE_FLOAT_WIDETAG:
     case SAP_WIDETAG: case SIMPLE_ARRAY_NIL_WIDETAG:
-        return 1;
-    case RATIO_WIDETAG: case COMPLEX_WIDETAG:
-        return fixnump(obj[1]) && fixnump(obj[2]);
-#ifdef LISP_FEATURE_SIMD_PACK
+#ifdef SIMD_PACK_WIDETAG
     case SIMD_PACK_WIDETAG:
 #endif
+#ifdef SIMD_PACK_256_WIDETAG
+    case SIMD_PACK_256_WIDETAG:
+#endif
+        return 1;
+    case RATIO_WIDETAG: case COMPLEX_RATIONAL_WIDETAG:
+        return fixnump(obj[1]) && fixnump(obj[2]);
     }
     if ((widetag > SIMPLE_VECTOR_WIDETAG && widetag < COMPLEX_BASE_STRING_WIDETAG)) {
         if (!vector_len((struct vector*)obj)) return 1; // length 0 vectors can't be stored into
@@ -126,36 +137,53 @@ static sword_t careful_object_size(lispobj* obj) {
 
 static void walk_range(lispobj* start, lispobj* end, void (*func)(lispobj*,uword_t), uword_t arg)
 {
-    lispobj* where = start;
-    for ( ; where < end ; where += careful_object_size(where) ) func(where, arg);
-}
-
-static void walk_all_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
-{
-    walk_range((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, fun, arg);
-    walk_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, fun, arg);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    walk_range((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, fun, arg);
-    walk_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, fun, arg);
-#endif
-    page_index_t first, last;
-    for ( first = 0 ; first < next_free_page ; first = 1+last ) {
-        last = contiguous_block_final_page(first);
-        walk_range((lispobj*)page_address(first),
-                   (lispobj*)page_address(last) + page_words_used(last),
-                   fun, arg);
+    lispobj* where = next_object(start, 0, end);
+    while (where) {
+        func(where, arg);
+        where = next_object(where, careful_object_size(where), end);
     }
 }
 
-static void ensure_forwarded(lispobj* obj)
+struct pair {
+    void (*func)(lispobj*,uword_t);
+    uword_t data;
+};
+
+static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, uword_t arg)
 {
-    if (forwarding_pointer_p(obj)) return;
+    struct pair* pair = (void*)arg;
+    walk_range(where, limit, pair->func, pair->data);
+    return 0;
+}
+
+/* Call 'fun' on every object in every space, passing it object and 'arg' */
+static void walk_all_gc_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
+{
+    walk_range((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, fun, arg);
+    walk_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, fun, arg);
+    walk_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer, fun, arg);
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    walk_range((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, fun, arg);
+#endif
+    walk_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, fun, arg);
+    struct pair pair = {fun, arg};
+    walk_generation(walk_range_wrapper, -1, (uword_t)&pair);
+}
+
+static lispobj readonlyize(lispobj* obj)
+{
     sword_t nwords = object_size(obj);
     lispobj* copy = read_only_space_free_pointer;
-    read_only_space_free_pointer += nwords;
-    gc_assert((uword_t)read_only_space_free_pointer <= READ_ONLY_SPACE_END);
+    lispobj* new_freeptr = copy + nwords;
+    if ((uword_t)new_freeptr > READ_ONLY_SPACE_END)
+        lose("overran R/O space? ptr=%p end=%p", read_only_space_free_pointer,
+             (void*)READ_ONLY_SPACE_END);
+    read_only_space_free_pointer = new_freeptr;
     memcpy(copy, obj, nwords << WORD_SHIFT);
-    set_forwarding_pointer(obj, make_lispobj(copy, OTHER_POINTER_LOWTAG));
+    lispobj new = make_lispobj(copy, OTHER_POINTER_LOWTAG);
+    set_forwarding_pointer(obj, new);
+    // gc_assert(careful_object_size(obj) == nwords);
+    return new;
 }
 
 // We have to take the unused arg for function signature compatibility.
@@ -164,7 +192,10 @@ static void ensure_symbol_name_forwarded(lispobj* obj,
                                          __attribute__((unused)) uword_t arg) {
     if (widetag_of(obj) == SYMBOL_WIDETAG) {
         struct symbol* s = (void*)obj;
-        ensure_forwarded(native_pointer(decode_symbol_name(s->name)));
+        lispobj* name = native_pointer(decode_symbol_name(s->name));
+        bool fp = forwarding_pointer_p(name);
+        if (fp || (*name & ((VECTOR_SHAREABLE|VECTOR_SHAREABLE_NONSTD)<<ARRAY_FLAGS_POSITION)))
+            set_symbol_name(s, fp ? forwarding_pointer_value(name) : readonlyize(name));
     }
 }
 
@@ -172,10 +203,10 @@ static lispobj follow_ro_fp(lispobj ptr, __attribute__((unused)) uword_t arg) {
     return follow_fp(ptr); // just ignore arg
 }
 static void follow_rospace_ptrs(lispobj* obj, __attribute__((unused)) uword_t arg) {
-    if (*obj != FORWARDING_HEADER) visit_pointer_words(obj, follow_ro_fp, 0);
+    if (!forwarding_pointer_p(obj)) visit_pointer_words(obj, follow_ro_fp, 0);
 }
 static void insert_filler(lispobj* obj, __attribute__((unused)) uword_t arg) {
-    if (*obj == FORWARDING_HEADER) {
+    if (forwarding_pointer_p(obj)) {
         sword_t nwords = object_size(native_pointer(forwarding_pointer_value(obj)));
         // TODO: huge fillers aren't really used elsewhere. Can this exceed the
         // bits allotted for the size field? Insert more than one filler if needed.
@@ -206,17 +237,20 @@ void prepare_readonly_space(int purify, int print)
     for ( first = 0; first < next_free_page; first = 1+last ) {
         last = contiguous_block_final_page(first);
         lispobj* where = (lispobj*)page_address(first);
-        lispobj* limit = (lispobj*)page_address(last) + page_words_used(last);
+        lispobj* limit = (lispobj*)page_limit(last);
+        where = next_object(where, 0, limit);
         sword_t nwords;
-        for ( ; where < limit ; where += nwords ) {
+        while (where) {
             nwords = object_size(where);
             if ( readonly_unboxed_obj_p(where) ) sum_sizes += nwords;
+            where = next_object(where, nwords, limit);
         }
     }
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     extern int compute_codeblob_offsets_nwords(int*);
     sum_sizes += compute_codeblob_offsets_nwords(NULL);
 #endif
+    sum_sizes += 2; // for the SIMPLE_VECTOR inserted below as a delimiter
     sum_sizes <<= WORD_SHIFT;
     if (print) fprintf(stderr, "%d bytes\n", sum_sizes);
     int string_space_size = ALIGN_UP(sum_sizes, BACKEND_PAGE_BYTES);
@@ -225,13 +259,13 @@ void prepare_readonly_space(int purify, int print)
         (uword_t)os_alloc_gc_space(READ_ONLY_CORE_SPACE_ID,
                                    MOVABLE, (char*)DYNAMIC_SPACE_START - string_space_size,
                                    string_space_size);
-    READ_ONLY_SPACE_END = READ_ONLY_SPACE_START + string_space_size;
+    READ_ONLY_SPACE_END = READ_ONLY_SPACE_START + sum_sizes;
     read_only_space_free_pointer = (lispobj*)READ_ONLY_SPACE_START;
 
     // 2. Forward all symbol names so that they're placed contiguously
     // Could be even more clever and sort lexicographically for determistic core
     if (print) fprintf(stderr, "purify: forwarding symbol names\n");
-    walk_all_spaces(ensure_symbol_name_forwarded, 0);
+    walk_all_gc_spaces(ensure_symbol_name_forwarded, 0);
 
     // Add a random delimiter object between symbol-names and everything else.
     // APROPOS-LIST uses this to detect the end of the strings.
@@ -243,15 +277,16 @@ void prepare_readonly_space(int purify, int print)
     for ( first = 0; first < next_free_page; first = 1+last ) {
         last = contiguous_block_final_page(first);
         lispobj* where = (lispobj*)page_address(first);
-        lispobj* limit = (lispobj*)page_address(last) + page_words_used(last);
-        for ( ; where < limit ; where += careful_object_size(where) )
-            if (readonly_unboxed_obj_p(where)) ensure_forwarded(where);
+        lispobj* limit = page_limit(last);
+        for ( where = next_object(where, 0, limit) ; where ;
+              where = next_object(where, careful_object_size(where), limit) )
+            if (readonly_unboxed_obj_p(where)) readonlyize(where);
     }
 
     // 4. Update all objects in all spaces to point to r/o copy of anything that moved
     if (print) fprintf(stderr, "purify: fixing all pointers\n");
-    walk_all_spaces(follow_rospace_ptrs, 0);
-    walk_all_spaces(insert_filler, 0);
+    walk_all_gc_spaces(follow_rospace_ptrs, 0);
+    walk_all_gc_spaces(insert_filler, 0);
 }
 
 /* Now for the opposite of 'purify' - moving back from R/O to dynamic */
@@ -286,12 +321,13 @@ void move_rospace_to_dynamic(__attribute__((unused)) int print)
     for ( ; where < read_only_space_free_pointer ; where += nwords, shadow_cursor += nwords ) {
         nwords = headerobj_size(where);
         lispobj *new = gc_general_alloc(unboxed_region, nwords*N_WORD_BYTES, PAGE_TYPE_BOXED);
+        SET_ALLOCATED_BIT(new);
         memcpy(new, where, nwords*N_WORD_BYTES);
         *shadow_cursor = make_lispobj(new, OTHER_POINTER_LOWTAG);
     }
     ensure_region_closed(unboxed_region, PAGE_TYPE_BOXED);
     os_deallocate((void*)READ_ONLY_SPACE_START, READ_ONLY_SPACE_END - READ_ONLY_SPACE_START);
-    walk_all_spaces(undo_rospace_ptrs, (uword_t)shadow_base);
+    walk_all_gc_spaces(undo_rospace_ptrs, (uword_t)shadow_base);
     // Set it empty
     read_only_space_free_pointer = (lispobj*)READ_ONLY_SPACE_START;
 }
@@ -317,8 +353,9 @@ void test_dirty_all_gc_cards()
     while (first < next_free_page) {
         page_index_t last = contiguous_block_final_page(first);
         lispobj* where = (lispobj*)page_address(first);
-        lispobj* limit = (lispobj*)page_address(last) + page_words_used(last);
-        for ( ; where < limit ; where += object_size(where) )
+        lispobj* limit = page_limit(last);
+        for (where = next_object(where, 0, limit) ; where ;
+             where = next_object(where, object_size(where), limit) )
             if (widetag_of(where) == CODE_HEADER_WIDETAG) {
 #ifndef LISP_FEATURE_SOFT_CARD_MARKS // only touch code pages, others got WP faults
                 gc_card_mark[addr_to_card_index(where)] = 1;
@@ -327,7 +364,6 @@ void test_dirty_all_gc_cards()
             }
         first = 1+last;
     }
-    extern boolean pre_verify_gen_0;
     pre_verify_gen_0 = 1;
 }
 

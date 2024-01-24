@@ -17,9 +17,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "arch.h"
-#include "signal.h"
+#include <signal.h>
 
 #include "runtime.h"
 #include "interr.h"
@@ -29,7 +29,6 @@
 #include "genesis/vector.h"
 #include "code.h"
 #include "thread.h"
-#include "monitor.h"
 #include "breakpoint.h"
 #include "var-io.h"
 #include "sc-offset.h"
@@ -37,6 +36,7 @@
 
 /* the way that we shut down the system on a fatal error */
 void lisp_backtrace(int frames);
+extern void ldb_monitor(void);
 
 static void
 default_lossage_handler(void)
@@ -53,7 +53,7 @@ default_lossage_handler(void)
 }
 static void (*lossage_handler)(void) = default_lossage_handler;
 
-#if QSHOW
+#ifdef LISP_FEATURE_WIN32
 static void
 configurable_lossage_handler()
 {
@@ -72,28 +72,28 @@ configurable_lossage_handler()
 "infinite sleep call, maximizing your chances that the thread's current\n"
 "state can be preserved until you attach an external debugger. Good luck!\n");
         for (;;)
-#         ifdef LISP_FEATURE_WIN32
             Sleep(10000);
-#         else
-            sleep(10);
-#         endif
     }
 
-    monitor_or_something();
+    ldb_monitor();
 }
 #endif
 
 void enable_lossage_handler(void)
 {
-#if QSHOW
+#ifdef LISP_FEATURE_WIN32
     lossage_handler = configurable_lossage_handler;
 #else
-    lossage_handler = monitor_or_something;
+    lossage_handler = ldb_monitor;
 #endif
 }
 void disable_lossage_handler(void)
 {
     lossage_handler = default_lossage_handler;
+}
+void set_lossage_handler(void (*handler)(void))
+{
+    lossage_handler = handler ? handler : &default_lossage_handler;
 }
 
 static
@@ -107,10 +107,7 @@ void print_message(char *fmt, va_list ap)
     fprintf(stderr, "\n");
 }
 
-static inline void
-call_lossage_handler() never_returns;
-
-static inline void
+static inline void never_returns
 call_lossage_handler()
 {
     lossage_handler();
@@ -118,10 +115,20 @@ call_lossage_handler()
     exit(1);
 }
 
+#include <setjmp.h>
 void
 lose(char *fmt, ...)
 {
     va_list ap;
+#ifdef STANDALONE_LDB
+    extern jmp_buf ldb_toplevel;
+    va_start(ap, fmt);
+    print_message(fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    longjmp(ldb_toplevel, 1);
+#else
     /* Block signals to prevent other threads, timers and such from
      * interfering. If only all threads could be stopped somehow. */
 
@@ -139,6 +146,7 @@ lose(char *fmt, ...)
     fprintf(stderr, "\n");
     fflush(stderr);
     call_lossage_handler();
+#endif
 }
 
 #if 0
@@ -167,7 +175,7 @@ void tprintf(char *fmt, ...)
 }
 #endif
 
-boolean lose_on_corruption_p = 0;
+int lose_on_corruption_p = 0; // DO NOT CHANGE THIS TO 'bool'. (Naughty users think it's 4 bytes)
 
 void
 corruption_warning_and_maybe_lose(char *fmt, ...)

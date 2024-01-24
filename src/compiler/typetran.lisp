@@ -67,6 +67,15 @@
         (abort-ir1-transform)
         expansion)))
 
+(progn
+  (defun type-other-pointer-p (type)
+    (csubtypep type (specifier-type '(not #1=(or fixnum #+64-bit single-float
+                                                 list function instance character
+                                                 extended-sequence)))))
+
+  (defun type-not-other-pointer-p (type)
+    (csubtypep type (specifier-type '#1#))))
+
 ;;; If the lvar OBJECT definitely is or isn't of the specified
 ;;; type, then return T or NIL as appropriate. Otherwise quietly
 ;;; GIVE-UP-IR1-TRANSFORM.
@@ -79,41 +88,106 @@
            (return-from ir1-transform-type-predicate t))
           ((eq type *empty-type*)
            (return-from ir1-transform-type-predicate nil)))
-    (let ((intersect (type-intersection2 type otype)))
-      ;; I guess the theory here is that an intersection type
-      ;; is never a singleton, because if we could see that it was
-      ;; a singleton, it wouldn't be an intersection.
-      (when (and intersect (not (intersection-type-p intersect)))
-        (multiple-value-bind (constantp value) (type-singleton-p intersect)
-          (when constantp
-            (return-from ir1-transform-type-predicate `(eql object ',value)))))
+    (let ((intersect (type-intersection type otype))
+          (current-predicate (combination-fun-source-name node)))
       ;; If the object type is known to be (OR NULL <type>),
       ;; it is almost always cheaper to test for not EQ to NIL.
       ;; There is one exception:
-      ;;  - FIXNUMP is possibly cheapear than comparison to NIL, or definitely
+      ;;  - FIXNUMP is possibly cheaper than comparison to NIL, or definitely
       ;;    not worse. For x86, NIL is a 4-byte immediate operand,
       ;;    for lack of a null-tn register. FIXNUM-TAG-MASK is only 1 byte.
       (when (type= otype (type-union (specifier-type 'null) type))
         (let ((difference (type-difference type (specifier-type 'null))))
           (unless (type= difference (specifier-type 'fixnum))
             (return-from  ir1-transform-type-predicate `(not (null object))))))
-      (cond ((typep type 'alien-type-type)
-             ;; We don't transform alien type tests until here, because
-             ;; once we do that the rest of the type system can no longer
-             ;; reason about them properly -- so we'd miss out on type
-             ;; derivation, etc.
-             (delay-ir1-transform node :ir1-phases)
-             (let ((alien-type (alien-type-type-alien-type type)))
-               ;; If it's a lisp-rep-type, the CTYPE should be one already.
-               (aver (not (compute-lisp-rep-type alien-type)))
-               `(sb-alien::alien-value-typep object ',alien-type)))
-            ((let ((intersect (type-intersection otype type))
-                   (fixnum (specifier-type 'fixnum)))
-               (when (and (csubtypep intersect fixnum)
-                          (not (csubtypep type fixnum)))
-                 `(typep object ',(type-specifier intersect)))))
-            (t
-             (give-up-ir1-transform))))))
+      (flet ((memory-type-test-p (type)
+               (and (types-equal-or-intersect
+                     type
+                     (specifier-type
+                      '(not (or fixnum #+64-bit single-float
+                                       boolean character
+                             function list))))
+                    (not (type= type (specifier-type 'instance))))))
+        (cond ((typep type 'alien-type-type)
+               ;; We don't transform alien type tests until here, because
+               ;; once we do that the rest of the type system can no longer
+               ;; reason about them properly -- so we'd miss out on type
+               ;; derivation, etc.
+               (delay-ir1-transform node :ir1-phases)
+               (let ((alien-type (alien-type-type-alien-type type)))
+                 ;; If it's a lisp-rep-type, the CTYPE should be one already.
+                 (aver (not (compute-lisp-rep-type alien-type)))
+                 `(sb-alien::alien-value-typep object ',alien-type)))
+              ;; (typep (the (or list fixnum) x) 'integer) =>
+              ;; (typep x 'fixnum)
+              ((let ((new-predicate
+                       (or
+                        (backend-type-predicate intersect)
+                        ;; Remove bounds from numeric types
+                        (and (csubtypep intersect (specifier-type 'real))
+                             (macrolet ((up (&rest types)
+                                          `(cond ,@(loop for (type predicate) on types by #'cddr
+                                                         collect
+                                                         `((and (csubtypep intersect (specifier-type ',type))
+                                                                (csubtypep (specifier-type ',type) type))
+                                                           ',predicate)))))
+                               (up fixnum fixnump
+                                   integer integerp
+                                   rational rationalp
+                                   single-float single-float-p
+                                   double-float double-float-p
+                                   float floatp
+                                   real realp))))))
+                 (when (and new-predicate
+                            (neq new-predicate current-predicate)
+                            ;; Some subtypes are more expensive to check
+                            (not (and (eq current-predicate 'listp)
+                                      (eq new-predicate 'consp)))
+                            (not (and (eq current-predicate 'functionp)
+                                      (eq new-predicate 'compiled-function-p)))
+                            (not (eq current-predicate 'characterp))
+                            (not (and (eq current-predicate 'non-null-symbol-p)
+                                      (eq new-predicate 'keywordp)))
+                            (not (eq new-predicate #+64-bit 'signed-byte-64-p
+                                                   #-64-bit 'signed-byte-32-p))
+                            (not (eq new-predicate #+64-bit 'unsigned-byte-64-p
+                                                   #-64-bit 'unsigned-byte-32-p)))
+                   `(,new-predicate object))))
+              ;; (typep (the float x) 'double-float) =>
+              ;; (typep x 'single-float)
+              ((let* ((diff (type-difference otype type))
+                      (pred (and (or (eq current-predicate 'sequencep) ;; always expensive
+                                     (not (memory-type-test-p diff)))
+                                 (or (backend-type-predicate diff)
+                                     ;; Remove bounds from numeric types
+                                     (and (csubtypep diff (specifier-type 'real))
+                                          (macrolet ((up (&rest types)
+                                                       `(cond ,@(loop for (type predicate) on types by #'cddr
+                                                                      collect
+                                                                      `((and (csubtypep diff (specifier-type ',type))
+                                                                             (not (types-equal-or-intersect type (specifier-type ',type))))
+                                                                        ',predicate)))))
+                                            (up fixnum fixnump
+                                                integer integerp
+                                                rational rationalp
+                                                single-float single-float-p
+                                                double-float double-float-p
+                                                float floatp
+                                                real realp)))))))
+                 (cond ((and pred
+                             ;; Testing for fixnum is usually the cheapest
+                             (or (eq pred 'fixnump)
+                                 (memory-type-test-p type)))
+                        `(not (,pred object)))
+                       ((and (memory-type-test-p type)
+                             (cond ((and (type-not-other-pointer-p diff)
+                                         (type-other-pointer-p type))
+                                    `(%other-pointer-p object))
+                                   ((and (type-other-pointer-p type)
+                                         (type-not-other-pointer-p type))
+                                    `(not (%other-pointer-p object)))))))))
+              (t
+               (give-up-ir1-transform)))))))
 
 ;;; Flush %TYPEP tests whose result is known at compile time.
 (deftransform %typep ((object type) * * :node node)
@@ -316,7 +390,8 @@
          (high (numeric-type-high type)))
     (ecase (numeric-type-complexp type)
       (:real
-       (cond ((and (eql (numeric-type-class type) 'integer)
+       (cond #-arm64
+             ((and (eql (numeric-type-class type) 'integer)
                    (and (fixnump low)
                         (fixnump high)
                         #+(or x86 x86-64 arm arm64)
@@ -329,8 +404,8 @@
               ;; in %SOURCE-TRANSFORM-TYPEP, but even if it wasn't,
               ;; the OR will drop out due to constraint propagation.
               `(or (eq ,object ,low) (eq ,object ,high)))
-             #+(or x86 x86-64 arm arm64) ;; Not implemented elsewhere yet
-             ((and (eql (numeric-type-class type) 'integer)
+             ((and (vop-existsp :translate fixnum-mod-p)
+                   (eql (numeric-type-class type) 'integer)
                    (or (eql low 0)
                        (and (eql low 1)
                             (not (eql high most-positive-fixnum))))
@@ -340,6 +415,14 @@
                     `(and (not (eq ,object 0))
                           ,mod-p)
                     mod-p)))
+             ((and (vop-existsp :translate check-range<=)
+                   (eql (numeric-type-class type) 'integer)
+                   (fixnump low)
+                   (fixnump high))
+              `(check-range<= ,low ,object ,high))
+             ((type= type (specifier-type '(or word sb-vm:signed-word)))
+              `(or (typep ,object 'sb-vm:signed-word)
+                   (typep ,object 'word)))
              (t
               `(and (typep ,object ',base)
                     ,(transform-numeric-bound-test object type base)))))
@@ -613,6 +696,22 @@
                      (widetags
                       `(or (%other-pointer-subtype-p ,object ',widetags)
                            (typep ,object '(or ,@(mapcar #'type-specifier more-types)))))
+                     ((and (cdr more-types)
+                           (every #'intersection-type-p more-types)
+                           (let ((common (intersection-type-types (car more-types))))
+                             (loop for type in (cdr more-types)
+                                   for types = (intersection-type-types type)
+                                   for int = (intersection common types :test #'type=)
+                                   always int
+                                   do (setf common int)
+                                   finally
+                                   (return `(and
+                                             (typep ,object '(and ,@(mapcar #'type-specifier common)))
+                                             (or ,@(loop for type in more-types
+                                                         for types = (intersection-type-types type)
+                                                         collect
+                                                         `(typep ,object '(and ,@(mapcar #'type-specifier
+                                                                                  (set-difference types common))))))))))))
                      (t
                       `(or
                         ,@(mapcar (lambda (x)
@@ -805,32 +904,85 @@
                        `((if ,header-test
                              (= (%array-dimension ,obj 0) ,@dims)
                              (= (vector-length ,obj) ,@dims))))
-                     nil))))))
+                     nil
+                     (car dims)))))))
 
 ;;; Return forms to test that OBJ has the element-type specified by type
 ;;; specified by TYPE, where STYPE is the type we have checked against (which
 ;;; is the same but for dimensions and element type). If HEADERP is true, OBJ
 ;;; is guaranteed to be an array-header.
-(defun test-array-element-type (obj type stype headerp)
+(defun test-array-element-type (obj type stype headerp pred length)
   (declare (type array-type type stype))
-  (let ((obj `(truly-the ,(type-specifier stype) ,obj))
-        (eltype (array-type-specialized-element-type type)))
+  (let ((eltype (array-type-specialized-element-type type)))
     (unless (or (type= eltype (array-type-specialized-element-type stype))
                 (eq eltype *wild-type*))
-      (let ((typecode (sb-vm:saetp-typecode (find-saetp-by-ctype eltype))))
-        (with-unique-names (data)
-         (if (and headerp (not (array-type-complexp stype)))
-             ;; If we know OBJ is an array header, and that the array is
-             ;; simple, we also know there is exactly one indirection to
-             ;; follow.
-             `(#-x86-64
-               (eq (%other-pointer-widetag (%array-data ,obj)) ,typecode)
-               #+x86-64
-               (widetag= (%array-data ,obj) ,typecode))
-             `((do ((,data ,(if headerp `(%array-data ,obj) obj)
-                           (%array-data ,data)))
-                   ((not (array-header-p ,data))
-                    (eq (%other-pointer-widetag ,data) ,typecode))))))))))
+      (let* ((typecode (sb-vm:saetp-typecode (find-saetp-by-ctype eltype))))
+        (cond ((and headerp (not (array-type-complexp stype)))
+               (let ((obj `(truly-the ,(type-specifier stype) ,obj)))
+                 ;; If we know OBJ is an array header, and that the array is
+                 ;; simple, we also know there is exactly one indirection to
+                 ;; follow.
+                 `(#-x86-64
+                   (eq (%other-pointer-widetag (%array-data ,obj)) ,typecode)
+                   #+x86-64
+                   (widetag= (%array-data ,obj) ,typecode))))
+              ((not (array-type-complexp stype))
+               (values
+                `((and (%other-pointer-p ,obj)
+                       (let ((widetag (%other-pointer-widetag ,obj)))
+                         (or (eq widetag ,typecode)
+                             (and (eq widetag sb-vm:simple-array-widetag)
+                                  (eq (%other-pointer-widetag (%array-data ,obj)) ,typecode))))))
+                ;; skip checking for array.
+                t))
+              (t
+               (ecase pred
+                 (arrayp
+                  (values `((and (%other-pointer-p ,obj)
+                                 (let ((data ,obj))
+                                   (loop
+                                    (let ((widetag (%other-pointer-widetag data)))
+                                      (if (eq widetag ,typecode)
+                                          (return t)
+                                          (if (or (eq widetag sb-vm:simple-array-widetag)
+                                                  (>= widetag sb-vm:complex-base-string-widetag))
+                                              (setf data (%array-data data))
+                                              (return nil))))))))
+                          t))
+                 (vectorp
+                  (if length
+                      (values `((and (%other-pointer-p ,obj)
+                                     (let ((widetag (%other-pointer-widetag ,obj)))
+                                       (if (eq widetag ,typecode)
+                                           (= (vector-length (truly-the (simple-array * (*)) ,obj)) ,length)
+                                           (and (= widetag sb-vm:complex-vector-widetag)
+                                                (= (%array-dimension (truly-the (and (array * (*))
+                                                                                     (not simple-array)) ,obj) 0)
+                                                   ,length)
+                                                (let ((data ,obj))
+                                                  (loop
+                                                   (setf data (%array-data data))
+                                                   (let ((widetag (%other-pointer-widetag data)))
+                                                     (if (eq widetag ,typecode)
+                                                         (return t)
+                                                         (unless (>= widetag sb-vm:complex-vector-widetag)
+                                                           (return nil)))))))))))
+                              t
+                              t)
+                      (values `((and (%other-pointer-p ,obj)
+                                     (let ((widetag (%other-pointer-widetag ,obj)))
+                                       (if (eq widetag ,typecode)
+                                           t
+                                           (and (= widetag sb-vm:complex-vector-widetag)
+                                                (let ((data ,obj))
+                                                  (loop
+                                                   (setf data (%array-data data))
+                                                   (let ((widetag (%other-pointer-widetag data)))
+                                                     (if (eq widetag ,typecode)
+                                                         (return t)
+                                                         (unless (>= widetag sb-vm:complex-vector-widetag)
+                                                           (return nil)))))))))))
+                              t))))))))))
 
 ;;; If we can find a type predicate that tests for the type without
 ;;; dimensions, then use that predicate and test for dimensions.
@@ -873,34 +1025,40 @@
                           (eq (%other-pointer-widetag ,object) ,complex-tag)
                           ,@(unless (eq (car dims) '*)
                               `((= (%array-dimension ,object 0) ,(car dims)))))
-                    (multiple-value-bind (tests headerp)
+                    (multiple-value-bind (dim-tests headerp length)
                         (test-array-dimensions object type stype
                                                simple-array-header-p)
-                      `(and
-                        ,@(cond ((and (eql pred 'vectorp)
-                                      complexp)
-                                 `((%other-pointer-subtype-p ,object
-                                                             ',(list sb-vm:complex-base-string-widetag
-                                                                     #+sb-unicode sb-vm:complex-character-string-widetag
-                                                                     sb-vm:complex-bit-vector-widetag
-                                                                     sb-vm:complex-vector-widetag))))
-                                ((and (eql pred 'arrayp)
-                                      complexp)
-                                 `((%other-pointer-subtype-p ,object
-                                                             ',(list sb-vm:complex-base-string-widetag
-                                                                     #+sb-unicode sb-vm:complex-character-string-widetag
-                                                                     sb-vm:complex-bit-vector-widetag
-                                                                     sb-vm:complex-vector-widetag
-                                                                     sb-vm:complex-array-widetag))))
-                                (t
-                                 `(,@(unless (or (and headerp (eql pred 'arrayp))
-                                                 simple-array-header-p)
-                                       ;; ARRAY-HEADER-P from TESTS will test for that
-                                       `((,pred ,object)))
-                                   ,@(when complexp
-                                       `((typep ,object '(not simple-array)))))))
-                        ,@tests
-                        ,@(test-array-element-type object type stype headerp)))))
+                      (multiple-value-bind (type-test no-check-for-array length-checked)
+                          (test-array-element-type object type stype headerp pred length)
+                        (if no-check-for-array
+                            `(and ,@type-test
+                                  ,@(unless length-checked
+                                      dim-tests))
+                            `(and
+                              ,@(cond ((and (eql pred 'vectorp)
+                                            complexp)
+                                       `((%other-pointer-subtype-p ,object
+                                                                   ',(list sb-vm:complex-base-string-widetag
+                                                                           #+sb-unicode sb-vm:complex-character-string-widetag
+                                                                           sb-vm:complex-bit-vector-widetag
+                                                                           sb-vm:complex-vector-widetag))))
+                                      ((and (eql pred 'arrayp)
+                                            complexp)
+                                       `((%other-pointer-subtype-p ,object
+                                                                   ',(list sb-vm:complex-base-string-widetag
+                                                                           #+sb-unicode sb-vm:complex-character-string-widetag
+                                                                           sb-vm:complex-bit-vector-widetag
+                                                                           sb-vm:complex-vector-widetag
+                                                                           sb-vm:complex-array-widetag))))
+                                      (t
+                                       `(,@(unless (or (and headerp (eql pred 'arrayp))
+                                                       simple-array-header-p)
+                                             ;; ARRAY-HEADER-P from DIM-TESTS will test for that
+                                             `((,pred ,object)))
+                                         ,@(when complexp
+                                             `((typep ,object '(not simple-array)))))))
+                              ,@dim-tests
+                              ,@type-test))))))
               `(%typep ,object ',(type-specifier type)))))))
 
 ;;; Transform a type test against some instance type. The type test is
@@ -966,15 +1124,14 @@
 
 #-(or x86 x86-64) ; vop-translated for these 2
 (defmacro layout-depthoid-ge (layout depthoid)
-  `(>= (wrapper-depthoid ,layout) ,depthoid))
-(symbol-macrolet ((get-hash #+metaspace 'layout-clos-hash #-metaspace 'wrapper-clos-hash)
-                  (get-flags #+metaspace 'layout-flags #-metaspace 'wrapper-flags))
+  `(>= (layout-depthoid ,layout) ,depthoid))
+(symbol-macrolet ((get-hash 'layout-clos-hash)
+                  (get-flags 'layout-flags))
 (defun transform-instance-typep (classoid)
   (binding*
       ((name (classoid-name classoid))
-       (wrapper (let ((res (info :type :compiler-layout name)))
-                 (when (and res (not (wrapper-invalid res))) res)))
-       (layout (and wrapper (wrapper-friend wrapper)))
+       (layout (let ((res (info :type :compiler-layout name)))
+                 (when (and res (not (layout-invalid res))) res)))
        ((lowtag lowtag-test slot-reader)
         (cond ((csubtypep classoid (specifier-type 'funcallable-instance))
                (values sb-vm:fun-pointer-lowtag
@@ -982,7 +1139,7 @@
               ((csubtypep classoid (specifier-type 'instance))
                (values sb-vm:instance-pointer-lowtag
                        '(%instancep object) '(%instance-layout object)))))
-       (depthoid (if wrapper (wrapper-depthoid wrapper) -1))
+       (depthoid (if layout (layout-depthoid layout) -1))
        (type (make-symbol "TYPE")))
     (declare (ignorable layout))
 
@@ -1010,16 +1167,16 @@
           ;; I think that means we should know the lowtag always. Nonetheless, this isn't
           ;; an important scenario, and only if you _do_ seal a class could this case be
           ;; reached; users rarely seal their classes since the standard doesn't say how.
-          ((and wrapper
+          ((and layout
                 (eq (classoid-state classoid) :sealed)
                 (not (classoid-subclasses classoid)))
            (cond ((and (eq lowtag sb-vm:instance-pointer-lowtag)
                        (vop-existsp :translate structure-typep))
-                  `(structure-typep object ,wrapper))
+                  `(structure-typep object ,layout))
                  (lowtag-test
                   `(and ,lowtag-test
                         ,(if (vop-existsp :translate layout-eq)
-                             `(layout-eq object ,wrapper ,lowtag)
+                             `(layout-eq object ,layout ,lowtag)
                              `(eq ,slot-reader ,layout))))
                  (t
                   ;; `(eq ,layout
@@ -1029,10 +1186,10 @@
                   ;;        (cond ((%instancep object) (%instance-layout object))
                   ;;              ((funcallable-instance-p object) (%fun-layout object))
                   ;;              (t ,(find-layout 't)))))
-                  (bug "Unexpected metatype for ~S" wrapper))))
+                  (bug "Unexpected metatype for ~S" layout))))
 
           ;; All other structure types
-          ((and (typep classoid 'structure-classoid) wrapper)
+          ((and (typep classoid 'structure-classoid) layout)
             ;; structure type tests; hierarchical layout depths
             (aver (eql lowtag sb-vm:instance-pointer-lowtag))
             ;; we used to check for invalid layouts here, but in fact that's both unnecessary and
@@ -1041,13 +1198,13 @@
             ;; to a structure type test.
            (if (vop-existsp :translate structure-typep)
                ;; A single VOP is easier to optimize later
-               `(structure-typep object ,wrapper)
+               `(structure-typep object ,layout)
                `(and (%instancep object)
                      ,(if (<= depthoid sb-kernel::layout-id-vector-fixed-capacity)
-                          `(%structure-is-a (%instance-layout object) ,wrapper)
+                          `(%structure-is-a (%instance-layout object) ,layout)
                           `(let ((,type (%instance-layout object)))
                              (and (layout-depthoid-ge ,type ,depthoid)
-                                  (%structure-is-a ,type ,wrapper)))))))
+                                  (%structure-is-a ,type ,layout)))))))
 
           ((> depthoid 0)
            ;; fixed-depth ancestors of non-structure types:
@@ -1435,12 +1592,12 @@
        `(character x))
       ;; Handle specialized element types for 1D arrays.
       ((multiple-value-bind (result already-type-p dimension specialization)
-           (cond ((or (and (array-type-p tspec)
-                           (neq (array-type-complexp tspec) t) ; :MAYBE and NIL are good
-                           (not (contains-unknown-type-p (array-type-element-type tspec)))
-                           ;; just for requesting (array nil (*)), you lose
-                           (neq (array-type-specialized-element-type tspec) *empty-type*)
-                           (consp (array-type-dimensions tspec))))
+           (cond ((and (array-type-p tspec)
+                       (neq (array-type-complexp tspec) t) ; :MAYBE and NIL are good
+                       (not (contains-unknown-type-p (array-type-element-type tspec)))
+                       ;; just for requesting (array nil (*)), you lose
+                       (neq (array-type-specialized-element-type tspec) *empty-type*)
+                       (consp (array-type-dimensions tspec)))
                   (values tspec
                           (source-transform-array-typep 'x tspec)
                           (car (array-type-dimensions tspec))
@@ -1524,7 +1681,7 @@
                  (#.+pathname-layout-flag+  (specifier-type 'pathname))
                  (#.+structure-layout-flag+ (specifier-type 'structure-object))
                  (t
-                  (wrapper-classoid layout))))
+                  (layout-classoid layout))))
          (diff (type-difference (lvar-type object) type))
          (pred (backend-type-predicate diff)))
     (if pred
@@ -1538,3 +1695,33 @@
     (if pred
         `(not (,pred object))
         (give-up-ir1-transform))))
+
+(when-vop-existsp (:translate fixnum-mod-p)
+  (deftransform fixnum-mod-p ((x mod) (t (constant-arg fixnum)) * :important nil)
+    (let* ((type (lvar-type x))
+           (mod (lvar-value mod))
+           (intersect (type-intersection type (specifier-type 'fixnum)))
+           (mod-type (specifier-type `(mod ,(1+ mod)))))
+      (cond ((csubtypep intersect mod-type)
+             `(fixnump x))
+            ((and (csubtypep type (specifier-type 'fixnum))
+                  (csubtypep (type-intersection type (specifier-type 'unsigned-byte))
+                             mod-type))
+             `(>= x 0))
+            ((let ((int (type-approximate-interval intersect)))
+               (when int
+                 (let ((power-of-two (1- (ash 1 (integer-length (interval-high int))))))
+                   (when (< 0 power-of-two mod)
+                     `(fixnum-mod-p x ,power-of-two))))))
+            (t
+             (give-up-ir1-transform))))))
+
+(when-vop-existsp (:translate signed-byte-8-p)
+  (macrolet ((def (bits)
+               `(deftransform ,(symbolicate "SIGNED-BYTE-" (princ-to-string bits) "-P")
+                    ((x) (unsigned-byte) * :important nil)
+                  '(typep x '(unsigned-byte ,(1- bits))))))
+    (def 8)
+    (def 16)
+    #+64-bit
+    (def 32)))

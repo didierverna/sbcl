@@ -13,7 +13,8 @@
 #define __ARCH_H__
 
 #include "os.h"
-#include "signal.h"
+#include <signal.h>
+#include <stdbool.h>
 #include "thread.h"
 
 /* Do anything we need to do when starting up the runtime environment
@@ -26,9 +27,9 @@ extern void asm_routine_poke(const char*, int, char);
 /* FIXME: It would be good to document these too! */
 extern void arch_skip_instruction(os_context_t*);
 extern void arch_handle_allocation_trap(os_context_t*);
-extern boolean arch_pseudo_atomic_atomic(os_context_t*);
-extern void arch_set_pseudo_atomic_interrupted(os_context_t*);
-extern void arch_clear_pseudo_atomic_interrupted(os_context_t*);
+extern bool arch_pseudo_atomic_atomic(struct thread *thread);
+extern void arch_set_pseudo_atomic_interrupted(struct thread *thread);
+extern void arch_clear_pseudo_atomic_interrupted(struct thread *thread);
 extern os_vm_address_t arch_get_bad_addr(int, siginfo_t*, os_context_t*);
 extern unsigned char *arch_internal_error_arguments(os_context_t*);
 extern unsigned int arch_install_breakpoint(void *pc);
@@ -41,6 +42,10 @@ extern int arch_os_thread_init(struct thread *thread);
 #if defined(LISP_FEATURE_X86) && defined(LISP_FEATURE_SB_THREAD)
 extern void arch_os_load_ldt(struct thread *thread);
 #endif
+#if defined(LISP_FEATURE_PPC) && defined(LISP_FEATURE_SB_THREAD)
+/* pthread_key_t is always unsigned long on PPC/Darwin */
+extern void *arch_os_thread_getspecific(unsigned long key);
+#endif
 extern int arch_os_thread_cleanup(struct thread *thread);
 
 extern lispobj funcall0(lispobj function);
@@ -48,8 +53,6 @@ extern lispobj funcall1(lispobj function, lispobj arg0);
 extern lispobj funcall2(lispobj function, lispobj arg0, lispobj arg1);
 extern lispobj funcall3(lispobj function, lispobj arg0, lispobj arg1,
                         lispobj arg2);
-extern lispobj *component_ptr_from_pc(char *pc);
-extern lispobj *dynamic_space_code_from_pc(char *pc);
 
 #if defined(LISP_FEATURE_X86)||defined(LISP_FEATURE_X86_64)
 extern unsigned int * single_stepping;

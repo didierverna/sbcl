@@ -31,6 +31,22 @@
 (defmacro kv-vector-high-water-mark (pairs)
   `(truly-the index/2 (data-vector-ref ,pairs 0)))
 
+;;; When a weak table's backing storage is iterated over, theoretically a read barrier would
+;;; be needed for each <k,v> pair. This is especially bad because each access would additionally
+;;; have to decide if the table is weak in the first place.
+;;; The performance loss can be mitigated by a simple strategy: act as if the vector is
+;;; strong. There is a header flag bit that could be toggled for that, but we don't want to
+;;; manipulate it from multiple threads. (Concurrent iterating is perfectly legal of course,
+;;; subject to the rules about modification during traversal)
+;;; Using a technique like *PINNED-OBJECTS* we can inform GC that a vector merits unusual
+;;; treatment for the lifetime of the iteration. Binding a special var says to ignore the
+;;; weakness bit. GC would only have to read the special when considering whether the bit
+;;; value of 1 should be respected. And that in itself is rare since most tables aren't weak.
+;;; GC would have to read the TLS of each thread which is still better than requiring
+;;; the mutator to strengthen each cell ref one pair at a time. Presuming the iterator doesn't
+;;; exit early (most calls to MAPHASH don't), then it's equivalent.
+(defvar *unweakened-vectors* nil)
+
 ;;; Hash table iteration does not need to perform bounds checks on access to the
 ;;; k/v pair vector.  We used to reload the local variable holding the k/v vector
 ;;; on each loop iteration because PUTHASH could assign a new vector at any time.
@@ -46,9 +62,12 @@
   (with-unique-names (fun limit i kv-vector key value)
     `(let* ((,fun (%coerce-callable-to-fun ,function-designator))
             (,kv-vector (hash-table-pairs ,hash-table))
+            #+weak-vector-readbarrier (*unweakened-vectors*
+                                       (cons ,kv-vector *unweakened-vectors*))
             ;; The high water mark needs to be loaded only once due to the
             ;; prohibition against adding keys during traversal.
             (,limit (1+ (* 2 (kv-vector-high-water-mark ,kv-vector)))))
+       #+weak-vector-readbarrier (declare (dynamic-extent *unweakened-vectors*))
        ;; Regarding this TRULY-THE: in the theoretical edge case of the largest
        ;; possible NEXT-VECTOR, it is not really true that the I+2 is an index.
        ;; However, for all intents and purposes, it is an INDEX because if not,
@@ -107,8 +126,11 @@ for."
         (ind (make-symbol "INDEX"))
         (step (make-symbol "THUNK")))
     `(let* ((,kvv (hash-table-pairs ,hash-table))
+            #+weak-vector-readbarrier (*unweakened-vectors*
+                                       (cons ,kvv *unweakened-vectors*))
             (,lim (1+ (* 2 (kv-vector-high-water-mark ,kvv))))
             (,ind 3))
+       #+weak-vector-readbarrier (declare (dynamic-extent *unweakened-vectors*))
        (declare (fixnum ,ind))
        (dx-flet ((,step ()
                    (loop
@@ -135,41 +157,3 @@ for."
     (if kind
         `(make-hash-table-using-defaults ,kind)
         form)))
-
-(defconstant hash-table-weak-flag         8)
-;;; USERFUN-FLAG implies a nonstandard hash function. Such tables may also have
-;;; a custom comparator. But you can't have a custom comparator without a custom
-;;; hash, because there's no way in general to produce a compatible hash.
-(defconstant hash-table-userfun-flag      2)
-(defconstant hash-table-synchronized-flag 1)
-
-;;; Keep in sync with weak_ht_alivep_funs[] in gc-common
-(defconstant +ht-weak-key-AND-value+ 0)
-(defconstant +ht-weak-key+           1)
-(defconstant +ht-weak-value+         2)
-(defconstant +ht-weak-key-OR-value+  3)
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; Don't raise this number to 8 - if you do it'll increase the memory
-  ;; consumption of a default MAKE-HASH-TABLE call by 7% just due to
-  ;; padding slots.  This is a "perfect" minimal size.
-  (defconstant +min-hash-table-size+ 7)
-  (defconstant default-rehash-size $1.5))
-
-(defmacro make-system-hash-table (&key test synchronized weakness)
-  (multiple-value-bind (kind args)
-      (cond ((equal test '(quote eq))  (values 0 '('eq  #'eq  #'eq-hash)))
-            ((equal test '(quote eql)) (values 1 '('eql #'eql #'eql-hash)))
-            (t
-             (bug "Incomplete implementation of MAKE-SYSTEM-HASH-TABLE")
-             0))
-    `(%make-hash-table
-      (logior ,(ecase weakness
-                (:key   '(pack-ht-flags-weakness +ht-weak-key+))
-                (:value '(pack-ht-flags-weakness +ht-weak-value+)))
-               (pack-ht-flags-kind ,kind)
-               ,(if synchronized 'hash-table-synchronized-flag 0))
-      ,@args
-      ,+min-hash-table-size+
-      ,default-rehash-size
-      $1.0)))

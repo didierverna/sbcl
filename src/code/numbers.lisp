@@ -307,6 +307,11 @@
      (%make-ratio (- (numerator n)) (denominator n)))
     ((complex)
      (complex (- (realpart n)) (- (imagpart n))))))
+
+(defun %multiply-high (x y)
+  (declare (type word x y))
+  (%multiply-high x y))
+
 
 ;;;; TRUNCATE and friends
 
@@ -382,21 +387,132 @@
         (foreach single-float double-float #+long-float long-float))
        (truncate-float (dispatch-type divisor))))))
 
-(defun %multiply-high (x y)
-  (declare (type word x y))
-  (%multiply-high x y))
-
 (defun floor (number &optional (divisor 1))
   "Return the greatest integer not greater than number, or number/divisor.
   The second returned value is (mod number divisor)."
   (declare (explicit-check))
-  (floor number divisor))
+  (macrolet ((truncate-float (rtype)
+               `(floor (coerce number ',rtype) (coerce divisor ',rtype)))
+             (single-digit-bignum-p (x)
+               #+(or x86-64 x86 ppc64)
+               `(or (typep ,x 'word)
+                    (typep ,x 'sb-vm:signed-word))
+               ;; Other backends don't have native double-word/word division,
+               ;; and their bigfloor implementation doesn't handle
+               ;; full-width divisors.
+               #-(or x86-64 x86 ppc64)
+               `(or (typep ,x '(unsigned-byte ,(1- sb-vm:n-word-bits)))
+                    (typep ,x '(integer ,(- 1 (expt 2 (- sb-vm:n-word-bits 1)))
+                                ,(1- (expt 2 (- sb-vm:n-word-bits 1)))))))
+             (fixup (form)
+               `(multiple-value-bind (tru rem) ,form
+                  (if (if (minusp divisor)
+                          (> rem 0)
+                          (< rem 0))
+                      (values (1- tru) (+ rem divisor))
+                      (values tru rem)))))
+    (number-dispatch ((number real) (divisor real))
+      ((fixnum fixnum) (floor number divisor))
+      (((foreach fixnum bignum) ratio)
+       (multiple-value-bind (quot rem)
+           (truncate (* number (denominator divisor))
+                     (numerator divisor))
+         (fixup (values quot (/ rem (denominator divisor))))))
+      ((fixnum bignum)
+       (fixup
+        (if (single-digit-bignum-p divisor)
+            (bignum-truncate-single-digit (make-small-bignum number) divisor)
+            (bignum-truncate (make-small-bignum number) divisor))))
+      ((ratio (or float rational))
+       (let ((q (truncate (numerator number)
+                          (* (denominator number) divisor))))
+         (fixup (values q (- number (* q divisor))))))
+      ((bignum fixnum)
+       (fixup (bignum-truncate-single-digit number divisor)))
+      ((bignum bignum)
+       (fixup (if (single-digit-bignum-p divisor)
+                  (bignum-truncate-single-digit number divisor)
+                  (bignum-truncate number divisor))))
+      (((foreach single-float double-float #+long-float long-float)
+        (or rational single-float))
+       (truncate-float (dispatch-type number)))
+      #+long-float
+      ((long-float (or single-float double-float long-float))
+       (truncate-float long-float))
+      #+long-float
+      (((foreach double-float single-float) long-float)
+       (truncate-float long-float))
+      ((double-float (or single-float double-float))
+       (truncate-float double-float))
+      ((single-float double-float)
+       (truncate-float double-float))
+      (((foreach fixnum bignum ratio)
+        (foreach single-float double-float #+long-float long-float))
+       (truncate-float (dispatch-type divisor))))))
 
 (defun ceiling (number &optional (divisor 1))
-  "Return the smallest integer not less than number, or number/divisor.
+  "Return number (or number/divisor) as an integer, rounded toward 0.
   The second returned value is the remainder."
   (declare (explicit-check))
-  (ceiling number divisor))
+  (macrolet ((truncate-float (rtype)
+               `(ceiling (coerce number ',rtype) (coerce divisor ',rtype)))
+             (single-digit-bignum-p (x)
+               #+(or x86-64 x86 ppc64)
+               `(or (typep ,x 'word)
+                    (typep ,x 'sb-vm:signed-word))
+               ;; Other backends don't have native double-word/word division,
+               ;; and their bigfloor implementation doesn't handle
+               ;; full-width divisors.
+               #-(or x86-64 x86 ppc64)
+               `(or (typep ,x '(unsigned-byte ,(1- sb-vm:n-word-bits)))
+                    (typep ,x '(integer ,(- 1 (expt 2 (- sb-vm:n-word-bits 1)))
+                                ,(1- (expt 2 (- sb-vm:n-word-bits 1)))))))
+             (fixup (form)
+               `(multiple-value-bind (tru rem) ,form
+                  (if (if (minusp divisor)
+                          (< rem 0)
+                          (> rem 0))
+                      (values (+ tru 1) (- rem divisor))
+                      (values tru rem)))))
+    (number-dispatch ((number real) (divisor real))
+      ((fixnum fixnum) (ceiling number divisor))
+      (((foreach fixnum bignum) ratio)
+       (multiple-value-bind (quot rem)
+           (truncate (* number (denominator divisor))
+                     (numerator divisor))
+         (fixup (values quot (/ rem (denominator divisor))))))
+      ((fixnum bignum)
+       (fixup
+        (if (single-digit-bignum-p divisor)
+            (bignum-truncate-single-digit (make-small-bignum number) divisor)
+            (bignum-truncate (make-small-bignum number) divisor))))
+      ((ratio (or float rational))
+       (let ((q (truncate (numerator number)
+                          (* (denominator number) divisor))))
+         (fixup (values q (- number (* q divisor))))))
+      ((bignum fixnum)
+       (fixup (bignum-truncate-single-digit number divisor)))
+      ((bignum bignum)
+       (fixup
+        (if (single-digit-bignum-p divisor)
+            (bignum-truncate-single-digit number divisor)
+            (bignum-truncate number divisor))))
+      (((foreach single-float double-float #+long-float long-float)
+        (or rational single-float))
+       (truncate-float (dispatch-type number)))
+      #+long-float
+      ((long-float (or single-float double-float long-float))
+       (truncate-float long-float))
+      #+long-float
+      (((foreach double-float single-float) long-float)
+       (truncate-float long-float))
+      ((double-float (or single-float double-float))
+       (truncate-float double-float))
+      ((single-float double-float)
+       (truncate-float double-float))
+      (((foreach fixnum bignum ratio)
+        (foreach single-float double-float #+long-float long-float))
+        (truncate-float (dispatch-type divisor))))))
 
 (defun rem (number divisor)
   "Return second result of TRUNCATE."
@@ -629,6 +745,95 @@ the first."
       (when (< arg n)
         (setf n arg)))))
 
+#+64-bit
+(defmacro float-bignum-= (float bignum type)
+  (macrolet ((sym (name)
+               `(package-symbolicate #.(find-package "SB-VM") type '- ',name)))
+    `(let* ((float ,float)
+            (bignum ,bignum)
+            (bignum-length (%bignum-length bignum))
+            (bits (,(sym bits) float))
+            (exp (ldb ,(sym exponent-byte) bits)))
+       (cond ((< exp (+ sb-vm:n-fixnum-bits ,(sym bias)))
+              nil)
+             (t
+              (let* ((exp (- exp ,(sym bias) ,(sym digits)))
+                     (sig (logior ,(sym hidden-bit)
+                                  (ldb ,(sym significand-byte) bits)))
+                     (int (if (minusp bits)
+                              (- sig)
+                              sig))
+                     (int-length (integer-length int)))
+                (and (= (truly-the bignum-length (sb-bignum::bignum-buffer-integer-length bignum bignum-length))
+                        (+ int-length exp))
+                     (sb-bignum::bignum-lower-bits-zero-p bignum exp bignum-length)
+                     (= int
+                        (truly-the fixnum
+                                   (sb-bignum::last-bignum-part=>fixnum (- (1- sb-bignum::digit-size) int-length) exp bignum))))))))))
+
+#+64-bit
+(defmacro float-bignum-< (float bignum type)
+  (macrolet ((sym (name)
+               `(package-symbolicate #.(find-package "SB-VM") type '- ',name)))
+    `(let* ((float ,float)
+            (bignum ,bignum)
+            (bignum-length (%bignum-length bignum))
+            (bits (,(sym bits) float))
+            (exp (ldb ,(sym exponent-byte) bits)))
+       (cond ((< exp (+ sb-vm:n-fixnum-bits ,(sym bias)))
+              (sb-bignum::%bignum-0-or-plusp bignum bignum-length))
+             (t
+              (let ((sig (logior ,(sym hidden-bit)
+                                  (ldb ,(sym significand-byte) bits)))
+                    (exp (- exp ,(sym bias) ,(sym digits))))
+                (let* ((int (if (minusp bits)
+                                (- sig)
+                                sig))
+                       (int-length (integer-length int))
+                       (length-diff (- (truly-the bignum-length (sb-bignum::bignum-buffer-integer-length bignum bignum-length))
+                                       (+ int-length exp))))
+                  (cond
+                    ((plusp length-diff) (sb-bignum::%bignum-0-or-plusp bignum bignum-length))
+                    ((minusp length-diff) (minusp float))
+                    (t
+                     (let ((diff (- (truly-the fixnum
+                                               (sb-bignum::last-bignum-part=>fixnum (- (1- sb-bignum::digit-size) int-length) exp bignum))
+                                    int)))
+                       (cond ((plusp diff) t)
+                             ((minusp diff) nil)
+                             (t
+                              (not (sb-bignum::bignum-lower-bits-zero-p bignum exp bignum-length))))))))))))))
+
+#+64-bit
+(defmacro float-bignum-> (float bignum type)
+  (macrolet ((sym (name)
+               `(package-symbolicate #.(find-package "SB-VM") type '- ',name)))
+    `(let* ((float ,float)
+            (bignum ,bignum)
+            (bignum-length (%bignum-length bignum))
+            (bits (,(sym bits) float))
+            (exp (ldb ,(sym exponent-byte) bits)))
+       (cond ((< exp (+ sb-vm:n-fixnum-bits ,(sym bias)))
+              (not (sb-bignum::%bignum-0-or-plusp bignum bignum-length)))
+             (t
+              (let ((sig (logior ,(sym hidden-bit)
+                                 (ldb ,(sym significand-byte) bits)))
+                    (exp (- exp ,(sym bias) ,(sym digits))))
+                (let* ((int
+                         (if (minusp bits)
+                             (- sig)
+                             sig))
+                       (int-length (integer-length int))
+                       (length-diff (- (truly-the bignum-length (sb-bignum::bignum-buffer-integer-length bignum bignum-length))
+                                       (+ int-length exp))))
+                  (cond ((plusp length-diff)
+                         (not (sb-bignum::%bignum-0-or-plusp bignum bignum-length)))
+                        ((minusp length-diff)
+                         (not (minusp float)))
+                        (t
+                         (< (truly-the fixnum (sb-bignum::last-bignum-part=>fixnum (- (1- sb-bignum::digit-size) int-length) exp bignum))
+                            int))))))))))
+
 (defmacro make-fixnum-float-comparer (operation integer float float-type)
   (multiple-value-bind (min max)
       (ecase float-type
@@ -768,24 +973,24 @@ the first."
          nil
          #+64-bit
          ,(case op
-            (> '(float-bignum-> x y))
-            (< '(float-bignum-< x y))
-            (>= '(not (float-bignum-< x y)))
-            (<= '(not (float-bignum-> x y)))
-            (= '(float-bignum-= x y)))
+            (> '(float-bignum-> x y (dispatch-type x)))
+            (< '(float-bignum-< x y (dispatch-type x)))
+            (>= '(not (float-bignum-< x y (dispatch-type x))))
+            (<= '(not (float-bignum-> x y (dispatch-type x))))
+            (= '(float-bignum-= x y (dispatch-type x))))
          #-64-bit
          (,op (rational x) y)))
-      ((bignum float)
+      ((bignum (foreach single-float double-float))
        (with-float-inf-or-nan-test y
          ,infinite-y-finite-x
          nil
          #+64-bit
          ,(case op
-            (> '(float-bignum-< y x))
-            (< '(float-bignum-> y x))
-            (>= '(not (float-bignum-> y x)))
-            (<= '(not (float-bignum-< y x)))
-            (= '(float-bignum-= y x)))
+            (> '(float-bignum-< y x (dispatch-type y)))
+            (< '(float-bignum-> y x (dispatch-type y)))
+            (>= '(not (float-bignum-> y x (dispatch-type y))))
+            (<= '(not (float-bignum-< y x (dispatch-type y))))
+            (= '(float-bignum-= y x (dispatch-type y))))
          #-64-bit
          (,op x (rational y))))))
   )                                     ; EVAL-WHEN
@@ -797,6 +1002,21 @@ the first."
               (fixnump ,denominator))
          (progn ,@body)
          (progn ,@body))))
+
+(defmacro dispatch-two-ratios ((ratio1 numerator1 denominator1)
+                               (ratio2 numerator2 denominator2)
+                               body
+                               &optional (fixnum-body body))
+  `(let ((,numerator1 (numerator ,ratio1))
+         (,denominator1 (denominator ,ratio1))
+         (,numerator2 (numerator ,ratio2))
+         (,denominator2 (denominator ,ratio2)))
+     (if (and (fixnump ,numerator1)
+              (fixnump ,numerator2)
+              (fixnump ,denominator1)
+              (fixnump ,denominator2))
+         ,fixnum-body
+         ,body)))
 
 
 (macrolet ((def-two-arg-</> (name op ratio-arg1 ratio-arg2 &rest cases)
@@ -827,8 +1047,9 @@ the first."
                                    denominator)
                       y)))
                   ((ratio ratio)
-                   (dispatch-ratio (x numerator-x denominator-x)
-                     (dispatch-ratio (y numerator-y denominator-y)
+                   (dispatch-two-ratios
+                       (x numerator-x denominator-x)
+                       (y numerator-y denominator-y)
                        (or
                         ,@(case op
                             ((<= >=)
@@ -839,7 +1060,32 @@ the first."
                             (>= '>)
                             (t op))
                          (* numerator-x denominator-y)
-                         (* numerator-y denominator-x))))))
+                         (* numerator-y denominator-x)))
+                       ,@(or
+                          (sb-c::when-vop-existsp (:named sb-vm::signed-multiply-low-high)
+                            `((multiple-value-bind (low1 high1) (%primitive sb-vm::signed-multiply-low-high numerator-x denominator-y)
+                                (multiple-value-bind (low2 high2) (%primitive sb-vm::signed-multiply-low-high numerator-y denominator-x)
+                                  (cond ((= high1 high2)
+                                         (,op low1
+                                              low2))
+                                        ((,(case op
+                                             (<= '<)
+                                             (>= '>)
+                                             (t op))
+                                          high1 high2)
+                                         t))))))
+                          (sb-c::when-vop-existsp (:translate %signed-multiply-high)
+                            `((let ((high1 (%signed-multiply-high numerator-x denominator-y))
+                                    (high2 (%signed-multiply-high numerator-y denominator-x)))
+                                (cond ((= high1 high2)
+                                       (,op (logand most-positive-word (* numerator-x denominator-y))
+                                            (logand most-positive-word (* numerator-y denominator-x))))
+                                      ((,(case op
+                                           (<= '<)
+                                           (>= '>)
+                                           (t op))
+                                        high1 high2)
+                                       t))))))))
                   ,@cases))))
   (def-two-arg-</> two-arg-< < floor ceiling
     ((fixnum bignum)
@@ -964,7 +1210,8 @@ the first."
                                      (= ,float (float quot))))
                                 (t)))))))))
            (def-range (name op &optional (low-op op) (high-op op))
-               `(defun ,name (low x high)
+             `(progn
+                (defun ,name (low x high)
                   (declare (explicit-check)
                            (fixnum low high))
                   (number-dispatch ((x real))
@@ -987,7 +1234,11 @@ the first."
                               minusp)
                              ((= x low)
                               (not minusp))
-                             (t))))))))
+                             (t))))))
+                (sb-c::when-vop-existsp (:translate check-range<)
+                 (defun ,(symbolicate "CHECK-" name) (low x high)
+                   (when (typep x 'fixnum)
+                     (,name low x high)))))))
   (def-range range< <)
   (def-range range<= <=)
   (def-range range<<= <<= < <=)
@@ -1060,7 +1311,7 @@ and the number of 0 bits if INTEGER is negative."
   (declare (explicit-check))
   (etypecase integer
     (fixnum
-     (logcount #-x86-64
+     (logcount #-(or x86-64 arm64)
                (truly-the (integer 0
                                    #.(max most-positive-fixnum
                                           (lognot most-negative-fixnum)))
@@ -1068,7 +1319,7 @@ and the number of 0 bits if INTEGER is negative."
                               (lognot (truly-the fixnum integer))
                               integer))
                ;; The VOP handles that case better
-               #+x86-64 integer))
+               #+(or x86-64 arm64) integer))
     (bignum
      (bignum-logcount integer))))
 
@@ -1079,7 +1330,7 @@ and the number of 0 bits if INTEGER is negative."
 (defun logbitp (index integer)
   "Predicate returns T if bit index of integer is a 1."
   (declare (explicit-check))
-  (number-dispatch ((index integer) (integer integer))
+  (number-dispatch ((index unsigned-byte) (integer integer))
     ((fixnum fixnum) (if (< index sb-vm:n-positive-fixnum-bits)
                          (not (zerop (logand integer (ash 1 index))))
                          (minusp integer)))
@@ -1159,15 +1410,17 @@ and the number of 0 bits if INTEGER is negative."
   (deposit-field newbyte bytespec integer))
 
 (defun %ldb (size posn integer)
-  (declare (type bit-index size posn) (explicit-check))
   ;; The naive algorithm is horrible in the general case.
   ;; Consider (LDB (BYTE 1 2) (SOME-GIANT-BIGNUM)) which has to shift the
   ;; input rightward 2 bits, consing a new bignum just to read 1 bit.
-  (if (and (<= 0 size sb-vm:n-positive-fixnum-bits)
-           (typep integer 'bignum))
-      (sb-bignum::ldb-bignum=>fixnum size posn integer)
-      (logand (ash integer (- posn))
-              (1- (ash 1 size)))))
+  (cond ((<= 0 size sb-vm:n-positive-fixnum-bits)
+         (if (fixnump integer)
+             (logand (ash integer (- posn))
+                     (1- (ash 1 size)))
+             (sb-bignum::ldb-bignum=>fixnum size posn integer)))
+        (t
+         (logand (ash integer (- posn))
+                 (1- (ash 1 size))))))
 
 (defun %mask-field (size posn integer)
   (declare (type bit-index size posn) (explicit-check))
@@ -1385,25 +1638,25 @@ and the number of 0 bits if INTEGER is negative."
             (iy (imagpart y)))
        (if (> (abs ry) (abs iy))
            (let* ((r (/ iy ry))
-                  (dn (* ry (+ 1 (* r r)))))
-             (canonical-complex (/ (+ rx (* ix r)) dn)
-                                (/ (- ix (* rx r)) dn)))
+                  (dn (+ ry (* r iy))))
+             (complex (/ (+ rx (* ix r)) dn)
+                      (/ (- ix (* rx r)) dn)))
            (let* ((r (/ ry iy))
-                  (dn (* iy (+ 1 (* r r)))))
-             (canonical-complex (/ (+ (* rx r) ix) dn)
-                                (/ (- (* ix r) rx) dn))))))
+                  (dn (+ iy (* r ry))))
+             (complex (/ (+ (* rx r) ix) dn)
+                      (/ (- (* ix r) rx) dn))))))
     (((foreach integer ratio single-float double-float) complex)
      (let* ((ry (realpart y))
             (iy (imagpart y)))
        (if (> (abs ry) (abs iy))
            (let* ((r (/ iy ry))
-                  (dn (* ry (+ 1 (* r r)))))
-             (canonical-complex (/ x dn)
-                                (/ (- (* x r)) dn)))
+                  (dn (+ ry (* r iy))))
+             (complex (/ x dn)
+                      (/ (- (* x r)) dn)))
            (let* ((r (/ ry iy))
-                  (dn (* iy (+ 1 (* r r)))))
-             (canonical-complex (/ (* x r) dn)
-                                (/ (- x) dn))))))
+                  (dn (+ iy (* r ry))))
+             (complex (/ (* x r) dn)
+                      (/ (- x) dn))))))
     ((complex (or rational float))
      (canonical-complex (/ (realpart x) y)
                         (/ (imagpart x) y)))

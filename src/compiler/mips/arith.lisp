@@ -150,6 +150,18 @@
 (define-binop logand 1 3 and (unsigned-byte 14) (unsigned-byte 16))
 (define-binop logxor 1 3 xor (unsigned-byte 14) (unsigned-byte 16))
 
+(define-vop (fast-logand/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r)
+         (y :scs (unsigned-reg) :target r))
+  (:arg-types signed-num unsigned-num))
+
+(define-vop (fast-logand-c/signed-unsigned=>unsigned fast-logand-c/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r))
+  (:arg-types signed-num (:constant (eql #.most-positive-word)))
+  (:ignore y)
+  (:generator 1
+    (move r x)))
+
 ;;; No -C/ VOPs for LOGNOR because the NOR instruction doesn't take
 ;;; immediate args.  -- CSR, 2003-09-11
 (define-vop (fast-lognor/fixnum=>fixnum fast-fixnum-binop)
@@ -380,7 +392,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 11
-    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x)))
       (inst beq y zero))
     (inst nop)
     (inst div x y)
@@ -396,7 +408,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 12
-    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x)))
       (inst beq y zero))
     (inst nop)
     (inst divu x y)
@@ -411,7 +423,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 12
-    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x)))
       (inst beq y zero))
     (inst nop)
     (inst div x y)
@@ -619,6 +631,43 @@
     (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count))
 
+(define-vop (fast-%ash/right/unsigned)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (unsigned-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 1
+    (inst srl result number amount)))
+
+(define-vop (fast-%ash/right/signed)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (signed-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types signed-num unsigned-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 1
+    (inst sra result number amount)))
+
+;;; I could not causes this vop to get selected
+(define-vop (fast-%ash/right/fixnum)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (any-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types tagged-num unsigned-num)
+  (:results (result :scs (any-reg)))
+  (:result-types tagged-num)
+  ;; An ANY-REG must not leak out (on an interrupt) if it has 1 bits under the fixnum
+  ;; tag mask when it was supposed to hold a fixnum. But there's no "AND dst, src, Imm"
+  ;; operation to clear the bits, so this can't really be fewer than 3 instructions.
+  (:temporary (:sc signed-reg) temp)
+  (:generator 2
+    (inst sra temp number amount)
+    (inst li result (lognot fixnum-tag-mask))
+    (inst and result temp result)))
+
 ;;; logical operations
 (define-modular-fun lognot-mod32 (x) lognot :untagged nil 32)
 (define-vop (lognot-mod32/unsigned=>unsigned)
@@ -640,8 +689,6 @@
   (if (oddp (length args))
       `(logxor ,@args)
       `(lognot (logxor ,@args))))
-(define-source-transform logandc1 (x y)
-  `(logand (lognot ,x) ,y))
 (define-source-transform logandc2 (x y)
   `(logand ,x (lognot ,y)))
 (define-source-transform logorc1 (x y)
@@ -794,19 +841,6 @@
     (inst mflo lo)
     (inst mfhi hi)))
 
-(define-vop (bignum-lognot lognot-mod32/unsigned=>unsigned)
-  (:translate sb-bignum:%lognot))
-
-(define-vop (fixnum-to-digit)
-  (:translate sb-bignum:%fixnum-to-digit)
-  (:policy :fast-safe)
-  (:args (fixnum :scs (any-reg)))
-  (:arg-types tagged-num)
-  (:results (digit :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 1
-    (inst sra digit fixnum n-fixnum-tag-bits)))
-
 (define-vop (bignum-floor)
   (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
@@ -874,3 +908,19 @@
   (:translate sb-bignum:%ashl)
   (:generator 1
     (inst sll result digit count)))
+
+(define-vop ()
+  (:translate fastrem-32)
+  (:policy :fast-safe)
+  (:args (dividend :scs (unsigned-reg))
+         (c :scs (unsigned-reg))
+         (divisor :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num unsigned-num)
+  (:results (remainder :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 10
+    (inst multu dividend c) ; keep only the low 32 bits
+    (inst mflo temp)
+    (inst multu temp divisor)
+    (inst mfhi remainder)))

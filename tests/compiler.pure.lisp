@@ -3842,7 +3842,8 @@
                                 (declare (ignore x y k1))
                                 t))))))
 
-(with-test (:name :bug-309448)
+(with-test (:name :bug-309448
+            :skipped-on :gc-stress)
   ;; Like all tests trying to verify that something doesn't blow up
   ;; compile-times this is bound to be a bit brittle, but at least
   ;; here we try to establish a decent baseline.
@@ -3915,7 +3916,7 @@
         (setq z 0)
         (flet ((foo ()
                  (foo z args)))
-          (declare (sb-int:truly-dynamic-extent #'foo))
+          (declare (dynamic-extent #'foo))
           (call #'foo nil))))
    :allow-style-warnings t))
 
@@ -6125,7 +6126,7 @@
   (checked-compile-and-assert ()
       `(lambda ()
          (let ((x (list 1)))
-           (declare (sb-int:truly-dynamic-extent x))
+           (declare (dynamic-extent x))
            (progv '(*) x
              (catch 'ct (the integer (eval (dotimes (i 1 42) 42)))))))
     (() 42)))
@@ -6328,3 +6329,36 @@
               (when (string= (format nil "~a" note)
                              "The second argument never returns a value.")
                 (return t))))))
+
+(with-test (:name :check-consistency-mv-call-substitute-single-use-lvar)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda (spec)
+       (multiple-value-call #'list
+         (first spec)
+         (values
+          5
+          6))))))
+
+(with-test (:name :check-consistency-call-symbol)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda ()
+        (print (lambda (x) (apply (read) x)))))))
+
+(with-test (:name :check-consistency-info-arg-count)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda (symbol expr eqx)
+        (declare (type function eqx))
+        (if (boundp symbol)
+            (let ((oldval (symbol-value symbol)))
+              (if (funcall eqx oldval expr) oldval expr))
+            expr)))))
+
+(with-test (:name :check-consistency-deleted-let)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda ()
+        (let ((x (error "fail")))
+          x)))))

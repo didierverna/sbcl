@@ -577,6 +577,34 @@
                  :initial-value 0))
     (("abc") 294)))
 
+(with-test (:name :reduce-initial-value-from-end)
+  (checked-compile-and-assert
+   ()
+   `(lambda (s)
+      (reduce #'funcall s :from-end t :initial-value '(1)))
+   (('(car)) 1))
+  (checked-compile-and-assert
+   ()
+   `(lambda (s e)
+      (reduce #'funcall s :from-end e :initial-value '(1)))
+   (('(car) t) 1))
+  (checked-compile-and-assert
+   ()
+   `(lambda (e)
+      (reduce #'funcall #*1 :from-end e :initial-value 1 :key (lambda (x) x 'list)))
+   ((t) '(1) :test #'equal))
+  (checked-compile-and-assert
+   ()
+   `(lambda ()
+      (reduce #'funcall #*1 :from-end t :initial-value 1 :key (lambda (x) x 'list)))
+   (() '(1) :test #'equal))
+  (checked-compile-and-assert
+   ()
+   `(lambda (f l)
+      (reduce (the (function ((unsigned-byte 16) (unsigned-byte 8))) f) l
+              :initial-value 300))
+   ((#'+ '(1 2 3)) 306)))
+
 (with-test (:name :get-defined-fun-lambda-list-error)
   (assert (nth-value 1 (checked-compile '(lambda () (defun x 10)) :allow-failure t))))
 
@@ -701,3 +729,46 @@
                            (let* ((a 1 2))
                              a)))
                       :allow-failure t))))
+
+(with-test (:name :position-derive-empty-type)
+  (multiple-value-bind (fun failure warning)
+      (checked-compile
+       `(lambda (s)
+          (position #\a (the simple-string s) :start 4 :end 2))
+       :allow-warnings t)
+    (declare (ignore failure))
+    (assert warning)
+    (assert-error (funcall fun "abcdef") sb-kernel:bounding-indices-bad-error)))
+
+(with-test (:name :cast-movement-empty-types)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (loop for x to 2
+                               sum (the cons (signum x))))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :dead-code-after-ir1-conversion)
+  (assert (nth-value 5
+                     (checked-compile
+                      `(lambda (r v)
+                         (labels ((scan (ch l)
+                                    (finish l)
+                                    (let ((d (digit-char-p ch r)))
+                                      (labels ((fix (x i l)
+                                                 (if (null l)
+                                                     (scan 1
+                                                           (cons (cons x i) nil))
+                                                     (if i
+                                                         (fix (+ (* 2 (aref v i)) x) (1+ i) nil)
+                                                         (scan 1
+                                                               (cons (cons x i) l))))))
+                                        (fix d 0 l))))
+                                  (finish (nil)))))
+                      :allow-failure t))))
+
+(with-test (:name :muffle-unknown-type)
+  (assert (nth-value 3
+                     (checked-compile
+                      `(lambda () (declare (sb-ext:muffle-conditions foo)) nil)
+                      :allow-style-warnings t))))

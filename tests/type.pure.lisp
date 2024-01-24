@@ -507,16 +507,16 @@
     (flet ((our-type-of (x) (sb-kernel:type-specifier (sb-kernel:ctype-of x))))
       (let ((hairy-t (make-array 3 :displaced-to simp-t)))
         (assert (equal (our-type-of hairy-t)
-                       '(and (vector t 3) (not simple-array))))
+                       '(vector t)))
         (assert (equal (type-of hairy-t) '(vector t 3))))
       (let ((hairy-t (make-array '(3 2) :displaced-to simp-t)))
         (assert (equal (our-type-of hairy-t)
-                       '(and (array t (3 2)) (not simple-array))))
+                       '(array t (* *))))
         (assert (equal (type-of hairy-t) '(array t (3 2)))))
       (let ((hairy-bit
-             (make-array 5 :displaced-to simp-bit :element-type 'bit)))
+              (make-array 5 :displaced-to simp-bit :element-type 'bit)))
         (assert (equal (our-type-of hairy-bit)
-                       '(and (bit-vector 5) (not simple-array))))
+                       'bit-vector))
         (assert (equal (type-of hairy-bit) '(bit-vector 5)))))))
 
 (with-test (:name (subtypep array :bug-309098))
@@ -765,7 +765,7 @@
                                           ,(sb-kernel:find-layout what))))))
 
 (with-test (:name :type-of-empty-instance)
-  (assert (eq (type-of (eval '(sb-kernel:%make-funcallable-instance 6)))
+  (assert (eq (type-of (test-util::make-funcallable-instance 6))
               'sb-kernel:funcallable-instance))
   (assert (eq (type-of (eval '(sb-kernel:%make-instance 12)))
               'sb-kernel:instance)))
@@ -842,7 +842,7 @@
             (sb-kernel:%simple-fun-type
              (checked-compile
               `(lambda (a) (array-rank (the (not (array t)) a))))))
-           `(values array-rank &optional))))
+           `(values (mod 129) &optional))))
 
 (with-test (:name (:rational-intersection :lp1998008))
   (flet ((bug101 ()
@@ -875,3 +875,15 @@
                                              (declare ((or list fixnum) x))
                                              (typep x 'integer))
                                           nil)))))
+
+(with-test (:name :union-intersection-simplification)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (typep a '(or
+                 (and symbol (not null))
+                 (and array (not string)))))
+   ((#()) t)
+   (("") nil)
+   ((t) t)
+   ((nil) nil)))

@@ -327,7 +327,7 @@
 ;;; Note: a constant-tn is allowed in CMP; it uses an EA displacement,
 ;;; not immediate data.
 (define-vop (if-eq)
-  (:args (x :scs (any-reg descriptor-reg control-stack immediate))
+  (:args (x :scs (any-reg descriptor-reg control-stack))
          (y :scs (any-reg descriptor-reg control-stack immediate constant)))
   (:conditional :e)
   (:policy :fast-safe)
@@ -419,10 +419,10 @@
   (assert (eql other-pointer-lowtag #b1111))
   ;; This is also assumed in src/runtime/x86-64-assem.S
   (assert (eql (min bignum-widetag ratio-widetag single-float-widetag double-float-widetag
-                    complex-widetag complex-single-float-widetag complex-double-float-widetag)
+                    complex-rational-widetag complex-single-float-widetag complex-double-float-widetag)
                bignum-widetag))
   (assert (eql (max bignum-widetag ratio-widetag single-float-widetag double-float-widetag
-                    complex-widetag complex-single-float-widetag complex-double-float-widetag)
+                    complex-rational-widetag complex-single-float-widetag complex-double-float-widetag)
                complex-double-float-widetag)))
 
 ;;; Most uses of EQL are transformed into a non-generic form, but when we need
@@ -460,10 +460,8 @@
 
     ;; If the widetags are not the same, return false.
     ;; Using a :dword compare gets us the bignum length check almost for free
-    ;; unless the length's representation requires more than 3 bytes.
-    ;; It sounds like a :qword compare would be the right thing, but remember
-    ;; one header bit acts as a concurrent GC mark bit in all headered objects,
-    ;; though we're not really using it yet. (We are, but not concurrently)
+    ;; unless the length's representation requires more 4 bytes.
+    ;; I bet nobody would mind if MAXIMUM-BIGNUM-LENGTH were #xFFFFFF.
     (inst mov :dword rax (ea (- other-pointer-lowtag) x))
     (inst cmp :dword rax (ea (- other-pointer-lowtag) y))
     (inst jmp :ne done) ; negative

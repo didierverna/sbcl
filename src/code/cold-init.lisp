@@ -116,14 +116,13 @@
                                       :if-does-not-exist nil)
                 (when stream
                   (let ((*package* (find-package "SB-KERNEL"))) (read stream))))))
+    (dolist (item list)
+      (destructuring-bind (object hash) item
+        (let ((calc (sxhash object)))
+          (unless (= hash calc)
+            (error "cross-compiler SXHASH failure on ~S: ~X vs ~X" object hash calc)))))
     (when list
-      (dolist (item list)
-        (destructuring-bind (object hash) item
-          (unless (= (sxhash object) hash)
-            (error "SXHASH computed wrong answer for ~S. Got ~x should be ~x"
-                   object hash (sxhash object)))))
-      (format t "~&cross-compiler SXHASH tests passed: ~D cases~%"
-              (length list)))))
+      (format t "~&cross-compiler SXHASH tests passed: ~D cases~%" (length list)))))
 
 ;;; called when a cold system starts up
 (defun !cold-init ()
@@ -149,10 +148,7 @@
   ;; debugging.
   (show-and-call !format-cold-init)
   (unless (!c-runtime-noinform-p)
-    ;; I'd like FORMAT to remain working in cold-init, where it does work,
-    ;; hence the conditional.
-    #+(or x86 x86-64) (format t "COLD-INIT... ")
-    #-(or x86 x86-64) (write-string "COLD-INIT... "))
+    (write-string "COLD-INIT... "))
 
   ;; Anyone might call RANDOM to initialize a hash value or something;
   ;; and there's nothing which needs to be initialized in order for
@@ -202,6 +198,13 @@
   ;; Must be done before any non-opencoded array references are made.
   (show-and-call sb-vm::!hairy-data-vector-reffer-init)
 
+  ;; It's not unreasonable to call PARSE-INTEGER in cold-init, which demands that
+  ;; WHITESPACE[1]P work properly, so it needs *STANDARD-READTABLE* established.
+  (let ((*readtable* (make-readtable)))
+    (show-and-call !reader-cold-init)
+    ;; *STANDARD-READTABLE* is assigned last to avoid an error about altering it.
+    (setf *standard-readtable* *readtable*))
+
   ;; Various toplevel forms call MAKE-ARRAY, which calls SUBTYPEP, so
   ;; the basic type machinery needs to be initialized before toplevel
   ;; forms run.
@@ -219,8 +222,7 @@
   (show-and-call sb-kernel::!set-up-structure-object-class)
 
   (unless (!c-runtime-noinform-p)
-    #+(or x86 x86-64) (format t "[Length(TLFs)=~D]" (length *!cold-toplevels*))
-    #-(or x86 x86-64) (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
+    (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
 
   (setq sb-pcl::*!docstrings* nil) ; needed before any documentation is set
   (setq sb-c::*queued-proclaims* nil) ; needed before any proclaims are run
@@ -281,8 +283,15 @@
 
   ;; We run through queued-up type and ftype proclaims that were made
   ;; before the type system was initialized, and (since it is now
-  ;; initalized) reproclaim them..
-  (mapcar #'proclaim sb-c::*queued-proclaims*)
+  ;; initalized) reproclaim them.
+  (loop for claim in sb-c::*queued-proclaims*
+        do
+        (when (eq (car claim) 'ftype)
+          ;; Avoid warnings about mismatched types.
+          (loop for name in (cddr claim)
+                do (setf (info :function :where-from name) :assumed)))
+        (proclaim claim))
+
   (makunbound 'sb-c::*queued-proclaims*)
 
   (show-and-call os-cold-init-or-reinit)
@@ -305,9 +314,6 @@
     (show-and-call !reader-cold-init)
     (show-and-call !sharpm-cold-init)
     (show-and-call !backq-cold-init)
-    ;; The *STANDARD-READTABLE* is assigned at last because the above
-    ;; functions would operate on the standard readtable otherwise---
-    ;; which would result in an error.
     (setf *standard-readtable* *readtable*))
   (setf *readtable* (copy-readtable *standard-readtable*))
   (setf sb-debug:*debug-readtable* (copy-readtable *standard-readtable*))
@@ -418,6 +424,7 @@ process to continue normally."
     (setf (extern-alien "internal_errors_enabled" int) 1)
     (float-cold-init-or-reinit))
   (gc-reinit)
+  (finalizers-reinit)
   (foreign-reinit)
   #+win32 (reinit-internal-real-time)
   ;; If the debugger was disabled in the saved core, we need to

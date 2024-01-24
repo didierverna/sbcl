@@ -541,8 +541,9 @@
          (or (not aligned) (zerop (logand (sap-int x)
                                           (1- (ash 1 word-shift))))))))
 
-(declaim (inline valid-lisp-pointer-p))
-(sb-alien:define-alien-routine valid-lisp-pointer-p sb-alien:int
+(declaim (inline valid-tagged-pointer-p))
+(sb-alien:define-alien-routine ("lisp_valid_tagged_pointer_p" valid-tagged-pointer-p)
+    sb-alien:int
   (pointer system-area-pointer))
 
 ;;; There are many opportunities for things to go wrong when searching
@@ -624,7 +625,7 @@
             ;; precise gc backends).
             (without-gcing
               (sb-alien:alien-funcall
-               (sb-alien:extern-alien "component_ptr_from_pc"
+               (sb-alien:extern-alien "lisp_component_ptr_from_pc"
                                       (function sb-alien:unsigned system-area-pointer))
                (etypecase pc
                  (system-area-pointer pc)
@@ -1270,8 +1271,6 @@ register."
                                                       sb-vm::undefined-alien-tramp))
                                       "undefined function")
                                      (routine)))))
-      (closure ; interrupted in an immobile code trampoline
-       (make-bogus-debug-fun "closure-calling trampoline"))
       ((eql :bpt-lra)
        (make-bogus-debug-fun "function end breakpoint")))))
 
@@ -1661,7 +1660,7 @@ register."
       ((not args)
        (values nil nil))
       ((eq args :minimal)
-       (values (coerce (debug-fun-debug-vars debug-fun) 'list)
+       (values (ensure-heap-list (coerce (debug-fun-debug-vars debug-fun) 'list))
                t))
       (t
        (values (parse-compiled-debug-fun-lambda-list/args-available
@@ -2335,7 +2334,7 @@ register."
 ;;; NOTE for precisely GC'd platforms:
 ;;; this function is not GC-safe in the slightest when creating
 ;;; a pointer to an object in dynamic space.  If a GC occurs between
-;;; the start of the call to VALID-LISP-POINTER-P and the end of
+;;; the start of the call to VALID-TAGGED-POINTER-P and the end of
 ;;; %MAKE-LISP-OBJ then the object could move before the boxed pointer
 ;;; is constructed.  This can happen on CHENEYGC if an asynchronous
 ;;; interrupt occurs within the window.  This can happen on GENCGC
@@ -2392,7 +2391,7 @@ register."
                    #-(or x86 x86-64) form))
         (let ((obj (if (and (typep val 'word) (is-lisp-pointer val))
                        (possibly-pin
-                        (if (= (valid-lisp-pointer-p (int-sap val)) 0)
+                        (if (= (valid-tagged-pointer-p (int-sap val)) 0)
                             0
                             (%make-lisp-obj val)))
                        0)))
@@ -3817,7 +3816,7 @@ register."
            ;; FIXME: this could handle static calls, but needs some
            ;; help from the backends
           (make-lisp-obj
-           (cond #+immobile-space
+           (cond #+(and immobile-space x86-64)
                  ((eql (sap-ref-8 (context-pc context) 0) #xB8) ; MOV EAX,imm
                   ;; Construct a properly tagged FDEFN given the value
                   ;; that machine code references it by for purposes
@@ -3826,11 +3825,8 @@ register."
                   ;; something like GET-FDEFN-FOR-SINGLE-STEP
                   (+ (sap-ref-32 (context-pc context) 1) -2 other-pointer-lowtag))
                  (t
-                  #+ppc64
                   (logior (context-register context callee-register-offset)
-                          other-pointer-lowtag)
-                  #-ppc64
-                  (context-register context callee-register-offset)))))
+                          #+untagged-fdefns other-pointer-lowtag)))))
          (step-info (single-step-info-from-context context)))
     ;; If there was not enough debug information available, there's no
     ;; sense in signaling the condition.
@@ -3883,7 +3879,7 @@ register."
         ;; CONTEXT, which is registered in thread->interrupt_contexts,
         ;; it will properly point to NEW-CALLEE.
         (cond
-         #+immobile-code
+         #+(and immobile-code x86-64)
          ((fdefn-p callee) ; as above, should be in {target}-vm.lisp
           ;; Store into RAX the necessary value for issuing a CALL to the JMP
           ;; opcode in the FDEFN header.
@@ -3893,9 +3889,9 @@ register."
           (sb-vm::incf-context-pc context 5))
          (t
           (setf (context-register context callee-register-offset)
-                #+ppc64
+                #+untagged-fdefns
                 (logandc2 (get-lisp-obj-address new-callee) lowtag-mask)
-                #-ppc64
+                #-untagged-fdefns
                 (get-lisp-obj-address new-callee))))))))
 
 ;;; Given a signal context, fetch the step-info that's been stored in

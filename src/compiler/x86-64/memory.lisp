@@ -33,30 +33,76 @@
 ;;;    be younger than the newly constructed thing.
 ;;; 2. hash-table k/v pair should mark once only.
 ;;;    (the vector elements are certainly on the same card)
-(defun emit-gengc-barrier (object cell-address scratch-reg &optional value-tn-ref value-tn)
+(defun emit-gengc-barrier (object cell-address scratch-reg &optional value-tn-ref value-tn allocator)
+  #-soft-card-marks (declare (ignore object cell-address scratch-reg value-tn-ref value-tn allocator))
+  #+soft-card-marks
+  (progn
   (when (sc-is object constant immediate)
     (aver (symbolp (tn-value object))))
-  (when (require-gc-store-barrier-p object value-tn-ref value-tn)
-    (if cell-address ; for SIMPLE-VECTOR, the page holding the specific element index gets marked
-        (inst lea scratch-reg cell-address)
-        ;; OBJECT could be a symbol in immobile space
-        (inst mov scratch-reg (encode-value-if-immediate object)))
-    (inst shr scratch-reg gencgc-card-shift)
-    ;; gc_allocate_ptes() asserts mask to be < 32 bits, which is hugely generous.
-    (inst and :dword scratch-reg card-index-mask)
-    ;; I wanted to use thread-tn as the source of the store, but it isn't 256-byte-aligned
-    ;; due to presence of negatively indexed thread header slots.
-    ;; Probably word-alignment is enough, because we can just check the lowest bit,
-    ;; borrowing upon the idea from PSEUDO-ATOMIC which uses RBP-TN as the source.
-    ;; I'd like to measure to see if using a register is actually better.
-    ;; If all threads store 0, it might be easier on the CPU's store buffer.
-    ;; Otherwise, it has to remember who "wins". 0 makes it indifferent.
-    (inst mov :byte (ea gc-card-table-reg-tn scratch-reg) 0)))
+  (multiple-value-bind (require #+debug-gc-barriers why-not)
+      (require-gengc-barrier-p object value-tn-ref value-tn allocator)
+    (cond (require
+           (if cell-address ; for SIMPLE-VECTOR, the page holding the specific element index gets marked
+               (inst lea scratch-reg cell-address)
+               ;; OBJECT could be a symbol in immobile space
+               (inst mov scratch-reg (encode-value-if-immediate object)))
+           (inst shr scratch-reg gencgc-card-shift)
+           ;; gc_allocate_ptes() asserts mask to be < 32 bits, which is hugely generous.
+           (inst and :dword scratch-reg card-index-mask)
+           ;; I wanted to use thread-tn as the source of the store, but it isn't 256-byte-aligned
+           ;; due to presence of negatively indexed thread header slots.
+           ;; Probably word-alignment is enough, because we can just check the lowest bit,
+           ;; borrowing upon the idea from PSEUDO-ATOMIC which uses RBP-TN as the source.
+           ;; I'd like to measure to see if using a register is actually better.
+           ;; If all threads store 0, it might be easier on the CPU's store buffer.
+           ;; Otherwise, it has to remember who "wins". 0 makes it indifferent.
+           (inst mov :byte (ea gc-card-table-reg-tn scratch-reg) CARD-MARKED))
+          #+debug-gc-barriers
+          (t
+           (flet ((encode (x)
+                    (sc-case x
+                      (constant
+                       (load-constant nil x scratch-reg)
+                       scratch-reg)
+                      (t
+                       (let ((value (encode-value-if-immediate x)))
+                         (if (integerp value)
+                             (constantize value)
+                             value))))))
+             (cond (value-tn
+                    (unless (and (sc-is value-tn immediate)
+                                 (typep (tn-value value-tn) '(or integer boolean)))
+                      (inst push (if (eq why-not :consecutive)
+                                     0
+                                     1))
+                      (inst push (encode object))
+                      (inst push (encode value-tn))
 
-(defun emit-store (ea value val-temp)
+                      (invoke-asm-routine 'call 'check-barrier sb-assem::*current-vop*)))
+                   (value-tn-ref
+                    (loop do
+                          (unless (and (sc-is (tn-ref-tn value-tn-ref) immediate)
+                                       (typep (tn-value (tn-ref-tn value-tn-ref)) '(or integer boolean)))
+                            (inst push (if (eq why-not :consecutive)
+                                           0
+                                           1))
+                            (inst push (encode object))
+                            (inst push (encode (tn-ref-tn value-tn-ref)))
+                            (invoke-asm-routine 'call 'check-barrier sb-assem::*current-vop*))
+                          (setf value-tn-ref (tn-ref-across value-tn-ref))
+                          while value-tn-ref)))))))))
+
+#-soft-card-marks
+(defun emit-code-page-gengc-barrier (object scratch-reg)
+  (inst mov scratch-reg object)
+  (inst shr scratch-reg gencgc-card-shift)
+  (inst and :dword scratch-reg card-index-mask)
+  (inst mov :byte (ea gc-card-table-reg-tn scratch-reg) CARD-MARKED))
+
+(defun emit-store (ea value val-temp &optional (tag-immediate t))
   (sc-case value
    (immediate
-      (let ((bits (encode-value-if-immediate value)))
+      (let ((bits (encode-value-if-immediate value tag-immediate)))
         ;; Try to move imm-to-mem if BITS fits
         (acond ((or (and (fixup-p bits)
                          ;; immobile-object fixups must fit in 32 bits
@@ -73,17 +119,8 @@
    (t
       (inst mov :qword ea value))))
 
-;;; CELL-REF and CELL-SET are used to define VOPs like CAR, where the
-;;; offset to be read or written is a property of the VOP used.
-(define-vop (cell-ref)
-  (:args (object :scs (descriptor-reg)))
-  (:results (value :scs (descriptor-reg any-reg)))
-  (:variant-vars offset lowtag)
-  (:policy :fast-safe)
-  (:generator 4
-    (loadw value object offset lowtag)))
-;; This vop's sole purpose is to be an ancestor for other vops, to assign
-;; default operands, policy, and generator.
+;; This vop's sole purpose is to provide the implementation of value-cell-set.
+;; It could be removed, for x86-64 anyway.
 (define-vop (cell-set)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg immediate)))

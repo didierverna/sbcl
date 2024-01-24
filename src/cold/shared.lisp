@@ -286,28 +286,36 @@
              ;; Bind temporarily so that TARGET-FEATUREP and TARGET-PLATFORM-KEYWORD
              ;; can see the tentative list.
              (sb-xc:*features* (funcall customizer default-features))
-             (gc (find-if (lambda (x) (member x '(:cheneygc :gencgc)))
-                          sb-xc:*features*))
+             (gc (intersection '(:cheneygc :gencgc :mark-region-gc)
+                               sb-xc:*features*))
              (arch (target-platform-keyword)))
+        (when (member :mark-region-gc sb-xc:*features*)
+          (setf sb-xc:*features* (remove :gencgc sb-xc:*features*)
+                gc (remove :gencgc gc)))
+        (unless (and gc (not (cdr gc)))
+          (error "Exactly 1 GC implementation needs to be selected"))
+        (setq gc (car gc))
+        ;; all our GCs are generational
+        (when (member gc '(:gencgc :mark-region-gc))
+          (pushnew :generational sb-xc:*features*))
+        (when (eq gc :mark-region-gc)
+          (setq sb-xc:*features* (remove :immobile-space sb-xc:*features*)))
         ;; Win32 conditionally adds :sb-futex in grovel-features.sh
-        ;; Futexes aren't available in all macos versions, but they are available in all versions that support arm, so always enable them there
+        ;; Futexes aren't available in all macos versions, but they are available in
+        ;; all versions that support arm, so always enable them there
         (when (target-featurep '(:and :sb-thread (:or :linux :freebsd :openbsd (:and :darwin :arm64))))
           (pushnew :sb-futex sb-xc:*features*))
-        ;; If may not be the best idea to put clock_gettime calls around every
-        ;; futex_wait if the OS/libc you're building for does not have a vdso entry point.
-        ;; So leave this out unless enabled explicitly and/or I gather more data on
-        ;; its performance impact.
-        #+nil
-        (when (target-featurep '(:and :sb-futex :x86-64 :linux))
-          (pushnew :futex-wait-metric sb-xc:*features*))
+        (when (target-featurep '(:and :sb-thread :x86-64))
+          (pushnew :system-tlabs sb-xc:*features*))
+        (when (target-featurep '(:and :mark-region-gc :permgen :x86-64))
+          (pushnew :compact-instance-header sb-xc:*features*))
         (when (target-featurep :immobile-space)
-          (when (member :sb-thread sb-xc:*features*)
-            (pushnew :system-tlabs sb-xc:*features*))
-          (pushnew :compact-instance-header sb-xc:*features*)
+          (when (target-featurep :x86-64)
+            (pushnew :compact-instance-header sb-xc:*features*))
           (pushnew :immobile-code sb-xc:*features*))
         (when (target-featurep :64-bit)
           (push :compact-symbol sb-xc:*features*))
-        (when (target-featurep '(:and :sb-thread (:or :darwin :openbsd)))
+        (when (target-featurep '(:and :sb-thread (:or (:and :darwin (:not (:or :ppc :x86))) :openbsd)))
           (push :os-thread-stack sb-xc:*features*))
         (when (target-featurep '(:and :x86 :int4-breakpoints))
           ;; 0xCE is a perfectly good 32-bit instruction,
@@ -358,17 +366,15 @@
 ;;; combinations now, and provide a description of what the actual
 ;;; failure is (not always obvious from when the build fails).
 (let ((feature-compatibility-tests
-       '(("(and sb-thread (not gencgc))"
-          ":SB-THREAD requires :GENCGC")
-         ("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
+       '(("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
          ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
+         ("(and mark-region-gc (not (or x86-64 arm64)))"
+          "mark-region is not supported on selected architecture")
          ("(and (not sb-thread) (or arm64 ppc64))"
           "The selected architecture requires :SB-THREAD")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
-         ("(not (or gencgc cheneygc))"
-          "One of :GENCGC or :CHENEYGC must be enabled")
          ("(and sb-safepoint (not (and (or arm64 x86 x86-64) (or darwin linux win32))))"
           ":SB-SAFEPOINT not supported on selected arch/OS")
          ("(not (or elf mach-o win32))"
@@ -382,9 +388,7 @@
           ;; It sorta kinda works to have both, but there should be no need,
           ;; and it's not really supported.
           "At most one interpreter can be selected")
-         ("(and immobile-space (not x86-64))"
-          ":IMMOBILE-SPACE is supported only on x86-64")
-         ("(and compact-instance-header (not immobile-space))"
+         ("(and compact-instance-header (not (or permgen immobile-space)))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
          ("(and immobile-code (not immobile-space))"
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
@@ -775,6 +779,9 @@
              (search "src/code/arena" stem)
              (search "src/code/avltree" stem)
              (search "src/code/brothertree" stem)
+             (search "src/code/early-classoid" stem)
+             (search "src/code/type-class" stem)
+             (search "src/code/class" stem)
              (search "src/code/debug" stem) ; also matches debug-{info,int,var-io}
              (search "src/code/early-defmethod" stem)
              (search "src/code/final" stem)
@@ -843,7 +850,7 @@
                ((and structure-object (not package))
                 (let ((type-name (string (type-of x))))
                   ;; This "LAYOUT" refers to *our* object, not host-sb-kernel:layout.
-                  (unless (member type-name '("WRAPPER" "LAYOUT" "FLOAT" "COMPLEXNUM")
+                  (unless (member type-name '("LAYOUT" "FLOAT" "COMPLEXNUM")
                                   :test #'string=)
                     ;(Format t "visit a ~/host-sb-ext:print-symbol-with-prefix/~%" (type-of x))
                     ;; This generalizes over any structure. I need it because we
@@ -871,6 +878,25 @@
 (compile 'install-read-interceptor)
 
 (defvar *math-ops-memoization* (make-hash-table :test 'equal))
+(defun math-journal-pathname (direction)
+  ;; Initialy we read from the file in the source tree, but writeback occurs
+  ;; to a new local file. Then if re-reading we read the local copy of the cache.
+  ;; This should allow multiple builds to happen (via make-all-targets.sh) in a
+  ;; single source tree. If exactly one target is built, we can mv the local file
+  ;; on top of the source file. For more than one, we could either merge them
+  ;; or just ignore any modifications.
+  (let* ((base "xfloat-math.lisp-expr")
+         (local (concatenate 'string sb-cold::*host-obj-prefix* base)))
+    (pathname
+     (ecase direction
+       (:input (if (probe-file local) local base))
+       (:output local)))))
+
+(defun count-lines-of (pathname &aux (n 0))
+  (with-open-file (f pathname)
+    (loop (let ((line (read-line f nil)))
+            (if line (incf n) (return n))))))
+
 (defmacro with-math-journal (&body body)
   `(let* ((table *math-ops-memoization*)
           (memo (cons table (hash-table-count table))))
@@ -883,13 +909,110 @@
      (when nil ; *compile-verbose*
        (funcall (intern "SHOW-INTERNED-NUMBERS" "SB-IMPL") *standard-output*))
      (when (> (hash-table-count table) (cdr memo))
-       (let ((filename "float-math.lisp-expr"))
+       (let ((filename (math-journal-pathname :output)))
          (with-open-file (stream filename :direction :output
                                           :if-exists :supersede)
            (funcall (intern "DUMP-MATH-MEMOIZATION-TABLE" "SB-IMPL")
                     table stream))
-         (format t "~&; wrote ~a - ~d entries"
+         ;; Enforce absence of spurious newlines from pretty-printing or whatever
+         ;; If this assertion is wrong on other lisps we can just remove it
+         (assert (= (count-lines-of filename) (+ (hash-table-count table) 5)))
+         (format t "~&; Math journal: wrote ~S (~d entries)"
                  filename (hash-table-count table))))))
+
+;;;; One more journal file because the math file isn't enough
+;;; Define this before renaming the SB- packages
+;;; A non-parallelized compile using a sufficiently new SBCL as the host
+;;; will use a paravirtualized implementation of generate-perfect-hash-sexpr
+;;; which is to say, it just uses the host; as a side-effect it records
+;;; the generated string so that we can replay it for any host
+;;; or for parallelized build.
+(defvar *perfect-hash-generator-mode* :PLAYBACK)
+(defvar *perfect-hash-generator-memo* nil)
+(defvar *perfect-hash-generator-journal* "xperfecthash.lisp-expr")
+#+sbcl (when (and (find-symbol "MAKE-PERFECT-HASH-LAMBDA" "SB-C")
+                  (find-symbol "NEWCHARSTAR-STRING" "SB-INT"))
+         (pushnew :use-host-hash-generator cl:*features*)
+         (setq *perfect-hash-generator-mode* :RECORD))
+
+;;; I want this to work using the host-native readtable if sb-cold:*xc-readtable*
+;;; isn't established. The caller should bind *READTABLE* to ours if reading
+;;; on a non-SBCL host; it's purposely not done here.
+(defun preload-perfect-hash-generator (pathname)
+  (with-open-file (stream pathname :if-does-not-exist nil)
+    (when stream
+      (let ((entries (let ((*read-base* 16)) (read stream))))
+        (setq *perfect-hash-generator-memo*
+              ;; Compute the XOR all the hashes of each entry as a quick pass/fail
+              ;; when searching, assuming thst EQUALP compares (CAR CONS) before
+              ;; the CDR, which is almost surely, though not necessarily, what it does.
+              (mapcar (lambda (entry)
+                        (destructuring-bind (array . string) entry
+                          ;; assert that the entry was stored in canonical form
+                          (assert (equalp array (sort (copy-seq array) #'<)))
+                          (let ((digest (reduce #'logxor array)))
+                            (cons (cons digest array) string))))
+                      entries))))))
+
+(defun emulate-generate-perfect-hash-sexpr (array)
+  (let ((computed
+         #+use-host-hash-generator
+         (let ((string
+                (sb-int:newcharstar-string
+                 (sb-sys:with-pinned-objects (array)
+                   (sb-alien:alien-funcall
+                    (sb-alien:extern-alien
+                     "generate_perfhash_sexpr"
+                     (function (* sb-alien:char) sb-alien:system-area-pointer sb-alien:int))
+                    (sb-sys:vector-sap array) (length array))))))
+           ;; don't need the final newline, it looks un-lispy in the file
+           (let ((l (length string)))
+             (assert (char= (char string (1- l)) #\newline))
+             (subseq string 0 (1- l))))))
+    ;; Entries are written to disk with hashes sorted in ascending order so that
+    ;; comparing as sets can be done using EQUALP.
+    ;; Sort nondestructively in case something else looks at the value as supplied.
+    (let* ((canonical-array (sort (copy-seq array) #'<))
+           (digest (reduce #'logxor canonical-array))
+           (match (assoc (cons digest canonical-array) *perfect-hash-generator-memo*
+                         :test #'equalp)))
+      (when match
+        (when computed (assert (string= (cdr match) computed)))
+        (return-from emulate-generate-perfect-hash-sexpr (cdr match)))
+    (ecase *perfect-hash-generator-mode*
+      (:playback
+       (error "perfect hash file is missing a needed entry for ~x" array))
+      (:record
+       (setf *perfect-hash-generator-memo*
+             (nconc *perfect-hash-generator-memo*
+                    (list (cons (cons digest canonical-array) computed))))
+       computed)))))
+
+(defun compile-perfect-hashfun-for-host (lambda)
+  ;; Remove the declare:
+  ;;   (declare (optimize (safety 0) (sb-c:store-source-form 0)))
+  (let ((third (third lambda)))
+    (assert (eq (car third) 'declare))
+    (let ((new `(lambda ,(second lambda) ,@(cdddr lambda))))
+      (compile nil new))))
+(defun maybe-save-perfect-hashfuns-for-playback ()
+  ;; FIXME: file corruption occurs for -jN > 1 from make-all-targets.sh
+  #+use-host-hash-generator
+  (when (eq *perfect-hash-generator-mode* :record)
+    (with-open-file (stream *perfect-hash-generator-journal*
+                            :direction :output
+                            :if-existS :supersede :if-does-not-exist :create)
+      (write-char #\( stream)
+      (dolist (entry *perfect-hash-generator-memo*)
+        (destructuring-bind ((digest . array) . string) entry
+          (declare (ignore digest))
+          (write (cons array string):stream stream :length nil :base 16
+                 :pretty t :right-margin 128))
+        (terpri stream))
+      (write-string ")
+;; EOF
+" stream)))
+  t)
 
 ;;;; Please avoid writing "consecutive" (un-nested) reader conditionals
 ;;;; in this file, whether for the same or different feature test.

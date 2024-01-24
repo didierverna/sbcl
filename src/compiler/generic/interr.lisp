@@ -107,7 +107,7 @@
    ("An attempt was made to use an undefined SYMBOL-VALUE." unbound-symbol 1)
    ("attempt to RETURN-FROM a block that no longer exists" invalid-unwind 0)
    ("attempt to THROW to a non-existent tag" unseen-throw-tag 1)
-   ("division by zero" division-by-zero 2)
+   ("division by zero" division-by-zero 1)
    ("Object is of the wrong type." object-not-type 2)
    ("ECASE failure" ecase-failure 2)
    ("ETYPECASE failure" etypecase-failure 2)
@@ -120,6 +120,7 @@
    ("An array with element-type NIL was accessed." nil-array-accessed 1)
    ("Object layout is invalid. (indicates obsolete instance)" layout-invalid 2)
    ("Thread local storage exhausted." tls-exhausted 0)
+   ("Stack allocated object overflows stack." stack-allocated-object-overflows-stack 1)
    ("Unreachable code reached" unreachable 0)
    ("Failed aver" failed-aver 1)
    ("Multiplication overflow" mul-overflow 2)
@@ -127,7 +128,11 @@
    #+x86-64
    ("Sub overflow" sub-overflow 1)
    ("Add overflow" signed-unsigned-add-overflow 1)
-   ("Sub overflow" sub-overflow2 2))
+   ("Add overflow" add-overflow2 2)
+   ("Sub overflow" sub-overflow2 2)
+   ("Mul overflow" mul-overflow2 2)
+   ("ASH overflow" ash-overflow2 2)
+   ("Negate overflow" negate-overflow 1))
   ;; (II) All the type specifiers X for which there is a unique internal
   ;;      error code corresponding to a primitive object-not-X-error.
   function
@@ -197,7 +202,7 @@
   sb-c::vop
   sb-c::basic-combination
   sb-sys:fd-stream
-  wrapper
+  layout
   (sb-assem:segment object-not-assem-segment)
   sb-c::cblock
   sb-disassem:disassem-state
@@ -240,7 +245,8 @@
   condition
   sb-pcl::fast-method-call
   ((or symbol string) object-not-or-symbol-string)
-  ((and unsigned-byte fixnum) object-not-unsigned-fixnum)))
+  ((and unsigned-byte fixnum) object-not-unsigned-fixnum)
+  bit-index))
 
 (defun error-number-or-lose (name)
   (or (position name sb-c:+backend-internal-errors+

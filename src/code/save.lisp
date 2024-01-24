@@ -17,7 +17,7 @@
 
 ;;;; SAVE-LISP-AND-DIE itself
 
-#-gencgc
+#+cheneygc
 (define-alien-routine "save" (boolean)
   (file c-string)
   (initial-fun (unsigned #.sb-vm:n-word-bits))
@@ -27,7 +27,6 @@
   (compression-level int)
   (application-type int))
 
-#+gencgc
 (define-alien-routine "gc_and_save" void
   (file c-string)
   (prepend-runtime int)
@@ -37,7 +36,6 @@
   (compression-level int)
   (application-type int))
 
-#+gencgc
 (define-alien-variable "lisp_init_function" (unsigned #.sb-vm:n-machine-word-bits))
 
 (define-condition save-condition (reference-condition)
@@ -203,7 +201,6 @@ This isn't because we like it this way, but just because there don't
 seem to be good quick fixes for either limitation and no one has been
 sufficiently motivated to do lengthy fixes."
   (declare (ignore environment-name))
-  #+gencgc
   (declare (ignorable root-structures))
   (when (and callable-exports toplevel-supplied)
     (error ":TOPLEVEL cannot be supplied when there are callable exports."))
@@ -232,12 +229,13 @@ sufficiently motivated to do lengthy fixes."
                                      :as-file t))
             (startfun (start-lisp toplevel callable-exports)))
         (deinit)
-        #+gencgc
+        #+generational
         (progn
           ;; Scan roots as close as possible to GC-AND-SAVE, in case anything
           ;; prior causes compilation to occur into immobile space.
           ;; Failing to see all immobile code would miss some relocs.
-          #+immobile-code (sb-vm::choose-code-component-order root-structures)
+          ;; FIXME: this could work on non-x86, but it doesn't right now.
+          #+(and x86-64 immobile-code) (sb-vm::choose-code-component-order root-structures)
           ;; Must clear this cache if asm routines are movable.
           (setq sb-disassem::*assembler-routines-by-addr* nil
                 ;; and save some space by deleting the instruction decoding table
@@ -261,7 +259,7 @@ sufficiently motivated to do lengthy fixes."
                        #+win32 (ecase application-type (:console 0) (:gui 1))
                        #-win32 0)
           (setf lisp-init-function 0)) ; only reach here on save error
-        #-gencgc
+        #-generational
         (progn
           ;; Coalescing after GC will do no good - the un-needed dups
           ;; of things won't actually go away. Do it before.
@@ -287,7 +285,7 @@ sufficiently motivated to do lengthy fixes."
 (defun tune-image-for-dump ()
   ;; C code will GC again (nonconservatively if pertinent), but the coalescing
   ;; steps done below will be more efficient if some junk is removed now.
-  #+gencgc (gc :full t)
+  (gc :full t)
 
   ;; Share EQUALP FUN-INFOs
   (let ((ht (make-hash-table :test 'equalp)))
@@ -333,10 +331,10 @@ sufficiently motivated to do lengthy fixes."
   (float-deinit)
   (profile-deinit)
   (foreign-deinit)
-  (when (zerop (hash-table-count sb-kernel::*forward-referenced-wrappers*))
+  (when (zerop (hash-table-count sb-kernel::*forward-referenced-layouts*))
     ;; I think this table should always be empty but I'm not sure. If it is,
     ;; recreate it so that we don't preserve an empty vector taking up 16KB
-    (setq sb-kernel::*forward-referenced-wrappers* (make-hash-table :test 'equal)))
+    (setq sb-kernel::*forward-referenced-layouts* (make-hash-table :test 'equal)))
   ;; Clean up the simulated weak list of covered code components.
   (rplacd sb-c:*code-coverage-info*
           (delete-if-not #'weak-pointer-value (cdr sb-c:*code-coverage-info*)))
@@ -346,7 +344,7 @@ sufficiently motivated to do lengthy fixes."
   (clrhash sb-c::*emitted-full-calls*) ; Don't immortalize compiler's scratchpad
   ;; Perform static linkage. Functions become un-statically-linked
   ;; on demand, for TRACE, redefinition, etc.
-  #+immobile-code (sb-vm::statically-link-core)
+  #+(and immobile-code x86-64) (sb-vm::statically-link-core)
   (finalizers-deinit)
   ;; Try to shrink the pathname cache. It might be largely nulls
   (rebuild-pathname-cache)
@@ -359,11 +357,13 @@ sufficiently motivated to do lengthy fixes."
         - nil + nil ++ nil +++ nil
         /// nil // nil / nil))
 
-sb-c::
+(in-package "SB-C")
+
 (defun coalesce-debug-info ()
   (flet ((debug-source= (a b)
-           (and (equal (debug-source-plist a) (debug-source-plist b))
-                (eql (debug-source-created a) (debug-source-created b)))))
+           (and (equalp a b)
+                ;; Case sensitive
+                (equal (debug-source-plist a) (debug-source-plist b)))))
     ;; Coalesce the following:
     ;;  DEBUG-INFO-SOURCE, DEBUG-FUN-NAME
     ;;  SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
@@ -377,59 +377,59 @@ sb-c::
        (lambda (obj widetag size)
          (declare (ignore size))
          (case widetag
-          (#.sb-vm:code-header-widetag
-           (let ((di (%code-debug-info obj)))
-             ;; Discard memoized debugger's debug info
-             (when (typep di 'sb-c::compiled-debug-info)
-               (setf (sb-c::compiled-debug-info-memo-cell di) nil)))
-           (dotimes (i (sb-kernel:code-n-entries obj))
-             (let* ((fun (sb-kernel:%code-entry-point obj i))
-                    (arglist (%simple-fun-arglist fun))
-                    (info (%simple-fun-info fun))
-                    (type (typecase info
-                            ((cons t simple-vector) (car info))
-                            ((not simple-vector) info)))
-                    (type  (ensure-gethash type type-hash type))
-                    (xref (%simple-fun-xrefs fun)))
-               (setf (%simple-fun-arglist fun)
-                     (ensure-gethash arglist arglist-hash arglist))
-               (setf (sb-impl::%simple-fun-info fun)
-                     (if (and type xref) (cons type xref) (or type xref))))))
-          (#.sb-vm:instance-widetag
-           (typecase obj
-            (compiled-debug-info
-             (let ((source (compiled-debug-info-source obj)))
-               (typecase source
-                 (core-debug-source)    ; skip - uh, why?
-                 (debug-source
-                  (let* ((namestring (debug-source-namestring source))
-                         (canonical-repr
-                           (find-if (lambda (x) (debug-source= x source))
-                                    (gethash namestring source-ht))))
-                    (cond ((not canonical-repr)
-                           (push source (gethash namestring source-ht)))
-                          ((neq source canonical-repr)
-                           (setf (compiled-debug-info-source obj)
-                                 canonical-repr)))))))
-             (loop for debug-fun = (compiled-debug-info-fun-map obj) then next
-                   for next = (sb-c::compiled-debug-fun-next debug-fun)
-                   do
-                   (binding* ((name (compiled-debug-fun-name debug-fun))
-                              ((new foundp) (gethash name name-ht)))
-                     (cond ((not foundp)
-                            (setf (gethash name name-ht) name))
-                           ((neq name new)
-                            (%instance-set debug-fun (get-dsd-index compiled-debug-fun name)
-                                  new))))
-                   while next))
-            (sb-lockless::linked-list
-             ;; In the normal course of execution, incompletely deleted nodes
-             ;; exist only for a brief moment, as the next operation on the list by
-             ;; any thread that touches the logically deleted node can fully delete it.
-             ;; If somehow we get here and there are in fact pending deletions,
-             ;; they must be finished or else bad things can happen, since 'coreparse'
-             ;; can not deal with the untagged pointer convention.
-             (sb-lockless::finish-incomplete-deletions obj))))))
+           (#.sb-vm:code-header-widetag
+            (let ((di (%code-debug-info obj)))
+              ;; Discard memoized debugger's debug info
+              (when (typep di 'sb-c::compiled-debug-info)
+                (setf (sb-c::compiled-debug-info-memo-cell di) nil)))
+            (dotimes (i (sb-kernel:code-n-entries obj))
+              (let* ((fun (sb-kernel:%code-entry-point obj i))
+                     (arglist (%simple-fun-arglist fun))
+                     (info (%simple-fun-info fun))
+                     (type (typecase info
+                             ((cons t simple-vector) (car info))
+                             ((not simple-vector) info)))
+                     (type  (ensure-gethash type type-hash type))
+                     (xref (%simple-fun-xrefs fun)))
+                (setf (%simple-fun-arglist fun)
+                      (ensure-gethash arglist arglist-hash arglist))
+                (setf (sb-impl::%simple-fun-info fun)
+                      (if (and type xref) (cons type xref) (or type xref))))))
+           (#.sb-vm:instance-widetag
+            (typecase obj
+              (compiled-debug-info
+               (let ((source (compiled-debug-info-source obj)))
+                 (typecase source
+                   (core-debug-source)  ; skip - uh, why?
+                   (debug-source
+                    (let* ((namestring (debug-source-namestring source))
+                           (canonical-repr
+                             (find-if (lambda (x) (debug-source= x source))
+                                      (gethash namestring source-ht))))
+                      (cond ((not canonical-repr)
+                             (push source (gethash namestring source-ht)))
+                            ((neq source canonical-repr)
+                             (setf (compiled-debug-info-source obj)
+                                   canonical-repr)))))))
+               (loop for debug-fun = (compiled-debug-info-fun-map obj) then next
+                     for next = (sb-c::compiled-debug-fun-next debug-fun)
+                     do
+                     (binding* ((name (compiled-debug-fun-name debug-fun))
+                                ((new foundp) (gethash name name-ht)))
+                       (cond ((not foundp)
+                              (setf (gethash name name-ht) name))
+                             ((neq name new)
+                              (%instance-set debug-fun (get-dsd-index compiled-debug-fun name)
+                                             new))))
+                     while next))
+              (sb-lockless::linked-list
+               ;; In the normal course of execution, incompletely deleted nodes
+               ;; exist only for a brief moment, as the next operation on the list by
+               ;; any thread that touches the logically deleted node can fully delete it.
+               ;; If somehow we get here and there are in fact pending deletions,
+               ;; they must be finished or else bad things can happen, since 'coreparse'
+               ;; can not deal with the untagged pointer convention.
+               (sb-lockless::finish-incomplete-deletions obj))))))
        :all))))
 
 (in-package "SB-VM")
@@ -665,22 +665,21 @@ sb-c::
        :immobile))
 
     (let* ((n (length ordering))
-           (array (make-alien int (1+ (* n 2)))))
+           (array (make-alien unsigned (1+ (* n 2)))))
       (loop for i below n
-            do (setf (deref array (* i 2))
-                     (get-lisp-obj-address (aref ordering i))))
+            do (setf (deref array (* i 2)) (get-lisp-obj-address (aref ordering i))))
       (setf (deref array (* n 2)) 0) ; null-terminate the array
       (setf (extern-alien "code_component_order" unsigned)
             (sap-int (alien-value-sap array)))))
 
   (multiple-value-bind (index relocs) (collect-immobile-code-relocs)
     (let* ((n (length index))
-           (array (make-alien int n)))
+           (array (make-alien unsigned n)))
       (dotimes (i n) (setf (deref array i) (aref index i)))
       (setf (extern-alien "immobile_space_reloc_index" unsigned)
             (sap-int (alien-value-sap array))))
     (let* ((n (length relocs))
-           (array (make-alien int n)))
+           (array (make-alien unsigned n)))
       (dotimes (i n) (setf (deref array i) (aref relocs i)))
       (setf (extern-alien "immobile_space_relocs" unsigned)
             (sap-int (alien-value-sap array))))))

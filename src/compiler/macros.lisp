@@ -189,22 +189,22 @@
                          keys))
            final-mandatory-arg)
       (collect ((binds))
-        (binds `(,tail (basic-combination-args ,node-var)))
+        (binds `(,tail (basic-combination-args (truly-the basic-combination ,node-var))))
         ;; The way this code checks for mandatory args is to verify that
         ;; the last positional arg is not null (it should be an LVAR).
         ;; But somebody could pedantically declare IGNORE on the last arg
         ;; so bind a dummy for it and then bind from the dummy.
         (mapl (lambda (args)
                 (cond ((cdr args)
-                       (binds `(,(car args) (pop ,tail))))
+                       (binds `(,(car args) (pop (truly-the list ,tail)))))
                       (t
                        (setq final-mandatory-arg (pop dummies))
-                       (binds `(,final-mandatory-arg (pop ,tail))
+                       (binds `(,final-mandatory-arg (pop (truly-the list ,tail)))
                               `(,(car args) ,final-mandatory-arg)))))
               req)
         ;; Optionals are pretty easy.
         (dolist (arg opt)
-          (binds `(,(if (atom arg) arg (car arg)) (pop ,tail))))
+          (binds `(,(if (atom arg) arg (car arg)) (pop (truly-the list ,tail)))))
         ;; Now if min or max # of args is incorrect,
         ;; or there are unacceptable keywords, bail out
         (when (or req keyp (not rest))
@@ -333,11 +333,15 @@
                            ,,n-lambda)))))))
           (if defun-only
               `(defun ,name ,@stuff)
-              `(%deftransform ',name
-                              ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
-                              '(function ,arg-types ,result-type)
-                              (named-lambda (deftransform ,name) ,@stuff)
-                              ,important)))))))
+              `(let ((fun (named-lambda (deftransform ,name) ,@stuff)))
+                 ,@(loop for arg-types in (if (typep arg-types '(cons (eql :or)))
+                                              (cdr arg-types)
+                                              (list arg-types))
+                         collect `(%deftransform ',name
+                                                 ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
+                                                 '(function ,arg-types ,result-type)
+                                                 fun
+                                                 ,important)))))))))
 
 (defmacro deftransforms (names (lambda-list &optional (arg-types '*)
                                                       (result-type '*)
@@ -597,12 +601,15 @@
       (lambda (,cleanup-var) ,@body) ,block ,return-value)))
 
 ;;; Bind the IR1 context variables to the values associated with NODE,
-;;; so that new, extra IR1 conversion related to NODE can be done
-;;; after the original conversion pass has finished.
+;;; so that IR1 conversion can be done after the main conversion pass
+;;; has finished.
 (defmacro with-ir1-environment-from-node (node &rest forms)
-  `(%with-ir1-environment-from-node
-    ,node
-    (lambda () ,@forms)))
+  (once-only ((node node))
+    `(let ((*current-component* (node-component ,node))
+           (*lexenv* (node-lexenv ,node))
+           (*current-path* (node-source-path ,node)))
+       (aver-live-component *current-component*)
+       ,@forms)))
 
 ;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
 ;;; taken through the source to reach the form. This provides a way to

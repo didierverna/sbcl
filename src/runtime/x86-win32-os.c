@@ -28,7 +28,7 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #include <sys/types.h>
 #include "runtime.h"
@@ -74,6 +74,7 @@ int arch_os_thread_init(struct thread *thread)
 
     TlsSetValue(OUR_TLS_INDEX,thread);
 
+    extern void win32_set_stack_guarantee(void);
     win32_set_stack_guarantee();
 
     return 1;

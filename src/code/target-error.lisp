@@ -91,7 +91,7 @@
                    (not (memq restart stack))
                    (or (not call-test-p)
                        (let ((*restart-test-stack* (cons restart stack)))
-                         (declare (truly-dynamic-extent *restart-test-stack*))
+                         (declare (dynamic-extent *restart-test-stack*))
                          (funcall (restart-test-function restart) condition))))
           (funcall function restart))))))
 
@@ -111,7 +111,7 @@ restarts associated with CONDITION (or with no condition) will be returned."
            (when (eq identifier (restart-name restart))
              (return-from %find-restart restart))))
     ;; KLUDGE: can the compiler infer this dx automatically?
-    (declare (truly-dynamic-extent #'eq-restart-p #'named-restart-p))
+    (declare (dynamic-extent #'eq-restart-p #'named-restart-p))
     (if (typep identifier 'restart)
         ;; The code under #+previous-... below breaks the abstraction
         ;; introduced by MAP-RESTARTS, but is about twice as
@@ -284,21 +284,21 @@ with that condition (or with no condition) will be returned."
          ;; right thing is..
          (new-inherits
           (order-layout-inherits (concatenate 'simple-vector
-                                              (wrapper-inherits cond-layout)
-                                              (mapcar #'classoid-wrapper cpl)))))
+                                              (layout-inherits cond-layout)
+                                              (mapcar #'classoid-layout cpl)))))
     (if (and olayout
-             (not (mismatch (wrapper-inherits olayout) new-inherits)))
+             (not (mismatch (layout-inherits olayout) new-inherits)))
         olayout
         ;; All condition classoid layouts carry the same LAYOUT-INFO - the defstruct
         ;; description for CONDITION - which is a representation of the primitive object
         ;; and not the lisp-level object.
         (make-layout (hash-layout-name name)
                      (make-undefined-classoid name)
-                     :info (wrapper-info cond-layout)
+                     :info (layout-info cond-layout)
                      :flags (logior +condition-layout-flag+ +strictly-boxed-flag+)
                      :inherits new-inherits
                      :depthoid -1
-                     :length (wrapper-length cond-layout)))))
+                     :length (layout-length cond-layout)))))
 
 ) ; EVAL-WHEN
 
@@ -383,11 +383,11 @@ with that condition (or with no condition) will be returned."
     (flet ((stream-err-p (layout)
              (let ((stream-err-layout (load-time-value (find-layout 'stream-error))))
                (or (eq layout stream-err-layout)
-                   (find stream-err-layout (wrapper-inherits layout)))))
+                   (find stream-err-layout (layout-inherits layout)))))
            (type-err-p (layout)
              (let ((type-err-layout (load-time-value (find-layout 'type-error))))
                (or (eq layout type-err-layout)
-                   (find type-err-layout (wrapper-inherits layout)))))
+                   (find type-err-layout (layout-inherits layout)))))
            ;; avoid full calls to STACK-ALLOCATED-P here
            (stackp (x)
              (let ((addr (get-lisp-obj-address x)))
@@ -397,7 +397,7 @@ with that condition (or with no condition) will be returned."
       (let* ((any-dx
                (loop for arg-index from 1 below (length initargs) by 2
                        thereis (stackp (fast-&rest-nth arg-index initargs))))
-             (layout (classoid-wrapper classoid))
+             (layout (classoid-layout classoid))
              (extra (if (and any-dx (type-err-p layout)) 2 0)) ; space for secret initarg
              (instance (%new-instance layout
                                       (+ sb-vm:instance-data-start
@@ -529,25 +529,25 @@ with that condition (or with no condition) will be returned."
       (insured-find-classoid name
                              #'condition-classoid-p
                              #'make-condition-classoid)
-    (setf (wrapper-classoid layout) class)
+    (setf (layout-classoid layout) class)
     (setf (classoid-direct-superclasses class)
           (mapcar #'find-classoid direct-supers))
     (cond ((not old-layout)
            (register-layout layout))
           ((not *type-system-initialized*)
-           (setf (wrapper-classoid old-layout) class)
+           (setf (layout-classoid old-layout) class)
            (setq layout old-layout)
-           (unless (eq (classoid-wrapper class) layout)
+           (unless (eq (classoid-layout class) layout)
              (register-layout layout)))
           ((warn-if-altered-layout  "current"
                                     old-layout
                                     "new"
-                                    (wrapper-length layout)
-                                    (wrapper-inherits layout)
-                                    (wrapper-depthoid layout)
-                                    (wrapper-bitmap layout))
+                                    (layout-length layout)
+                                    (layout-inherits layout)
+                                    (layout-depthoid layout)
+                                    (layout-bitmap layout))
            (register-layout layout :invalidate t))
-          ((not (classoid-wrapper class))
+          ((not (classoid-layout class))
            (register-layout layout)))
 
     (setf (find-classoid name) class)
@@ -1990,6 +1990,21 @@ the usual naming convention (names like *FOO*) for special variables"
   ()
   (:default-initargs :kind 'ftype :description "known function"))
 
+(define-condition ftype-proclamation-derived-mismatch-warning (ftype-proclamation-mismatch-warning)
+  ()
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "~@<The new ~A proclamation for~@[ ~A~] ~
+               ~/sb-ext:print-symbol-with-prefix/~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:_~
+               does not match the derived return type~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:>"
+             (proclamation-mismatch-kind condition)
+             (proclamation-mismatch-description condition)
+             (proclamation-mismatch-name condition)
+             (proclamation-mismatch-new condition)
+             (proclamation-mismatch-old condition)))))
 
 ;;;; deprecation conditions
 
@@ -2286,6 +2301,16 @@ the restart does not exist."))
                   the octet sequence ~S cannot be decoded.~@:>"
              (character-coding-error-external-format c)
              (character-decoding-error-octets c)))))
+
+
+(define-condition stack-allocated-object-overflows-stack (storage-condition)
+  ((size :initarg :size :reader stack-allocated-object-overflows-stack-size))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "~@<Stack allocating object of size ~D bytes exceeds the ~
+remaining space left on the control stack.~@:>"
+             (stack-allocated-object-overflows-stack-size condition)))))
 
 (define-condition control-stack-exhausted (storage-condition)
   ()

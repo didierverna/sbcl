@@ -9,9 +9,6 @@
  * files for more information.
  */
 
-/* FIXME: Aren't symbols with underscore prefixes supposed to be
- * reserved for system libraries? Perhaps rename stuff like this
- * to names like INCLUDED_SBCL_RUNTIME_H. */
 #ifndef _SBCL_RUNTIME_H_
 #define _SBCL_RUNTIME_H_
 
@@ -88,17 +85,6 @@ void gc_state_unlock();
 #endif
 
 /*
- * The next few defines serve as configuration -- edit them inline if
- * you are a developer and want to affect FSHOW behaviour.
- */
-
-#ifdef LISP_FEATURE_SB_QSHOW
-# define QSHOW 1
-#else
-# define QSHOW 0
-#endif
-
-/*
  * Configuration options end here -- the following defines do not
  * generally need customization.
  */
@@ -106,7 +92,6 @@ void gc_state_unlock();
 /* Flags defined in a structure to avoid code duplication between
  * declaration and definition. */
 extern struct dyndebug_config {
-    int dyndebug_fshow;
     int dyndebug_gencgc_verbose;
     int dyndebug_safepoints;
     int dyndebug_seh;
@@ -118,190 +103,13 @@ extern struct dyndebug_config {
     int dyndebug_runtime_link;
 } dyndebug_config;
 
-#ifdef LISP_FEATURE_GENCGC
-extern int gencgc_verbose;
-#endif
-
 void dyndebug_init(void);
-
-#if 0
-/* To see output from FSHOW - which is almost certainly a bad idea because it's
- * quite likely to hinder your progress by causing deadlock in stdio - then change
- * the preceding line to "#if 1" */
-# define FSHOW(args) fprintf args
-#else
-# define FSHOW(args)
-#endif
-
-#ifdef _WIN64
-#define AMD64_SYSV_ABI __attribute__((sysv_abi))
-#else
-#define AMD64_SYSV_ABI
-#endif
 
 #include <sys/types.h>
 
 #define OBJ_FMTX PRIxPTR
 
-static inline int
-lowtag_of(lispobj obj)
-{
-    return obj & LOWTAG_MASK;
-}
-
-static inline int
-widetag_of(lispobj* obj)
-{
-#ifdef LISP_FEATURE_BIG_ENDIAN
-    return ((unsigned char*)obj)[N_WORD_BYTES-1];
-#else
-    return *(unsigned char*)obj;
-#endif
-}
-static inline int
-header_widetag(lispobj obj)
-{
-    return obj & WIDETAG_MASK;
-}
-
-static inline uword_t
-HeaderValue(lispobj obj)
-{
-  return obj >> N_WIDETAG_BITS;
-}
-
-static inline int listp(lispobj obj) {
-    return lowtag_of(obj) == LIST_POINTER_LOWTAG;
-}
-static inline int instancep(lispobj obj) {
-    return lowtag_of(obj) == INSTANCE_POINTER_LOWTAG;
-}
-static inline int functionp(lispobj obj) {
-    return lowtag_of(obj) == FUN_POINTER_LOWTAG;
-}
-static inline int other_pointer_p(lispobj obj) {
-    return lowtag_of(obj) == OTHER_POINTER_LOWTAG;
-}
-static inline int simple_vector_p(lispobj obj) {
-    return other_pointer_p(obj) &&
-           widetag_of((lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
-}
-
-/* Is the Lisp object obj something with pointer nature (as opposed to
- * e.g. a fixnum or character or unbound marker)? */
-static inline int
-is_lisp_pointer(lispobj obj)
-{
-#ifdef LISP_FEATURE_PPC64
-    return (obj & 5) == 4;
-#elif N_WORD_BITS == 64
-    return (obj & 3) == 3;
-#else
-    return obj & 1;
-#endif
-}
-
-#include "fixnump.h"
-
-/* Is the Lisp object obj something with immediate nature (e.g. a
- * fixnum or character or unbound marker)? */
-static inline int
-is_lisp_immediate(lispobj obj)
-{
-    int widetag;
-    return (fixnump(obj)
-            || ((widetag = header_widetag(obj)) == CHARACTER_WIDETAG)
-#if N_WORD_BITS == 64
-            || (widetag == SINGLE_FLOAT_WIDETAG)
-#endif
-            || (widetag == UNBOUND_MARKER_WIDETAG));
-}
-
-/* Convert from a lispobj with type bits to a native (ordinary
- * C/assembly) pointer to the beginning of the object. */
-static inline lispobj *
-native_pointer(lispobj obj)
-{
-    return (lispobj *) ((uintptr_t) (obj & ~LOWTAG_MASK));
-}
-
-/* inverse operation: create a suitably tagged lispobj from a native
- * pointer or integer.*/
-static inline lispobj
-make_lispobj(void *o, int low_tag)
-{
-    return (lispobj)o | low_tag;
-}
-
-#define make_fixnum(n) ((uword_t)(n) << N_FIXNUM_TAG_BITS)
-
-static inline sword_t
-fixnum_value(lispobj n)
-{
-    return (sword_t)n >> N_FIXNUM_TAG_BITS;
-}
-
 #include "align.h"
-
-#if defined(LISP_FEATURE_WIN32)
-/* KLUDGE: Avoid double definition of boolean by rpcndr.h included via
- * shlobj.h.
- *
- * FIXME: We should probably arrange to use the rpcndr.h boolean on Windows,
- * or get rid of our own boolean type.  If the boolean type is only used in
- * the runtime, and never passed to Lisp, then it doesn't matter which one
- * we use.
- */
-#define boolean rpcndr_boolean
-#include <shlobj.h>
-#undef boolean
-#endif
-typedef int boolean;
-
-// other_immediate_lowtag_p is the least strict of the tests for whether a word
-// is potentially an object header, merely checking whether the bits fit the general
-// pattern of header widetags without regard for whether some headered object type
-// could in fact have those exact low bits. Specifically, this falsely returns 1
-// for UNBOUND_MARKER_WIDETAG, CHARACTER_WIDETAG, and on 64-bit machines,
-// SINGLE_FLOAT_WIDETAG; as well as unallocated and unused widetags (e.g. LRA on x86)
-// none of which denote the start of a headered object.
-// The ambiguous cases are for words would start a cons - the three mentioned above.
-// Other cases (NO_TLS_VALUE_MARKER_WIDETAG and other things) do not cause a problem
-// in practice because they can't be the first word of a lisp object.
-static inline boolean
-other_immediate_lowtag_p(lispobj header)
-{
-    /* These lowtags are spaced 4 apart throughout the lowtag space. */
-    return (lowtag_of(header) & 3) == OTHER_IMMEDIATE_0_LOWTAG;
-}
-
-// widetag_lowtag encodes in the sign bit whether the byte corresponds
-// to a headered object, and in the low bits the lowtag of a tagged pointer
-// pointing to this object, be it headered or a cons.
-extern unsigned char widetag_lowtag[256];
-#define LOWTAG_FOR_WIDETAG(x) (widetag_lowtag[x] & LOWTAG_MASK)
-
-// is_header() and is_cons_half() are logical complements when invoked
-// on the first word of any lisp object. However, given a word which is
-// only *potentially* the first word of a lisp object, they can both be false.
-// In ambiguous root detection, is_cons_half() is to be used, as it is the more
-// stringent check. The set of valid bit patterns in the low byte of the car
-// of a cons is smaller than the set of patterns accepted by !is_header().
-static inline int is_header(lispobj potential_header_word) {
-    return widetag_lowtag[potential_header_word & WIDETAG_MASK] & 0x80;
-}
-
-static inline int
-is_cons_half(lispobj obj)
-{
-    if (fixnump(obj) || is_lisp_pointer(obj)) return 1;
-    int widetag = header_widetag(obj);
-    return widetag == CHARACTER_WIDETAG ||
-#if N_WORD_BITS == 64
-           widetag == SINGLE_FLOAT_WIDETAG ||
-#endif
-           widetag == UNBOUND_MARKER_WIDETAG;
-}
 
 /* KLUDGE: As far as I can tell there's no ANSI C way of saying
  * "this function never returns". This is the way that you do it
@@ -319,23 +127,7 @@ is_cons_half(lispobj obj)
 extern void *successful_malloc (size_t size);
 extern char *copied_string (char *string);
 
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_SAFEPOINT)
-# define THREADS_USING_GCSIGNAL 1
-#endif
-
-/* FIXME: this is the wrong header to make this choice */
-#if defined(LISP_FEATURE_GENCGC) && !defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
-# define GENCGC_IS_PRECISE 1
-#else
-# define GENCGC_IS_PRECISE 0
-#endif
-
-void *os_dlsym_default(char *name);
-
-struct lisp_startup_options {
-    boolean noinform;
-};
-extern struct lisp_startup_options lisp_startup_options;
+void *os_dlsym_default(char *name); // Why not in 'os.h' ?
 
 /* Even with just -O1, gcc optimizes the jumps in this "loop" away
  * entirely, giving the ability to define WITH-FOO-style macros. */
@@ -364,56 +156,5 @@ extern struct lisp_startup_options lisp_startup_options;
 #else
 #define NO_SANITIZE_MEMORY
 #endif
-
-/// Object sizing macros. One of these days I'd like to rationalize
-/// all our headers making them more intuitive as to which need be
-/// included to get access to various things.
-/// For the time being, this file makes as much sense as anything else.
-
-/// These sizing macros return the number of *payload* words,
-/// exclusive of the object header word. Payload length is always
-/// an odd number so that total word count is an even number.
-
-/* Each size category is designed to allow 1 bit for a GC mark bit,
- * possibly some flag bits, and the payload length in words.
- * There are three size categories for most non-vector objects,
- * differing in how many flag bits versus size bits there are.
- * The GC mark bit is always in bit index 31 of the header regardless of
- * machine word size.  Bit index 31 is chosen for consistency between 32-bit
- * and 64-bit machines. It is a natural choice for 32-bit headers by avoiding
- * intererence with other header fields. It is also chosen for 64-bit headers
- * because the upper 32 bits of headers for some objects are already occupied
- * by other data: symbol TLS index, instance layout, etc.
- */
-
-/* The largest payload count is expressed in 23 bits. These objects
- * can't reside in immobile space as there is no room for generation bits.
- * All sorts of objects fall into this category, but mostly due to inertia.
- * There are no non-vector boxed objects whose size should be so large.
- * Header:   size |    tag
- *          -----   ------
- *        23 bits | 8 bits
- */
-#define BOXED_NWORDS(obj) ((HeaderValue(obj) & 0x7FFFFF) | 1)
-
-/* Medium-sized payload count is expressed in 15 bits. Objects in this category
- * may reside in immobile space: CLOSURE, FUNCALLABLE-INSTANCE.
- * The single data bit is used as a closure's NAMED flag.
- *
- * Header:  gen# |  data |     size |    tag
- *         -----   -----    -------   ------
- *        8 bits | 1 bit |  15 bits | 8 bits
- */
-#define SHORT_BOXED_NWORDS(obj) ((HeaderValue(obj) & SHORT_HEADER_MAX_WORDS) | 1)
-
-/* Tiny payload count is expressed in 8 bits. Objects in this size category
- * can reside in immobile space: SYMBOL, FDEFN.
- * Header:  gen# | flags |   size |    tag
- *         -----   ------  ------   ------
- *        8 bits   8 bits  8 bits | 8 bits
- * FDEFN  flag bits: 1 bit for statically-linked
- * SYMBOL flag bits: 1 bit for present in initial core image
- */
-#define TINY_BOXED_NWORDS(obj) ((HeaderValue(obj) & 0xFF) | 1)
 
 #endif /* _SBCL_RUNTIME_H_ */

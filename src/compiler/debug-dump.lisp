@@ -185,6 +185,13 @@
            (the fixnum (logior (ash offset registers-size)
                                (tn-offset tn)))
            offset)))
+    (cons (let ((last (cdr (last x))))
+            (if (restart-location-p last)
+                (let ((new (copy-list x)))
+                  (setf (cdr (last new))
+                        (encode-restart-location location last))
+                  new)
+                x)))
     (t
      x)))
 
@@ -775,6 +782,7 @@
             (cond ((eq (return-info-kind info) :unknown)
                    (setf (compiled-debug-fun-returns dfun)
                          :standard))
+                  ((eq (return-info-kind info) :unboxed))
                   ((/= level 0)
                    (setf (compiled-debug-fun-returns dfun)
                          (compute-debug-returns fun)))))))

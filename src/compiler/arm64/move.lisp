@@ -25,7 +25,8 @@
                    (setf ffff-count ffff
                          zero-count zero
                          single-mov (or (= ffff 1)
-                                        (= zero 1))))))
+                                        (= zero 1))))
+             single-mov))
       (cond ((typep val '(unsigned-byte 16))
              (inst movz y val)
              y)
@@ -84,6 +85,18 @@
                                (try b a 0 c 32))
                               ((= c d)
                                (try c a 0 b 16)))))))
+             y)
+            ((and (not single-mov)
+                  (not single-instruction)
+                  (= (ldb (byte 32 0) val)
+                     (ldb (byte 32 32) val))
+                  (let ((a (ldb (byte 16 0) val))
+                        (b (ldb (byte 16 16) val)))
+                    (when (and (/= a #xFFFF 0)
+                               (/= b #xFFFF 0))
+                      (inst movz y a)
+                      (inst movk y b 16)
+                      (inst orr y y (lsl y 32)))))
              y)
             ((and (< ffff-count zero-count)
                   (or single-mov
@@ -146,7 +159,8 @@
        (load-symbol y val))
       (structure-object
        (if (eq val sb-lockless:+tail+)
-           (inst add y null-tn (- sb-vm::lockfree-list-tail-value sb-vm:nil-value))
+           (inst add y null-tn (- lockfree-list-tail-value-offset
+                                  nil-value-offset))
            (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
@@ -460,13 +474,11 @@
 ;;; RESULT may be a bignum, so we have to check.  Use a worst-case
 ;;; cost to make sure people know they may be number consing.
 (define-vop (move-from-signed)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg) :to :result))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
   (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:note "signed word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst adds y x x)
     (inst b :vc DONE)
     (with-fixed-allocation (y lr bignum-widetag (1+ bignum-digits-offset)
@@ -502,13 +514,11 @@
 ;;; result.  Use a worst-case cost to make sure people know they may
 ;;; be number consing.
 (define-vop (move-from-unsigned)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg) :to :save))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
   (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:note "unsigned word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst tst x (ash (1- (ash 1 (- n-word-bits
                                    n-positive-fixnum-bits)))
                      n-positive-fixnum-bits))

@@ -16,19 +16,15 @@
 
 (defun record-component-xrefs (component)
   (declare (type component component))
-  (when (policy *lexenv* (zerop store-xref-data))
-    (return-from record-component-xrefs))
-  (do ((block (block-next (component-head component)) (block-next block)))
-      ((null (block-next block)))
-    (let ((start (block-start block)))
+  (unless (policy *lexenv* (zerop store-xref-data))
+    (do-blocks (block component)
       (flet ((handle-node (functional)
                ;; Record xref information for all nodes in the block.
                ;; Note that this code can get executed several times
                ;; for the same block, if the functional is referenced
                ;; from multiple XEPs.
-               (loop for ctran = start then (node-next (ctran-next ctran))
-                     while ctran
-                     do (record-node-xrefs (ctran-next ctran) functional))
+               (do-nodes (node nil block)
+                 (record-node-xrefs node functional))
                ;; Properly record the deferred macroexpansion and source
                ;; transform information that's been stored in the block.
                (loop for (kind what path) in (block-xrefs block)
@@ -79,14 +75,8 @@
 (defun record-node-xrefs (node context)
   (declare (type node node))
   (etypecase node
-    ((or creturn cif entry mv-combination cast exit enclose))
-    (combination
-     ;; Record references to globals made using SYMBOL-VALUE.
-     (let ((fun (principal-lvar-use (combination-fun node)))
-           (arg (car (combination-args node))))
-       (when (and (ref-p fun) (eq 'symbol-value (leaf-%source-name (ref-leaf fun)))
-                  (constant-lvar-p arg) (symbolp (lvar-value arg)))
-         (record-xref :references (lvar-value arg) context node nil))))
+    ((or creturn cif entry combination mv-combination cast exit
+         enclose combination cdynamic-extent))
     (ref
      (let ((leaf (ref-leaf node)))
        (typecase leaf
@@ -101,10 +91,11 @@
                (record-xref :calls name context node nil)))))
          ;; Inlined global function
          (clambda
-          (let ((inline-var (functional-inline-expanded leaf)))
-            (when (global-var-p inline-var)
+          (let ((fun (or (lambda-optional-dispatch leaf) leaf)))
+            (when (and (leaf-has-source-name-p fun)
+                       (functional-inline-expanded fun))
               ;; TODO: a WHO-INLINES xref-kind could be useful
-              (record-xref :calls (leaf-debug-name inline-var) context node nil))))
+              (record-xref :calls (leaf-source-name fun) context node nil))))
          ;; Reading a constant
          (constant
           (record-xref :references (leaf-%source-name leaf) context node nil)))))

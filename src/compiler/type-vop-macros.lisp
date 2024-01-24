@@ -156,8 +156,6 @@
                          nil)))
     (unless type-codes
       (error "At least one type must be supplied for TEST-TYPE."))
-    (unless headers
-      (remf other-args :value-tn-ref))
     (cond
       (fixnump
        (when (set-difference lowtags fixnum-lowtags)
@@ -170,18 +168,17 @@
                                                ,(car immediates)
                                                ',(canonicalize-widetags
                                                   headers)
+                                               :immediate-tested '(fixnum ,(car immediates))
                                                ,@other-args))
          (immediates
-          (if (= n-word-bits 64)
-              `(%test-fixnum-and-immediate ,value ,temp ,target ,not-p
-                                           ,(car immediates)
-                                           ,@other-args)
-              (error "can't mix fixnum testing with other immediates")))
+          (error "can't mix fixnum testing with other immediates"))
          (headers
           `(%test-fixnum-and-headers ,value ,temp ,target ,not-p
                                      ',(canonicalize-widetags headers)
+                                     :immediate-tested '(fixnum)
                                      ,@other-args))
          (t
+          (remf other-args :value-tn-ref)
           `(%test-fixnum ,value ,temp ,target ,not-p
                          ,@other-args))))
       (immediates
@@ -191,6 +188,7 @@
               `(%test-immediate-and-headers ,value ,temp ,target ,not-p
                                             ,(car immediates)
                                             ',(canonicalize-widetags headers)
+                                            :immediate-tested '(,(car immediates))
                                             ,@other-args)
               (error "can't mix testing of immediates with testing of headers")))
          (lowtags

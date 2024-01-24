@@ -2,6 +2,13 @@
 (setf *print-level* 5 *print-length* 5)
 (load "src/cold/shared.lisp")
 (in-package "SB-COLD")
+(compile 'preload-perfect-hash-generator)
+;;; Always read the file since we need the complete set of entries
+;;; for 32-bit and 64-bit builds, which may differ, and we don't want
+;;; to wipe out whatever file entries weren't needed in this build.
+(let ((*readtable* sb-cold:*xc-readtable*))
+  (preload-perfect-hash-generator *perfect-hash-generator-journal*))
+
 ;;; FIXME: these prefixes look like non-pathnamy ways of defining a
 ;;; relative pathname.  Investigate whether they can be made relative
 ;;; pathnames.
@@ -16,6 +23,13 @@
 
 ;; Avoid natively compiling new code under ecl
 #+ecl (ext:install-bytecodes-compiler)
+
+(defun copy-file-from-file (new old)
+  (with-open-file (output new :direction :output :if-exists :supersede
+                          :if-does-not-exist :create)
+    (with-open-file (input old)
+      (loop (let ((line (read-line input nil)))
+              (if line (write-line line output) (return new)))))))
 
 ;;; Run the cross-compiler to produce cold fasl files.
 (setq sb-c::*track-full-called-fnames* :minimal) ; Change this as desired
@@ -38,6 +52,10 @@
                      (setq warnp 'warning))))
     (sb-xc:with-compilation-unit ()
       (load "src/cold/compile-cold-sbcl.lisp")
+      (let ((cache (math-journal-pathname :output)))
+        (when (probe-file cache)
+          (copy-file-from-file "xfloat-math.lisp-expr" cache)
+          (format t "~&Math journal: replaced from ~S~%" cache)))
       ;; Enforce absence of unexpected forward-references to warm loaded code.
       ;; Looking into a hidden detail of this compiler seems fair game.
       (when sb-c::*undefined-warnings*
@@ -48,8 +66,7 @@
             (:type (setf types t))
             (:function (setf functions t)))))))
   ;; Exit the compilation unit so that the summary is printed. Then complain.
-  ;; win32 is not clean
-  (when (and fail (not (target-featurep :win32)))
+  (when fail
     (cerror "Proceed anyway"
             "Undefined ~:[~;variables~] ~:[~;types~]~
              ~:[~;functions (incomplete SB-COLD::*UNDEFINED-FUN-ALLOWLIST*?)~]"

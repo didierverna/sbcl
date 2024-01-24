@@ -6,10 +6,6 @@
 (defvar *compile-files-p* nil)
 (load (merge-pathnames "src/cold/warm.lisp" *load-pathname*))
 
-(with-open-file (stream "output/asm-routines.txt" :direction :output
-                        :if-does-not-exist :create :if-exists :supersede)
-  (sb-c:dis sb-fasl:*assembler-routines* stream))
-
 ;; sb-xref-for-internals is actively harmful to tree-shaking.
 ;; Remove some symbols to make the hide-packages test pass.
 #+sb-xref-for-internals
@@ -59,6 +55,8 @@
           ;; The final batch of symbols is strictly for C. The LISP_FEATURE_
           ;; prefix on the corresponding #define is unfortunate.
           :GCC-TLS :USE-SYS-MMAP
+          ;;; Enforce using of posix semaphores on Darwin instead of dispatch.
+          :USE-DARWIN-POSIX-SEMAPHORES
           ;; only for 'src/runtime/wrap.h'
           :OS-PROVIDES-BLKSIZE-T
           ;; only for src/runtime/run-program.c
@@ -75,8 +73,8 @@
            :MACH-O :ELF ; obj file format: pick zero or one
            ;; I would argue that this should not be exposed,
            ;; but I would also anticipate blowback from removing it.
-           :CHENEYGC :GENCGC ; GC: pick one and only one
-           :ARENA-ALLOCATOR
+           :GENCGC :MARK-REGION-GC ; GC: pick one and only one
+           :ARENA-ALLOCATOR :ALLOCATION-SIZE-HISTOGRAM
            ;; Can't use s-l-a-d :compression safely without it
            :SB-CORE-COMPRESSION
            ;; Features that are also in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
@@ -95,7 +93,6 @@
            :PACKAGE-LOCAL-NICKNAMES
            ;; Developer mode features. A release build will never have them,
            ;; hence it makes no difference whether they're public or not.
-           :METASPACE
            :SB-DEVEL :SB-DEVEL-LOCK-PACKAGES)")))
        (removable-features
         (append non-target-features public-features)))
@@ -164,9 +161,9 @@
     ;; can't be uninterned if referenced by a defstruct-description.
     ;; So loop over all structure classoids and clobber any
     ;; symbol that should be uninternable.
-    (maphash (lambda (classoid wrapper)
+    (maphash (lambda (classoid layout)
                (when (structure-classoid-p classoid)
-                 (let ((dd (wrapper-%info wrapper)))
+                 (let ((dd (layout-%info layout)))
                    (setf (dd-constructors dd)
                          (delete-if (lambda (x)
                                       (and (consp x) (uninternable-p (car x))))
@@ -340,10 +337,19 @@ Please check that all strings which were not recognizable to the compiler
   ;; SAVE-LISP-AND-DIE.
   #-sb-devel (!unintern-init-only-stuff)
 
-  ;; A symbol whose INFO slot underwent any kind of manipulation
-  ;; such that it now has neither properties nor globaldb info,
-  ;; can have the slot set back to NIL if it wasn't already.
+
   (do-all-symbols (symbol)
+    ;; Don't futz with the header of static symbols.
+    ;; Technically LOGIOR-HEADER-BITS can only be used on an OTHER-POINTER-LOWTAG
+    ;; objects, so modifying NIL should not ever work, but it's especially wrong
+    ;; on ppc64 where OTHER- and LIST- pointer lowtags are 10 bytes apart instead
+    ;; of 8, so this was making a random alteration to the header.
+    (unless (eq (heap-allocated-p symbol) :static)
+      (sb-kernel:logior-header-bits symbol sb-vm::+symbol-initial-core+))
+
+    ;; A symbol whose INFO slot underwent any kind of manipulation
+    ;; such that it now has neither properties nor globaldb info,
+    ;; can have the slot set back to NIL if it wasn't already.
     (when (and (sb-kernel:symbol-%info symbol) ; "raw" value is something
                ;; but both "cooked" values are empty
                (null (sb-kernel:symbol-dbinfo symbol))
@@ -436,11 +442,14 @@ Please check that all strings which were not recognizable to the compiler
       (#.(find-package "SB-ALIEN")
        (or (eq accessibility :external) (eq symbol 'sb-alien::alien-callback-p)))
       (#.(mapcar 'find-package
-                 '("SB-ASSEM" "SB-BROTHERTREE" "SB-C" "SB-DISASSEM" "SB-FORMAT"
+                 '("SB-ASSEM" "SB-BROTHERTREE" "SB-DISASSEM" "SB-FORMAT"
                    "SB-IMPL" "SB-KERNEL" "SB-MOP" "SB-PCL" "SB-PRETTY" "SB-PROFILE"
                    "SB-REGALLOC" "SB-SYS" "SB-UNICODE" "SB-UNIX" "SB-WALKER"))
        ;; Assume all and only external symbols must be retained
-       (eq accessibility :external))
+         (eq accessibility :external))
+      (#.(find-package "SB-C")
+       (or (eq accessibility :external)
+           (member symbol '(sb-c::tab sb-c::scramble))))
       (#.(find-package "SB-LOOP")
        (or (eq accessibility :external)
            ;; Retain some internals to keep CLSQL working.

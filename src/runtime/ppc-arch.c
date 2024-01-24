@@ -11,27 +11,19 @@
 
 #include <stdio.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "arch.h"
 #include "globals.h"
 #include "validate.h"
 #include "os.h"
 #include "interrupt.h"
 #include "lispregs.h"
-#include "signal.h"
+#include <signal.h>
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
-#include "alloc.h"
 #include "pseudo-atomic.h"
-
-#if defined(LISP_FEATURE_GENCGC)
-#include "gencgc-alloc-region.h"
-#endif
-
-#ifdef LISP_FEATURE_SB_THREAD
-#include "pseudo-atomic.h"
-#endif
+#include "gc-assert.h"
 
   /* The header files may not define PT_DAR/PT_DSISR.  This definition
      is correct for all versions of ppc linux >= 2.0.30
@@ -46,8 +38,10 @@
 
      Caveat callers.  */
 
+#if defined (LISP_FEATURE_DARWIN) || defined(LISP_FEATURE_LINUX)
 #ifndef PT_DAR
 #define PT_DAR          41
+#endif
 
 #ifndef PT_DSISR
 #define PT_DSISR        42
@@ -88,22 +82,16 @@ arch_internal_error_arguments(os_context_t *context)
 }
 
 
-boolean
-arch_pseudo_atomic_atomic(os_context_t *context)
-{
-    return get_pseudo_atomic_atomic(get_sb_vm_thread());
+bool arch_pseudo_atomic_atomic(struct thread *thread) {
+    return get_pseudo_atomic_atomic(thread);
 }
 
-void
-arch_set_pseudo_atomic_interrupted(os_context_t *context)
-{
-    set_pseudo_atomic_interrupted(get_sb_vm_thread());
+void arch_set_pseudo_atomic_interrupted(struct thread *thread) {
+    set_pseudo_atomic_interrupted(thread);
 }
 
-void
-arch_clear_pseudo_atomic_interrupted(os_context_t *context)
-{
-    clear_pseudo_atomic_interrupted(get_sb_vm_thread());
+void arch_clear_pseudo_atomic_interrupted(struct thread *thread) {
+    clear_pseudo_atomic_interrupted(thread);
 }
 
 unsigned int
@@ -143,7 +131,7 @@ arch_remove_breakpoint(void *pc, unsigned int orig_inst)
 static unsigned int *skipped_break_addr, displaced_after_inst;
 static sigset_t orig_sigmask;
 
-static boolean
+static bool
 should_branch(os_context_t *context, unsigned int orig_inst)
 {
     /* orig_inst is a conditional branch instruction.  We need to
@@ -379,7 +367,7 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
      *
      */
 
-    boolean handle_it = 0;
+    bool handle_it = 0;
     unsigned prev_inst;
     if ((code & ~(31 << 16)) == ((3<<26)|(4<<21))) { // mask out RA for test
         prev_inst= ((uint32_t*)pc)[-1];
@@ -516,7 +504,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
             if (handle_allocation_trap(context)) return;
         }
         if (code == 0x7C2002A6) { // pending interrupt
-            arch_clear_pseudo_atomic_interrupted(context);
+            arch_clear_pseudo_atomic_interrupted(get_sb_vm_thread());
             arch_skip_instruction(context);
             interrupt_handle_pending(context);
             return;
@@ -533,7 +521,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     if (code == ((3 << 26) | (0x18 << 21) | (reg_NL3 << 16))|| // TWI NE,$NL3,0
         /* trap instruction from do_pending_interrupt */
         code == 0x7fe00008) { // TW T,0,0
-        arch_clear_pseudo_atomic_interrupted(context);
+        arch_clear_pseudo_atomic_interrupted(get_sb_vm_thread());
         arch_skip_instruction(context);
         /* interrupt or GC was requested in PA; now we're done with the
            PA section we may as well get around to it */
@@ -749,9 +737,9 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
 
+#ifdef LISP_FEATURE_64_BIT
 void gcbarrier_patch_code(void* where, int nbits)
 {
-#ifdef LISP_FEATURE_64_BIT
     int m_operand = 64 - nbits;
     // the M field has a kooky encoding
     int m_encoded = ((m_operand & 0x1F) << 1) | (m_operand >> 5);
@@ -760,7 +748,5 @@ void gcbarrier_patch_code(void* where, int nbits)
     // .... ____ _xxx xxx_ ____ = 0x7E0;
     //                  ^ deposit it here, in (BYTE 6 5) of the instruction.
     *pc = (inst & ~0x7E0) | (m_encoded << 5);
-#else
-    lose("can't patch rldicl in 32-bit"); // illegal instruction
-#endif
 }
+#endif

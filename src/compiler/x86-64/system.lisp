@@ -51,7 +51,7 @@
 ;; ~17 instructions vs. 35
 (define-vop ()
     (:policy :fast-safe)
-    (:translate wrapper-of)
+    (:translate layout-of)
     (:args (object :scs (descriptor-reg)))
     (:temporary (:sc unsigned-reg :offset rax-offset) rax)
     (:results (result :scs (descriptor-reg)))
@@ -88,8 +88,7 @@
       (inst jmp  done)
       NULL
       (inst mov  result (make-fixup 'null :layout))
-      DONE
-      #+metaspace (inst mov result (ea +5 result)))) ; layout->wrapper
+      DONE))
 (define-vop ()
     (:policy :fast-safe)
     (:translate %instanceoid-layout)
@@ -144,8 +143,7 @@
   (:generator 6
     (move temp data)
     (inst shl temp (- n-widetag-bits n-fixnum-tag-bits))
-    ;; merge in the widetag. We should really preserve bit 63 as well
-    ;; which could be a GC mark bit, but it's not concurrent at the moment.
+    ;; merge in the widetag
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
     (storew temp x 0 other-pointer-lowtag)))
 (define-vop (logior-header-bits)
@@ -283,32 +281,8 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
-    (inst lea result
-          (ea  (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes))
-               result))))
+    (inst sub result (- (* simple-fun-insts-offset n-word-bytes) fun-pointer-lowtag))))
 
-;;;; symbol frobbing
-(defun load-symbol-dbinfo (result symbol)
-  (loadw result symbol symbol-info-slot other-pointer-lowtag)
-  ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-  ;; This CMOV safely reads from memory when it does not move, because if
-  ;; there is a PACKED-INFO in the slot, it has at least 4 data words in total
-  ;; - the header, at least one info descriptor, and at least one datum.
-  ;; And since 3 is odd, that would be aligned up to 4.
-  ;; Use bit index 2 of the lowtag to distinguish list from instance.
-  ;; An instance will have a 0 in that bit.
-  ;; This would compile to almost the same code without a VOP,
-  ;; but using a jmp around a mov instead.
-  (aver (= (logior instance-pointer-lowtag #b0100) list-pointer-lowtag))
-  (inst test :byte result #b0100)
-  (inst cmov :nz result (object-slot-ea result cons-cdr-slot list-pointer-lowtag)))
-
-(define-vop (symbol-dbinfo)
-  (:policy :fast-safe)
-  (:translate symbol-dbinfo)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:generator 1 (load-symbol-dbinfo res x)))
 
 ;;;; other miscellaneous VOPs
 
@@ -501,17 +475,6 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
    (move c ecx)
    (move d edx)))
 
-(define-vop (set-fdefn-has-static-callers)
-  (:args (fdefn :scs (descriptor-reg)))
-  (:generator 1
-    ;; atomic because the immobile gen# is in the same byte
-    (inst or :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x80)))
-(define-vop (unset-fdefn-has-static-callers)
-  (:args (fdefn :scs (descriptor-reg)))
-  (:generator 1
-    ;; atomic because the immobile gen# is in the same byte
-    (inst and :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f)))
-
 (define-vop (sb-c::mark-covered)
  (:info index)
  (:generator 1
@@ -520,7 +483,7 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
    (inst store-coverage-mark index)))
 
 (define-vop ()
-  (:translate sb-lockless::get-next)
+  (:translate sb-lockless:get-next)
   (:policy :fast-safe)
   (:args (node :scs (descriptor-reg)))
   (:results (next-tagged :scs (descriptor-reg))

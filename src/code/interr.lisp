@@ -129,8 +129,8 @@
   (let* ((name (etypecase fdefn-or-symbol
                  #+untagged-fdefns
                  ((unsigned-byte 61)
-                  (fdefn-name (make-lisp-obj (logior (get-lisp-obj-address fdefn-or-symbol)
-                                                     sb-vm:other-pointer-lowtag))))
+                  (fdefn-name (%make-lisp-obj (logior (get-lisp-obj-address fdefn-or-symbol)
+                                                      sb-vm:other-pointer-lowtag))))
                  (symbol fdefn-or-symbol)
                  (fdefn (fdefn-name fdefn-or-symbol))))
          (condition
@@ -174,32 +174,45 @@
 
 (deferr invalid-arg-count-error (nargs)
   (let* ((frame (find-interrupted-frame))
-         (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame))))
-    (when (typep name '(cons (eql sb-pcl::fast-method)))
-      (decf nargs 2)))
-  (restart-case
-      (%program-error "invalid number of arguments: ~S" nargs)
-    #+(or x86-64 arm64)
-    (replace-function (value)
-      :report (lambda (stream)
-                (format stream "Call a different function with the same arguments"))
-      :interactive read-evaluated-form
-      (sb-vm::context-call-function *current-internal-error-context*
-                                    (fdefinition value)))
-    #+(or x86-64 arm64)
-    (call-form (form)
-      :report (lambda (stream)
-                (format stream "Call a different form"))
-      :interactive read-evaluated-form
-      (sb-vm::context-call-function *current-internal-error-context*
-                                    (lambda ()
-                                      ;; Don't invoke the compiler in
-                                      ;; case it's dealing with an
-                                      ;; error within the compiler
-                                      (let (#+(or sb-eval sb-fasteval)
-                                            (*evaluator-mode* :interpret))
-                                        (eval form)))
-                                    0))))
+         (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame)))
+         (context (sb-di:error-context)))
+    (cond (context
+           (destructuring-bind (name type . restart) context
+               (restart-case
+                   (error 'simple-program-error
+                          :format-control "Function~@[ ~s~] declared to return ~s returned ~a value~:p"
+                          :format-arguments (list name type nargs))
+                 (continue ()
+                   :report (lambda (stream)
+                             (format stream "Ignore extra values / use NIL for missing values."))
+                   (sb-vm::incf-context-pc *current-internal-error-context*
+                                           restart)))))
+          (t
+           (when (typep name '(cons (eql sb-pcl::fast-method)))
+             (decf nargs 2))
+           (restart-case
+               (%program-error "invalid number of arguments: ~S" nargs)
+             #+(or x86-64 arm64)
+             (replace-function (value)
+               :report (lambda (stream)
+                         (format stream "Call a different function with the same arguments"))
+               :interactive read-evaluated-form
+               (sb-vm::context-call-function *current-internal-error-context*
+                                             (fdefinition value)))
+             #+(or x86-64 arm64)
+             (call-form (form)
+               :report (lambda (stream)
+                         (format stream "Call a different form"))
+               :interactive read-evaluated-form
+               (sb-vm::context-call-function *current-internal-error-context*
+                                             (lambda ()
+                                               ;; Don't invoke the compiler in
+                                               ;; case it's dealing with an
+                                               ;; error within the compiler
+                                               (let (#+(or sb-eval sb-fasteval)
+                                                     (*evaluator-mode* :interpret))
+                                                 (eval form)))
+                                             0)))))))
 
 (deferr local-invalid-arg-count-error (nargs name)
   (%program-error "~S called with invalid number of arguments: ~S"
@@ -302,10 +315,10 @@
   (error 'nil-array-accessed-error
          :datum array :expected-type '(not (array nil))))
 
-(deferr division-by-zero-error (this that)
+(deferr division-by-zero-error (number)
   (error 'division-by-zero
          :operation '/
-         :operands (list this that)))
+         :operands (list number 0)))
 
 (defun restart-type-error (type condition &optional pc-offset)
   (let ((tn-offset (car *current-internal-error-args*)))
@@ -342,9 +355,14 @@
                              'cerror)
                             (t
                              (sb-di:error-context))))
+             (object (cond ((eq context 'sb-c::truncate-to-integer)
+                            (setf context nil)
+                            (truncate object))
+                           (t
+                            object)))
              (condition
                (make-condition (if (and (%instancep object)
-                                        (wrapper-invalid (%instance-wrapper object)))
+                                        (layout-invalid (%instance-layout object)))
                                    ;; Signaling LAYOUT-INVALID is dubious, but I guess it provides slightly
                                    ;; more information in that it says that the object may have at some point
                                    ;; been TYPE. Anyway, it's not wrong - it's a subtype of TYPE-ERROR.
@@ -354,8 +372,8 @@
                                :expected-type (typecase type
                                                 (classoid-cell
                                                  (classoid-cell-name type))
-                                                (wrapper
-                                                 (wrapper-proper-name type))
+                                                (layout
+                                                 (layout-proper-name type))
                                                 (t
                                                  type))
                                :context (and (not (integerp context))
@@ -407,6 +425,9 @@
   (%primitive print "Thread local storage exhausted.")
   (sb-impl::%halt))
 
+(deferr stack-allocated-object-overflows-stack-error (size)
+  (error 'stack-allocated-object-overflows-stack :size size))
+
 (deferr uninitialized-memory-error (address nbytes value)
   (declare (type sb-vm:word address))
   ;; Ignore sanitizer errors from reading the C stack.
@@ -442,10 +463,7 @@
     (declare (ignorable raw-low raw-high))
     (let ((type (or (sb-di:error-context)
                     'fixnum)))
-      (object-not-type-error #+x86-64
-                             (* low high)
-                             #-x86-64
-                             (if (memq (sb-c:sc+offset-scn raw-low) `(,sb-vm:any-reg-sc-number
+      (object-not-type-error (if (memq (sb-c:sc+offset-scn raw-low) `(,sb-vm:any-reg-sc-number
                                                                       ,sb-vm:descriptor-reg-sc-number))
                                  (ash (logior
                                        (ash high sb-vm:n-word-bits)
@@ -457,7 +475,7 @@
                              type
                              nil))))
 
-(sb-c::when-vop-existsp (:translate sb-c::unsigned+)
+(sb-c::when-vop-existsp (:translate overflow+)
   (flet ((err (x of cf)
            (let* ((raw-x (car *current-internal-error-args*))
                   (signed (= (sb-c:sc+offset-scn raw-x) sb-vm:signed-reg-sc-number)))
@@ -481,7 +499,7 @@
       (multiple-value-bind (of cf) (sb-vm::context-overflow-carry-flags *current-internal-error-context*)
         (err x of cf)))
 
-   #+x86-64
+    #+x86-64
     (deferr sub-overflow-error (x)
       (multiple-value-bind (of cf) (sb-vm::context-overflow-carry-flags *current-internal-error-context*)
         (err x of (not cf)))))
@@ -503,10 +521,40 @@
                                        (dpb 1 (byte 1 sb-vm:n-word-bits) x))))
                              type nil)))
 
+  (deferr add-overflow2-error (x y)
+    (let ((type (or (sb-di:error-context)
+                    'fixnum)))
+      (if (numberp x)
+          (object-not-type-error (+ x y) type nil)
+          (object-not-type-error x 'number nil))))
+
   (deferr sub-overflow2-error (x y)
     (let ((type (or (sb-di:error-context)
                     'fixnum)))
-      (object-not-type-error (- x y) type nil))))
+      (if (numberp x)
+          (object-not-type-error (- x y) type nil)
+          (object-not-type-error x 'number nil))))
+
+  (deferr mul-overflow2-error (x y)
+    (let ((type (or (sb-di:error-context)
+                    'fixnum)))
+      (if (numberp x)
+          (object-not-type-error (* x y) type nil)
+          (object-not-type-error x 'number nil))))
+
+  (deferr ash-overflow2-error (x y)
+    (let ((type (or (sb-di:error-context)
+                    'fixnum)))
+      (if (numberp x)
+          (object-not-type-error (ash x y) type nil)
+          (object-not-type-error x 'number nil))))
+
+  (deferr negate-overflow-error (x)
+    (let ((type (or (sb-di:error-context)
+                    'fixnum)))
+      (if (numberp x)
+          (object-not-type-error (- x) type nil)
+          (object-not-type-error x 'number nil)))))
 
 ;;;; INTERNAL-ERROR signal handler
 
@@ -601,22 +649,22 @@
 (defun control-stack-exhausted-error ()
   (let ((sb-debug:*stack-top-hint* nil))
     (infinite-error-protect
-     (format *error-output*
-             "Control stack guard page temporarily disabled: proceed with caution~%")
+     (write-line "Control stack guard page temporarily disabled: proceed with caution"
+                 *error-output*)
      (error 'control-stack-exhausted))))
 
 (defun binding-stack-exhausted-error ()
   (let ((sb-debug:*stack-top-hint* nil))
     (infinite-error-protect
-     (format *error-output*
-             "Binding stack guard page temporarily disabled: proceed with caution~%")
+     (write-line "Binding stack guard page temporarily disabled: proceed with caution"
+                 *error-output*)
      (error 'binding-stack-exhausted))))
 
 (defun alien-stack-exhausted-error ()
   (let ((sb-debug:*stack-top-hint* nil))
     (infinite-error-protect
-     (format *error-output*
-             "Alien stack guard page temporarily disabled: proceed with caution~%")
+     (write-line "Alien stack guard page temporarily disabled: proceed with caution"
+                 *error-output*)
      (error 'alien-stack-exhausted))))
 
 ;;; KLUDGE: we keep a single HEAP-EXHAUSTED-ERROR object around, so

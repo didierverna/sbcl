@@ -27,14 +27,23 @@
 (defun double-float-high-bits (x)
   (ash (double-float-bits x) -32))
 
-(flet ((output-part (x stream)
+;;; This choice exists because cold-init reads from "output/sxhash-calls.lisp-expr"
+;;; using the ordinary definition of "#." which has to call the function at the car
+;;; of a list; but warm.lisp uses a purpose-made #. reader that handles only 2
+;;; symbols, reducing the size of xfloat-math.lisp-expr by abbreviating the float
+;;; constructors to single-character symbols.
+(defvar *proxy-sfloat-ctor* "MAKE-SINGLE-FLOAT")
+(defvar *proxy-dfloat-ctor* "MAKE-DOUBLE-FLOAT")
+(labels
+      ((stringify (bits) (if (= bits 0) 0 (format nil "#x~x" bits)))
+       (output-part (x stream)
          (typecase x
            (single-float
-            (format stream "(MAKE-SINGLE-FLOAT #x~x)" (flonum-%bits x)))
+            (format stream "(~A ~A)" *proxy-sfloat-ctor* (stringify (flonum-%bits x))))
            (double-float
-            (format stream "(MAKE-DOUBLE-FLOAT #x~x #x~x)"
-                    (double-float-high-bits x)
-                    (double-float-low-bits x)))
+            (format stream "(~A ~A ~A)" *proxy-dfloat-ctor*
+                    (stringify (double-float-high-bits x))
+                    (stringify (double-float-low-bits x))))
            (rational
             (prin1 x stream)))))
   (defmethod print-object ((self float) stream)
@@ -267,29 +276,42 @@
 (defun get-float-ops-cache (&aux (cache sb-cold::*math-ops-memoization*))
   (when (atom cache)
     (return-from get-float-ops-cache cache))
-  (let ((table (car cache)))
+  (let ((table (car cache))
+        (pathname))
     (when (zerop (hash-table-count table))
-      (with-open-file (stream "float-math.lisp-expr" :if-does-not-exist nil)
+      (with-open-file (stream (setq pathname (sb-cold::math-journal-pathname :input))
+                              :if-does-not-exist nil)
         (when stream
           ;; Ensure that we're reading the correct variant of the file
           ;; in case there is more than one set of floating-point formats.
           (assert (eq (read stream) :default))
-          (let ((*package* (find-package "SB-KERNEL")))
-            (dolist (expr (read stream))
+          (let ((pkg (make-package "SB-FLOAT-MATH-GENIE" :use '("CL")))
+                (line 0))
+            (loop for (alias . actual) in '(("MAKE-SINGLE-FLOAT" . sb-kernel:make-single-float)
+                                            ("MAKE-DOUBLE-FLOAT" . sb-kernel:make-double-float)
+                                            ("S" . sb-kernel:make-single-float)
+                                            ("D" . sb-kernel:make-double-float))
+                  do (setf (fdefinition (intern alias pkg)) (fdefinition actual)))
+            (dolist (expr (let ((*package* pkg)) (read stream)))
+              (incf line)
               (destructuring-bind (fun args . values) expr
-                ;; some symbols, such as SQRT, read as XC-STRICT-CL:SQRT
-                ;; from the SB-KERNEL package, but the cache key should
-                ;; always use the symbol in the CL package.
-                (float-ops-cache-insert (cons (intern (string fun) "CL") args)
+                (let ((old-count (hash-table-count table)))
+                  (float-ops-cache-insert (cons fun args)
                                         (if (and (symbolp (first values))
                                                  (string= (symbol-name (first values))
                                                           "&VALUES"))
                                             (rest values)
                                             values)
-                                        table))))
+                                        table)
+                  (unless (= (hash-table-count table) (1+ old-count))
+                    (let ((*print-pretty* nil))
+                      (error "~&Line ~D of float cache: PUTHASH ~S did not insert a new key"
+                             line (cons fun args)))))))
+            (delete-package pkg))
           (setf (cdr cache) (hash-table-count table))
           (when cl:*compile-verbose*
-            (format t "~&; Float-ops cache prefill: ~D entries~%" (cdr cache))))))
+            (format t "~&; Math journal: prefilled ~D entries from ~S~%"
+                    (cdr cache) pathname)))))
     table))
 
 (defun record-math-op (key &rest values)
@@ -298,12 +320,38 @@
          (fun (car key))
          (args (cdr key))
          ;; args list is potentially on stack, so copy it
-         (key (cons fun (if (listp args) (copy-list args) args))))
-    (float-ops-cache-insert key values table))
+         (key (cons fun (if (listp args) (copy-list args) args)))
+         (old-count (hash-table-count table)))
+    (float-ops-cache-insert key values table)
+    (unless (= (hash-table-count table) (1+ old-count))
+      (bug "Non-canonical math journal entry ~S" key)))
   (apply #'values values))
 
+;;; Disallow non-canonical symbols in the float math cache,
+;;; or it gets very confusing as to whether the cache is dirty.
+(defun canonical-math-op-args (expr)
+  ;; Try to avoid consing a new list unless we have to.
+  (labels ((check (expr)
+             (cond ((consp expr) (and (check (car expr)) (check (cdr expr))))
+                   ((symbolp expr) (eq (cl:symbol-package expr) *cl-package*))
+                   (t)))
+           (recons (expr)
+             (cond ((consp expr) (cons (recons (car expr)) (recons (cdr expr))))
+                   ((symbolp expr) (intern (string expr) *cl-package*))
+                   (t expr))))
+    (if (check expr) expr (recons expr))))
+
 (defmacro with-memoized-math-op ((name key-expr) calculation)
-  `(dx-let ((cache-key (cons ',(intern (string name) "CL") ,key-expr)))
+  (assert (symbolp name))
+  ;; In theory I could make this so that only a cache miss has to call SANIFY-MATH-OP-ARGS
+  ;; so that in the frequently-occuring cases we do not have to make an extra pass over
+  ;; the expression to determine whether was is canonical. But since only COERCE can have
+  ;; a problem of non-canononical symbols, it's easiest to just always canonicalize
+  ;; for COERCE, and nothing else.
+  `(dx-let ((cache-key
+             ,(if (string= name 'coerce)
+                  `(cons ',(intern (string name) "CL") (canonical-math-op-args ,key-expr))
+                  `(cons ',(intern (string name) "CL") ,key-expr))))
      (multiple-value-bind (answer foundp) (gethash cache-key (get-float-ops-cache))
        (if foundp
            (if (and (listp answer)
@@ -414,6 +462,23 @@
                (arg-contagion
                 (position arg-fmt
                           '(rational short-float single-float double-float long-float))))
+          (when (cl:> arg-contagion result-contagion)
+            (setq result-fmt arg-fmt result-contagion arg-contagion)))))))
+
+(defun pick-float-result-format (&rest args)
+  (flet ((target-num-fmt (num)
+           (cond ((rationalp num) 'single-float)
+                 ((floatp num) (flonum-format num))
+                 (t (error "What? ~S" num)))))
+    (let* ((result-fmt 'single-float)
+           (result-contagion 0))
+      (dolist (arg args result-fmt)
+        (let* ((arg-fmt (target-num-fmt arg))
+               ;; This is inadequate for complex numbers,
+               ;; but we don't need them.
+               (arg-contagion
+                (position arg-fmt
+                          '(short-float single-float double-float long-float))))
           (when (cl:> arg-contagion result-contagion)
             (setq result-fmt arg-fmt result-contagion arg-contagion)))))))
 
@@ -563,17 +628,25 @@
                       (,(intern (string name) "CL") number divisor)
                       (,float-fun number divisor)))
                 (defun ,float-fun (number divisor)
-                  (with-memoized-math-op (,name (list number divisor))
-                    (multiple-value-bind (q r)
-                        (,(intern (string name) "CL")
-                         (realnumify number)
-                         (realnumify divisor))
-                      (values q
-                              (make-flonum r (if (or (eq (flonum-format number) 'double-float)
-                                                     (and (floatp divisor)
-                                                          (eq (flonum-format divisor) 'double-float)))
-                                                 'double-float
-                                                 'single-float)))))))))
+                  (let ((type (if (or (eq (flonum-format number) 'double-float)
+                                      (and (floatp divisor)
+                                           (eq (flonum-format divisor) 'double-float)))
+                                  'double-float
+                                  'single-float)))
+                    (if (and (floatp number)
+                             (eq (flonum-%value number) :minus-zero))
+                        (values 0
+                                (make-flonum (if  (< divisor 0)
+                                                  0
+                                                  :minus-zero)
+                                             type))
+                        (with-memoized-math-op (,name (list number divisor))
+                          (multiple-value-bind (q r)
+                              (,(intern (string name) "CL")
+                               (realnumify number)
+                               (realnumify divisor))
+                            (values q
+                                    (make-flonum r type))))))))))
   (define floor xfloat-floor)
   (define ceiling xfloat-ceiling)
   (define truncate xfloat-truncate)
@@ -758,6 +831,8 @@
              `(if (every #'rationalp args)
                   (apply #',f args)
                   (with-memoized-math-op (,f args) ,irrational)))
+           (dispatch-float (f irrational)
+             `(with-memoized-math-op (,f args) ,irrational))
            (flonums-eql-p ()
              `(let ((x (car args)) (y (cadr args)))
                 (and (floatp x) (floatp y) (eql (flonum-%bits x) (flonum-%bits y)))))
@@ -768,7 +843,11 @@
                    (floatp (car args))
                    (floatp (cadr args))
                    (member (flonum-%value (car args)) '(:-infinity :+infinity))
-                   (eq (flonum-%value (cadr args)) (flonum-%value (car args))))))
+                   (eq (flonum-%value (cadr args)) (flonum-%value (car args)))))
+           (infinity-p (n kind)
+             `(let ((arg (nth ,n args)))
+                (and (floatp arg)
+                     (eq (flonum-%value arg) ,kind)))))
 
   ;; Simple case of using the interceptor to return a boolean.  If
   ;; infinity leaks in, the host will choke since those are
@@ -778,10 +857,22 @@
 
   ;; Simple case of using the interceptor to return a float.
   ;; As above, no funky values allowed.
-  (intercept (max min + acos acosh asin asinh atan atanh conjugate cos cosh fceiling ffloor fround ftruncate phase sin sinh tan tanh) (&rest args)
+  (intercept (max min +) (&rest args)
     (dispatch :me
      (make-flonum (apply #':me (realnumify* args))
                   (apply #'pick-result-format args))))
+
+  (intercept (acos acosh asin asinh atan atanh conjugate cos cosh phase sin sinh tan tanh) (&rest args)
+    (dispatch-float :me
+     (make-flonum (apply #':me (realnumify* args))
+                  (apply #'pick-float-result-format args))))
+
+  (intercept (fceiling ffloor fround ftruncate) (&rest args)
+             (dispatch :me
+                       (multiple-value-bind (a b) (apply #':me (realnumify* args))
+                         (let ((format (apply #'pick-result-format args)))
+                          (values (make-flonum a format)
+                                  (make-flonum b format))))))
 
   (intercept (sqrt) (&rest args)
     (destructuring-bind (x) args
@@ -852,6 +943,18 @@
              nil)
             ((two-zeros-p) t) ; signed zeros are equal
             ((same-sign-infinities-p) t) ; infinities are =
+            ((and (eql nargs 2)
+                  (infinity-p 0 :+infinity))
+             t)
+            ((and (eql nargs 2)
+                  (infinity-p 1 :+infinity))
+             nil)
+            ((and (eql nargs 2)
+                  (infinity-p 0 :-infinity))
+             nil)
+            ((and (eql nargs 2)
+                  (infinity-p 1 :-infinity))
+             t)
             ((and (eql nargs 2) (zerop (cadr args)))
              ;; Need this case if the first arg is represented as bits
              (if (rationalp (car args))
@@ -865,22 +968,20 @@
 
   (intercept (<=) (&rest args  &aux (nargs (length args)))
     (dispatch :me
-      (cond ((and (eql nargs 3) (every #'floatp args))
-             (destructuring-bind (a b c) args
-               (if (and (eq (flonum-format a) (flonum-format c))
-                        (or (eq (flonum-format b) (flonum-format a))
-                            (eq (flonum-format b) 'single-float)))
-                   (cond ((and (eql a most-negative-single-float)
-                               (eql c most-positive-single-float))
-                          (not (float-infinity-p b)))
-                         ((and (eql a most-negative-double-float)
-                               (eql c most-positive-double-float))
-                          (not (float-infinity-p b)))
-                         (t
-                          (error "Unhandled")))
-                   (error "Unhandled"))))
-            ((two-zeros-p) t) ; signed zeros are equal
+      (cond ((two-zeros-p) t) ; signed zeros are equal
             ((same-sign-infinities-p) t) ; infinities are =
+            ((and (eql nargs 2)
+                  (infinity-p 0 :+infinity))
+             nil)
+            ((and (eql nargs 2)
+                  (infinity-p 1 :+infinity))
+             t)
+            ((and (eql nargs 2)
+                  (infinity-p 0 :-infinity))
+             t)
+            ((and (eql nargs 2)
+                  (infinity-p 1 :-infinity))
+             nil)
             ((and (eql nargs 2) (zerop (cadr args)))
              ;; Need this case if the first arg is represented as bits
              (if (floatp (car args))
@@ -889,8 +990,12 @@
             ((eql nargs 2)
              (multiple-value-bind (a b) (collapse-zeros (car args) (cadr args))
                (:me a b)))
+            ((eql nargs 1)
+             t)
             (t
-             (apply #':me (realnumify* args))))))
+             (loop for (a . rest) on args
+                   always (or (not rest)
+                              (sb-xc:<= a (car rest))))))))
 
 ) ; end MACROLET
 
@@ -901,7 +1006,8 @@
 (defun sb-c::maybe-exact-reciprocal (x)
   (cond ((eql x $2.0d0) $.5d0)
         ((eql x $10.0d0) nil)
-        ((eql x #.(make-flonum #x3FE62E42FEFA39EF 'double-float))
+        ((or (eql x #.(make-flonum #x3FE62E42FEFA39EF 'double-float))
+             (eql x #.(make-flonum #x3FF71547652B82FE 'double-float)))
          nil)
         ((eql x #.(make-flonum #x49742400 'single-float))
          nil)
@@ -926,6 +1032,12 @@
                    ((single-float-p x) 2)
                    ((double-float-p x) 3)
                    (t (error "Unclassifiable arg ~S" x))))
+           (spelling-of (expr)
+             ;; MUST not write package prefixes !
+             ;; e.g. avoid writing a line like (COERCE (-33619991 SB-XC:DOUBLE-FLOAT) ...)
+             (let ((hex (write-to-string expr :pretty nil :base 16 :radix t :escape nil))
+                   (dec (write-to-string expr :pretty nil :base 10 :escape nil)))
+               (if (<= (length hex) (length dec)) hex dec)))
            (lessp (expr-a expr-b)
              (let ((f (string (car expr-a)))
                    (g (string (car expr-b))))
@@ -958,11 +1070,14 @@
     ;; if ~S is used here. The intent is to use only SBCL as host to compute
     ;; the table, since we assume that everybody's math routines suck.
     ;; But anyway, this does seem to work in most other lisps.
-    (let ((*print-pretty* nil) (*print-base* 16) (*print-radix* t))
+    (let ((*print-pretty* nil) (*proxy-sfloat-ctor* "S")  (*proxy-dfloat-ctor* "D"))
       (dolist (pair (sort (%hash-table-alist table) #'lessp :key #'car))
         (destructuring-bind ((fun . args) . result) pair
           (format stream "(~A ~A~{ ~A~})~%"
-                  fun args
+                  fun
+                  ;; Why do ABS and RATIONAL write the unary arg as an atom
+                  ;; but SQRT writes it as a singleton list?
+                  (if (listp args) (mapcar #'spelling-of args) (spelling-of args))
                   ;; Can't use ENSURE-LIST. We need NIL -> (NIL)
                   (if (consp result) result (list result)))))))
   (format stream ")~%"))

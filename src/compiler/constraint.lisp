@@ -89,6 +89,22 @@
   ;; does *not* hold.
   (not-p nil :type boolean))
 
+(defstruct (equality-constraint
+            (:include constraint)
+            (:constructor make-equality-constraint
+                (number operator x y not-p &optional (amount 0)
+                 &aux (kind 'equality))))
+  (operator nil :type symbol)
+  (amount 0 :type integer))
+
+;;; The basic interval type. It can handle open and closed intervals.
+;;; A bound is open if it is a list containing a number, just like
+;;; Lisp says. NIL means unbounded.
+(defstruct (interval (:constructor %make-interval (low high))
+                     (:copier nil))
+  low high)
+(declaim (freeze-type interval))
+
 
 ;;; Historically, CMUCL and SBCL have used a sparse set implementation
 ;;; for which most operations are O(n) (see sset.lisp), but at the
@@ -385,6 +401,11 @@
         (when (lambda-var-p y)
           (register-constraint y new x))
         new)))
+
+(declaim (inline type-for-constraints-p))
+(defun type-for-constraints-p (type)
+  (not (or (eq type *universal-type*)
+           (contains-hairy-type-p type))))
 
 ;;; Actual conset interface
 ;;;
@@ -442,8 +463,6 @@
       `(flet ((body (,symbol)
                 (declare (type constraint ,symbol))
                 ,@body))
-         (declare (optimize speed)
-                  (inline body))
          (when ,constraints
            (let ((,min (conset-min ,conset))
                  (,max (conset-max ,conset)))
@@ -493,9 +512,6 @@
            (body-fun con))
          (do-conset-constraints-intersection
              (con (,conset (lambda-var-inheritable-constraints ,variable)) ,result)
-           (body-fun con))
-         (do-conset-constraints-intersection
-             (con (,conset (lambda-var-equality-constraints ,variable)) ,result)
            (body-fun con))))))
 
 (declaim (inline conset-lvar-lambda-var-eql-p conset-add-lvar-lambda-var-eql))
@@ -579,7 +595,14 @@
                   (conset-lvar-lambda-var-eql-p constraints lvar lambda-var)
                   lambda-var)))
           ((cast-p use)
-           (ok-lvar-lambda-var (cast-value use) constraints)))))
+           (ok-lvar-lambda-var (cast-value use) constraints))
+          ((set-p use)
+           (let ((leaf (set-var use)))
+             (when (and (lambda-var-p leaf)
+                        (lambda-var-constraints leaf))
+               (and leaf
+                    (conset-lvar-lambda-var-eql-p constraints lvar leaf)
+                    leaf)))))))
 ;;;; Searching constraints
 
 ;;; Add the indicated test constraint to TARGET.
@@ -631,12 +654,22 @@
                                          consequent-constraints
                                          alternative-constraints
                                          quick-p)
-  (flet ((add (fun x y not-p)
-           (add-complement-constraints quick-p
-                                       fun x y not-p
-                                       constraints
-                                       consequent-constraints
-                                       alternative-constraints))
+  (flet ((add (fun lvar y &optional no-complement)
+           (let ((x (ok-lvar-lambda-var lvar constraints)))
+             (if no-complement
+                 (when x
+                   (add-test-constraint quick-p
+                                        fun x y nil
+                                        constraints
+                                        consequent-constraints))
+                 (add-complement-constraints quick-p
+                                             fun x y nil
+                                             constraints
+                                             consequent-constraints
+                                             alternative-constraints)))
+           (constraint-propagate-back lvar fun y constraints consequent-constraints
+                                      (and (not no-complement)
+                                           alternative-constraints)))
          (prop (triples target)
            (map nil (lambda (constraint)
                       (destructuring-bind (kind x y &optional not-p)
@@ -649,25 +682,20 @@
                 triples)))
     (when (eq (combination-kind use) :known)
       (binding* ((info (combination-fun-info use) :exit-if-null)
-                 (propagate (fun-info-constraint-propagate-if
-                             info)
-                            :exit-if-null))
-        (multiple-value-bind (lvar type if else)
+                 (propagate (fun-info-constraint-propagate-if info) :exit-if-null))
+        (multiple-value-bind (lvar type if else no-complement)
             (funcall propagate use constraints)
           (prop if consequent-constraints)
           (prop else alternative-constraints)
           (when (and lvar type)
-            (add 'typep (ok-lvar-lambda-var lvar constraints)
-                 type nil)
+            (add 'typep lvar type no-complement)
             (return-from add-combination-test-constraints)))))
     (let* ((name (lvar-fun-name
                   (basic-combination-fun use)))
            (args (basic-combination-args use))
            (ptype (gethash name *backend-predicate-types*)))
       (when ptype
-        (add 'typep (ok-lvar-lambda-var (first args)
-                                        constraints)
-             ptype nil)))))
+        (add 'typep (first args) ptype)))))
 
 ;;; Add test constraints to the consequent and alternative blocks of
 ;;; the test represented by USE.
@@ -681,12 +709,14 @@
     (let ((consequent-constraints (make-conset))
           (alternative-constraints (make-conset))
           (quick-p (policy if (> compilation-speed speed))))
-      (labels ((add (fun x y not-p)
+      (labels ((add (fun x y not-p &optional lvar)
                  (add-complement-constraints quick-p
                                              fun x y not-p
                                              constraints
                                              consequent-constraints
-                                             alternative-constraints))
+                                             alternative-constraints)
+                 (when lvar
+                   (constraint-propagate-back lvar fun y constraints consequent-constraints alternative-constraints)))
                (process-node (node)
                  (typecase node
                    (ref
@@ -739,7 +769,8 @@
                                    ((constant-lvar-p arg2)
                                     (add 'eql var1
                                          (nth-value 1 (lvar-value arg2))
-                                         nil))
+                                         nil
+                                         arg1))
                                    (t
                                     (add-test-constraint quick-p
                                                          'typep var1 (lvar-type arg2)
@@ -982,7 +1013,8 @@
                     (setq not-type (type-union not-type other)))))
             (eql
              (let ((other-type (leaf-type other)))
-               (cond ((not not-p)
+               (cond ((not (type-for-constraints-p other-type)))
+                     ((not not-p)
                       (intersect-result other-type))
                      ((constant-p other)
                       (cond ((member-type-p other-type)
@@ -1098,55 +1130,39 @@
                (other (if (eq x leaf) y x))
                (kind (constraint-kind con)))
           (case kind
-            (equality
-             (unless (eq (ref-constraints ref)
-                         (pushnew con (ref-constraints ref)))
-               (labels ((reoptimize (node)
-                          (when (valued-node-p node)
-                            (let ((lvar (node-lvar node))
-                                  (principal-lvar (nth-value 1 (principal-lvar-end (node-lvar ref)))))
-                              (reoptimize-lvar lvar)
-                              (unless (eq lvar principal-lvar)
-                                (reoptimize-lvar principal-lvar)))))
-                        (try (x)
-                          (when (and (vector-length-constraint-p x)
-                                     (eq (vector-length-constraint-var x) leaf))
-                            (reoptimize (node-dest ref))
-                            t)))
-                 (or (try x)
-                     (try y)
-                     (reoptimize ref)))))
             (typep
-             (if not-p
-                 (if (member-type-p other)
-                     (mapc-member-type-members #'note-not other)
-                     (setq not-res (type-union not-res other)))
-                 (setq res (type-intersection res other))))
+             (when (type-for-constraints-p other)
+               (if not-p
+                   (if (member-type-p other)
+                       (mapc-member-type-members #'note-not other)
+                       (setq not-res (type-union not-res other)))
+                   (setq res (type-intersection res other)))))
             (eql
              (let ((other-type (leaf-type other)))
-               (if not-p
-                   (when (constant-p other)
-                     (cond ((member-type-p other-type)
-                            (note-not (constant-value other)))
-                           ;; Numeric types will produce interesting
-                           ;; negations, other than just "not equal"
-                           ;; which can be handled by the equality
-                           ;; constraints.
-                           ((numeric-type-p other-type)
-                            (add-to-xset (constant-value other) not-numeric))))
-                   (let ((leaf-type (leaf-type leaf)))
-                     (cond
-                       ((or (constant-p other)
-                            (and (leaf-refs other) ; protect from
+               (when (type-for-constraints-p other-type)
+                 (if not-p
+                     (when (constant-p other)
+                       (cond ((member-type-p other-type)
+                              (note-not (constant-value other)))
+                             ;; Numeric types will produce interesting
+                             ;; negations, other than just "not equal"
+                             ;; which can be handled by the equality
+                             ;; constraints.
+                             ((numeric-type-p other-type)
+                              (add-to-xset (constant-value other) not-numeric))))
+                     (let ((leaf-type (leaf-type leaf)))
+                       (cond
+                         ((or (constant-p other)
+                              (and (leaf-refs other) ; protect from
                                         ; deleted vars
-                                 (csubtypep other-type leaf-type)
-                                 (not (type= other-type leaf-type))
-                                 ;; Don't change to a LEAF not visible here.
-                                 (leaf-visible-from-node-p other ref)))
-                        (change-ref-leaf ref other)
-                        (when (constant-p other) (return)))
-                       (t
-                        (setq res (type-intersection res other-type))))))))
+                                   (csubtypep other-type leaf-type)
+                                   (not (type= other-type leaf-type))
+                                   ;; Don't change to a LEAF not visible here.
+                                   (leaf-visible-from-node-p other ref)))
+                          (change-ref-leaf ref other)
+                          (when (constant-p other) (return)))
+                         (t
+                          (setq res (type-intersection res other-type)))))))))
             ((< > <= >= =)
              (let ((type (type-after-comparison kind not-p res y)))
                (when type
@@ -1220,9 +1236,10 @@
                  and val in (combination-args call)
                  when (and val (lambda-var-constraints var))
                  do (let ((type (lvar-type val)))
-                      (unless (eq type *universal-type*)
+                      (when (type-for-constraints-p type)
                         (conset-add-constraint gen 'typep var type nil)))
-                    (maybe-add-eql-var-var-constraint var val gen)))))
+                    (maybe-add-eql-var-var-constraint var val gen)
+                    (add-var-result-constraints var val gen)))))
       (ref
        (when (ok-ref-lambda-var node)
          (maybe-add-eql-var-lvar-constraint node gen)
@@ -1230,11 +1247,12 @@
            (constrain-ref-type node gen))))
       (cast
        (let* ((lvar (cast-value node))
-              (var (ok-lvar-lambda-var lvar gen)))
-         (when var
-           (let ((atype (single-value-type (cast-derived-type node)))) ;FIXME
-             (unless (eq atype *universal-type*)
-               (conset-add-constraint-to-eql gen 'typep var atype nil))))
+              (var (ok-lvar-lambda-var lvar gen))
+              (atype (single-value-type (cast-derived-type node))))
+         (when (and var
+                    (type-for-constraints-p atype))
+           (conset-add-constraint-to-eql gen 'typep var atype nil))
+         (constraint-propagate-back lvar 'typep atype gen gen nil)
          (when (and (bound-cast-p node)
                     (bound-cast-check node)
                     (not (node-deleted (bound-cast-check node))))
@@ -1242,7 +1260,7 @@
              (destructuring-bind (array dim index)
                  (combination-args check-bound)
                (declare (ignore array))
-               (add-equality-constraints '< (list index dim) gen gen nil))))))
+               (add-equality-constraint '< index dim gen gen nil))))))
       (cset
        (binding* ((var (set-var node))
                   (nil (lambda-var-p var) :exit-if-null)
@@ -1250,35 +1268,46 @@
          (when (policy node (or (and (= speed 3) (> speed compilation-speed))
                                 (> debug 1)))
            (let ((type (lambda-var-type var)))
-             (unless (eq *universal-type* type)
+             (when (type-for-constraints-p type)
                (do-eql-vars (other (var gen))
                  (unless (eql other var)
                    (conset-add-constraint gen 'typep other type nil))))))
-         (conset-clear-lambda-var gen var)
+
+         (let ((new (add-set-constraints var (set-value node) gen)))
+           (conset-clear-lambda-var gen var)
+           (when new
+             (conset-union gen new)))
+
          (let ((type (single-value-type (node-derived-type node))))
-           (unless (eq type *universal-type*)
+           (when (type-for-constraints-p type)
              (conset-add-constraint gen 'typep var type nil)))
          (unless (policy node (> compilation-speed speed))
            (maybe-add-eql-var-var-constraint var (set-value node) gen))
-         (add-eq-constraint var (set-value node) gen)))
+         (add-eq-constraint var (set-value node) gen)
+         (when (node-lvar node)
+           (conset-add-lvar-lambda-var-eql gen (node-lvar node) var))))
       (combination
        (when (eq (combination-kind node) :known)
-         (binding* ((info (combination-fun-info node) :exit-if-null)
-                    (propagate (fun-info-constraint-propagate info)
-                               :exit-if-null)
-                    (constraints (funcall propagate node gen))
-                    (register (if (policy node
-                                          (> compilation-speed speed))
-                                  #'conset-add-constraint
-                                  #'conset-add-constraint-to-eql)))
-           (map nil (lambda (constraint)
-                      (destructuring-bind (kind x y &optional not-p)
-                          constraint
-                        (when (and kind x y)
-                          (funcall register gen
-                                   kind x y
-                                   not-p))))
-                constraints))))))
+         (unless (and preprocess-refs-p
+                      (try-equality-constraint node gen))
+           (let ((lvar (node-lvar node)))
+             (when lvar
+               (add-var-result-constraints lvar lvar gen)))
+           (binding* ((info (combination-fun-info node) :exit-if-null)
+                      (propagate (fun-info-constraint-propagate info)
+                                 :exit-if-null)
+                      (constraints (funcall propagate node gen))
+                      (register (if (policy node
+                                        (> compilation-speed speed))
+                                    #'conset-add-constraint
+                                    #'conset-add-constraint-to-eql)))
+             (map nil (lambda (constraint)
+                        (destructuring-bind (kind x y &optional not-p) constraint
+                          (when (and kind x y)
+                            (funcall register gen
+                                     kind x y
+                                     not-p))))
+                  constraints)))))))
   gen)
 
 (defun constraint-propagate-if (block gen)
@@ -1379,45 +1408,51 @@
 
 ;;; Join the constraints coming from the predecessors of BLOCK on
 ;;; every constrained variable into the constraint set IN.
-(defun join-type-constraints (in block)
+(defun join-type-constraints (in block &optional equality-only)
   (let ((vars '())
+        (equality-vars)
         (predecessors (block-pred block)))
-    (progn
-      ;;unless (singleton-p predecessors) for some reason it makes the whole thing loop infinitely
-      ;; Find some set of constrained variables in the predecessors.
-      (dolist (pred predecessors)
-        (let ((out (block-out-for-successor pred block)))
-          (when out
-            (do-conset-elements (con out)
-              (let ((kind  (constraint-kind con))
-                    (y     (constraint-y con))
-                    (not-p (constraint-not-p con)))
-                (when (or (member kind '(typep < >))
-                          (and (eq kind 'eql) (or (not not-p)
-                                                  (constant-p y)))
-                          (and (eq kind '=) (and (numeric-type-p y)
-                                                 (not not-p))))
-                  (pushnew (constraint-x con) vars))))
-            (return))))
-      (dolist (var vars)
-        (let ((in-var-type *empty-type*))
-          (dolist (pred (block-pred block))
-            (let ((out (block-out-for-successor pred block)))
-              (when out
-                (setq in-var-type
-                      (type-union in-var-type
-                                  (type-from-constraints var out *universal-type*))))))
+    (dolist (pred predecessors)
+      (let ((out (block-out-for-successor pred block)))
+        (when out
+          (do-conset-elements (con out)
+            (let ((kind  (constraint-kind con))
+                  (y     (constraint-y con))
+                  (not-p (constraint-not-p con)))
+              (when (and (not equality-only)
+                         (or (member kind '(typep < >))
+                             (and (eq kind 'eql) (or (not not-p)
+                                                     (constant-p y)))
+                             (and (eq kind '=) (and (numeric-type-p y)
+                                                    (not not-p)))))
+                (pushnew (constraint-x con) vars))
+              (when (and (eq kind 'equality)
+                         (/= (equality-constraint-amount con) 0))
+                (pushnew (constraint-x con) equality-vars)
+                (when (lambda-var/vector-length-p y)
+                  (pushnew y equality-vars)))))
+          (return))))
+    (dolist (var vars)
+      (let ((in-var-type *empty-type*))
+        (dolist (pred (block-pred block))
+          (let ((out (block-out-for-successor pred block)))
+            (when out
+              (setq in-var-type
+                    (type-union in-var-type
+                                (type-from-constraints var out *universal-type*))))))
 
-          (unless (eq in-var-type *universal-type*)
-            ;; Remove the existing constraints to avoid joining them again later.
-            (do-propagatable-constraints (con (in var))
-              (when (eq (constraint-kind con) 'typep)
-                (conset-delete con in)))
-            (conset-adjoin (find-or-create-constraint 'typep
-                                                      var
-                                                      in-var-type
-                                                      nil)
-                           in)))))))
+        (when (type-for-constraints-p in-var-type)
+          ;; Remove the existing constraints to avoid joining them again later.
+          (do-propagatable-constraints (con (in var))
+            (when (eq (constraint-kind con) 'typep)
+              (conset-delete con in)))
+          (conset-adjoin (find-or-create-constraint 'typep
+                                                    var
+                                                    in-var-type
+                                                    nil)
+                         in))))
+    (dolist (var equality-vars)
+      (join-equality-constraints var block in))))
 
 (defun compute-block-in (block join-types-p)
   (let ((in nil))
@@ -1429,8 +1464,8 @@
           (if in
               (conset-intersection in out)
               (setq in (copy-conset out))))))
-    (when join-types-p
-      (join-type-constraints in block))
+    (when (rest (block-pred block))
+      (join-type-constraints in block (not join-types-p)))
     (or in (make-conset))))
 
 (defun update-block-in (block join-types-p)
@@ -1509,9 +1544,10 @@
           ;; Propagate constraints
           (loop for block = (pop blocks-to-process)
                 while block do
-                  (unless (eq block (component-tail component))
-                    (when (update-block-in block join-types-p)
-                      (enqueue (find-block-type-constraints block nil))))))
+                (unless (or (block-delete-p block)
+                            (eq block (component-tail component)))
+                  (when (update-block-in block join-types-p)
+                    (enqueue (find-block-type-constraints block nil))))))
 
         rest-of-blocks))))
 

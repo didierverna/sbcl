@@ -82,7 +82,8 @@
                   &key derive-type optimizer result-arg
                        overwrite-fndb-silently
                        call-type-deriver
-                       annotation)
+                       annotation
+                       folder)
   (let* ((ctype (specifier-type type))
          (type-to-store (if (contains-unknown-type-p ctype)
                             ;; unparse it, so SFUNCTION -> FUNCTION
@@ -123,7 +124,8 @@
                  (setf (fun-info-attributes old-fun-info) attributes
                        (fun-info-result-arg old-fun-info) result-arg
                        (fun-info-annotation old-fun-info) annotation
-                       (fun-info-call-type-deriver old-fun-info) call-type-deriver))
+                       (fun-info-call-type-deriver old-fun-info) call-type-deriver
+                       (fun-info-folder old-fun-info) folder))
                 (t
                  (setf (info :function :info name)
                        (make-fun-info :attributes attributes
@@ -131,7 +133,8 @@
                                       :optimizer optimizer
                                       :result-arg result-arg
                                       :call-type-deriver call-type-deriver
-                                      :annotation annotation))))
+                                      :annotation annotation
+                                      :folder folder))))
           (if location
               (setf (getf (info :source-location :declaration name) 'defknown)
                     location)
@@ -171,11 +174,15 @@
     (setq attributes (union '(unwind) attributes)))
   (when (member 'flushable attributes)
     (pushnew 'unsafely-flushable attributes))
-  #-(or arm64 x86-64) ;; Needs to be supported by the call VOPs
+  ;; Needs to be supported by the call VOPs
+  #-(or arm64 x86-64)
   (setf attributes (remove 'no-verify-arg-count attributes))
+  #-(or arm64 x86-64)
+  (setf attributes (remove 'unboxed-return attributes))
   #-(or arm64 x86-64) ;; Needs to be supported by the call VOPs, sb-vm::fixed-call-arg-location
   (setf attributes (remove 'fixed-args attributes))
-  (when (memq 'fixed-args attributes)
+  (when (or (memq 'fixed-args attributes)
+            (memq 'unboxed-return attributes))
     (pushnew 'no-verify-arg-count attributes))
 
   (multiple-value-bind (type annotation)
@@ -188,7 +195,14 @@
                 (ir1-attributes ,@attributes)
                 (source-location)
                 :annotation ,annotation
-                ,@keys)))
+                ,@keys
+                :folder ,(and (memq 'foldable attributes)
+                              (not (getf keys :folder))
+                              (or
+                               (memq 'fixed-args attributes)
+                               (memq 'unboxed-return attributes))
+                              (let ((args (make-gensym-list (length arg-types))))
+                                `(lambda ,args (funcall ',name ,@args)))))))
 
 (defstruct (fun-type-annotation
             (:copier nil))
@@ -334,16 +348,23 @@
 ;;; N'th argument. If arg is a list, result is a list. If arg is a
 ;;; vector, result is a vector with the same element type.
 (defun sequence-result-nth-arg (n &key preserve-dimensions
-                                       preserve-vector-type)
+                                       preserve-vector-type
+                                       string-designator)
   (lambda (call)
     (declare (type combination call))
     (let ((lvar (nth n (combination-args call))))
       (when lvar
         (let ((type (lvar-type lvar)))
-          (cond ((simplify-list-type type
-                                     :preserve-dimensions preserve-dimensions))
+          (cond ((and (not string-designator)
+                      (simplify-list-type type
+                                          :preserve-dimensions preserve-dimensions)))
                 ((not (csubtypep type (specifier-type 'vector)))
-                 nil)
+                 (cond ((not string-designator) nil)
+                       ((csubtypep type (specifier-type 'character))
+                        (specifier-type `(simple-string 1)))
+                       ((and (constant-lvar-p lvar)
+                             (symbolp (lvar-value lvar)))
+                        (ctype-of (symbol-name (lvar-value lvar))))))
                 (preserve-vector-type
                  type)
                 (t

@@ -46,6 +46,7 @@
  ;; This comes early because it's useful for debugging everywhere.
  ("src/code/show" :c-headers)
  ("src/compiler/early-constantp" :c-headers)
+ ("src/compiler/vop-existsp" :c-headers)
  ("src/code/defsetfs" :not-host)
 
   ;; Declare all target special variables defined by ANSI
@@ -97,8 +98,6 @@
 
  ("src/code/defbangtype" :c-headers)
  ("src/code/early-constants" :c-headers)
-
- ("src/compiler/vop-existsp" :c-headers)
 
  ;; comes early so that stuff can reason about function names
  ("src/code/function-names" :c-headers)
@@ -264,7 +263,7 @@
  ("src/compiler/proclaim" :c-headers)
 
  ("src/compiler/constantp" :c-headers)
- ("src/compiler/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
+ ("src/code/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
  ("src/code/type" :c-headers)
  ("src/compiler/generic/vm-type" :c-headers)
  ("src/code/pred" :not-host)
@@ -372,6 +371,7 @@
 
  ("src/compiler/constraint")
  ("src/compiler/equality-constraints")
+ ("src/compiler/constraint-back")
  ("src/compiler/saptran")
  ("src/compiler/modarith")
  ("src/compiler/sxhash")
@@ -379,7 +379,6 @@
  ("src/compiler/bitops-derive-type")
 
  ("src/compiler/dfo")
- ("src/compiler/dce")
  ("src/compiler/checkgen")
 
  ("src/compiler/tn")
@@ -408,14 +407,13 @@
  ("src/compiler/{arch}/arith")
  ("src/compiler/{arch}/pred")
 
- ;; this file defines the INTERVAL struct which is also used in 'srctran'
  ("src/compiler/float-tran")
  ("src/compiler/array-tran")
- ("src/compiler/ir1final")
  ("src/compiler/generic/vm-tran")
  ("src/compiler/type-vop-macros")
  ("src/compiler/{arch}/type-vops")
  ("src/compiler/generic/type-vops")
+ ("src/compiler/ir1final")
 
  ;; This is a terrible name for a file that contains type derivers
  ;; and IR1 transforms. Maybe split it up into more appropriately named pieces.
@@ -439,7 +437,7 @@
  ("src/compiler/generic/type-error")
  ("src/compiler/envanal")
 
- ;; KLUDGE: The assembly files need to be compiled twice: once as
+ ;; The assembly files need to be compiled twice: once as
  ;; normal lisp files, and once by sb-c:assemble-file.  We use a
  ;; different suffix / "file type" for the :assem versions to make
  ;; sure we don't scribble over anything we shouldn't.
@@ -496,8 +494,6 @@
 
  ("src/code/share-vm" :not-host)
 
- ;; KLUDGE: I'd prefer to have this done with a "code/target" softlink
- ;; instead of a bunch of reader macros. -- WHN 19990308
  #+sparc ("src/code/sparc-vm" :not-host)
  #+x86   ("src/code/x86-vm"   :not-host)
  #+x86-64("src/code/x86-64-vm"   :not-host)
@@ -525,7 +521,6 @@
  ("src/code/late-extensions") ; needs condition system
 
  ("src/code/brothertree" :c-headers)
- #+metaspace ("src/code/metaspace" :not-host)
  ("src/code/simple-fun"        :not-host) ; function slot accessors
  ("src/code/eval"              :not-host) ; uses INFO, wants compiler macro
  ("src/code/toplevel"          :not-host)
@@ -556,7 +551,7 @@
  ("src/code/early-step")                  ; target-thread needs *STEP-OUT*
 
  ("src/code/gc"                :not-host)
- ("src/code/avltree"           :not-host)
+ ("src/code/avltree"           :c-headers)
  ("src/code/target-thread"     :not-host)
 
  ("src/code/error-error" :not-host) ; needs WITH-STANDARD-IO-SYNTAX macro
@@ -617,11 +612,12 @@
 ;;; make-target-2 build steps
 (("src/code/early-ntrace" ; lets PCL hook into tracing
   "src/code/room" ; for MAP-ALLOCATED-OBJECTS
-  #+immobile-code "src/code/immobile-space" ; needs src/code/room
-  ;; Delay (re)defining WARN until after remove-static-links works.
+  #+x86-64 "src/code/text-space" ; needs src/code/room
+  ;; Delay (re)defining WARN until after undo-static-linkage works.
   ;; The definition in cold-error is good enough for self-build.
   "src/code/warm-error"
   "src/code/icf"
+  "src/code/warm-target-unicode"
   "src/code/defpackage")
 
  #+sb-fasteval
@@ -633,9 +629,10 @@
   "src/interpreter/eval"
   "src/interpreter/debug")
 
- ;; For an easy core size decreases by 3.5% put :UNICODE-LITE in features to exclude
- ;; a few external-formats that you'll probably never need.
- ;; Even better would be if they were all demand-loadable.
+ ;; For an easy core size decrease by 3.5% put :UNICODE-LITE in
+ ;; features to exclude a few external-formats that you'll probably
+ ;; never need.  Even better would be if they were all
+ ;; demand-loadable.
  #+sb-unicode ("src/code/external-formats/enc-utf")
  #-unicode-lite ("src/code/external-formats/enc-ebcdic")
  #+(and sb-unicode (not unicode-lite))
@@ -715,7 +712,7 @@
   "src/code/alien-callback"
   "src/code/run-program"
   #+win32 "src/code/warm-mswin"
-  #+gencgc "src/code/traceroot"
+  "src/code/traceroot"
 
   "src/code/query"
   "src/code/timer"

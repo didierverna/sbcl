@@ -2,46 +2,25 @@
 #define _INCLUDE_THREAD_H_
 
 #include <sys/types.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <stddef.h>
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "globals.h"
 #include "runtime.h"
 #include "os.h"
-#ifdef LISP_FEATURE_GENCGC
-#include "gencgc-alloc-region.h"
-#endif
 #include "genesis/symbol.h"
 #include "genesis/static-symbols.h"
-
-struct thread_state_word {
-  // - control_stack_guard_page_protected is referenced from
-  //   hand-written assembly code. (grep "THREAD_STATE_WORD_OFFSET")
-  // - sprof_enable is referenced with SAPs.
-  //   (grep "sb-vm:thread-state-word-slot")
-  char control_stack_guard_page_protected;
-  char sprof_enable; // statistical CPU profiler switch
-  char state;
-  char user_thread_p; // opposite of lisp's ephemeral-p
-#ifdef LISP_FEATURE_64_BIT
-  char padding[4];
-#endif
-};
-
-// (DEFCONSTANT +N-SMALL-BUCKETS+ 32)
-typedef lispobj size_histogram[32+N_WORD_BITS];
-
 #include "genesis/thread.h"
-#include "genesis/thread-instance.h"
-#include "genesis/fdefn.h"
 #include "genesis/vector.h"
 #include "interrupt.h"
 #include "validate.h"           /* for BINDING_STACK_SIZE etc */
+#include "gc-typedefs.h" // for page_index_t
 
 enum threadstate {STATE_RUNNING=1, STATE_STOPPED, STATE_DEAD};
 
 #ifdef LISP_FEATURE_SB_THREAD
-void set_thread_state(struct thread *thread, char state, boolean);
+void set_thread_state(struct thread *thread, char state, bool);
 int thread_wait_until_not(int state, struct thread *thread);
 #endif
 
@@ -65,13 +44,6 @@ struct extra_thread_data
 {
     // Lisp needs to be able to access this array. KEEP IT AS THE FIRST FIELD!
     os_context_t* sigcontexts[MAX_INTERRUPTS];
-#ifdef LISP_FEATURE_GC_METRICS
-    long on_cpu_time;
-    long avg_gc_wait;
-    long worst_gc_wait;
-    long n_gc_wait;
-    long sum_gc_wait;
-#endif
 
     // Data from here down are never looked at from Lisp.
     struct interrupt_data interrupt_data;
@@ -128,7 +100,6 @@ struct extra_thread_data
 #define nth_interrupt_context(n,thread) thread_extra_data(thread)->sigcontexts[n]
 #define thread_interrupt_data(thread) thread_extra_data(thread)->interrupt_data
 
-extern struct thread *all_threads;
 extern int dynamic_values_bytes;
 
 #define THREAD_ALIGNMENT_BYTES BACKEND_PAGE_BYTES
@@ -140,66 +111,6 @@ extern int dynamic_values_bytes;
 /* there's some possibility a SSC could notice this never actually
  * loops  */
 #define for_each_thread(th) for(th=all_threads;th;th=0)
-#endif
-
-#ifndef LISP_FEATURE_SB_THREAD
-/* no threads: every symbol's tls_index is statically zero */
-#  define tls_index_of(x) 0
-#  define per_thread_value(sym, thread) sym->value
-#else
-#ifdef LISP_FEATURE_64_BIT
-static inline unsigned int
-tls_index_of(struct symbol *symbol) // untagged pointer
-{
-#ifdef LISP_FEATURE_X86_64
-  return ((unsigned int*)symbol)[1];
-#else
-  return symbol->header >> 32;
-#endif
-}
-#else
-#  define tls_index_of(x) (x)->tls_index
-#endif
-#  define per_thread_value(sym,th) *(lispobj*)(tls_index_of(sym) + (char*)th)
-#endif
-
-#define NO_TLS_VALUE_MARKER (~(uword_t)0)
-
-static inline lispobj
-SymbolValue(lispobj tagged_symbol_pointer, void *thread)
-{
-    struct symbol *sym = SYMBOL(tagged_symbol_pointer);
-    if (thread && tls_index_of(sym)) {
-        lispobj r = per_thread_value(sym, thread);
-        if (r != NO_TLS_VALUE_MARKER) return r;
-    }
-    return sym->value;
-}
-
-static inline void
-SetSymbolValue(lispobj tagged_symbol_pointer,lispobj val, void *thread)
-{
-    struct symbol *sym = SYMBOL(tagged_symbol_pointer);
-    if(thread && tls_index_of(sym)) {
-        if (per_thread_value(sym, thread) != NO_TLS_VALUE_MARKER) {
-            per_thread_value(sym, thread) = val;
-            return;
-        }
-    }
-    sym->value = val;
-}
-
-#ifdef LISP_FEATURE_SB_THREAD
-/* write_TLS assigns directly into TLS causing the symbol to
- * be thread-local without saving a prior value on the binding stack. */
-# define write_TLS(sym, val, thread) write_TLS_index(sym##_tlsindex, val, thread, _ignored_)
-# define write_TLS_index(index, val, thread, sym) \
-   *(lispobj*)(index + (char*)thread) = val
-# define read_TLS(sym, thread) *(lispobj*)(sym##_tlsindex + (char*)thread)
-#else
-# define write_TLS(sym, val, thread) SYMBOL(sym)->value = val
-# define write_TLS_index(index, val, thread, sym) sym->value = val
-# define read_TLS(sym, thread) SYMBOL(sym)->value
 #endif
 
 /* These are for use during GC, on the current thread, or on prenatal
@@ -357,6 +268,7 @@ inline static int lisp_thread_p(os_context_t __attribute__((unused)) *context) {
     return 1;
 #endif
 }
+extern char* vm_thread_name(struct thread*);
 
 extern void record_backtrace_from_context(void*,struct thread*);
 
@@ -439,8 +351,16 @@ extern int sb_GetTID();
 #endif
 
 #ifdef LISP_FEATURE_DARWIN_JIT
-#define THREAD_JIT(x) pthread_jit_write_protect_np((x))
+#define THREAD_JIT_WP(x) pthread_jit_write_protect_np((x))
 #else
-#define THREAD_JIT(x)
+#define THREAD_JIT_WP(x)
 #endif
+
+extern bool is_in_stack_space(lispobj);
+extern void scrub_control_stack(void);
+extern void scrub_thread_control_stack(struct thread *);
+extern void scavenge_control_stack(struct thread *th);
+extern void scavenge_interrupt_contexts(struct thread *thread);
+extern void gc_close_thread_regions(struct thread*, int);
+
 #endif /* _INCLUDE_THREAD_H_ */

@@ -11,8 +11,6 @@
 
 (in-package "SB-IMPL")
 
-(declaim (declaration truly-dynamic-extent))
-
 ;;; MAYBE-INLINE, FREEZE-TYPE, and block compilation declarations can be safely ignored
 ;;; (possibly at some cost in efficiency).
 (declaim (declaration freeze-type maybe-inline start-block end-block))
@@ -49,13 +47,11 @@
 (declaim (inline realp))
 (defun realp (x) (cl:typep x 'real))
 
-(declaim (inline short-float-p single-float-p double-float-p long-float-p))
+(declaim (inline single-float-p double-float-p long-float-p))
 (defun single-float-p (x) (and (floatp x) (eq (flonum-format x) 'single-float)))
 (defun double-float-p (x) (and (floatp x) (eq (flonum-format x) 'double-float)))
-(defun short-float-p  (x) (single-float-p x))
 (defun long-float-p   (x) (double-float-p x))
 
-(deftype short-float  () '(satisfies short-float-p))
 (deftype single-float () '(satisfies single-float-p))
 (deftype double-float () '(satisfies double-float-p))
 (deftype long-float   () '(satisfies long-float-p))
@@ -87,6 +83,12 @@
 (declaim (inline numberp))
 (defun numberp (x) (cl:typep x 'number))
 
+(declaim (inline ratiop))
+(defun ratiop (x) (cl:typep x 'ratio))
+
+(declaim (inline sequencep))
+(defun sequencep (x) (cl:typep x 'sequence))
+
 ;;; ZEROP is needer sooner than the rest of the cross-float. (Not sure why exactly)
 (declaim (inline zerop))
 (defun zerop (x) (if (rationalp x) (= x 0) (xfloat-zerop x)))
@@ -96,3 +98,12 @@
   (if (complexp self)
       `(complex ,(complexnum-real self) ,(complexnum-imag self))
       `(make-flonum ,(flonum-%bits self) ',(flonum-format self))))
+
+#+weak-vector-readbarrier
+(progn (deftype weak-vector () nil) ; nothing is a weak-vector
+       (defun sb-int:weak-vector-ref (v i)
+         (error "Called WEAK-VECTOR-REF on ~S ~S" v i))
+       (defun (setf sb-int:weak-vector-ref) (new v i)
+         (error "Called (SETF WEAK-VECTOR-REF) on ~S ~S ~S" new v i))
+       (defun sb-int:weak-vector-len (v)
+         (error "Called WEAK-VECTOR-LEN on ~S" v)))

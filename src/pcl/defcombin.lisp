@@ -235,6 +235,12 @@ combination type."
 (setf (random-documentation 'standard 'method-combination)
       "The standard method combination.")
 
+(defmethod compute-primary-methods
+    ((gf generic-function)
+     (combin standard-standard-method-combination)
+     applicable-methods)
+  (remove-if #'method-qualifiers applicable-methods))
+
 
 
 ;; -------------------------
@@ -310,9 +316,8 @@ combination type."
               new :options (or options '(:most-specific-first)))))
     (load-defcombin name new documentation)))
 
-(defmethod invalid-qualifiers ((gf generic-function)
-                               (combin short-method-combination)
-                               method)
+(defmethod invalid-qualifiers
+    ((gf generic-function) (combin short-method-combination) method)
   (let* ((qualifiers (method-qualifiers method))
          (qualifier (first qualifiers))
          (type-name (method-combination-type-name combin))
@@ -333,6 +338,16 @@ combination type."
       of DEFINE-METHOD-COMBINATION and so requires all methods have ~
       either ~{the single qualifier ~S~^ or ~}.~@:>"
      method gf why type-name (short-method-combination-qualifiers type-name))))
+
+(defmethod compute-primary-methods ((gf generic-function)
+                                    (combin short-method-combination)
+                                    applicable-methods)
+  (let ((type-name (method-combination-type-name combin)))
+    (remove-if-not (lambda (m) (let ((qs (method-qualifiers m)))
+                                 (and (eql (car qs) type-name)
+                                      (null (cdr qs)))))
+                   applicable-methods)))
+
 
 
 ;; ------------------------

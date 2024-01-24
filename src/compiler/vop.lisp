@@ -155,6 +155,9 @@
   ;; first.
   (start-stack () :type list)
   (end-stack () :type list)
+  ;; list of all lvars ever pushed onto the stack when control reaches
+  ;; the start of this block.
+  (stack-mess-up () :type list)
   ;; the first and last VOP in this block. If there are none, both
   ;; slots are null.
   (start-vop nil :type (or vop null))
@@ -231,7 +234,10 @@
   ;;
   ;; If this is :UNUSED, then this LVAR should never actually be used
   ;; as the destination of a value: it is only used tail-recursively.
-  (kind :fixed :type (member :delayed :fixed :unknown :unused))
+  ;;
+  ;; If this is :STACK, then this LVAR represents the stack pointer
+  ;; used to undo stack allocation of dynamic extent objects.
+  (kind :fixed :type (member :delayed :fixed :unknown :unused :stack))
   ;; The primitive-type of the first value of this LVAR. This is
   ;; primarily for internal use during LTN, but it also records the
   ;; type restriction on delayed references. In multiple-value
@@ -248,8 +254,7 @@
   ;; since type checking is the responsibility of the values receiver,
   ;; these TNs primitive type is only based on the proven type
   ;; information.
-  (locs nil :type list)
-  (stack-pointer nil :type (or tn null)))
+  (locs nil :type list))
 
 (defprinter (ir2-lvar)
   kind
@@ -292,6 +297,11 @@
   ;; POPPED. This slot is initialized by LTN-ANALYZE as an input to
   ;; STACK-ANALYZE.
   (values-receivers nil :type list)
+  ;; If this component stack allocates anything, this is true.
+  (stack-allocates-p nil :type boolean)
+  ;; a list of all the blocks which mess up the stack with dynamic
+  ;; extent allocated objects.
+  (stack-mess-ups nil :type list)
   ;; an adjustable vector that records all the constants in the
   ;; constant pool. A non-immediate :CONSTANT TN with offset 0 refers
   ;; to the constant in element 0, etc. Normal constants are
@@ -448,7 +458,7 @@
   ;; The return convention used:
   ;; -- If :UNKNOWN, we use the standard return convention.
   ;; -- If :FIXED, we use the known-values convention.
-  (kind (missing-arg) :type (member :fixed :unknown))
+  (kind (missing-arg) :type (member :fixed :unknown :unboxed))
   ;; the number of values returned, or :UNKNOWN if we don't know.
   ;; COUNT may be known when KIND is :UNKNOWN, since we may choose the
   ;; standard return convention for other reasons.
@@ -536,6 +546,8 @@
   ;; the link for a list running through all TN-REFs for this TN of
   ;; the same kind (read or write)
   (next nil :type (or tn-ref null))
+  ;; For faster delete-tn-ref
+  (prev nil :type (or tn-ref null))
   ;; the VOP where the reference happens, or NIL temporarily
   (vop nil :type (or vop null))
   ;; the link for a list of all TN-REFs in VOP, in reverse order of
@@ -1141,3 +1153,10 @@
   block
   kind
   (number :test number))
+
+(defstruct (conditional-flags
+            (:constructor make-conditional-flags (flags))
+            (:copier nil))
+  flags)
+
+(declaim (freeze-type conditional-flags))

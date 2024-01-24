@@ -257,6 +257,12 @@
 (assert (equalp #(251) (string-to-octets (string (code-char 369))
                                          :external-format :latin-2)))
 
+(with-test (:name (:euc-jp :encoding-errors) :skipped-on (or (not :sb-unicode) :unicode-lite))
+  (handler-bind ((sb-int:character-encoding-error
+                  (lambda (c) (use-value #\? c))))
+    (assert (equalp (string-to-octets (map 'string 'code-char '(#xb2 #x5e #xb3))
+                                      :external-format :euc-jp)
+                    (vector (char-code #\?) (char-code #\^) (char-code #\?))))))
 (with-test (:name (:euc-jp :decoding-errors) :skipped-on (or (not :sb-unicode) :unicode-lite))
   (handler-bind ((sb-int:character-decoding-error
                   (lambda (c) (use-value #\? c))))
@@ -422,3 +428,12 @@
         (assert (string= b1 b2))
         ;; COMPILE-FILE-POSITION is insensitive to file encoding.
         (assert (string= c1 c2))))))
+
+(with-test (:name (:compile-constant-bad-external-format :octets-to-string))
+  (checked-compile-and-assert ()
+    '(lambda (x) (sb-ext:octets-to-string x :external-format 0))
+    (((make-array 0 :element-type '(unsigned-byte 8))) (condition 'error))))
+(with-test (:name (:compile-constant-bad-external-format :string-to-octets))
+  (checked-compile-and-assert ()
+    '(lambda (x) (sb-ext:octets-to-string x :external-format 0))
+    (("foo") (condition 'error))))

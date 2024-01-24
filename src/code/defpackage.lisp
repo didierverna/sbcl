@@ -43,8 +43,8 @@ implementation it is ~S." *!default-package-use-list*)
           ;; a "resolved" package is not in the global name->package mapping yet,
           ;; which is why the FIND-PACKAGE / CERROR below does not signal.
           (or (resolve-deferred-package name)
-              (%make-package (make-symbol-hashset internal-symbols)
-                             (make-symbol-hashset external-symbols))))
+              (%make-package (make-symbol-table internal-symbols)
+                             (make-symbol-table external-symbols))))
          (existing-pkg)
          (namelist (cons name nicks))
          (conflict))
@@ -202,7 +202,7 @@ implementation it is ~S." *!default-package-use-list*)
                           ;; Setting PACKAGE-%NAME to NIL is required in order to
                           ;; make PACKAGE-NAME return NIL for a deleted package as
                           ;; ANSI requires. Setting the other slots to NIL
-                          ;; and blowing away the SYMBOL-HASHSETs is just done
+                          ;; and blowing away the SYMBOL-TABLEs is just done
                           ;; for tidiness and to help the GC.
                           (package-keys package) #()))
                   (atomic-incf *package-names-cookie*)
@@ -210,8 +210,8 @@ implementation it is ~S." *!default-package-use-list*)
                     (setf (sb-c::package-environment-changed sb-c::*compilation*) t))
                   (setf (package-tables package) #()
                         (package-%shadowing-symbols package) nil
-                        (package-internal-symbols package) (make-symbol-hashset 0)
-                        (package-external-symbols package) (make-symbol-hashset 0)))
+                        (package-internal-symbols package) (make-symbol-table 0)
+                        (package-external-symbols package) (make-symbol-table 0)))
                 (return-from delete-package t)))))))
 
 ;;; Possible FIXME:
@@ -647,7 +647,7 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
   (let* ((string (truly-the simple-string
                             (stringify-string-designator string-designator)))
          (length (length string))
-         (hash (compute-symbol-hash string length))
+         (hash (calc-symbol-name-hash string length))
          (result (list nil)))
     (do-packages (p) ; FIXME: should not acquire package-names lock
       (add-to-bag-if-found (package-internal-symbols p) string length hash result)
@@ -701,7 +701,7 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
                     #+sb-unicode
                     (= widetag sb-vm:simple-character-string-widetag))
                 (when (search string obj :test #'char-equal)
-                  (push (cons (compute-symbol-hash obj (length obj)) obj) candidates)))
+                  (push (cons (calc-symbol-name-hash obj (length obj)) obj) candidates)))
                (t
                 (return-from done))))
        :read-only))
@@ -748,12 +748,79 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
     (briefly-describe-symbol symbol))
   (values))
 
+(defun perfectly-hash-package (designator)
+  (flet ((rehash (table &aux (cells (symtbl-%cells table)))
+           (when (functionp (car cells))
+             (return-from rehash)) ; already hashed
+           (let* ((cells (cdr cells))
+                  (hashes (map '(simple-array (unsigned-byte 32) (*))
+                               (lambda (symbol) (ldb (byte 32 0) (symbol-hash symbol)))
+                               (remove-if-not #'symbolp cells))))
+             (when (or (< (length (remove-duplicates hashes)) (length hashes))
+                       ;; limitation of perfecthash, also probably no benefit
+                       (< (length hashes) 5))
+               (return-from rehash))
+             (let* ((hash-expr (sb-c:make-perfect-hash-lambda hashes))
+                    (fun (compile nil hash-expr))
+                    (new-cells (make-array (length hashes) :initial-element 0)))
+               (dovector (s cells)
+                 (when (symbolp s)
+                   (let ((hash (funcall fun (ldb (byte 32 0) (symbol-hash s)))))
+                     (aver (eq (svref new-cells hash) 0))
+                     (setf (svref new-cells hash) s))))
+               (setf (symtbl-%cells table) (cons fun new-cells)
+                     (symtbl-size table) (length hashes)
+                     (symtbl-free table) 0
+                     (symtbl-deleted table) 0)))))
+    (let ((package (find-package designator)))
+      (rehash (package-internal-symbols package))
+      (rehash (package-external-symbols package)))))
+
+;;; Reorganize both hashsets of all packages, called by SAVE-LISP-AND-DIE.
+;;; With a few exceptions, tables are saved at 100% load factor and a perfect hash.
+;;; The danger of attempting to achieve such high load using an open-addressing table
+;;; is that despite the robinhood algorithm rearranging elements, there could always
+;;; be a tremendously bad probe sequence for some symbol, not to mention that unused
+;;; cells must be scattered throughout, to assure probing always terminates.
+;;; The relevant benchmark is how quickly we can return that a symbol is NOT found.
+;;; Test case:
+;;; * (defvar *l* (let (l) (do-all-symbols (s l) (push s l))))
+;;; * (defun f (list &aux (n 0))
+;;;    (dolist (s list n) (if (find-symbol (string s) #.(find-package "CL")) (incf n))))
+;;; * (time (f *l*))
+;;;
+;;; Freshly restarted image after save-lisp-and-die without perfect hash:
+;;;   0.017 seconds of real time
+;;;
+;;; Freshly restarted image with perfect hash:
+;;;   0.012 seconds of real time
+;;;
+(defun tune-hashset-sizes-of-all-packages ()
+  (flet ((tune-table-size (desired-lf table)
+           (resize-symbol-table table (%symtbl-count table) t desired-lf)
+           ;; The APROPOS-LIST R/O scan optimization is inadmissible if no R/O space
+           #-darwin-jit (setf (symtbl-modified table) nil)))
+    (dolist (package (list-all-packages))
+      ;; Choose load factor based on whether INTERN is expected at runtime
+      (let ((lf (cond ((eq (the package package) *keyword-package*) 60/100)
+                      ((eq (package-id package) +package-id-user+) 8/10)
+                      (t 1))))
+        (cond ((= lf 1)
+               (perfectly-hash-package package))
+              (t
+               (tune-table-size lf (package-internal-symbols (truly-the package package)))
+               (tune-table-size lf (package-external-symbols package))))))))
+
+;;; This function is mainly of interest to developers, should we remove it
+;;; from the image?
 (export 'show-package-utilization)
 (defun show-package-utilization (&aux (tot-ncells 0))
-  (flet ((symtbl-metrics (table &aux (cells (symtbl-%cells table))
-                                     (reciprocals (car cells))
-                                     (vec (cdr cells))
-                                     (nslots (length vec)))
+  (flet ((metrics (table &aux (cells (symtbl-%cells table))
+                              (reciprocals (car cells))
+                              (vec (cdr cells))
+                              (nslots (length vec)))
+           (when (functionp reciprocals)
+             (return-from metrics (values 1 1 1))) ; 1 probe max+avg, 100% load
            (flet ((probe-seq-len (symbol)
                     (let* ((name-hash (sxhash symbol))
                            (index (symbol-table-hash 1 name-hash nslots))
@@ -776,8 +843,8 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
   (dolist (pkg (list-all-packages))
     (binding* ((ext (package-external-symbols pkg))
                (int (package-internal-symbols pkg))
-               ((ext-max ext-psl ext-lf) (symtbl-metrics ext))
-               ((int-max int-psl int-lf) (symtbl-metrics int))
+               ((ext-max ext-psl ext-lf) (metrics ext))
+               ((int-max int-psl int-lf) (metrics int))
                (ncells (+ (length (symtbl-cells int))
                           (length (symtbl-cells ext)))))
       (incf tot-ncells ncells)

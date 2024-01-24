@@ -78,9 +78,8 @@
   (:info name offset lowtag)
   (:temporary (:scs (non-descriptor-reg)) t1)
   (:vop-var vop)
-  (:ignore name)
   (:generator 1
-    (emit-gengc-barrier object nil (list t1) (vop-nth-arg 1 vop) value)
+    (emit-gengc-barrier object nil (list t1) (vop-nth-arg 1 vop) value name)
     (storew value object offset lowtag)))
 
 (define-vop (compare-and-swap-slot)
@@ -294,8 +293,6 @@
 
 ;;;; Fdefinition (fdefn) objects.
 
-(define-vop (fdefn-fun cell-ref) ; does not translate anything
-  (:variant fdefn-fun-slot other-pointer-lowtag))
 (define-vop (untagged-fdefn-fun cell-ref) ; does not translate anything
   (:variant fdefn-fun-slot 0))
 
@@ -341,26 +338,22 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (emit-gengc-barrier fdefn nil (list type))
-    (let ((normal-fn (gen-label)))
-      (load-type type function (- fun-pointer-lowtag))
-      (inst cmpdi type simple-fun-widetag)
-      ;;(inst mr lip function)
-      (inst addi lip function
-            (- (ash simple-fun-insts-offset word-shift) fun-pointer-lowtag))
-      (inst beq normal-fn)
-      (inst addi lip null-tn (make-fixup 'closure-tramp :assembly-routine*))
-      (emit-label normal-fn)
-      (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-      (move result function))))
+    (load-type type function (- fun-pointer-lowtag))
+    (inst cmpdi type simple-fun-widetag)
+    ;;(inst mr lip function)
+    (inst addi lip function
+          (- (ash simple-fun-insts-offset word-shift) fun-pointer-lowtag))
+    (inst beq SIMPLE)
+    (inst addi lip null-tn (make-fixup 'closure-tramp :assembly-routine*))
+    SIMPLE
+    (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
+    (storew function fdefn fdefn-fun-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -470,9 +463,6 @@
     (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; Value Cell hackery.
-
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))

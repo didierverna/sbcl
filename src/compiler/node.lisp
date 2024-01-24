@@ -194,8 +194,8 @@
   ;; the optimizer for this node type doesn't care, it can elect not
   ;; to clear this flag.
   (reoptimize t :type boolean)
-  ;; if the LVAR value is DYNAMIC-EXTENT, some information.
-  (dynamic-extent nil :type (or null dx-info))
+  ;; the DYNAMIC-EXTENT of this lvar
+  (dynamic-extent nil :type (or null cdynamic-extent))
   ;; something or other that the back end annotates this lvar with
   (info nil)
   ;; Nodes to reoptimize together with the lvar
@@ -203,25 +203,6 @@
   (annotations nil)
   (dependent-annotations nil))
 (!set-load-form-method lvar (:xc :target) :ignore-it)
-
-;;; A DX-INFO structure is used to accumulate information about a
-;;; dynamic extent declaration.
-(defstruct (dx-info (:copier nil))
-  ;; The kind of dynamic extent this is.
-  (kind (missing-arg) :type (member enclose dynamic-extent truly-dynamic-extent))
-  ;; The value recognized to be declared dynamic extent.
-  (value (missing-arg) :type lvar)
-  ;; The stack-allocatable values in the transitive closure of the
-  ;; relation determined by the "otherwise inaccessible part"
-  ;; criterion. This is filled in by environment analysis.
-  (subparts nil :type list)
-  ;; The CLEANUP associated with this dynamic extent.
-  (cleanup (missing-arg) :type cleanup))
-
-(defprinter (dx-info :identity t)
-  kind
-  value
-  subparts)
 
 ;;; These are used for annotating a LVAR with information that can't
 ;;; be expressed using types or if the CAST semantics are undesirable
@@ -365,14 +346,10 @@
 (defun node-block (node)
   (ctran-block (node-prev node)))
 
-(defun %with-ir1-environment-from-node (node fun)
-  (declare (type node node) (type function fun))
-  (declare (dynamic-extent fun))
-  (let ((*current-component* (node-component node))
-        (*lexenv* (node-lexenv node))
-        (*current-path* (node-source-path node)))
-    (aver-live-component *current-component*)
-    (funcall fun)))
+(declaim (inline node-component))
+(defun node-component (node)
+  (declare (type node node))
+  (block-component (node-block node)))
 
 (defstruct (valued-node (:conc-name node-)
                         (:include node)
@@ -418,6 +395,7 @@
   (defattr block-type-check)
   (defattr block-delete-p))
 
+;;; The LOOP structure holds information about a loop.
 (defstruct (cloop (:conc-name loop-)
                   (:predicate loop-p)
                   (:constructor make-loop)
@@ -502,13 +480,14 @@
   ;; other sets used in constraint propagation and/or copy propagation
   (in nil)
   (out nil)
-  ;; Set of all blocks that dominate this block. NIL is interpreted
-  ;; as "all blocks in component".
-  (dominators nil :type (or null sset))
-  ;; the LOOP that this block belongs to
-  (loop nil :type (or null cloop))
-  ;; next block in the loop.
+  ;; The Loop structure for the innermost loop that contains this
+  ;; block. Null only temporarily.
+  (loop nil :type (or cloop null))
+  ;; A link that holds together the list of blocks within Loop. Null
+  ;; at the end or when we haven't determined it yet.
   (loop-next nil :type (or null cblock))
+  ;; The immediate dominator of this block.
+  (dominator nil :type (or null cblock))
   ;; the component this block is in, or NIL temporarily during IR1
   ;; conversion and in deleted blocks
   (component (progn
@@ -563,12 +542,7 @@
 ;;;   component.
 (defstruct (component (:copier nil)
                       (:constructor make-component
-                       (head
-                        tail &aux
-                        (last-block tail)
-                        (outer-loop (make-loop :kind :outer
-                                               :head head
-                                               :tail (list tail))))))
+                       (head tail &aux (last-block tail))))
   ;; space where this component will be allocated in
   ;; :auto won't make any codegen optimizations pertinent to immobile space,
   ;; but will place the code there given sufficient available space.
@@ -659,10 +633,8 @@
   ;; from COMPONENT-LAMBDAS.
   (reanalyze-functionals nil :type list)
   (delete-blocks nil :type list)
-  ;; this is filled by environment analysis
-  (dx-lvars nil :type list)
   ;; The default LOOP in the component.
-  (outer-loop (missing-arg) :type cloop)
+  (outer-loop (make-loop :kind :outer :head head :tail (list tail)) :type cloop)
   (max-block-number 0 :type fixnum)
   (dominators-computed nil))
 
@@ -685,7 +657,6 @@
   ;; COMPILE-COMPONENT hasn't happened yet. Might it be even better
   ;; (certainly stricter, possibly also correct...) to assert that
   ;; IR1-FINALIZE hasn't happened yet?
-  #+sb-xc-host (declare (notinline component-info)) ; unknown type
   (aver (not (eql (component-info component) :dead))))
 
 ;;; A CLEANUP structure represents some dynamic binding action. Blocks
@@ -710,12 +681,8 @@
   ;; non-messed-up environment. Null only temporarily. This could be
   ;; deleted due to unreachability.
   (mess-up nil :type (or node null))
-  ;; For all kinds, except :DYNAMIC-EXTENT: a list of all the NLX-INFO
-  ;; structures whose NLX-INFO-CLEANUP is this cleanup. This is filled
-  ;; in by environment analysis.
-  ;;
-  ;; For :DYNAMIC-EXTENT: a list of all DX-INFOs, preserved by this
-  ;; cleanup.
+  ;; a list of all the NLX-INFO structures whose NLX-INFO-CLEANUP is
+  ;; this cleanup.
   (nlx-info nil :type list))
 (defprinter (cleanup :identity t)
   kind
@@ -726,13 +693,8 @@
 (defstruct (environment (:copier nil))
   ;; the function that allocates this environment
   (lambda (missing-arg) :type clambda :read-only t)
-  ;; This ultimately converges to a list of all the LAMBDA-VARs and
-  ;; NLX-INFOs needed from enclosing environments by code in this
-  ;; environment. In the meantime, it may be
-  ;;   * NIL at object creation time
-  ;;   * a superset of the correct result, generated somewhat later
-  ;;   * smaller and smaller sets converging to the correct result as
-  ;;     we notice and delete unused elements in the superset
+  ;; a list of all the LAMBDA-VARs and NLX-INFOs needed from enclosing
+  ;; environments by code in this environment.
   (closure nil :type list)
   ;; a list of NLX-INFO structures describing all the non-local exits
   ;; into this environment
@@ -777,7 +739,7 @@
 ;;; ENVIRONMENT-NLX-INFO.
 (defstruct (nlx-info
             (:copier nil)
-            (:constructor make-nlx-info (cleanup block exit)))
+            (:constructor make-nlx-info (cleanup block)))
   ;; the cleanup associated with this exit. In a catch or
   ;; unwind-protect, this is the :CATCH or :UNWIND-PROTECT cleanup,
   ;; and not the cleanup for the escape block. The CLEANUP-KIND of
@@ -794,7 +756,6 @@
   ;; ENTRY must also be used to disambiguate, since exits to different
   ;; places may deliver their result to the same continuation.
   (block (missing-arg) :type cblock)
-  (exit (missing-arg) :type exit)
   ;; the entry stub inserted by environment analysis. This is a block
   ;; containing a call to the %NLX-ENTRY funny function that has the
   ;; original exit destination as its successor. Null only
@@ -807,7 +768,6 @@
   (info nil))
 (defprinter (nlx-info :identity t)
   block
-  exit
   target
   info)
 (!set-load-form-method nlx-info (:xc :target) :ignore-it)
@@ -857,11 +817,12 @@
   (defined-type *universal-type* :type ctype)
   ;; where the TYPE information came from (in order, from strongest to weakest):
   ;;  :DECLARED, from a declaration.
+  ;;  :DECLARED-VERIFY
   ;;  :DEFINED-HERE, from examination of the definition in the same file.
   ;;  :DEFINED, from examination of the definition elsewhere.
   ;;  :DEFINED-METHOD, implicit, piecemeal declarations from CLOS.
   ;;  :ASSUMED, from uses of the object.
-  (where-from :assumed :type (member :declared :assumed :defined-here :defined :defined-method))
+  (where-from :assumed :type (member :declared :declared-verify :assumed :defined-here :defined :defined-method))
   ;; list of the REF nodes for this leaf
   (refs () :type list)
   ;; For tracking whether to warn about unused variables:
@@ -869,9 +830,9 @@
   ;; SET if there was a set but no REF.
   ;; T if there was a REF.
   ;; This may be non-nil when REFS and SETS are null, since code can be deleted.
-  (ever-used nil :type (member nil set t))
-  ;; is it declared dynamic-extent, or truly-dynamic-extent?
-  (dynamic-extent nil :type (member nil truly-dynamic-extent dynamic-extent))
+  (ever-used nil :type (member nil set t initial-unused))
+  ;; True if declared dynamic-extent.
+  (dynamic-extent nil :type boolean)
   ;; some kind of info used by the back end
   (info nil))
 (!set-load-form-method leaf (:xc :target) :ignore-it)
@@ -1121,9 +1082,8 @@
   ;; xref information for this functional (only used for functions with an
   ;; XEP)
   (xref () :type list)
-  ;; True if this functional was created from an inline expansion. This
-  ;; is either T, or the GLOBAL-VAR for which it is an expansion.
-  (inline-expanded nil)
+  ;; True if this functional was created from an inline expansion.
+  (inline-expanded nil :type boolean)
   ;; Is it coming from a top-level NAMED-LAMBDA?
   (top-level-defun-p nil)
   (ignore nil))
@@ -1219,6 +1179,9 @@
   (lets nil :type list)
   ;; all the ENTRY nodes in this function and its LETs, or null in a LET
   (entries nil :type list)
+  ;; all the DYNAMIC-EXTENT nodes in this function and its LETs, or
+  ;; null in a LET.
+  (dynamic-extents nil :type list)
   ;; CLAMBDAs which are locally called by this lambda, and other
   ;; objects (closed-over LAMBDA-VARs and XEPs) which this lambda
   ;; depends on in such a way that DFO shouldn't put them in separate
@@ -1471,9 +1434,7 @@
   ;; The leaf referenced.
   (leaf nil :type leaf)
   ;; KLUDGE: This is supposed to help with keyword debug messages somehow.
-  (%source-name (missing-arg) :type symbol :read-only t)
-  ;; Constraints that cannot be expressed as NODE-DERIVED-TYPE
-  (constraints nil))
+  (%source-name (missing-arg) :type symbol :read-only t))
 (defprinter (ref :identity t)
   (%source-name :test (neq %source-name '.anonymous.))
   leaf)
@@ -1646,10 +1607,9 @@
   type-to-check)
 
 ;;; The DELAY node is interposed between a VALUE's USE and its DEST in
-;;; order to allow the value to be immediately used. This is necessary
-;;; for implementing multiple-use unknown values LVARs, as otherwise,
-;;; a non-moveable dynamic extent object may be allocated between the
-;;; DEST and one of the LVAR's uses but not the others.
+;;; order to allow the value to be immediately used. This allows us to
+;;; do substitution of lvars without doing flow analysis to check the
+;;; validity of the substitution in certain cases.
 (defstruct (delay (:include cast
                    (%type-check nil)
                    (asserted-type *wild-type*)
@@ -1715,15 +1675,37 @@
 
 ;;; The ENCLOSE node marks the place at which closure allocation code
 ;;; would be emitted, if necessary.
-(defstruct (enclose (:include valued-node) ; this node uses a dummy lvar for dx analysis
+(defstruct (enclose (:include node)
                     (:copier nil))
   ;; The list of functionals that this ENCLOSE node allocates.
   (funs nil :type list)
-  ;; The cleanup for this enclose if any of its functionals are
+  ;; The dynamic extent for this enclose if any of its functionals are
   ;; declared dynamic extent.
-  (cleanup nil :type (or null cleanup)))
+  (dynamic-extent nil :type (or null cdynamic-extent)))
 (defprinter (enclose :identity t)
   funs)
+
+;;; The DYNAMIC-EXTENT node is used to accumulate information about a
+;;; dynamic extent declaration. It is the mess-up for the
+;;; corresponding :DYNAMIC-EXTENT cleanup.
+(defstruct (cdynamic-extent (:include node)
+                            (:conc-name dynamic-extent-)
+                            (:predicate dynamic-extent-p)
+                            (:constructor make-dynamic-extent)
+                            (:copier nil))
+  ;; the values explicitly declared with this dynamic extent.
+  (values nil :type list)
+  ;; the cleanup for this extent. NULL indicates that this dynamic
+  ;; extent is over the environment and hence needs no cleanup code.
+  (cleanup nil :type (or cleanup null))
+  ;; some kind of info used by the back end
+  (info nil)
+  (preserve-info nil))
+
+(defprinter (cdynamic-extent :conc-name dynamic-extent-
+                             :identity t)
+  values
+  (info :test info))
 
 
 ;;;; miscellaneous IR1 structures
@@ -1780,21 +1762,8 @@
                         (lexenv thing)
                         (node (node-lexenv thing))
                         (functional (functional-lexenv thing)))))))
-
-;;; The basic interval type. It can handle open and closed intervals.
-;;; A bound is open if it is a list containing a number, just like
-;;; Lisp says. NIL means unbounded.
-(defstruct (interval (:constructor %make-interval (low high))
-                     (:copier nil))
-  low high)
-
-(defstruct (conditional-flags
-            (:constructor make-conditional-flags (flags))
-            (:copier nil))
-  flags)
 
 ;;;; Freeze some structure types to speed type testing.
 
 (declaim (freeze-type node lexenv ctran lvar cblock component cleanup
-                      environment tail-set nlx-info leaf interval
-                      conditional-flags))
+                      environment tail-set nlx-info leaf))

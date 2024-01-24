@@ -66,7 +66,7 @@
   (:use #:cl #:sb-ext #:sb-alien #:sb-sys #:sb-int #:sb-kernel)
   (:export #:aprof-run #:aprof-show #:aprof-reset
            #:aprof-start #:aprof-stop #:patch-all-code)
-  (:import-from #:sb-di #:valid-lisp-pointer-p)
+  (:import-from #:sb-di #:valid-tagged-pointer-p)
   (:import-from #:sb-vm #:thread-reg)
   (:import-from #:sb-x86-64-asm
                 #:register-p #:get-gpr #:reg #:reg-num
@@ -102,7 +102,7 @@
          (sb-fasl:get-asm-routine 'sb-vm::enable-sized-alloc-counter t))
         (stack (make-array 1 :element-type 'sb-vm:word))
         (insts (code-instructions code)))
-    (declare (truly-dynamic-extent stack))
+    (declare (dynamic-extent stack))
     (with-alien ((allocation-tracker-counted (function void system-area-pointer) :extern)
                  (allocation-tracker-sized (function void system-area-pointer) :extern))
       (do-packed-varints (loc locs)
@@ -214,9 +214,9 @@
        sb-vm::*room-info*))
 
 (defun layout-name (ptr)
-  (if (eql (valid-lisp-pointer-p (int-sap ptr)) 0)
+  (if (eql (valid-tagged-pointer-p (int-sap ptr)) 0)
       'structure
-      (wrapper-classoid-name (layout-friend (make-lisp-obj ptr)))))
+      (layout-classoid-name (make-lisp-obj ptr))))
 
 ;;; These EAs are s-expressions, not instances of EA or MACHINE-EA.
 #-sb-safepoint
@@ -235,7 +235,7 @@
       `((fixed+header
          (add ?end ?nbytes)
          (cmp :qword ?end :tlab-limit)
-         (jmp :nbe ?_)
+         (jmp :a ?_)
          (mov :qword :tlab-freeptr ?end)
          (:or (add ?end ?bias) (dec ?end))
          (mov ?_ (ea ?_ ?end) ?header))
@@ -243,7 +243,7 @@
         (var-array
          (add ?end ?nbytes)
          (cmp :qword ?end :tlab-limit)
-         (jmp :nbe ?_)
+         (jmp :a ?_)
          (mov :qword :tlab-freeptr ?end)
          (sub ?end ?nbytes)
          (mov ?_ (ea ?_ ?end) ?header)
@@ -254,7 +254,7 @@
                ;; and free-ptr points to the end of the putative data block.
                (xadd ?free ?size)
                (cmp :qword ?free :tlab-limit)
-               (jmp :nbe ?_)
+               (jmp :a ?_)
                (mov :qword :tlab-freeptr ?free)
                ;; Could have one or two stores prior to ORing in a lowtag.
                (:optional (mov ?_ (ea 0 ?size) ?header))
@@ -267,7 +267,7 @@
                   (lea :qword ?end (ea 0 ?nbytes-var ?free))
                   (add ?end ?free)) ; ?end originally holds the size in bytes
              (cmp :qword ?end :tlab-limit)
-             (jmp :nbe ?_)
+             (jmp :a ?_)
              (mov :qword :tlab-freeptr ?end)
              (mov ?_ (ea 0 ?free) ?header)
              (:optional (mov ?_ (ea ?_ ?free) ?vector-len))
@@ -278,7 +278,7 @@
         ;; not the first cons.
         (list (lea :qword ?end (ea 0 ?nbytes ?free))
               (cmp :qword ?end :tlab-limit)
-              (jmp :nbe ?_)
+              (jmp :a ?_)
               (mov :qword :tlab-freeptr ?end)
               (lea :qword ?free (ea ,(- sb-vm:list-pointer-lowtag
                                         (* sb-vm:cons-size sb-vm:n-word-bytes))
@@ -287,7 +287,7 @@
 
         (acons (lea :qword ?end (ea 32 ?free))
                (cmp :qword ?end :tlab-limit)
-               (jmp :nbe ?_)
+               (jmp :a ?_)
                (mov :qword :tlab-freeptr ?end)
                (:repeat (mov . ignore))
                (lea :qword ?result (ea #.(+ 16 sb-vm:list-pointer-lowtag) ?free)))
@@ -297,7 +297,7 @@
                              (lea :qword ?end (ea 0 ?nbytes-var ?free))
                              (add ?end ?free))
                         (cmp :qword ?end :tlab-limit)
-                        (jmp :nbe ?_)
+                        (jmp :a ?_)
                         (mov :qword :tlab-freeptr ?end)
                         (:repeat (:or (mov . ignore) (lea . ignore)))
                         (:or (or ?free ?lowtag)

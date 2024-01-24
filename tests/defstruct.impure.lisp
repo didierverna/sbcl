@@ -530,7 +530,7 @@
 (with-test (:name :dd-bitmap-vs-layout-bitmap)
   (dolist (typename '(huge-manyraw hugest-manyraw))
     (let* ((layout (sb-kernel:find-layout typename))
-           (info (sb-kernel:wrapper-dd layout))
+           (info (sb-kernel:layout-dd layout))
            (bitmap (sb-kernel::dd-bitmap info)))
       (assert (typep bitmap 'bignum))
       (assert (= (sb-bignum:%bignum-length bitmap)
@@ -547,7 +547,7 @@
                (eql (huge-manyraw-w1 s) #xffee)
                (eql (huge-manyraw-w2 s) #xeeee)))
   (dolist (slot (sb-kernel:dd-slots
-                 (sb-kernel:wrapper-info (sb-kernel:wrapper-of s))))
+                 (sb-kernel:layout-info (sb-kernel:layout-of s))))
     (let ((name (string (sb-kernel:dsd-name slot))))
       (cond ((eql (mismatch name "SLOT-") 5)
              (let ((n (parse-integer name :start 5)))
@@ -570,17 +570,22 @@
   (terpri s)
   (write-string "(defun dumped-huge-manyraw () '#.(make-huge-manyraw))" s)
   (write-string "(defun dumped-hugest-manyraw () '#.(make-hugest-manyraw))" s))
-(defvar *tempfasl* (compile-file *tempfile*))
-(delete-file *tempfile*)
+(defvar *tempfasl*)
+(with-test (:name :compile-huge-manyraw
+            :skipped-on :gc-stress)
+  (setf *tempfasl* (compile-file *tempfile*))
+  (delete-file *tempfile*)
 
-;;; nuke the objects and try another GC just to be extra careful
-(setf *manyraw* nil)
-(sb-ext:gc :full t)
+  ;; nuke the objects and try another GC just to be extra careful
+  (setf *manyraw* nil)
+  (sb-ext:gc :full t)
 
-;;; re-read the dumped structures and check them
-(load *tempfasl*)
-(delete-file *tempfasl*)
-(with-test (:name (:defstruct-raw-slot load))
+  ;; re-read the dumped structures and check them
+  (load *tempfasl*)
+  (delete-file *tempfasl*))
+
+(with-test (:name (:defstruct-raw-slot load)
+                  :skipped-on :gc-stress)
   (check-manyraws (dumped-manyraws))
   (check-huge-manyraw (make-huge-manyraw))
   (assert (equalp (make-huge-manyraw) (dumped-huge-manyraw)))
@@ -902,7 +907,7 @@ redefinition."
   (assert (funcall predicate instance)))
 
 (defun assert-invalid (instance)
-  (assert (sb-kernel:wrapper-invalid (sb-kernel:%instance-wrapper instance))))
+  (assert (sb-kernel:layout-invalid (sb-kernel:%instance-layout instance))))
 
 ;; Don't try to understand this macro; just look at its expansion.
 (defmacro with-defstruct-redefinition-test (name
@@ -1445,15 +1450,14 @@ redefinition."
 
 (test-util:with-test (:name :specialized-equalp)
   ;; make sure we didn't mess up PATHNAME and HASH-TABLE
-  (let ((f (sb-kernel:wrapper-equalp-impl (sb-kernel:find-layout 'pathname))))
+  (let ((f (sb-kernel:layout-equalp-impl (sb-kernel:find-layout 'pathname))))
     (assert (eq f #'sb-int:pathname=)))
-  (let ((f (sb-kernel:wrapper-equalp-impl (sb-kernel:find-layout 'hash-table))))
+  (let ((f (sb-kernel:layout-equalp-impl (sb-kernel:find-layout 'hash-table))))
     (assert (eq f #'sb-int:hash-table-equalp))))
 
 (defstruct (badbuf (:constructor make-badbuf ()))
   (str (make-string 128) :type (simple-array character (128))))
 
-;; STR slot gets a type-check in the constructor. It should not
-(test-util:with-test (:name :make-string-type-inference :fails-on :sbcl)
+(test-util:with-test (:name :make-string-type-inference)
   (let ((things (ctu:find-code-constants #'make-badbuf :type 'list)))
     (assert (not things))))

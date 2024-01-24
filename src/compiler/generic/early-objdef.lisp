@@ -196,7 +196,7 @@
   ratio-widetag                                   ;  0E   15       |
   single-float-widetag                            ;  12   19       |
   double-float-widetag                            ;  16   1D       | EQL-hash picks off this
-  complex-widetag                                 ;  1A   21       | range of widetags.
+  complex-rational-widetag                        ;  1A   21       | range of widetags.
   complex-single-float-widetag                    ;  1E   25       |
   complex-double-float-widetag                    ;  22   29       |
   ;; -- end of numeric widetags --                                 |
@@ -290,6 +290,14 @@
 ;;; on the heap.
 (defconstant no-tls-value-marker most-positive-word)
 
+(defmacro unbound-marker-bits ()
+  ;; By having unbound-marker-bits appear to be a valid pointer into static
+  ;; space, it admits some optimizations that might "dereference" the value
+  ;; before checking the widetag.
+  ;; Architectures other than x86-64 do not take that liberty.
+  #+x86-64 (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag)
+  #-x86-64 unbound-marker-widetag)
+
 ;;; Map each widetag symbol to a string to go in 'tagnames.h'.
 ;;; I didn't want to mess with the formatting of the table above.
 (defparameter *widetag-string-alist*
@@ -297,7 +305,7 @@
     (ratio-widetag "ratio")
     (single-float-widetag "sfloat")
     (double-float-widetag "dfloat")
-    (complex-widetag "cplxnum")
+    (complex-rational-widetag "cplxnum")
     (complex-single-float-widetag "cplx-sfloat")
     (complex-double-float-widetag "cplx-dfloat")
     (symbol-widetag "symbol")
@@ -370,7 +378,6 @@
 
 ;;; "extra" contain the following fields:
 ;;;  - generation number for immobile space (4 low bits of extra)
-;;;  - fullcgc mark bit (header bit index 31), not used by Lisp
 ;;;  - VISITED bit (header bit index 30) for weak vectors, not used by Lisp
 ;;;  - ALLOC-DYNAMIC-EXTENT (bit index 29), not used by lisp
 ;;;  - ALLOC-MIXED-REGION (bit index 28), not used by Lisp
@@ -433,11 +440,13 @@
 ;; Set if vector is weak. Weak hash tables have both this AND the hashing bit.
 (defconstant vector-weak-flag          #x01)
 
-;;; This header bit is set for symbols which were present in the pristine core.
-;;; The backend may emit different code when referencing such symbols.
-;;; For x86-64, symbols with this bit set may be assumed to have been
-;;; allocated in immobile space.
-(defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
+;;; A symbol that is "unlocked" is neither constant, nor global,
+;;; nor a global symbol-macro, nor in a locked package. Such symbols can be
+;;; bound by PROGV without calling ABOUT-TO-MODIFY-SYMBOL-VALUE, except in the
+;;; case where PROGV invokes UNBIND.
+;;; This is a mask tested against GET-HEADER-DATA, so skip over the payload size byte.
+(defconstant +symbol-fast-bindable+ #x100)
+(defconstant +symbol-initial-core+ #x200)
 
 ;;; Bit indices of the status bits in an INSTANCE header
 ;;; that implement lazily computed stable hash codes.
@@ -451,13 +460,12 @@
   #-sb-thread
   (defglobal function-layout 0))        ; set by genesis
 
-;;; MIXED-REGION is at the beginning of static space
-;;; Be sure to update "#define main_thread_mixed_region" etc
-;;; if these get changed.
+;;; These regions occupy the initial words of static space.
 #-sb-thread
-(progn (defconstant mixed-region static-space-start)
-       (defconstant cons-region (+ mixed-region (* 3 n-word-bytes)))
-       (defconstant boxed-region (+ cons-region (* 3 n-word-bytes))))
+(progn
+  (defconstant mixed-region-offset 0)
+  (defconstant cons-region-offset (* 3 n-word-bytes))
+  (defconstant boxed-region-offset (* 6 n-word-bytes)))
 
 #|
 ;; Run this in the SB-VM package once for each target feature combo.

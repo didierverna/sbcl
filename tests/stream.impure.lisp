@@ -31,16 +31,16 @@
 (assert (streamp *str*))
 (defclass astream (fundamental-output-stream) (x y))
 (with-test (:name :update-stream-layout)
-  (assert (sb-kernel:wrapper-invalid (sb-kernel:%instance-wrapper *str*)))
+  (assert (sb-kernel:layout-invalid (sb-kernel:%instance-layout *str*)))
   (assert (streamp *str*))
-  (assert (/= 0 (sb-kernel:wrapper-clos-hash (sb-kernel:%instance-wrapper *str*))))
+  (assert (/= 0 (sb-kernel:layout-clos-hash (sb-kernel:%instance-layout *str*))))
   (defclass astream () (x y))
-  (assert (sb-kernel:wrapper-invalid (sb-kernel:%instance-wrapper *str*)))
-  (assert (= 0 (sb-kernel:wrapper-clos-hash (sb-kernel:%instance-wrapper *str*))))
+  (assert (sb-kernel:layout-invalid (sb-kernel:%instance-layout *str*)))
+  (assert (= 0 (sb-kernel:layout-clos-hash (sb-kernel:%instance-layout *str*))))
   (assert (not (streamp *str*)))
-  (assert (/= 0 (sb-kernel:wrapper-clos-hash (sb-kernel:%instance-wrapper *str*))))
+  (assert (/= 0 (sb-kernel:layout-clos-hash (sb-kernel:%instance-layout *str*))))
   (defclass astream (fundamental-output-stream) (x y))
-  (assert (sb-kernel:wrapper-invalid (sb-kernel:%instance-wrapper *str*)))
+  (assert (sb-kernel:layout-invalid (sb-kernel:%instance-layout *str*)))
   (assert (streamp *str*)))
 
 ;;; type errors for inappropriate stream arguments, fixed in
@@ -182,7 +182,7 @@
 
 ;;; CLOSING a non-new streams should not delete them, and superseded
 ;;; files should be restored.
-(with-test (:name :test-file-for-close-should-not-delete :fails-on :win32)
+(with-test (:name :test-file-for-close-should-not-delete)
   (let ((test (scratch-file-name)))
     (macrolet ((test-mode (mode)
                           `(progn
@@ -814,7 +814,10 @@
                       (n-bin #'mock-fd-stream-n-bin-fun)
                       (cin-buffer
                        (make-array sb-impl::+ansi-stream-in-buffer-length+
-                                   :element-type 'character))))
+                                   :element-type 'character))
+                      (csize-buffer
+                       (make-array sb-impl::+ansi-stream-in-buffer-length+
+                                   :element-type '(unsigned-byte 8)))))
   buffer-chain)
 
 (defun make-mock-fd-stream (buffer-chain)
@@ -822,13 +825,14 @@
   (%make-mock-fd-stream
    (mapcar (lambda (x) (substitute #\Newline #\| x)) buffer-chain)))
 
-(defun mock-fd-stream-n-bin-fun (stream char-buf start count eof-err-p)
+(defun mock-fd-stream-n-bin-fun (stream char-buf size-buf start count eof-err-p)
   (cond ((mock-fd-stream-buffer-chain stream)
          (let* ((chars (pop (mock-fd-stream-buffer-chain stream)))
                 (n-chars (length chars)))
            ;; make sure the mock object is being used as expected.
            (assert (>= count (length chars)))
            (replace char-buf chars :start1 start)
+           (fill size-buf 1 :start start :end (+ start n-chars))
            n-chars))
         (t
          (sb-impl::eof-or-lose stream eof-err-p 0))))

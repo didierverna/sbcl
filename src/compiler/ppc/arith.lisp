@@ -395,7 +395,6 @@
 (!define-var-binop + 4 add)
 (!define-var-binop - 4 sub)
 (!define-var-binop logand 2 and)
-(!define-var-binop logandc1 2 andc t)
 (!define-var-binop logandc2 2 andc)
 (!define-var-binop logior 2 or)
 (!define-var-binop logorc1 2 orc t t)
@@ -416,6 +415,23 @@
 (!define-const-logop logand 2 andi.)
 (!define-const-logop logior 2 ori oris)
 (!define-const-logop logxor 2 xori xoris)
+
+(define-vop (fast-logandc2/unsigned-signed=>unsigned fast-logandc2/unsigned=>unsigned)
+  (:args (x :scs (unsigned-reg))
+         (y :scs (signed-reg)))
+  (:arg-types unsigned-num signed-num))
+
+(define-vop (fast-logand/signed-unsigned=>unsigned fast-logand/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r)
+         (y :scs (unsigned-reg) :target r))
+  (:arg-types signed-num unsigned-num))
+
+(define-vop (fast-logand-c/signed-unsigned=>unsigned fast-logand-c/unsigned=>unsigned)
+  (:args (x :scs (signed-reg) :target r))
+  (:arg-types signed-num (:constant (eql #.most-positive-word)))
+  (:ignore y)
+  (:generator 1
+    (move r x)))
 
 (define-vop (fast-*/fixnum=>fixnum fast-fixnum-binop)
   (:temporary (:scs (non-descriptor-reg)) temp)
@@ -567,6 +583,38 @@
              (let ((amount (min 31 (- amount))))
                (inst srawi result number amount))
              (inst slwi result number amount)))))))
+
+(define-vop (fast-%ash/right/unsigned)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (unsigned-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 1
+    (inst srw result number amount)))
+
+(define-vop (fast-%ash/right/signed)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (signed-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types signed-num unsigned-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 1
+    (inst sraw result number amount)))
+
+(define-vop (fast-%ash/right/fixnum)
+  (:translate %ash/right)
+  (:policy :fast-safe)
+  (:args (number :scs (any-reg)) (amount :scs (unsigned-reg)))
+  (:arg-types tagged-num unsigned-num)
+  (:results (result :scs (any-reg)))
+  (:result-types tagged-num)
+  (:temporary (:sc signed-reg) temp)
+  (:generator 2
+    (inst sraw temp number amount)
+    (inst clrrwi result temp n-fixnum-tag-bits)))
 
 (define-vop (signed-byte-32-len)
   (:translate integer-length)
@@ -730,7 +778,6 @@
   (define-modular-backend logeqv)
   (define-modular-backend lognand)
   (define-modular-backend lognor)
-  (define-modular-backend logandc1)
   (define-modular-backend logandc2)
   (define-modular-backend logorc1)
   (define-modular-backend logorc2))
@@ -1148,19 +1195,6 @@
     (inst lr mask fixnum-tag-mask)
     (inst andc hi temp mask)))
 
-(define-vop (bignum-lognot lognot-mod32/unsigned=>unsigned)
-  (:translate sb-bignum:%lognot))
-
-(define-vop (fixnum-to-digit)
-  (:translate sb-bignum:%fixnum-to-digit)
-  (:policy :fast-safe)
-  (:args (fixnum :scs (any-reg)))
-  (:arg-types tagged-num)
-  (:results (digit :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 1
-    (inst srawi digit fixnum n-fixnum-tag-bits)))
-
 (define-vop (bignum-floor)
   (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
@@ -1232,6 +1266,20 @@
   (:translate sb-bignum:%ashl)
   (:generator 1
     (inst slw result digit count)))
+
+(define-vop ()
+  (:translate fastrem-32)
+  (:policy :fast-safe)
+  (:args (dividend :scs (unsigned-reg))
+         (c :scs (unsigned-reg))
+         (divisor :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num unsigned-num)
+  (:results (remainder :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 10
+    (inst mullw temp dividend c)
+    (inst mulhwu remainder temp divisor)))
 
 (in-package "SB-C")
 

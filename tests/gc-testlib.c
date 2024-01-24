@@ -3,9 +3,10 @@
  * or update_writeprotection() */
 
 #include <stdio.h>
-#include "sbcl.h"
-#include "gc-internal.h"
-#include "gc-private.h"
+#include "genesis/sbcl.h"
+#include "gc.h"
+#include "genesis/instance.h"
+#include "thread.h"
 
 extern struct generation generations[];
 extern os_vm_size_t bytes_allocated;

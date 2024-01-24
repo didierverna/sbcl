@@ -25,7 +25,7 @@
 
 (defun guess-alignment (bits)
   (cond ((null bits) nil)
-        #-(and x86 (not win32)) ((> bits 32) 64)
+        #-(or (and x86 (not win32)) (and ppc darwin)) ((> bits 32) 64)
         ((> bits 16) 32)
         ((> bits 8) 16)
         ((> bits 1) 8)
@@ -1432,7 +1432,7 @@
          ;; Only pin things on GENCGC, since on CHENEYGC it'd imply
          ;; disabling the GC.  Which is something we don't want to do
          ;; every time we're calling to C.
-         #+gencgc
+         #-cheneygc
          (loop for variable in variables
             for type in types
             when (invoke-alien-type-method :deport-pin-p type)
@@ -1570,6 +1570,8 @@
 (defun single-float-type () (parse-alien-type 'single-float nil))
 (defun double-float-type () (parse-alien-type 'double-float nil))
 (defun sap-type () (parse-alien-type 'system-area-pointer nil))
+
+(declaim (freeze-type alien-type))
 
 ;;; Genesis is limited in its ability to patch load-time-values into objects
 ;;; other than code components. For this reason we want to emit a single sexpr

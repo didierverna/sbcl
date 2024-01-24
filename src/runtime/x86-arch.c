@@ -11,23 +11,22 @@
 
 #include <stdio.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "validate.h"
 #include "os.h"
 #include "arch.h"
 #include "lispregs.h"
-#include "alloc.h"
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
-#include "forwarding-ptr.h"
+#include "gc.h"
 #include "var-io.h"
 #include "code.h"
-#include "unaligned.h"
+#include "align.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
@@ -53,15 +52,16 @@ arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
  * want to get to, and on OS, which determines how we get to it.)
  */
 
-void visit_context_registers(void (*proc)(os_context_register_t,int), os_context_t *context)
+void visit_context_registers(void (*proc)(os_context_register_t,void*),
+                             os_context_t *context, void* arg)
 {
-    proc(os_context_pc(context), 1);
-    proc(*os_context_register_addr(context,reg_EAX), 1);
-    proc(*os_context_register_addr(context,reg_ECX), 1);
-    proc(*os_context_register_addr(context,reg_EDX), 1);
-    proc(*os_context_register_addr(context,reg_EBX), 1);
-    proc(*os_context_register_addr(context,reg_ESI), 1);
-    proc(*os_context_register_addr(context,reg_EDI), 1);
+    proc(os_context_pc(context), arg);
+    proc(*os_context_register_addr(context,reg_EAX), arg);
+    proc(*os_context_register_addr(context,reg_ECX), arg);
+    proc(*os_context_register_addr(context,reg_EDX), arg);
+    proc(*os_context_register_addr(context,reg_EBX), arg);
+    proc(*os_context_register_addr(context,reg_ESI), arg);
+    proc(*os_context_register_addr(context,reg_EDI), arg);
 }
 
 int *
@@ -80,6 +80,8 @@ os_context_flags_addr(os_context_t *context)
     return &context->uc_mcontext.mc_eflags;
 #elif defined __OpenBSD__
     return &context->sc_eflags;
+#elif defined LISP_FEATURE_DARWIN
+    return (int *)(&context->uc_mcontext->SS.EFLAGS);
 #elif defined __NetBSD__
     return &(context->uc_mcontext.__gregs[_REG_EFL]);
 #elif defined LISP_FEATURE_WIN32
@@ -127,8 +129,6 @@ void arch_skip_instruction(os_context_t *context)
             break;
         }
 
-    FSHOW((stderr,
-           "/[arch_skip_inst resuming at %x]\n", OS_CONTEXT_PC(context)));
 }
 
 unsigned char *
@@ -137,23 +137,15 @@ arch_internal_error_arguments(os_context_t *context)
     return 1 + (unsigned char *)(OS_CONTEXT_PC(context));
 }
 
-boolean
-arch_pseudo_atomic_atomic(os_context_t *context)
-{
-    return get_pseudo_atomic_atomic(get_sb_vm_thread());
+bool arch_pseudo_atomic_atomic(struct thread *thread) {
+    return get_pseudo_atomic_atomic(thread);
 }
 
-void
-arch_set_pseudo_atomic_interrupted(os_context_t *context)
-{
-    struct thread *thread = get_sb_vm_thread();
+void arch_set_pseudo_atomic_interrupted(struct thread *thread) {
     set_pseudo_atomic_interrupted(thread);
 }
 
-void
-arch_clear_pseudo_atomic_interrupted(os_context_t *context)
-{
-    struct thread *thread = get_sb_vm_thread();
+void arch_clear_pseudo_atomic_interrupted(struct thread *thread) {
     clear_pseudo_atomic_interrupted(thread);
 }
 
@@ -330,18 +322,9 @@ arch_install_interrupt_handlers()
 void
 gencgc_apply_code_fixups(struct code *old_code, struct code *new_code)
 {
-    lispobj fixups = new_code->fixups;
+    lispobj fixups = barrier_load(&new_code->fixups);
     /* It will be a nonzero integer if valid, or 0 if there are no fixups */
     if (!fixups) return;
-
-    /* Could be pointing to a forwarding pointer. */
-    /* This is extremely unlikely, because the only referent of the fixups
-       is usually the code itself; so scavenging a bignum of fixups won't occur
-       until after the code object is known to be live. As we're just now
-       enlivening the code, the fixups shouldn't have been forwarded.
-       Maybe the bignum is otherwise referenced though ... */
-    if (is_lisp_pointer(fixups) && forwarding_pointer_p(native_pointer(fixups)))
-        fixups = forwarding_pointer_value(native_pointer(fixups));
 
     char* code_start_addr = code_text_start(new_code);
     os_vm_size_t displacement = (char*)new_code - (char*)old_code;

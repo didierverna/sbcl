@@ -97,7 +97,7 @@ EOF
 m_arg=`run_sbcl --eval '(progn #+sb-core-compression (princ " -lzstd") #+x86 (princ " -m32"))' --quit`
 
 (cd $SBCL_PWD/../src/runtime ; rm -f libsbcl.a; make libsbcl.a)
-run_sbcl --script ../tools-for-build/editcore.lisp split \
+run_sbcl --script ../tools-for-build/elftool.lisp split \
   ${tmpcore} $TEST_DIRECTORY/elfcore-test.s
 # I guess we're going to have to hardwire the system libraries
 # until I can figure out how to get a Makefile to work, which is fine
@@ -105,7 +105,7 @@ run_sbcl --script ../tools-for-build/editcore.lisp split \
 ./run-compiler.sh -no-pie -g -o $TEST_DIRECTORY/elfcore-test \
   $TEST_DIRECTORY/elfcore-test.s \
   $TEST_DIRECTORY/elfcore-test-core.o \
-  $SBCL_PWD/../src/runtime/libsbcl.a -ldl -lm -lpthread ${m_arg}
+  $SBCL_PWD/../src/runtime/libsbcl.a -lm -lpthread ${m_arg}
 
 $TEST_DIRECTORY/elfcore-test $SBCL_ARGS --eval '(assert (zerop (f 1 2 3)))' --quit
 echo Custom core: PASS
@@ -114,7 +114,7 @@ echo Custom core: PASS
   $TEST_DIRECTORY/elfcore-test.s \
   $TEST_DIRECTORY/elfcore-test-core.o \
   $SBCL_PWD/../tests/heap-reloc/fake-mman.c \
-  $SBCL_PWD/../src/runtime/libsbcl.a -ldl -lm -lpthread ${m_arg}
+  $SBCL_PWD/../src/runtime/libsbcl.a -lm -lpthread ${m_arg}
 
 (cd $SBCL_PWD/../src/runtime ; rm -f libsbcl.a)
 

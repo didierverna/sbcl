@@ -55,7 +55,8 @@
 (defun make-effective-method-function1 (generic-function form
                                         method-alist-p wrappers-p)
   (if (and (listp form)
-           (eq (car form) 'call-method))
+           (eq (car form) 'call-method)
+           (not (gf-requires-emf-keyword-checks generic-function)))
       (make-effective-method-function-simple generic-function form)
       ;; We have some sort of `real' effective method. Go off and get a
       ;; compiled function for it. Most of the real hair here is done by
@@ -271,8 +272,6 @@
   (multiple-value-bind (nreq applyp)
       (get-generic-fun-info gf)
     (let ((ll (make-fast-method-call-lambda-list nreq applyp))
-          (error-p (or (eq (first effective-method) '%no-primary-method)
-                       (eq (first effective-method) '%invalid-qualifiers)))
           (mc-args-p
            (when (eq **boot-state** 'complete)
              ;; Otherwise the METHOD-COMBINATION slot is not bound.
@@ -281,16 +280,6 @@
                     (long-method-combination-%args-lambda-list combin)))))
           (name `(emf ,(generic-function-name gf))))
       (cond
-        (error-p
-         `(named-lambda ,name (.pv. .next-method-call. &rest .args.)
-            (declare (ignore .pv. .next-method-call.))
-            (declare (ignorable .args.))
-            (flet ((%no-primary-method (gf args)
-                     (call-no-primary-method gf args))
-                   (%invalid-qualifiers (gf combin method)
-                     (invalid-qualifiers gf combin method)))
-              (declare (ignorable #'%no-primary-method #'%invalid-qualifiers))
-              ,effective-method)))
         (mc-args-p
          (let* ((required (make-dfun-required-args nreq))
                 (gf-args (if applyp
@@ -307,7 +296,9 @@
                 ,effective-method))))
         (t
          `(named-lambda ,name ,ll
-            (declare (ignore ,@(if error-p ll '(.pv. .next-method-call.))))
+            (declare (ignore .pv. .next-method-call.))
+            (declare (ignorable ,@(make-dfun-required-args nreq)
+                                ,@(when applyp '(.dfun-more-context. .dfun-more-count.))))
             ,effective-method))))))
 
 (defun expand-emf-call-method (gf form metatypes applyp env)
@@ -342,7 +333,6 @@
             generic-function form method-alist-p wrappers-p)
        (fast-method-call '.fast-call-method-list.)
        (t '.call-method-list.)))
-    (check-applicable-keywords 'check-applicable-keywords)
     (t (default-test-converter form))))
 
 ;;; CMUCL comment (2003-10-15):
@@ -368,12 +358,6 @@
        (values `(dolist (emf ,gensym nil)
                  ,(make-emf-call (length metatypes) applyp 'emf type))
                (list gensym))))
-    (check-applicable-keywords
-     (values `(check-applicable-keywords .keyargs-start.
-                                         .valid-keys.
-                                         .dfun-more-context.
-                                         .dfun-more-count.)
-             '()))
     (t
      (default-code-converter form))))
 
@@ -389,8 +373,6 @@
                            (make-effective-method-function-simple
                             generic-function form))
                          (cdr form)))))
-    (check-applicable-keywords
-     '())
     (t
      (default-constant-converter form))))
 
@@ -456,20 +438,35 @@
 (defun standard-compute-effective-method
     (generic-function combin applicable-methods)
   (collect ((before) (primary) (after) (around))
-    (flet ((invalid (gf combin m) (invalid-qualifiers gf combin m)))
+    (flet ((invalid (method)
+             (return-from standard-compute-effective-method
+               `(invalid-qualifiers ',generic-function ',combin ',method))))
       (dolist (m applicable-methods)
         (let ((qualifiers (if (listp m)
                               (early-method-qualifiers m)
                               (safe-method-qualifiers m))))
           (cond
             ((null qualifiers) (primary m))
-            ((cdr qualifiers) (invalid generic-function combin m))
+            ((cdr qualifiers) (invalid m))
             ((eq (car qualifiers) :around) (around m))
             ((eq (car qualifiers) :before) (before m))
             ((eq (car qualifiers) :after) (after m))
-            (t (invalid generic-function combin m))))))
-    (cond ((null (primary))
-           `(%no-primary-method ',generic-function .args.))
+            (t (invalid m))))))
+    (cond ((null applicable-methods)
+           ;; APPLICABLE-METHODS is normally non-null in effective
+           ;; method computation, but COMPUTE-APPLICABLE-METHODS can
+           ;; in principle be called by MetaObject Protocol programmers.
+           `(method-combination-error
+             "No applicable method found for ~S"
+             ',generic-function))
+          ((null (primary))
+           ;; PCL checks for no primary method before method
+           ;; combination, but a MetaObject Protocol programmer could
+           ;; call COMPUTE-EFFECTIVE-METHOD themselves and end up
+           ;; here.
+           `(method-combination-error
+             "No primary method found for ~S among applicable methods: ~S"
+             ',generic-function (list ,@(mapcar (lambda (m) `(quote ,m)) applicable-methods))))
           ((and (null (before)) (null (after)) (null (around)))
            ;; By returning a single call-method `form' here we enable
            ;; an important implementation-specific optimization; that
@@ -481,17 +478,12 @@
            ;; perform this checking in fast-method-functions given
            ;; that they are not solely used for effective method
            ;; functions, but also in combination, when they should not
-           ;; perform argument checks.
-           (let ((call-method
-                  `(call-method ,(first (primary)) ,(rest (primary)))))
-             (if (gf-requires-emf-keyword-checks generic-function)
-                 (multiple-value-bind (valid-keys keyargs-start)
-                     (compute-applicable-keywords generic-function applicable-methods)
-                   `(let ((.valid-keys. ',valid-keys)
-                          (.keyargs-start. ',keyargs-start))
-                      (check-applicable-keywords)
-                      ,call-method))
-                 call-method)))
+           ;; perform argument checks.  We still return the bare
+           ;; CALL-METHOD, but the caller is responsible for ensuring
+           ;; that keyword applicability is checked if this is a fast
+           ;; method function used in an effective method.  (See
+           ;; WRAP-WITH-APPLICABLE-KEYWORD-CHECK below).
+           `(call-method ,(first (primary)) ,(rest (primary))))
           (t
            (let ((main-effective-method
                    (if (or (before) (after))
@@ -522,18 +514,18 @@
         (order (car (method-combination-options combin)))
         (around ())
         (primary ()))
-    (flet ((invalid (gf combin m)
+    (flet ((invalid (method)
              (return-from short-compute-effective-method
-               `(%invalid-qualifiers ',gf ',combin ',m))))
+               `(invalid-qualifiers ',generic-function ',combin ',method))))
       (dolist (m applicable-methods)
         (let ((qualifiers (method-qualifiers m)))
-          (cond ((null qualifiers) (invalid generic-function combin m))
-                ((cdr qualifiers) (invalid generic-function combin m))
+          (cond ((null qualifiers) (invalid m))
+                ((cdr qualifiers) (invalid m))
                 ((eq (car qualifiers) :around)
                  (push m around))
                 ((eq (car qualifiers) type-name)
                  (push m primary))
-                (t (invalid generic-function combin m))))))
+                (t (invalid m))))))
     (setq around (nreverse around))
     (ecase order
       (:most-specific-last) ; nothing to be done, already in correct order
@@ -545,34 +537,21 @@
                 `(call-method ,(car primary) ())
                 `(,operator ,@(mapcar (lambda (m) `(call-method ,m ()))
                                       primary)))))
-      (cond ((null primary)
-             ;; As of sbcl-0.8.0.80 we don't seem to need to do
-             ;; anything messy like
-             ;;        `(APPLY (FUNCTION (IF AROUND
-             ;;                              'NO-PRIMARY-METHOD
-             ;;                              'NO-APPLICABLE-METHOD)
-             ;;                           ',GENERIC-FUNCTION
-             ;;                           .ARGS.)
-             ;; here because (for reasons I don't understand at the
-             ;; moment -- WHN) control will never reach here if there
-             ;; are no applicable methods, but instead end up
-             ;; in NO-APPLICABLE-METHODS first.
-             ;;
-             ;; FIXME: The way that we arrange for .ARGS. to be bound
-             ;; here seems weird. We rely on EXPAND-EFFECTIVE-METHOD-FUNCTION
-             ;; recognizing any form whose operator is %NO-PRIMARY-METHOD
-             ;; as magical, and carefully surrounding it with a
-             ;; LAMBDA form which binds .ARGS. But...
-             ;;   1. That seems fragile, because the magicalness of
-             ;;      %NO-PRIMARY-METHOD forms is scattered around
-             ;;      the system. So it could easily be broken by
-             ;;      locally-plausible maintenance changes like,
-             ;;      e.g., using the APPLY expression above.
-             ;;   2. That seems buggy w.r.t. to MOPpish tricks in
-             ;;      user code, e.g.
-             ;;         (DEFMETHOD COMPUTE-EFFECTIVE-METHOD :AROUND (...)
-             ;;           `(PROGN ,(CALL-NEXT-METHOD) (INCF *MY-CTR*)))
-             `(%no-primary-method ',generic-function .args.))
+      (cond ((null applicable-methods)
+             ;; APPLICABLE-METHODS is normally non-null in effective
+             ;; method computation, but COMPUTE-APPLICABLE-METHODS can
+             ;; in principle be called by MetaObject Protocol programmers.
+             `(method-combination-error
+               "No applicable method found for ~S"
+               ',generic-function))
+            ((null primary)
+             ;; PCL checks for no primary method before method
+             ;; combination, but a MetaObject Protocol programmer could
+             ;; call COMPUTE-EFFECTIVE-METHOD themselves and end up
+             ;; here.
+             `(method-combination-error
+               "No primary method found for ~S among applicable methods: ~S"
+               ',generic-function (list ,@(mapcar (lambda (m) `(quote ,m)) applicable-methods))))
             ((null around) main-method)
             (t
              `(call-method ,(car around)
@@ -589,7 +568,7 @@
                  (setq any-keyp t))
                (values nopt (ll-kwds-allowp llks) keys))))
       (multiple-value-bind (nopt allowp keys)
-          (analyze (generic-function-lambda-list gf))
+          (analyze (gf-lambda-list gf))
         (dolist (method methods)
           (let ((ll (if (consp method)
                         (early-method-lambda-list method)
@@ -636,6 +615,13 @@
                ((eq t valid-keys))
                ((not (memq key valid-keys)) (invalid key))))
            (incf i))))))
+
+(defun wrap-with-applicable-keyword-check (effective valid-keys keyargs-start)
+  `(let ((.valid-keys. ',valid-keys)
+         (.keyargs-start. ',keyargs-start))
+     (check-applicable-keywords
+      .keyargs-start. .valid-keys. .dfun-more-context. .dfun-more-count.)
+     ,effective))
 
 ;;;; the STANDARD method combination type. This is coded by hand
 ;;;; (rather than with DEFINE-METHOD-COMBINATION) for bootstrapping
@@ -654,15 +640,20 @@
                                      combin
                                      applicable-methods))
 
+;;; not INVALID-METHOD-ERROR as that would violate CLHS 11.1.2.1.1
+(define-condition invalid-method-program-error (program-error simple-condition)
+  ())
 (defun invalid-method-error (method format-control &rest format-arguments)
   (let ((sb-debug:*stack-top-hint* (find-caller-frame)))
-    (error "~@<invalid method error for ~2I~_~S ~I~_method: ~2I~_~?~:>"
-           method
-           format-control
-           format-arguments)))
+    (error 'invalid-method-program-error
+           :format-control "~@<invalid method error for ~2I~_~S ~I~_method: ~2I~_~?~:>"
+           :format-arguments (list method format-control format-arguments))))
 
+;;; not METHOD-COMBINATION-ERROR as that would violate CLHS 11.1.2.1.1
+(define-condition method-combination-program-error (program-error simple-condition)
+  ())
 (defun method-combination-error (format-control &rest format-arguments)
   (let ((sb-debug:*stack-top-hint* (find-caller-frame)))
-    (error "~@<method combination error in CLOS dispatch: ~2I~_~?~:>"
-           format-control
-           format-arguments)))
+    (error 'method-combination-program-error
+           :format-control "~@<method combination error in CLOS dispatch: ~2I~_~?~:>"
+           :format-arguments (list format-control format-arguments))))

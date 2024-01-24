@@ -223,7 +223,9 @@
          ;; dynamic-space-free-pointer increments only when a page is full.
          ;; Using mixed_region directly is finer-grained.
          #+(and (not sb-thread) gencgc)
-         (sb-sys:sap-ref-word (sb-sys:int-sap sb-vm::mixed-region) 0)))
+         (sb-sys:sap-ref-word (sb-sys:int-sap (+ sb-vm::static-space-start
+                                                 sb-vm::mixed-region-offset))
+                              0)))
     ;; counter should increase by 1 for each cons cell allocated
     (ash word (- (1+ sb-vm:word-shift)))))
 ;;; Return some bits that are dependent on the next address that will be
@@ -671,7 +673,7 @@
          ;; Inherited slots are mixed in by calling the supertype's hash function.
          (hashed-slots
           (mapcan (lambda (slot &aux (type (getf (cddr slot) :type))
-                                     (hasher (getf (cddr slot) :hasher 'clipped-sxhash))
+                                     (hasher (getf (cddr slot) :hasher :fail))
                                      (comparator (getf (cddr slot) :test)))
                     (cond ((or comparator (null hasher))) ; ok
                           ((eq type 'ctype)
@@ -679,7 +681,9 @@
                           ((or (and (typep type '(cons (eql member)))
                                     (every #'symbolp (cdr type)))
                                (eq type 'boolean))
-                           (setq comparator 'eq))
+                           (setq comparator 'eq)
+                           (when (eq type 'boolean)
+                             (setq hasher '(lambda (x) (if x #xaa55aa #x55aa55)))))
                           (t (bug "Underspecified slot: ~S.~S type ~S~%"
                                   name (car slot) type)))
                     (when hasher (list (vector (car slot) hasher comparator))))
@@ -701,9 +705,9 @@
                    direct-slots))
        ;; Always define hash-consing functions if any new slots, even if abstract.
        ,@(when direct-slots
-           (let ((hashfn (symbolicate "CALC-" name "-HASH"))
-                 (compare (symbolicate name "-EQUIV")))
-             `((defun ,hashfn (x)
+           (let
+            ((functions
+             `((defun ,(symbolicate "CALC-" name "-HASH") (x)
                  #-sb-xc-host (declare (optimize (safety 0)))
                  (,(if (assoc :extra-mix-step options) 'type-hash-final-mix 'progn)
                   (type-hash-mix
@@ -712,13 +716,14 @@
                                                  (symbolicate conc-name (svref slot 0))))
                                `(,(svref slot 1) (,reader x)))
                              hashed-slots))))
-               (defun ,compare (a b)
+               (defun ,(symbolicate name "-EQUIV") (a b)
                  #-sb-xc-host (declare (optimize (safety 0)))
                  (and ,@(mapcar (lambda (slot &aux (reader
                                                     (symbolicate conc-name (svref slot 0))))
                                   `(,(elt slot 2) (,reader a) (,reader b)))
                                 hashed-slots)
                       ,@(when include `((,(symbolicate include "-EQUIV") a b))))))))
+             functions))
        ;; Define a hashset unless this is an abstract type
        ,@(unless (member name '(compound-type args-type))
            (let* ((stem (if direct-slots name include))
@@ -743,30 +748,49 @@
                              (array-type '(type-flags element-type)))
                           ,@(cdr private-ctor-args))))))))
 
-;;; The "clipped hash" is just some stable hash that may rely on the host's SXHASH
-;;; but always ensuring that the result is an unsigned fixnum for the target,
-;;; so that we can call our MIX on the value. It's needlessly tedious to fully
-;;; replicate our SXHASH on BIGNUM and RATIO which can appear in numeric bounds.
-#+sb-xc-host
-(defun clipped-sxhash (x)
-  (typecase x
-    (rational ; numeric-type high,low bound; array dimensions, etc
-     ;; All integers can fall through to the host because it would be silly to restrict
-     ;; this case to exactly (OR (AND INTEGER (NOT SB-XC:FIXNUM)) RATIO).
-     (logand (cl:sxhash x) sb-xc:most-positive-fixnum))
-    (cons
-     (if (eq (car x) 'satisfies)
-         (sb-xc:sxhash (cadr x)) ; it's good enough
-         (error "please no: ~S" x)))
-    (t
-     (sb-xc:sxhash x)))) ; FLOAT representation as struct, or SYMBOL
-#-sb-xc-host (defmacro clipped-sxhash (x) `(sxhash ,x))
-
 (defmacro type-hash-mix (&rest args) (reduce (lambda (a b) `(mix ,a ,b)) args))
 ;;; The final mix ensures that all bits affect the masked hash.
 ;;; Since it takes non-zero time, only do it for NUMERIC and ARRAY, where it seems
 ;;; to make a large difference in the maximum probe sequence length.
 (defmacro type-hash-final-mix (val) `(murmur-hash-word/+fixnum ,val))
+
+;;; The fallback hashing functions might rely on the host's SXHASH but always
+;;; return an SB-XC:FIXNUM result so that we can call our MIX on the value.
+;;; It turns out that we have to largely reimplement numeric hashing because
+;;; some hosts produce sufficiently poor hashes that our type hashsets would explode
+;;; in size due to so many collisions were we to use the host's SXHASH.
+#+sb-xc-host
+(progn
+(defun number-hash (x) ; this does *not* have to match SB-IMPL::NUMBER-SXHASH
+  (etypecase x
+    (integer
+     (if (typep x 'sb-xc:fixnum)
+         (sb-xc:sxhash x)
+         ;; mix target-fixnum-sized chunks
+         (let ((nbits (1+ (integer-length x))) (h #xbbbb) (pos 0))
+           (dotimes (i (ceiling nbits sb-vm:n-positive-fixnum-bits) h)
+             (let ((chunk (ldb (byte sb-vm:n-positive-fixnum-bits pos) x)))
+               (setf h (mix (number-hash chunk) h)))
+             (incf pos sb-vm:n-positive-fixnum-bits)))))
+    (ratio (mix (number-hash (numerator x)) (number-hash (denominator x))))
+    (single-float (number-hash (single-float-bits x)))
+    (double-float (mix (number-hash (double-float-low-bits x))
+                       (number-hash (double-float-high-bits x))))))
+(defun fallback-hash (x)
+  ;; This is used on a HAIRY specifier which could be an UNKNOWN (just a symbol), or a SATISFIES.
+  (etypecase x
+    (symbol
+     ;; There is no reason at all that two distinct symbols should hash the same when their
+     ;; names are STRING= so really we want something better than SXHASH, but it'll do.
+     (sb-xc:sxhash x))
+    (cons (if (eq (car x) 'satisfies)
+              (sb-xc:sxhash (cadr x)) ; it's good enough
+              (error "please no: ~S" x))))))
+
+#-sb-xc-host
+(progn
+  (defmacro number-hash (x) `(sb-impl::number-sxhash ,x))
+  (defmacro fallback-hash (x) `(sxhash ,x)))
 
 ;; Singleton MEMBER types are best dealt with via a weak-value hash-table because:
 ;; * (MEMBER THING) might lack an address-insensitive hash for THING
@@ -831,7 +855,7 @@
     ;; COPY-CTYPE can copy subparts like the numeric bound if arena-allocated
     #-sb-xc-host
     `(let ((temp (,allocator (logior ,flag-bits ,class-bits) ,@initargs)))
-       (declare (truly-dynamic-extent temp))
+       (declare (dynamic-extent temp))
        #+nil ; or #+sb-devel as you see fit
        (unless *hashsets-preloaded*
          (write-string "CTYPE hashset preload failure")
@@ -874,7 +898,7 @@
   ;; is that apparently we'll store _illegal_ type specifiers in a hairy-type.
   ;; There's an example in the regression test named
   ;;  :single-warning-for-single-undefined-type
-  (specifier nil :type t :test equal))
+  (specifier nil :type t :test equal :hasher fallback-hash))
 
 (macrolet ((hash-fp-zeros (x) ; order-insensitive
              `(let ((h 0))
@@ -921,7 +945,8 @@
   ;; is unspecified, it is *.
   (dimensions '* :type (or list (eql *)) :test equal :hasher hash-dims)
   ;; Is this not a simple array type? (:MAYBE means that we don't know.)
-  (complexp :maybe :type (member t nil :maybe))
+  (complexp :maybe :type (member t nil :maybe)
+            :hasher (lambda (s) (case s (:maybe #36rMAYBE) ((nil) #xffff) (t 1))))
   ;; the element type as originally specified
   (element-type nil :type ctype)
   ;; the element type as it is specialized in this implementation
@@ -1077,17 +1102,13 @@
 
 (macrolet ((numbound-hash (b)
              ;; It doesn't matter what the hash of a number is, as long as it's stable.
-             ;; Use the host's SXHASH for convenience.
-             ;; We aren't obliged to fully emulate own behavior on numbers,
-             ;; but we can't trust the host to do the right thing on our proxy floats.
              `(let ((x ,b))
                 (block nil
                   (multiple-value-bind (h v)
                       (if (listp x)
                           (if x (values #x55AA55 (car x)) (return 0))
                           (values 0 x))
-                    (logxor h (#+sb-xc-host clipped-sxhash
-                               #-sb-xc-host sb-impl::number-sxhash v))))))
+                    (logxor h (number-hash v))))))
            (numbound-eql (a b)
              ;; Determine whether the 'low' and 'high' slots of two NUMERIC-TYPE instances
              ;; are "the same". It is a stricter test than in the SIMPLE-= method, because
@@ -1156,11 +1177,8 @@
        (eq (key-info-type a) (key-info-type b))))
 (defun key-info-hash (x)
   (declare (optimize (safety 0)))
-  (#+sb-xc-host progn
-   #-sb-xc-host murmur-hash-word/fixnum ; scramble some more
-   (mix (#+sb-xc-host sb-impl::symbol-name-hash #-sb-xc-host sxhash (key-info-name x))
-        ;; MIX requires positive fixnums
-        (logand (type-hash-value (key-info-type x)) sb-xc:most-positive-fixnum))))
+  (murmur-hash-word/+fixnum
+   (mix (type-hash-value (key-info-type x)) (sb-xc:sxhash (key-info-name x)))))
 
 (defun hash-key-info-set (set) ; order-insensitive
   (declare (optimize (safety 0)))
@@ -1237,7 +1255,7 @@
 (def-type-model (simd-pack-type
                  (:constructor* %make-simd-pack-type (tag-mask)))
   (tag-mask (missing-arg) ; bitmask over possible simd-pack-tag values
-   :test =
+   :test = :hasher identity ; the tag-mask is its own hash
    :type (and (unsigned-byte #.(length +simd-pack-element-types+))
               (not (eql 0)))))
 
@@ -1245,7 +1263,7 @@
 (def-type-model (simd-pack-256-type
                  (:constructor* %make-simd-pack-256-type (tag-mask)))
   (tag-mask (missing-arg)
-   :test =
+   :test = :hasher identity ; the tag-mask is its own hash
    :type (and (unsigned-byte #.(length +simd-pack-element-types+))
               (not (eql 0)))))
 
@@ -1340,64 +1358,6 @@
                       (symbol-value symbol))
               caches)))
       (display caches))))
-
-#-sb-xc-host
-(progn
-(defglobal *!initial-ctypes* nil)
-(defun preload-ctype-hashsets ()
-  (dolist (pair (nreverse *!initial-ctypes*))
-    (let ((instance (car pair))
-          (container (symbol-value (cdr pair))))
-      (cond ((hash-table-p container)
-             (aver (member-type-p instance))
-             ;; As of this writing there are only two EQL types to preload:
-             ;; one is in the IR1-transform of FORMAT with stream (EQL T),
-             ;; the other is CHECK-ARG-TYPE looking for (EQL DUMMY) type.
-             (let ((key (first (member-type-members instance))))
-               (aver (not (gethash key container)))
-               (setf (gethash key container) instance)))
-            (t
-             (aver (not (hashset-find container instance))) ; instances are built bottom-up
-             (hashset-insert container instance)))
-      (labels ((ensure-interned-list (list hashset)
-                 (let ((found (hashset-find hashset list)))
-                   (when (and found (neq found list))
-                     (bug "genesis failed to uniquify list-of-ctype in ~X"
-                          (get-lisp-obj-address instance)))
-                   (when (and list (not found))
-                     (hashset-insert hashset list)))
-                 (mapc #'check list))
-               ;; Assert that looking for SUBPART finds nothing or finds itself
-               (check (subpart &aux (hashset-symbol (ctype->hashset-sym subpart)))
-                 (when hashset-symbol
-                   (let* ((hashset (symbol-value hashset-symbol))
-                          (found (hashset-find hashset subpart)))
-                     (when (and found (neq found subpart))
-                       (bug "genesis dumped bad instance within ~X"
-                            (get-lisp-obj-address instance)))))))
-        (etypecase instance
-          ((or numeric-type member-type character-set-type ; nothing extra to do
-           #+sb-simd-pack simd-pack-type #+sb-simd-pack-256 simd-pack-256-type
-           hairy-type))
-          (args-type
-           (ensure-interned-list (args-type-required instance) *ctype-list-hashset*)
-           (ensure-interned-list (args-type-optional instance) *ctype-list-hashset*)
-           (awhen (args-type-rest instance) (check it))
-           (when (fun-type-p instance)
-             (aver (null (fun-type-keywords instance)))
-             (check (fun-type-returns instance))))
-          (cons-type
-           (check (cons-type-car-type instance))
-           (check (cons-type-cdr-type instance)))
-          (array-type
-           (check (array-type-element-type instance))
-           (check (array-type-specialized-element-type instance)))
-          (compound-type
-           (ensure-interned-list (compound-type-types instance) *ctype-set-hashset*))
-          (negation-type
-           (check (negation-type-type instance)))))))
-  #+sb-devel (setq *hashsets-preloaded* t))
-(preload-ctype-hashsets))
 
 ;;; *TYPE-CLASS-LIST* is defined only in the host. When the cross-compiler
 ;;; expands TYPEP-IMPL-MACRO it get the value of this symbol from the host's
@@ -1535,101 +1495,6 @@
               (:real
                (and (not (complexp object))
                     (bound-test object))))))))
-
-;;; Copy X to the heap, give it a random hash, and if it is a MEMBER type
-;;; then assert that all members are cacheable.
-#+sb-xc-host
-(defun copy-ctype (x)
-  (let ((bits (logior (type-%bits x) (logand (ctype-random) +ctype-hash-mask+))))
-    (etypecase x
-      (member-type
-       (!alloc-member-type bits (member-type-xset x) (member-type-fp-zeroes x))))))
-#-sb-xc-host
-(defun copy-ctype (x &optional (flags 0))
-  (declare (type ctype x))
-  (declare (sb-c::tlab :system) (inline !new-xset))
-  #+c-stack-is-control-stack (aver (stack-allocated-p x))
-  (labels ((copy (x)
-             ;; Return a heap copy of X if X was arena or stack-allocated.
-             ;; I suspect it's quicker to copy always rather than conditionally.
-             ;; The use for this is that supposing the user constructs a type specifier
-             ;; like (DOUBLE-FLOAT (2.0) 4.0) where those numbers and the inner list
-             ;; were constructed on an arena, they need to be copied.
-             (etypecase x
-               (number (sb-vm:copy-number-to-heap x))
-               (cons (cons (copy (car x)) (copy (cdr x))))
-               (symbol x)))
-           (copy-xset (xset &aux (data (xset-data xset)))
-             ;; MEMBER-TYPE is a problem because the members could be arena-allocated.
-             ;; It would be easy enough to avoid entering some instances in a hashset, though
-             ;; the larger issue is that it may be inserted into any number of other caches.
-             ;; CLHS never says whether DX objects are or aren't legal in type specifiers.
-             ;; I consider this "user error" as it seems to push the boundary of what should
-             ;; be permissible, but we can do better than to cache data that are on the stack.
-             ;; If the XSET is represented as a hash-table, we may have another issue
-             ;; which is not dealt with here (hash-table in the arena)
-             (cond ((listp data)
-                    ;; the XSET can be empty if a MEMBER type contains only FP zeros.
-                    ;; While we could use (load-time-value) to referece a constant empty xset
-                    ;; there's really no point to doing that.
-                    (collect ((elts))
-                      (dolist (x data (!new-xset (elts) (xset-extra xset)))
-                        (elts (cond ((numberp x) (sb-vm:copy-number-to-heap x))
-                                    ((safe-member-type-elt-p x) x)
-                                    ;; surely things will go haywire if this occurs
-                                    (t (error "Off-heap MEMBER type member @ ~X"
-                                              (get-lisp-obj-address x))))))))
-                   ;; Huge MEMBER types are rare so I'm not going to worry too much,
-                   ;; just check whether it's OK or not
-                   ((and (loop for k being each hash-key of data
-                               always (safe-member-type-elt-p k))
-                         (heap-allocated-p data))
-                    xset)
-                   (t ; This could certainly be improved
-                    (error "Off-heap MEMBER type members")))))
-    (let ((bits (logior (type-%bits x) (logand (ctype-random) +ctype-hash-mask+) flags)))
-      ;; These cases are in descending order of frequency of seek in the hashsets.
-      ;; It matters only for backends that don't convert TYPECASE to a jump table.
-      (etypecase x
-        (values-type
-         (!alloc-values-type bits (values-type-required x) (values-type-optional x)
-                             (values-type-rest x)))
-        (fun-type ; or FUN-DESIGNATOR-TYPE
-         (let ((copy (!alloc-fun-type
-                      bits (fun-type-required x) (fun-type-optional x) (fun-type-rest x)
-                      (fun-type-keyp x) (fun-type-keywords x) (fun-type-allowp x)
-                      (fun-type-wild-args x) (fun-type-returns x))))
-           (%set-instance-layout copy (%instance-layout x))
-           copy))
-        (numeric-type
-         (!alloc-numeric-type bits (numeric-type-aspects x)
-                              (copy (numeric-type-low x)) (copy (numeric-type-high x))))
-        (compound-type ; UNION or INTERSECTION
-         (let ((copy (!alloc-union-type bits (compound-type-enumerable x)
-                                        (compound-type-types x))))
-           (%set-instance-layout copy (%instance-layout x))
-           copy))
-        (member-type
-         (!alloc-member-type bits (copy-xset (member-type-xset x))
-          (mapcar 'sb-vm:copy-number-to-heap (member-type-fp-zeroes x))))
-        (array-type
-         (!alloc-array-type bits (copy (array-type-dimensions x))
-                            (array-type-complexp x) (array-type-element-type x)
-                            (array-type-specialized-element-type x)))
-        (hairy-type ; SATISFIES or UNKNOWN
-         (let ((copy (!alloc-hairy-type bits (copy (hairy-type-specifier x)))))
-           (%set-instance-layout copy (%instance-layout x))
-           copy))
-        (negation-type (!alloc-negation-type bits (negation-type-type x)))
-        (constant-type (!alloc-constant-type bits (constant-type-type x)))
-        (cons-type (!alloc-cons-type bits (cons-type-car-type x) (cons-type-cdr-type x)))
-        (character-set-type
-         (!alloc-character-set-type bits (copy (character-set-type-pairs x))))
-        #+sb-simd-pack
-        (simd-pack-type (!alloc-simd-pack-type bits (simd-pack-type-tag-mask x)))
-        #+sb-simd-pack-256
-        (simd-pack-256-type (!alloc-simd-pack-256-type bits (simd-pack-256-type-tag-mask x)))
-        (alien-type-type (!alloc-alien-type-type bits (alien-type-type-alien-type x)))))))
 
 ;;; Drop NILs, possibly reducing the storage vector length
 (defun rebuild-ctype-hashsets ()

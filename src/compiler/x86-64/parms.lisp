@@ -30,26 +30,20 @@
 (defconstant gencgc-page-bytes 32768)
 ;;; The divisor relative to page-bytes which computes the granularity
 ;;; at which writes to old generations are logged.
-(defconstant cards-per-page 32)
+#+soft-card-marks (defconstant cards-per-page
+                               #+mark-region-gc (/ gencgc-page-bytes 128)
+                               #-mark-region-gc 32)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 ;;; The card size for immobile/low space
 (defconstant immobile-card-bytes 4096)
 
-;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
-;;; and a 16 bit quantity depending on context. This is because Intel
-;;; insists on calling 16 bit things words and 32 bit things
-;;; double-words (or dwords). Therefore, in the instruction definition
-;;; and register specs, we use the Intel convention. But whenever we
-;;; are talking about stuff the rest of the lisp system might be
-;;; interested in, we use ``word'' to mean the size of a descriptor
-;;; object, which is 64 bits.
+;;; ### Note: 'lispword' always means 8 bytes, and 'word' usually means
+;;; the same as 'lispword', except in the assembler and disassembler,
+;;; where 'word' means 2 bytes to match AMD/Intel terminology.
 
 ;;;; machine architecture parameters
 
@@ -92,21 +86,20 @@
 ;;; it would cause. -- JES, 2005-12-11
 
 #+(or linux darwin)
-(!gencgc-space-setup #x50000000
-                     :read-only-space-size #+metaspace #.(* 2 1024 1024)
-                                           #-metaspace 0
-                     :fixedobj-space-size #.(* 40 1024 1024)
+(gc-space-setup #x50000000
+                     :read-only-space-size 0
+                     :fixedobj-space-size #.(* 60 1024 1024)
                      :text-space-size #.(* 130 1024 1024)
                      :dynamic-space-start #x1000000000)
 
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
-;;; run under the default 512M data size limit.
+;;; run under the default 1G data size limit.
 
 #-(or linux darwin)
-(!gencgc-space-setup #x20000000
+(gc-space-setup #x20000000
                      :read-only-space-size 0
                      :dynamic-space-start #x1000000000
-                     #+openbsd :dynamic-space-size #+openbsd #x1bcf0000)
+                     #+openbsd :dynamic-space-size #+openbsd #x2fff0000)
 
 (defconstant alien-linkage-table-growth-direction :up)
 (defconstant alien-linkage-table-entry-size 16)
@@ -167,7 +160,7 @@
   #'equalp)
 
 (defconstant-eqx +static-fdefns+
-    `#(ensure-symbol-hash sb-impl::install-hash-table-lock update-object-layout
+    `#(sb-impl::install-hash-table-lock update-object-layout
        ,@common-static-fdefns)
   #'equalp)
 

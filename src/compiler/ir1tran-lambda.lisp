@@ -486,16 +486,12 @@
               (found-allow-p nil))
 
           (temps #-stack-grows-downward-not-upward
-                 `(,n-index (+ ,n-count ,(if (vop-existsp :translate %more-keyword-pair)
+                 `(,n-index (+ ,n-count ,(if (vop-existsp :translate %more-kw-arg)
                                              0
                                              -1)))
                  #+stack-grows-downward-not-upward
-                 `(,n-index (- (1- ,n-count)))
-                 #-stack-grows-downward-not-upward n-value-temp
-                 #-stack-grows-downward-not-upward n-key)
-          (body `(declare (fixnum ,n-index)
-                          #-stack-grows-downward-not-upward
-                          (ignorable ,n-value-temp ,n-key)))
+                 `(,n-index (- (1- ,n-count))))
+          (body `(declare (fixnum ,n-index)))
 
           (collect ((tests))
             (dolist (key keys)
@@ -544,9 +540,11 @@
                        (setq ,n-lose ,n-key))))
 
             (body
-             `(when (oddp ,(if (vop-existsp :translate %more-keyword-pair)
-                               n-index
-                               n-count))
+             `(when (oddp ,(cond #-stack-grows-downward-not-upward
+                                 ((vop-existsp :translate %more-kw-arg)
+                                  n-index)
+                                 (t
+                                  n-count)))
                 (%odd-key-args-error)))
 
             (body
@@ -554,19 +552,20 @@
              `(locally
                 (declare (optimize (safety 0)))
                 (loop
-                 ,@(cond ((vop-existsp :translate %more-keyword-pair)
-                          `((when (zerop ,n-index) (return))
-                            (decf ,n-index 2)
-                            (multiple-value-bind (key value)
-                                (%more-keyword-pair ,n-context ,n-index)
-                              (setf ,n-value-temp value ,n-key key))))
-                         (t
-                          `((when (minusp ,n-index) (return))
-                            (setf ,n-value-temp (%more-arg ,n-context ,n-index))
-                            (decf ,n-index)
-                            (setq ,n-key (%more-arg ,n-context ,n-index))
-                            (decf ,n-index))))
-                 (case ,n-key ,@(tests))))
+                  ,@(cond ((vop-existsp :translate %more-kw-arg)
+                           `((when (zerop ,n-index) (return))
+                             (decf ,n-index 2)
+                             (multiple-value-bind (,n-value-temp ,n-key)
+                                 (%more-kw-arg ,n-context ,n-index)
+                               (declare (ignorable ,n-value-temp ,n-key))
+                               (case ,n-key ,@(tests)))))
+                          (t
+                           `((when (minusp ,n-index) (return))
+                             (let ((,n-value-temp (%more-arg ,n-context ,n-index))
+                                   (,n-key (%more-arg ,n-context (decf ,n-index))))
+                               (declare (ignorable ,n-value-temp ,n-key))
+                               (decf ,n-index)
+                               (case ,n-key ,@(tests))))))))
              #+stack-grows-downward-not-upward
              `(locally (declare (optimize (safety 0)))
                 (loop
@@ -1129,7 +1128,12 @@
       (if (eq (car fun) 'lambda-with-lexenv)
           (cdr fun)
           `(() . ,(cdr fun)))
-    (let* ((*lexenv*
+    (let* ((notinlines
+             (loop for fun in (lexenv-funs *lexenv*)
+                   when (and (defined-fun-p (cdr fun))
+                             (defined-fun-inlinep (cdr fun)))
+                   collect fun))
+           (*lexenv*
              (if decls
                  (make-lexenv
                   :default (process-decls decls nil nil
@@ -1149,9 +1153,13 @@
                   (lexenv-lambda *lexenv*)
                   *lexenv*)))
            (*inlining* (1+ *inlining*))
-           (clambda (ir1-convert-lambda `(lambda ,@body)
-                                        :source-name source-name
-                                        :debug-name debug-name)))
+           (clambda (progn
+                      (when notinlines
+                        (setf (lexenv-funs *lexenv*)
+                              notinlines))
+                      (ir1-convert-lambda `(lambda ,@body)
+                                          :source-name source-name
+                                          :debug-name debug-name))))
       (setf (functional-inline-expanded clambda) t)
       clambda)))
 
@@ -1291,27 +1299,6 @@
       (setf (functional-inlinep fun) inlinep)
       (assert-new-definition var fun)
       (setf (defined-fun-inline-expansion var) var-expansion)
-      ;; Associate VAR with the FUN -- and in case of an optional dispatch
-      ;; with the various entry-points. This allows XREF to know where the
-      ;; inline CLAMBDA comes from.
-      (flet ((note-inlining (f)
-               (typecase f
-                 (functional
-                  (setf (functional-inline-expanded f) var))
-                 (cons
-                  ;; Delayed entry-point.
-                  (if (car f)
-                      (setf (functional-inline-expanded (cdr f)) var)
-                      (let ((old-thunk (cdr f)))
-                        (setf (cdr f) (lambda ()
-                                        (let ((g (funcall old-thunk)))
-                                          (setf (functional-inline-expanded g) var)
-                                          g)))))))))
-        (note-inlining fun)
-        (when (optional-dispatch-p fun)
-          (note-inlining (optional-dispatch-main-entry fun))
-          (note-inlining (optional-dispatch-more-entry fun))
-          (mapc #'note-inlining (optional-dispatch-entry-points fun))))
       ;;
       ;; If definitely not an interpreter stub, then substitute for any
       ;; old references.

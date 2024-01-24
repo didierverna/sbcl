@@ -16,7 +16,7 @@
                        (push x result) ; keep a strong reference to this symbol
                        (push (cons (string x) (make-weak-pointer x)) result))))
                (fill cells 0)
-               (resize-symbol-hashset table 0 t)
+               (resize-symbol-table table 0 t)
                result)))
       (dolist (package (list-all-packages))
         ;; Never discard standard symbols
@@ -27,8 +27,7 @@
                 list))))
     (gc :gen 7)
     (when query
-      #+cheneygc (error "Can't search for GC roots")
-      #+gencgc (sb-ext:search-roots query :criterion :static :gc t))
+      (sb-ext:search-roots query :criterion :static))
     (let ((n-dropped 0))
       (flet ((reintern (symbols table package access)
                (declare (ignore package))

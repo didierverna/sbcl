@@ -26,20 +26,23 @@
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg zero)))
   (:info name offset lowtag)
-  (:ignore name)
   (:results)
+  (:vop-var vop)
   (:generator 1
+    (emit-gengc-barrier object nil tmp-tn (vop-nth-arg 1 vop) value name)
     (storew value object offset lowtag)))
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg))
-         (old :scs (descriptor-reg any-reg))
-         (new :scs (descriptor-reg any-reg)))
+         (old :scs (descriptor-reg any-reg zero))
+         (new :scs (descriptor-reg any-reg zero)))
   (:info name offset lowtag)
   (:ignore name)
   (:temporary (:sc non-descriptor-reg) lip)
   (:results (result :scs (descriptor-reg any-reg) :from :load))
+  (:vop-var vop)
   (:generator 5
+    (emit-gengc-barrier object nil lip (vop-nth-arg 2 vop) new)
     (inst add-sub lip object (- (* offset n-word-bytes) lowtag))
     (cond ((member :arm-v8.1 *backend-subfeatures*)
            (move result old)
@@ -81,6 +84,7 @@
                                       (symbol-always-has-tls-value-p (tn-value object)))))
            (value :scs (descriptor-reg any-reg zero)))
     (:temporary (:sc any-reg) tls-index)
+    (:vop-var vop)
     (:generator 4
       (sc-case object
         (constant
@@ -91,6 +95,7 @@
            (inst ldr tmp-tn (@ thread-tn tls-index))
            (compare-to-no-tls-value-marker tmp-tn)
            (inst b :ne LOCAL)
+           (emit-gengc-barrier object nil tls-index (vop-nth-arg 1 vop) value)
            (storew value object symbol-value-slot other-pointer-lowtag)
            (inst b DONE)
            LOCAL
@@ -244,11 +249,14 @@
       (loadw tmp-tn symbol symbol-name-slot other-pointer-lowtag)
       (inst and result tmp-tn (1- (ash 1 sb-impl::symbol-name-bits))))))
 
+;; Is it worth eliding the GC store barrier for a thread-local CAS?
+;; Not really, because why does such an operation even exists?
+;; No other thread can see our TLS except via SAP-REF.
 (define-vop (%compare-and-swap-symbol-value)
   (:translate %compare-and-swap-symbol-value)
   (:args (symbol :scs (descriptor-reg))
-         (old :scs (descriptor-reg any-reg))
-         (new :scs (descriptor-reg any-reg)))
+         (old :scs (descriptor-reg any-reg zero))
+         (new :scs (descriptor-reg any-reg zero)))
   (:results (result :scs (descriptor-reg any-reg) :from :load))
   #+sb-thread
   (:temporary (:sc any-reg) tls-index)
@@ -256,6 +264,7 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 15
+    (emit-gengc-barrier symbol nil lip (vop-nth-arg 2 vop) new)
     (inst dsb)
     #+sb-thread
     (assemble ()
@@ -299,6 +308,7 @@
   (:vop-var vop)
   (:guard (member :arm-v8.1 *backend-subfeatures*))
   (:generator 14
+    (emit-gengc-barrier symbol nil lip (vop-nth-arg 2 vop) new)
     #+sb-thread
     (assemble ()
       (inst ldr (32-bit-reg tls-index) (tls-index-of symbol))
@@ -322,9 +332,6 @@
 
 ;;;; Fdefinition (fdefn) objects.
 
-(define-vop (fdefn-fun cell-ref)
-  (:variant fdefn-fun-slot other-pointer-lowtag))
-
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
   (:policy :fast-safe)
@@ -342,23 +349,21 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
+    (emit-gengc-barrier fdefn nil lip)
     (inst add-sub lip function (- (* simple-fun-insts-offset n-word-bytes)
                                   fun-pointer-lowtag))
     (load-type type function (- fun-pointer-lowtag))
     (inst cmp type simple-fun-widetag)
     (inst b :eq SIMPLE-FUN)
-    (load-inline-constant lip '(:fixup closure-tramp :assembly-routine))
+    (load-asm-routine lip 'closure-tramp)
     SIMPLE-FUN
     (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-    (move result function)))
+    (storew function fdefn fdefn-fun-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -367,7 +372,7 @@
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (load-inline-constant temp '(:fixup undefined-tramp :assembly-routine))
+    (load-asm-routine temp 'undefined-tramp)
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 
@@ -395,8 +400,7 @@
       (inst ldr (32-bit-reg tls-index) (tls-index-of symbol))
       (inst cbnz (32-bit-reg tls-index) TLS-INDEX-VALID)
       (move alloc-tls-symbol symbol)
-      (load-inline-constant lr '(:fixup alloc-tls-index :assembly-routine))
-      (inst blr lr)
+      (invoke-asm-routine 'alloc-tls-index lr)
       TLS-INDEX-VALID
       (inst ldr alloc-tls-symbol (@ thread-tn tls-index))
       (inst stp alloc-tls-symbol tls-index
@@ -566,9 +570,6 @@
 
 ;;;; Value Cell hackery.
 
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
-
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))
 
@@ -590,6 +591,48 @@
 (define-full-setter instance-index-set * instance-slots-offset
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-set)
 
+(define-vop (instance-set-multiple)
+  (:args (instance :scs (descriptor-reg))
+         (values :more t :scs (descriptor-reg any-reg)))
+  (:temporary (:sc descriptor-reg) val-temp)
+  (:info indices)
+  (:generator 1
+    (emit-gengc-barrier instance nil tmp-tn values)
+    (do ((tn-ref values (tn-ref-across tn-ref))
+         (indices indices (cdr indices)))
+        ((null tn-ref))
+      (let* ((value (tn-ref-tn tn-ref))
+             (source
+              (sc-case value
+               (immediate
+                ;; Pretty sure this should not be a copy-and-paste from
+                ;; LOAD-IMMEDIATE. What am I doing wrong?
+                (let ((val (tn-value value)))
+                  (etypecase val
+                    (integer
+                     ;; This is a FIXNUM, as IMMEDIATE-CONSTANT-SC only
+                     ;; accepts integers if they are FIXNUMs.
+                     (load-immediate-word val-temp (fixnumize val)))
+                    (character
+                     (let* ((codepoint (char-code val))
+                            (tagged (dpb codepoint (byte 24 8) character-widetag)))
+                       (load-immediate-word val-temp tagged)))
+                    (symbol
+                     (load-symbol val-temp val))))
+                val-temp)
+               (constant
+                (inst load-constant val-temp (tn-byte-offset value))
+                val-temp)
+               (control-stack
+                (load-stack-tn val-temp value)
+                val-temp)
+               ((any-reg descriptor-reg)
+                value))))
+        (inst str source
+              (@ instance (load-store-offset
+                           (- (ash (+ instance-slots-offset (car indices)) word-shift)
+                              instance-pointer-lowtag))))))))
+
 (define-vop (%instance-cas word-index-cas)
   (:policy :fast-safe)
   (:translate %instance-cas)
@@ -599,7 +642,7 @@
   (:args (object)
          (index)
          (old-value :scs (unsigned-reg))
-         (new-value :scs (unsigned-reg)))
+         (new-value :scs (unsigned-reg zero)))
   (:arg-types * tagged-num unsigned-num unsigned-num)
   (:results (result :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
@@ -609,12 +652,37 @@
   (:args (object)
          (index)
          (old-value :scs (signed-reg))
-         (new-value :scs (signed-reg)))
+         (new-value :scs (signed-reg zero)))
   (:arg-types * tagged-num signed-num signed-num)
   (:results (result :scs (signed-reg) :from :load))
   (:result-types signed-num)
   (:translate %raw-instance-cas/signed-word))
 
+(define-vop (%instance-cas-v8.1 word-index-cas-v8.1)
+  (:policy :fast-safe)
+  (:translate %instance-cas)
+  (:variant instance-slots-offset instance-pointer-lowtag)
+  (:arg-types instance tagged-num * *))
+
+(define-vop (%raw-instance-cas/word-v8.1 %instance-cas-v8.1)
+  (:args (object)
+         (index)
+         (old-value :scs (unsigned-reg) :target result)
+         (new-value :scs (unsigned-reg zero)))
+  (:arg-types * tagged-num unsigned-num unsigned-num)
+  (:results (result :scs (unsigned-reg) :from (:argument 2)))
+  (:result-types unsigned-num)
+  (:translate %raw-instance-cas/word))
+
+(define-vop (%raw-instance-cas/signed-word-v8.1 %instance-cas-v8.1)
+  (:args (object)
+         (index)
+         (old-value :scs (signed-reg) :target result)
+         (new-value :scs (signed-reg zero)))
+  (:arg-types * tagged-num signed-num signed-num)
+  (:results (result :scs (signed-reg) :from (:argument 2)))
+  (:result-types signed-num)
+  (:translate %raw-instance-cas/signed-word))
 
 ;;;; Code object frobbing.
 
@@ -632,19 +700,52 @@
   (:temporary (:scs (non-descriptor-reg)) temp card)
   (:temporary (:sc non-descriptor-reg) pa-flag)
   (:generator 10
-    (load-inline-constant temp `(:fixup "gc_card_table_mask" :foreign-dataref))
-    (inst ldr temp (@ temp))
-    (inst ldr (32-bit-reg temp) (@ temp)) ; 4-byte int
     (pseudo-atomic (pa-flag)
+      #+immobile-space
+      (progn
+        #-sb-thread
+        (error "doesn't work yet")
+        (loadw temp thread-tn thread-text-space-addr-slot)
+        (inst sub temp object temp)
+        (inst lsr card temp (1- (integer-length immobile-card-bytes)))
+        (loadw temp thread-tn thread-text-card-count-slot)
+        (inst cmp card temp)
+        (inst b :hs try-dynamic-space)
+        (loadw temp thread-tn thread-text-card-marks-slot)
+
+        ;; compute &((unsigned long*)text_page_touched_bits)[page_index/64]
+        (inst lsr pa-flag card 6)
+        (inst lsl pa-flag pa-flag 3)
+        (inst add temp temp pa-flag)
+
+        ;; compute 1U << (page_index & 63)
+        (inst mov pa-flag 1)
+        (inst and card card 63)
+        (inst lsl pa-flag pa-flag card)
+
+        (cond ((member :arm-v8.1 *backend-subfeatures*)
+               (inst ldset pa-flag pa-flag temp))
+              (t
+               (let ((loop (gen-label)))
+                 (emit-label LOOP)
+                 (inst ldaxr card temp)
+                 (inst orr card card pa-flag)
+                 (inst stlxr pa-flag card temp)
+                 (inst cbnz (32-bit-reg pa-flag) LOOP))))
+        (inst b store))
+      TRY-DYNAMIC-SPACE
+      (load-foreign-symbol temp "gc_card_table_mask" :dataref t)
+      (inst ldr (32-bit-reg temp) (@ temp)) ; 4-byte int
       ;; Compute card mark index
       (inst lsr card object gencgc-card-shift)
       (inst and card card temp)
       ;; Load mark table base
-      (load-inline-constant temp `(:fixup "gc_card_mark" :foreign-dataref))
-      (inst ldr temp (@ temp))
+      (load-foreign-symbol temp "gc_card_mark" :dataref t)
       (inst ldr temp (@ temp))
       ;; Touch the card mark byte.
       (inst strb null-tn (@ temp card))
+
+      STORE
       ;; set 'written' flag in the code header
       ;; If two threads get here at the same time, they'll write the same byte.
       (let ((byte (- #+big-endian 4 #+little-endian 3 other-pointer-lowtag)))

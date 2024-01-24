@@ -2,7 +2,7 @@
 ;;; The layout of FOO must not get promoted from gen0 to gen1.
 ;;; Due to random variation, there might be a gc-with-promotion cycle
 ;;; just after the defstruct. So prevent that.
-#+gencgc (setf (generation-number-of-gcs-before-promotion 0) 1000000)
+#+generational (setf (generation-number-of-gcs-before-promotion 0) 1000000)
 (defstruct foo x)
 (defun get-layouts-for-test ()
   ;; Return a young layout and an old layout
@@ -11,11 +11,13 @@
 
 (with-test (:name :compact-instance-header-layout
             :skipped-on (or :win32
-                            (:not (:and :compact-instance-header :soft-card-marks))))
+                            :gc-stress
+                            (:not (:and :compact-instance-header :soft-card-marks)))
+            :fails-on (and :darwin :x86-64)) ;; can't compile the .so
   (unless (probe-file "gc-testlib.so")
     (sb-ext:run-program "sh"
                         `("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
-                          #+darwin ,@'("-flat_namespace" "-undefined" "suppress")
+                          #+darwin ,@'("-flat_namespace" "-undefined" "suppress"  "-mmacosx-version-min=10.7")
                           "-I../src/runtime"
                           "gc-testlib.c" "-o" "gc-testlib.so")
                         :search t

@@ -54,12 +54,14 @@
   #+sb-thread
   (:temporary (:sc complex-double-reg) xmm-temp)
   (:results (block :scs (any-reg)))
+  (:vop-var vop)
   (:generator 22
     (inst lea block (unwind-block-ea tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
     (storew temp block unwind-block-uwp-slot)
     (storew rbp-tn block unwind-block-cfp-slot)
-    (inst lea temp (rip-relative-ea entry-label))
+    (inst lea (pc-size vop)
+      temp (rip-relative-ea entry-label))
     (storew temp block unwind-block-entry-pc-slot)
     #+sb-thread
     (let ((bsp (info :variable :wired-tls '*binding-stack-pointer*)))
@@ -82,12 +84,14 @@
   (:temporary (:sc descriptor-reg) temp)
   #+sb-thread
   (:temporary (:sc complex-double-reg) xmm-temp)
+  (:vop-var vop)
   (:generator 44
     (inst lea block (catch-block-ea tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
     (storew temp block catch-block-uwp-slot)
     (storew rbp-tn block catch-block-cfp-slot)
-    (inst lea temp (rip-relative-ea entry-label))
+    (inst lea (pc-size vop)
+      temp (rip-relative-ea entry-label))
     (storew temp block catch-block-entry-pc-slot)
     (storew tag block catch-block-tag-slot)
     #+sb-thread

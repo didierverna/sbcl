@@ -323,10 +323,11 @@
 
 (defun nuke-fop-vector (vector)
   (declare (simple-vector vector)
-           #-gencgc (ignore vector)
+           (ignorable vector)
            (optimize speed))
   ;; Make sure we don't keep any garbage.
-  #+gencgc
+  ;; NOTE: for the work-in-progress concurrent GC, it is better *NOT* to 0-fill
+  ;; if the the deletion barrier is enabled.
   (fill vector 0))
 
 
@@ -774,17 +775,13 @@
         (n-data-words (- size sb-vm:instance-data-start)))
     (with-fop-stack ((stack (operand-stack)) ptr n-data-words)
       (declare (type index ptr))
-      ;; FIXME: this is basically DO-LAYOUT-BITMAP, but probably not as efficient.
-      (let ((bitmap (sb-kernel::%layout-bitmap layout)))
-        ;; Values on the stack are in the same order as in the structure itself.
-        (do ((i sb-vm:instance-data-start (1+ i)))
-            ((>= i size))
-          (declare (type index i))
-          (let ((val (fop-stack-ref ptr)))
-            (if (logbitp i bitmap)
-                (%instance-set res i val)
-                (%raw-instance-set/word res i val))
-            (incf ptr)))))
+      ;; Values on the stack are in the same order as in the structure itself.
+      (do-layout-bitmap (i taggedp layout size)
+        (let ((val (fop-stack-ref ptr)))
+          (if taggedp
+              (%instance-set res i val)
+              (%raw-instance-set/word res i val)))
+        (incf ptr)))
     res))
 
 ;;; Symbol-like entities
@@ -852,17 +849,7 @@
            (multiple-value-bind (name length elt-type)
                (read-symbol-name length+flag fasl-input)
              (push-fop-table (%intern name length package elt-type t inherited)
-                             fasl-input)))
-         (ensure-hashed (symbol)
-           ;; ENSURE-SYMBOL-HASH when vop-translated is flushable since it is
-           ;; conceptually just a slot reader, however its actual effect is to fill in
-           ;; the hash if absent, so it's not quite flushable when called expressly
-           ;; to fill in the slot. In this case we need a full call to ENSURE-SYMBOL-HASH
-           ;; to ensure the side-effect happens.
-           ;; Careful if changing this again. There'a regression test thank goodness.
-           (declare (notinline ensure-symbol-hash))
-           (ensure-symbol-hash symbol)
-           symbol))
+                             fasl-input))))
 
   (define-fop 77 :not-host (fop-lisp-symbol-save ((:operands length+flag)))
     (aux-fop-intern length+flag *cl-package* t (fasl-input)))
@@ -875,12 +862,11 @@
 
   (define-fop 80 :not-host (fop-uninterned-symbol-save ((:operands length+flag)))
     (multiple-value-bind (name len) (read-symbol-name length+flag (fasl-input))
-      (push-fop-table (ensure-hashed (make-symbol (subseq name 0 len)))
+      (push-fop-table (make-symbol (subseq name 0 len))
                       (fasl-input))))
 
   (define-fop 81 :not-host (fop-copy-symbol-save ((:operands table-index)))
-    (push-fop-table (ensure-hashed
-                     (copy-symbol (ref-fop-table (fasl-input) table-index)))
+    (push-fop-table (copy-symbol (ref-fop-table (fasl-input) table-index))
                     (fasl-input))))
 
 (define-fop 82 (fop-package (pkg-designator))
@@ -939,7 +925,7 @@
   #-sb-xc-host (%make-ratio num den))
 
 (define-fop 71 (fop-complex (realpart imagpart))
-  #+sb-xc-host (number-pair-to-core realpart imagpart sb-vm:complex-widetag)
+  #+sb-xc-host (number-pair-to-core realpart imagpart sb-vm:complex-rational-widetag)
   #-sb-xc-host (%make-complex realpart imagpart))
 
 (macrolet ((fast-read-single-float ()
