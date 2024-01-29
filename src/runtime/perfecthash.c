@@ -990,7 +990,7 @@ static void driver(
   free((void *)tab);
 }
 
-char* generate_perfhash_sexpr(unsigned int *key_array, int nkeys)
+char* generate_perfhash_sexpr(int flags, unsigned int *key_array, int nkeys)
 {
   key* keylist = 0;
   key* keyspace = calloc(nkeys, sizeof (key));
@@ -1001,7 +1001,12 @@ char* generate_perfhash_sexpr(unsigned int *key_array, int nkeys)
     this->next_k = keylist;
     keylist = this;
   }
-  hashform form = { .hashtype = INT_HT, .perfect = MINIMAL_HP, .speed = SLOW_HS, .infix = 0 };
+  hashform form = {
+    .hashtype = INT_HT,
+    .perfect = (flags & 1) ? MINIMAL_HP : NORMAL_HP,
+    .speed = (flags & 2) ? FAST_HS : SLOW_HS,
+    .infix = 0
+  };
   struct mem_stream * scratchfile = make_mem_stream();
   driver(&form, keylist, nkeys, scratchfile);
 
@@ -1021,13 +1026,15 @@ int main(int argc, char *argv[])
   key keybuffer[1000];
   while (fgets(line, sizeof line, stdin)) {
       key *this = (keycount < 1000) ? &keybuffer[keycount]  : (key*)malloc(sizeof (key));
-      memset(this, 0, sizeof key);
+      memset(this, 0, sizeof *this);
       this->hash_k = strtoul(line, 0, 16);
       this->next_k = keylist;
       keylist = this;
       ++keycount;
   }
-  driver(&form, keylist, keycount, stdout);
+  struct mem_stream * scratchfile = make_mem_stream();
+  driver(&form, keylist, keycount, scratchfile);
+  fwrite(scratchfile->buffer, 1, scratchfile->position, stdout);
   return 0;
 }
 #endif

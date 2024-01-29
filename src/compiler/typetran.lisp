@@ -1641,7 +1641,12 @@
                            `(make-array ,dimension ,@specialization :initial-contents x))))))))
       ((type= tspec (specifier-type 'list))
        `(coerce-to-list x))
-      ((csubtypep tspec (specifier-type 'function))
+      ((csubtypep tspec (specifier-type 'extended-sequence))
+       (let ((class (and (symbolp tval) (find-class tval nil))))
+         (if (null class)
+             (give-up-ir1-transform)
+             `(coerce-to-extended-sequence x (load-time-value (find-class ',tval) t)))))
+      ((type= tspec (specifier-type 'function))
        (if (csubtypep (lvar-type x) (specifier-type 'symbol))
            `(coerce-symbol-to-fun x)
            ;; if X can later be derived as FUNCTION then we don't want
