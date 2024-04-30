@@ -88,7 +88,7 @@
   (with-registers-preserved (c :except (rsi rdi))
     (pseudo-atomic ()
       #-system-tlabs (inst break halt-trap)
-      #+system-tlabs (call-c (make-fixup "switch_to_arena" :foreign) #+win32 rdi-tn #+win32 rsi-tn))))
+      #+system-tlabs (call-c "switch_to_arena" #+win32 rdi-tn #+win32 rsi-tn))))
 
 (macrolet ((def-routine-pair (name&options vars &body code)
              `(progn
@@ -104,41 +104,30 @@
 
 (def-routine-pair (alloc-tramp) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "alloc" :foreign)
-            (ea 16 rbp-tn)
-            system-tlab-p)
+    (call-c "alloc" (ea 16 rbp-tn) system-tlab-p)
     (inst mov (ea 16 rbp-tn) rax-tn))) ; result onto stack
 
 (def-routine-pair (list-alloc-tramp) () ; CONS, ACONS, LIST, LIST*
   (with-registers-preserved (c)
-    (call-c (make-fixup "alloc_list" :foreign)
-            (ea 16 rbp-tn)
-            system-tlab-p)
+    (call-c "alloc_list" (ea 16 rbp-tn) system-tlab-p)
     (inst mov (ea 16 rbp-tn) rax-tn))) ; result onto stack
 
 (def-routine-pair (listify-&rest (:return-style :none)) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "listify_rest_arg" :foreign)
-            (ea 16 rbp-tn)
-            (ea 24 rbp-tn)
-            system-tlab-p)
+    (call-c "listify_rest_arg" (ea 16 rbp-tn) (ea 24 rbp-tn) system-tlab-p)
     (inst mov (ea 24 rbp-tn) rax-tn))   ; result
   (inst ret 8)) ; pop one argument; the unpopped word now holds the result
 
 (def-routine-pair (make-list (:return-style :none)) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "make_list" :foreign)
-            (ea 16 rbp-tn)
-            (ea 24 rbp-tn)
-            system-tlab-p)
+    (call-c "make_list" (ea 16 rbp-tn) (ea 24 rbp-tn) system-tlab-p)
     (inst mov (ea 24 rbp-tn) rax-tn)) ; result
   (inst ret 8)) ; pop one argument; the unpopped word now holds the result
 )
 
 (define-assembly-routine (alloc-funinstance) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "alloc_funinstance" :foreign)
-            (ea 16 rbp-tn))
+    (call-c "alloc_funinstance" (ea 16 rbp-tn))
     (inst mov (ea 16 rbp-tn) rax-tn)))
 
 ;;; These routines are for the deterministic consing profiler.
@@ -147,22 +136,13 @@
   (with-registers-preserved (c)
     #+sb-thread
     (pseudo-atomic ()
-      (call-c (make-fixup "allocation_tracker_counted" :foreign)
-              (* (ea 8 rbp-tn))))))
+      (call-c "allocation_tracker_counted" (* (ea 8 rbp-tn))))))
 
 (define-assembly-routine (enable-sized-alloc-counter) ()
   (with-registers-preserved (c)
     #+sb-thread
     (pseudo-atomic ()
-      (call-c (make-fixup "allocation_tracker_sized" :foreign)
-              (* (ea 8 rbp-tn))))))
-
-(define-assembly-routine (undefined-tramp (:return-style :none))
-    ((:temp rax descriptor-reg rax-offset))
-  (inst pop (ea n-word-bytes rbp-tn))
-  (emit-error-break nil cerror-trap (error-number-or-lose 'undefined-fun-error) (list rax))
-  (inst push (ea n-word-bytes rbp-tn))
-  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) rax)))
+      (call-c "allocation_tracker_sized" (* (ea 8 rbp-tn))))))
 
 #+win32
 (define-assembly-routine
@@ -239,10 +219,7 @@
   (inst ret 24)
   check
   (with-registers-preserved (c :except fp) ;; shouldn't have any fp operations
-    (call-c (make-fixup "check_barrier" :foreign)
-            (ea 16 rbp-tn)
-            (ea 24 rbp-tn)
-            (ea 32 rbp-tn)))
+    (call-c "check_barrier" (ea 16 rbp-tn) (ea 24 rbp-tn) (ea 32 rbp-tn)))
   (inst ret 24))
 
 ;;; Perform a store to code, updating the GC card mark bit.
@@ -297,3 +274,21 @@
       ;; store newval into object
       (inst mov (ea (- other-pointer-lowtag) rdi rdx n-word-bytes) rax)))
   (inst ret 24)) ; remove 3 stack args
+
+#+ultrafutex
+(progn
+(define-assembly-routine (mutex-wake-waiter (:return-style :raw)) ()
+  (with-registers-preserved (lisp)
+    (inst call (make-fixup "lispmutex_wake_waiter" :foreign)))) ; no args!
+
+(define-assembly-routine (mutex-unlock (:return-style :raw)) ()
+  ;; There are no registers reserved for this asm routine
+  (inst push rax-tn)
+  (inst mov rax-tn (thread-tls-ea (load-time-tls-offset '*current-mutex*)))
+  (inst mov :qword (mutex-slot rax-tn %owner) 0)
+  (inst dec :lock :byte (mutex-slot rax-tn state))
+  (inst jmp :z uncontested) ; if ZF then previous value was 1, no waiters
+  (inst call (make-fixup 'mutex-wake-waiter :assembly-routine))
+  uncontested
+  (inst pop rax-tn))
+) ; end PROGN

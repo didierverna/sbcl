@@ -280,15 +280,23 @@
   (when arg3p (dump-varint arg3 fasl-output)))
 
 ;;; Dump the FOP code for the named FOP to the specified FASL-OUTPUT.
-(defmacro dump-fop (fs-expr file &rest args)
-  (let* ((fs (eval fs-expr))
-         (val (or (get fs 'opcode)
+;;; This macro is supposed to look functional in that it evals its args,
+;;; but it wants to evaluate the first arg at compile-time. For this reason
+;;; it should really not be a quoted symbol, but I think this used to actually
+;;; be a function which had to look up the fop's opcode every time called.
+(defmacro dump-fop (fop-symbol file &rest args)
+  (let* ((fop-symbol
+          ;; EVAL is too much. Just ascertain we have a quoted symbol
+          (if (typep fop-symbol '(cons (eql quote) (cons symbol null)))
+              (cadr fop-symbol)
+              (error "Bad 1st arg to DUMP-FOP: ~S" fop-symbol)))
+         (val (or (gethash fop-symbol *fop-name-to-opcode*)
                   (error "compiler bug: ~S is not a legal fasload operator."
-                         fs-expr)))
+                         fop-symbol)))
          (fop-argc (aref (car **fop-signatures**) val)))
     (cond
       ((not (eql (length args) fop-argc))
-       (error "~S takes ~D argument~:P" fs fop-argc))
+       (error "~S takes ~D argument~:P" fop-symbol fop-argc))
       ((eql fop-argc 0)
        `(dump-byte ,val ,file))
       (t
@@ -469,11 +477,6 @@
               (dump-object 'values-specifier-type file)
               (dump-object (type-specifier x) file)
               (dump-fop 'fop-funcall file 1))
-             (sb-c::debug-name-marker ; these are atoms, much like symbols
-              (dump-fop 'fop-debug-name-marker file
-                        (cond ((eq x sb-c::*debug-name-sharp*) 1)
-                              ((eq x sb-c::*debug-name-ellipsis*) 2)
-                              (t (bug "Bogus debug name marker")))))
              (instance
               (multiple-value-bind (slot-names slot-names-p)
                   (gethash x (fasl-output-saved-slot-names file))
@@ -570,15 +573,16 @@
                (dump-fop 'fop-nthcdr file i))
             (declare (type index i)))))
 
-      (dump-byte (ecase (circularity-type info)
-                   (:rplaca     #.(get 'fop-rplaca 'opcode))
-                   (:rplacd     #.(get 'fop-rplacd 'opcode))
-                   (:svset      #.(get 'fop-svset 'opcode))
-                   (:struct-set #.(get 'fop-structset 'opcode))
-                   (:slot-set
-                    (dump-object (circularity-slot-name info) file)
-                    #.(get 'fop-slotset 'opcode)))
-                 file)
+      (macrolet ((fop-op (symbol) (gethash symbol *fop-name-to-opcode*)))
+        (dump-byte (ecase (circularity-type info)
+                     (:rplaca     (fop-op fop-rplaca))
+                     (:rplacd     (fop-op fop-rplacd))
+                     (:svset      (fop-op fop-svset))
+                     (:struct-set (fop-op fop-structset))
+                     (:slot-set
+                      (dump-object (circularity-slot-name info) file)
+                      (fop-op fop-slotset)))
+                   file))
       (dump-varint (gethash (circularity-object info) table) file)
       (dump-varint (circularity-index info) file))))
 
@@ -1045,6 +1049,10 @@
     :layout-id)
   #'equalp)
 
+(defun encoded-fixup-flavor (flavor)
+  (or (position flavor +fixup-flavors+)
+      (error "Bad fixup flavor ~s" flavor)))
+
 ;;; Pack the aspects of a fixup into an integer.
 ;;; DATA is for asm routine fixups. The routine can be represented in 8 bits,
 ;;; so the fixup can be reduced to one word instead of an integer and a symbol.
@@ -1054,9 +1062,7 @@
           (the (mod 16) (or (position kind +fixup-kinds+)
                            (error "Bad fixup kind ~s" kind)))
           ;; 4 bits
-          (ash (the (mod 16) (or (position flavor +fixup-flavors+)
-                                 (error "Bad fixup flavor ~s" flavor)))
-               4)
+          (ash (the (mod 16) (encoded-fixup-flavor flavor)) 4)
           ;; 8 bits
           (ash (the (mod 256) data) 8)
           ;; whatever it needs
@@ -1064,10 +1070,10 @@
 
 ;;; Unpack an integer from DUMP-FIXUPs. Shared by genesis and target fasloader
 (declaim (inline !unpack-fixup-info))
-(defun !unpack-fixup-info (packed-info) ; Return (VALUES offset kind flavor data)
+(defun !unpack-fixup-info (packed-info) ; Return (VALUES offset kind flavor-id data)
   (values (ash packed-info -16)
           (aref +fixup-kinds+ (ldb (byte 4 0) packed-info))
-          (aref +fixup-flavors+ (ldb (byte 4 4) packed-info))
+          (ldb (byte 4 4) packed-info)
           (ldb (byte 8 8) packed-info)))
 
 #-(or x86 x86-64) ; these two architectures provide an overriding definition
@@ -1153,7 +1159,9 @@
       ;; Dump the constants, noting any :ENTRY constants that have to
       ;; be patched.
       (loop for i from sb-vm:code-constants-offset below header-length do
-        (let ((entry (aref constants i)))
+        (binding* ((entry (aref constants i))
+                   ((kind payload)
+                    (if (listp entry) (values (car entry) (cadr entry)))))
           (etypecase entry
             (constant
              (cond ((sb-c::leaf-has-source-name-p entry)
@@ -1161,34 +1169,33 @@
                     (dump-fop 'fop-misc-trap fasl-output))
                    (t
                     (dump-object (sb-c::constant-value entry) fasl-output))))
-            (cons
-             (ecase (car entry)
+            (null
+             (dump-fop 'fop-misc-trap fasl-output))
+            (list
+             (ecase kind
                (:constant ; anything that has not been wrapped in a #<CONSTANT>
-                (dump-object (cadr entry) fasl-output))
+                (dump-object payload fasl-output))
                (:entry
-                (let* ((info (sb-c::leaf-info (cadr entry)))
+                (let* ((info (sb-c::leaf-info payload))
                        (handle (gethash info
-                                        (fasl-output-entry-table
-                                         fasl-output))))
+                                        (fasl-output-entry-table fasl-output))))
                   (declare (type sb-c::entry-info info))
-                  (cond
-                   (handle
-                    (dump-push handle fasl-output))
-                   (t
-                    (patches (cons info i))
-                    (dump-fop 'fop-misc-trap fasl-output)))))
+                  (cond (handle (dump-push handle fasl-output))
+                        (t
+                         (patches (cons info i))
+                         (dump-fop 'fop-misc-trap fasl-output)))))
                (:load-time-value
-                (dump-push (cadr entry) fasl-output))
+                (dump-push payload fasl-output))
                (:fdefinition
                 ;; It's possible for other fdefns to be found in the header, but they can't
                 ;; have resulted from IR2 conversion. They would have had to come from
                 ;; something like (load-time-value (find-or-create-fdefn ...))
                 ;; which is fine, but they don't count for this purpose.
                 (incf n-fdefns)
-                (dump-object (cadr entry) fasl-output)
+                (dump-object payload fasl-output)
                 (dump-fop 'fop-fdefn fasl-output))
                (:known-fun
-                (dump-object (cadr entry) fasl-output)
+                (dump-object payload fasl-output)
                 (dump-fop 'fop-known-fun fasl-output))
                (:coverage-marks
                 ;; Avoid the coalescence done by DUMP-VECTOR
@@ -1198,10 +1205,8 @@
                                          fasl-output))
                #+arm64
                (:tls-index
-                (dump-object (cdr entry) fasl-output)
-                (dump-fop 'fop-tls-index fasl-output))))
-            (null
-             (dump-fop 'fop-misc-trap fasl-output)))))
+                (dump-object payload fasl-output)
+                (dump-fop 'fop-tls-index fasl-output)))))))
 
       ;; Dump the debug info.
       (let ((info (sb-c::debug-info-for-component component)))

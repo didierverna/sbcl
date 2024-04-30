@@ -639,6 +639,13 @@
     (inst cmp temp list-pointer-lowtag)
     (inst ccmp value null-tn :eq 4)))
 
+(define-vop (pointerp consp)
+  (:translate pointerp)
+  (:conditional :eq)
+  (:generator 3
+    (inst and temp value 3)
+    (inst cmp temp 3)))
+
 (define-vop (single-float-p)
   (:args (value :scs (any-reg descriptor-reg)))
   (:arg-refs value-ref)
@@ -664,10 +671,10 @@
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 1
-    (unless (other-pointer-tn-ref-p args (not null-label))
-      (when null-label
-        (inst cmp value null-tn)
-        (inst b :eq null-label))
+    (when null-label
+      (inst cmp value null-tn)
+      (inst b :eq null-label))
+    (unless (other-pointer-tn-ref-p args t)
       (inst and r value lowtag-mask)
       (inst cmp r other-pointer-lowtag)
       (inst b :ne not-other-pointer-label))

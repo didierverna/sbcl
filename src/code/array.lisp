@@ -1826,7 +1826,7 @@ function to be removed without further warning."
 ;;; dispatching when called. It expects arguments that match PARAMS.
 ;;;
 (defmacro sb-impl::!define-array-dispatch (style dispatch-name params nil-array &body body)
-  #-(or x86 x86-64) (setq style :call)
+  #-(or x86 x86-64 arm64) (setq style :call)
   (let ((table-name (symbolicate "%%" dispatch-name "-FUNS%%"))
         (error-name (symbolicate "HAIRY-" dispatch-name "-ERROR")))
     (declare (ignorable table-name))
@@ -1869,7 +1869,9 @@ function to be removed without further warning."
        (defmacro ,dispatch-name (&rest args)
          (aver (symbolp (first args)))
          (let ((tag (gensym "TAG")))
-           `(funcall
+           `(,',(if (find '&rest params)
+                    'apply
+                    'funcall)
              (truly-the function
                (let ((,tag 0))
                  (when (%other-pointer-p ,(first args))
@@ -1881,28 +1883,23 @@ function to be removed without further warning."
      (multiple-value-bind (body decls) (parse-body body nil)
        `((declaim (inline ,dispatch-name))
          (defun ,dispatch-name ,params
+           (declare (optimize (sb-c:jump-table 3)))
            ,@decls
            (case (if (%other-pointer-p ,(first params))
                      (ash (%other-pointer-widetag ,(first params)) -2)
                      0)
-             ;; All widetags have to be listed so that the jump table logic doesn't
-             ;; give up due to deciding that it's a waste of space. It could probably
-             ;; be based on the SPACE compilation policy. However, I would imagine that
-             ;; it is almost always a win to use 4x or 5x table words as cases
-             ;; given the amount of code that has to be emitted if not a table.
-             ;; This table has only 2.5x as many words as relevant (non-error) cases.
-             (,(loop for i below 64
-                     unless (find i *specialized-array-element-type-properties*
-                                  :key (lambda (x) (ash (saetp-typecode x) -2)))
-                       collect i)
-              (,error-name ,@params))
              ,@(loop
-                   for info across *specialized-array-element-type-properties*
-                   collect `(,(ash (saetp-typecode info) -2)
-                             (let ((,(first params)
-                                    (truly-the (simple-array ,(saetp-specifier info) (*))
-                                               ,(first params))))
-                               ,@body))))))))))))
+                 for info across *specialized-array-element-type-properties*
+                 for specifier = (saetp-specifier info)
+                 collect `(,(ash (saetp-typecode info) -2)
+                           (let ((,(first params)
+                                   (truly-the (simple-array ,specifier (*))
+                                              ,(first params))))
+                             ,@(if (null specifier)
+                                   nil-array
+                                   body))))
+             (t
+              (,error-name ,@params)))))))))))
 
 (defun sb-kernel::check-array-shape (array dimensions)
   (when (let ((dimensions dimensions))

@@ -34,14 +34,12 @@
 
 ;;;; routines for dealing with static symbols
 
-(defun static-symbol-p (symbol)
-  (or (null symbol)
-      (and (find symbol +static-symbols+) t)))
-
 ;;; the byte offset of the static symbol SYMBOL
 (defun static-symbol-offset (symbol)
   (if symbol
-      (let ((posn (position symbol +static-symbols+)))
+      ;; This predicate returns a generalized boolean, integer indicating truth
+      ;; and also the index, or T if the argument is NIL, or NIL if non-static.
+      (let ((posn (static-symbol-p symbol)))
         (unless posn (error "~S is not a static symbol." symbol))
         (+ (* posn (pad-data-block symbol-size))
            (pad-data-block (1- symbol-size))
@@ -65,23 +63,6 @@
     (:down
      (1- (floor (- alien-linkage-table-space-end addr) alien-linkage-table-space-end)))))
 )
-
-(defconstant-eqx +all-static-fdefns+
-    #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
-
-;;; Return the (byte) offset from NIL to the start of the fdefn object
-;;; for the static function NAME.
-(defun static-fdefn-offset (name)
-  (let ((static-fun-index (position name +all-static-fdefns+)))
-    (and static-fun-index
-         (+ (* (length +static-symbols+) (pad-data-block symbol-size))
-            (pad-data-block (1- symbol-size))
-            ;; sizeof SB-LOCKLESS:+TAIL+ is calculated as 1 user data slot,
-            ;; round-to-odd, add the header word.
-            (* (1+ (logior (1+ sb-vm:instance-data-start) 1)) n-word-bytes)
-            (- list-pointer-lowtag)
-            (* static-fun-index (pad-data-block fdefn-size))
-            other-pointer-lowtag))))
 
 ;;; Return absolute address of the 'fun' slot in static fdefn NAME.
 (defun static-fdefn-fun-addr (name)
@@ -516,6 +497,18 @@
                     smallest-f d n))
            (values (ceiling (expt 2 fraction-bits) d) fraction-bits)))))
 
+(defun env-system-tlab-p (env)
+  #-system-tlabs (declare (ignore env))
+  #+system-tlabs
+  (or sb-c::*force-system-tlab*
+      (and env
+           (dolist (data (sb-c::lexenv-user-data env)
+                         (and (sb-c::lexenv-parent env)
+                              (env-system-tlab-p (sb-c::lexenv-parent env))))
+             (when (and (eq (first data) :declare)
+                        (eq (second data) 'sb-c::tlab))
+               (return (eq (third data) :system)))))))
+
 (defun system-tlab-p (type node)
   #-system-tlabs (declare (ignore type node))
   #+system-tlabs
@@ -528,13 +521,7 @@
           (error "~S instance constructor called in a non-system file"
                  typename)))
       (and node
-           (named-let search-env ((env (sb-c::node-lexenv node)))
-             (dolist (data (sb-c::lexenv-user-data env)
-                           (and (sb-c::lexenv-parent env)
-                                (search-env (sb-c::lexenv-parent env))))
-               (when (and (eq (first data) :declare)
-                          (eq (second data) 'sb-c::tlab))
-                 (return (eq (third data) :system))))))))
+           (env-system-tlab-p (sb-c::node-lexenv node)))))
 
 (defun call-out-pseudo-atomic-p (vop)
   (declare (ignorable vop))
@@ -563,3 +550,10 @@
            (when (and (member-type-p type)
                       (= (member-type-size type) 1))
              (the symbol (first (member-type-members type))))))))
+
+(defun aligned-stack-p (&optional dx)
+  (or (eq dx :aligned-stack)
+      (and sb-assem::*current-vop*
+           (let ((node (sb-c::vop-node sb-assem::*current-vop*)))
+             (and (sb-c::combination-p node)
+                  (eq (sb-c::combination-info node) :aligned-stack))))))

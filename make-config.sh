@@ -546,6 +546,9 @@ echo "(lambda (features) (set-difference (union features (list :${sbcl_arch}$WIT
 case "$sbcl_arch" in
     x86-64) ;; *) SBCL_CONTRIB_BLOCKLIST="$SBCL_CONTRIB_BLOCKLIST sb-simd" ;;
 esac
+case "$sbcl_os" in
+    linux) ;; *) SBCL_CONTRIB_BLOCKLIST="$SBCL_CONTRIB_BLOCKLIST sb-perf" ;;
+esac
 
 echo //setting up OS-dependent information
 
@@ -762,7 +765,8 @@ esac
 if [ "$sbcl_os" = darwin -a  "$sbcl_arch" = arm64 ]
 then
     # Launching new executables is pretty slow on macOS, but this configuration is pretty uniform
-    echo ' :little-endian :os-provides-dlopen :os-provides-dladdr :os-provides-blksize-t :os-provides-suseconds-t' >> $ltf
+    echo ' :little-endian :os-provides-dlopen :os-provides-dladdr' >> $ltf
+    echo ' :os-provides-blksize-t :os-provides-suseconds-t :os-provides-posix-spawn' >> $ltf
 else
     # Use a little C program to try to guess the endianness.  Ware
     # cross-compilers!
@@ -801,7 +805,12 @@ if [ `uname` = "SunOS" ] ; then
   # use /usr/xpg4/bin/id instead of /usr/bin/id
   PATH=/usr/xpg4/bin:$PATH
 fi
-echo '"'`hostname`-`id -un`-`date +%Y-%m-%d-%H-%M-%S`'"' > output/build-id.inc
+
+if [ -n "$SOURCE_DATE_EPOCH" ]; then
+  echo '"'hostname-id-"$SOURCE_DATE_EPOCH"'"' > output/build-id.inc
+else
+  echo '"'`hostname`-`id -un`-`date +%Y-%m-%d-%H-%M-%S`'"' > output/build-id.inc
+fi
 
 if [ -n "$SBCL_HOST_LOCATION" ]; then
     echo //setting up host configuration

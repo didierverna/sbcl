@@ -66,9 +66,8 @@
 #include "interr.h"
 #include "gc.h"
 #include "genesis/sap.h"
-#include "dynbind.h"
 #include "pseudo-atomic.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 #include "genesis/cons.h"
 #include "genesis/vector.h"
 #include "genesis/thread.h"
@@ -2082,44 +2081,39 @@ siginfo_code(siginfo_t *info)
 void
 lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
 {
-    /* If we lose on corruption, provide LDB with debugging information. */
-    fake_foreign_function_call(context);
 
     /* If it's a store to read-only space, it's not "corruption", so don't say that.
      * Lisp will change its wording of the memory-fault-error string */
 
     if (!readonly_space_p((uword_t)addr)) {
-    /* To allow debugging memory faults in signal handlers and such. */
+        /* To allow debugging memory faults in signal handlers and such. */
 #ifdef ARCH_HAS_STACK_POINTER
-    char* pc = (char*)os_context_pc(context);
-    struct code* code = (struct code*)component_ptr_from_pc(pc);
-    unsigned int offset = code ? pc - (char*)code : 0;
-    if (offset)
-        corruption_warning_and_maybe_lose(
-            "Memory fault at %p (pc=%p [code %p+0x%X ID 0x%x], fp=%p, sp=%p)" THREAD_ID_LABEL,
-            addr, pc, code, offset, code_serialno(code),
-            os_context_frame_pointer(context),
-            *os_context_sp_addr(context), THREAD_ID_VALUE);
-    else
-        corruption_warning_and_maybe_lose(
-            "Memory fault at %p (pc=%p, fp=%p, sp=%p)" THREAD_ID_LABEL,
-            addr, pc, os_context_frame_pointer(context),
-            *os_context_sp_addr(context), THREAD_ID_VALUE);
+        char* pc = (char*)os_context_pc(context);
+        struct code* code = (struct code*)component_ptr_from_pc(pc);
+        unsigned int offset = code ? pc - (char*)code : 0;
+        if (offset)
+            corruption_warning(
+                "Memory fault at %p (pc=%p [code %p+0x%X ID 0x%x], fp=%p, sp=%p)" THREAD_ID_LABEL,
+                addr, pc, code, offset, code_serialno(code),
+                os_context_frame_pointer(context),
+                *os_context_sp_addr(context), THREAD_ID_VALUE);
+        else
+            corruption_warning(
+                "Memory fault at %p (pc=%p, fp=%p, sp=%p)" THREAD_ID_LABEL,
+                addr, pc, os_context_frame_pointer(context),
+                *os_context_sp_addr(context), THREAD_ID_VALUE);
 #else
-    corruption_warning_and_maybe_lose("Memory fault at %p (pc=%p)",
-                                      addr, (void*)os_context_pc(context));
+        corruption_warning("Memory fault at %p (pc=%p)",
+                           addr, (void*)os_context_pc(context));
 #endif
+        /* If we lose on corruption, provide LDB with debugging information. */
+        fake_foreign_function_call(context);
+        maybe_lose();
+    } else {
+        fake_foreign_function_call(context);
     }
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-    /* Holy hell is this more obfuscated than necessary when using
-     * signal emulation on macOS. It almost makes one want to cry.
-     * We're not actually on an alternate stack at this point.
-     * Instead of telling the emulated sigsegv (which needn't have been
-     * emulated at all) to return to an intruction which executes a
-     * sigtrap (also emulated), we should just go straight where
-     * we need to go and hand it the original context rather than
-     * having to track the context through two bogus signals */
 #  if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
 #    error memory fault emulation needs validating for this architecture
 #  endif
@@ -2273,10 +2267,14 @@ int sb_toggle_sigprof(os_context_t* context, int block) {
         // This case is used with INTERRUPT-THREAD to unmask SIGPROF in any thread
         // other than the current thread.
         gc_assert(!block);
+
         // Alter the mask on return from the _outermost_ signal context, which
         // should usually be the supplied context, but not if nesting happened.
-        context = nth_interrupt_context(0, get_sb_vm_thread());
-        gc_assert(context);
+        if (read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,get_sb_vm_thread()) > 0) {
+            context = nth_interrupt_context(0, get_sb_vm_thread());
+            gc_assert(context);
+        }
+
         sigset_t *mask = os_context_sigmask_addr(context);
         int was_blocked = sigismember(mask, SIGPROF);
         if (block) sigaddset(mask, SIGPROF); else sigdelset(mask, SIGPROF);

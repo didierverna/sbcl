@@ -35,9 +35,8 @@
 #include "target-arch-os.h"
 #include "os.h"
 #include "globals.h"
-#include "dynbind.h"
 #include "genesis/cons.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 #include "genesis/instance.h"
 #include "genesis/vector.h"
 #include "interr.h"             /* for lose() */
@@ -1353,5 +1352,22 @@ void wake_thread(struct thread_instance* lispthread)
 #else
     pthread_kill(lispthread->uw_os_thread, SIGURG);
 #endif
+}
+#endif
+
+#ifdef LISP_FEATURE_ULTRAFUTEX
+extern int futex_wake(int *lock_word, int n);
+void lispmutex_wake_waiter()
+{
+    struct lispmutex* m = (void*)INSTANCE(read_TLS(CURRENT_MUTEX, get_sb_vm_thread()));
+    // The lock word is in the least-significant half of the state word if 64-bit.
+    // See the definition of MUTEX-STATE-ADDRESS which adds 4 if #+big-endian.
+    int* word =
+#ifdef LISP_FEATURE_BIG_ENDIAN
+                     1 +
+#endif
+        (int*)&m->uw_state;
+    *word = 0; // slam 0 in, meaning uncontested
+    futex_wake(word, 1);
 }
 #endif

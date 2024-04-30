@@ -273,32 +273,6 @@
     (or (csubtypep type (specifier-type 'list))
         (csubtypep type (specifier-type 'vector)))))
 
-;;; It's possible with some sequence operations to declare the length
-;;; of a result vector, and to be safe, we really ought to verify that
-;;; the actual result has the declared length.
-(defun vector-of-checked-length-given-length (vector declared-length)
-  (declare (type vector vector))
-  (declare (type index declared-length))
-  (let ((actual-length (length vector)))
-    (unless (= actual-length declared-length)
-      (error 'simple-type-error
-             :datum vector
-             :expected-type `(vector ,declared-length)
-             :format-control
-             "Vector length (~W) doesn't match declared length (~W)."
-             :format-arguments (list actual-length declared-length))))
-  vector)
-
-(defun sequence-of-checked-length-given-type (sequence result-type)
-  (let ((ctype (specifier-type result-type)))
-    (if (not (array-type-p ctype))
-        sequence
-        (let ((declared-length (first (array-type-dimensions ctype))))
-          (if (eq declared-length '*)
-              sequence
-              (vector-of-checked-length-given-length sequence
-                                                     declared-length))))))
-
 (declaim (ftype (function (sequence index) nil) signal-index-too-large-error))
 (define-error-wrapper signal-index-too-large-error (sequence index)
   (let* ((length (length sequence))
@@ -353,36 +327,38 @@
   "Return the element of SEQUENCE specified by INDEX."
   (declare (explicit-check sequence))
   (seq-dispatch-checking sequence
-                (do ((count index (1- count))
-                     (list sequence (cdr list)))
-                    ((= count 0)
-                     (if (endp list)
-                         (signal-index-too-large-error sequence index)
-                         (car list)))
-                  (declare (type index count)))
-                (locally
-                    (declare (optimize (sb-c:insert-array-bounds-checks 0)))
-                  (when (>= index (length sequence))
-                    (signal-index-too-large-error sequence index))
-                  (aref sequence index))
-                (sb-sequence:elt sequence index)))
+      (do ((count index (1- count))
+           (list sequence (cdr list)))
+          ((= count 0)
+           (if (atom list)
+               (signal-index-too-large-error sequence index)
+               (car list)))
+        (declare (type index count)))
+      (locally
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+        (when (>= index (length sequence))
+          (signal-index-too-large-error sequence index))
+        (aref sequence index))
+      (sb-sequence:elt sequence index)))
 
 (defun %setelt (sequence index newval)
   "Store NEWVAL as the component of SEQUENCE specified by INDEX."
   (declare (explicit-check sequence))
   (seq-dispatch-checking sequence
-                (do ((count index (1- count))
-                     (seq sequence))
-                    ((= count 0) (rplaca seq newval) newval)
-                  (declare (fixnum count))
-                  (if (atom (cdr seq))
-                      (signal-index-too-large-error sequence index)
-                      (setq seq (cdr seq))))
-                (progn
-                  (when (>= index (length sequence))
-                    (signal-index-too-large-error sequence index))
-                  (setf (aref sequence index) newval))
-                (setf (sb-sequence:elt sequence index) newval)))
+      (do ((count index (1- count))
+           (seq sequence))
+          ((= count 0) (rplaca seq newval) newval)
+        (declare (fixnum count))
+        (let ((cdr (cdr seq)))
+          (if (atom cdr)
+              (signal-index-too-large-error sequence index)
+              (setq seq cdr))))
+      (if (>= index (length sequence))
+          (signal-index-too-large-error sequence index)
+          (locally
+              (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+            (setf (aref sequence index) newval)))
+      (setf (sb-sequence:elt sequence index) newval)))
 
 (defun length (sequence)
   "Return an integer that is the length of SEQUENCE."
@@ -652,8 +628,18 @@
     (if (simple-vector-p vector)
         (locally
             (declare (optimize (speed 3) (safety 0))) ; transform will kick in
-          (fill (truly-the simple-vector vector) item
-                :start start :end end))
+          (cond #+soft-card-marks
+                ((sb-c::unless-vop-existsp (:named sb-kernel:vector-fill/t)
+                   (typep item '(or fixnum boolean)))
+                 ;; No gc-card mark for these types
+                 ;; Omit character and single-float for better
+                 ;; type-checking, they are likely to go a
+                 ;; specialized array.
+                 (fill (truly-the simple-vector vector) item
+                       :start start :end end))
+                (t
+                 (fill (truly-the simple-vector vector) item
+                       :start start :end end))))
         (let* ((widetag (%other-pointer-widetag vector))
                (bashers (svref %%fill-bashers%% widetag)))
           (macrolet ((fill-float (type)
@@ -1498,14 +1484,10 @@ many elements are copied."
   (declare (explicit-check))
   (declare (dynamic-extent function))
   (let ((result
-         (apply #'%map result-type function first-sequence more-sequences)))
+          (apply #'%map result-type function first-sequence more-sequences)))
     (if (or (eq result-type 'nil) (typep result result-type))
         result
-        (error 'simple-type-error
-               :format-control "MAP result ~S is not a sequence of type ~S"
-               :datum result
-               :expected-type result-type
-               :format-arguments (list result result-type)))))
+        (sb-c::%type-check-error result result-type 'map))))
 
 (declaim (end-block))
 
@@ -1523,7 +1505,7 @@ many elements are copied."
 
 ;;; seqtran can generate code which accesses the array of specialized
 ;;; functions, so we need the array for this, not a jump table.
-(!define-array-dispatch :call vector-map-into (data start end fun sequences)
+(!define-array-dispatch :call vector-map-into (data start end fun &rest sequences)
     ((declare (ignore fun sequences))
      (unless (zerop (- end start))
        (sb-c::%type-check-error/c data 'nil-array-accessed-error nil))
@@ -1543,7 +1525,6 @@ many elements are copied."
         (setf (aref data index) (apply fun args))
         (incf index)))
     index))
-
 ;;; Uses the machinery of (MAP NIL ...). For non-vectors we avoid
 ;;; computing the length of the result sequence since we can detect
 ;;; the end during mapping (if MAP even gets that far).
@@ -1558,41 +1539,57 @@ many elements are copied."
 ;;; safety is turned off for vectors and lists but kept for generic
 ;;; sequences.
 (defun map-into (result-sequence function &rest sequences)
-  (declare (dynamic-extent function))
+  (declare (dynamic-extent function)
+           (explicit-check))
   (let ((really-fun (%coerce-callable-to-fun function)))
-    (etypecase result-sequence
-      (vector
-       (with-array-data ((data result-sequence) (start) (end)
-                         ;; MAP-INTO ignores fill pointer when mapping
-                         :check-fill-pointer nil)
-         (let ((new-end (vector-map-into data start end really-fun sequences)))
-           (when (array-has-fill-pointer-p result-sequence)
-             (setf (fill-pointer result-sequence) (- new-end start))))))
-      (list
-       (let ((node result-sequence))
-         (declare (type list node))
-         (map-into-lambda sequences (&rest args)
-           (declare (dynamic-extent args))
-           (cond ((null node)
-                  (return-from map-into result-sequence))
-                 ((not (listp (cdr node)))
-                  (error 'simple-type-error
-                         :format-control "~a is not a proper list"
-                         :format-arguments (list result-sequence)
-                         :expected-type 'list
-                         :datum result-sequence)))
-           (setf (car node) (apply really-fun args))
-           (setf node (cdr node)))))
-      (sequence
-       (multiple-value-bind (iter limit from-end step endp elt set)
-           (sb-sequence:make-sequence-iterator result-sequence)
-         (declare (ignore elt) (type function step endp set))
-         (map-into-lambda sequences (&rest args)
-           (declare (dynamic-extent args) (optimize speed))
-           (when (funcall endp result-sequence iter limit from-end)
-             (return-from map-into result-sequence))
-           (funcall set (apply really-fun args) result-sequence iter)
-           (setf iter (funcall step result-sequence iter from-end)))))))
+    (block nil
+      (etypecase result-sequence
+        (vector
+         (with-array-data ((data result-sequence) (start) (end)
+                           ;; MAP-INTO ignores fill pointer when mapping
+                           :check-fill-pointer nil)
+           (let ((new-end (truly-the index (vector-map-into data start end really-fun sequences))))
+             (when (array-has-fill-pointer-p result-sequence)
+               (setf (%array-fill-pointer result-sequence)
+                     (truly-the index (- new-end start)))))))
+        (list
+         (let ((node result-sequence))
+           (flet ((not-proper ()
+                    (error 'simple-type-error
+                           :format-control "~a is not a proper list"
+                           :format-arguments (list result-sequence)
+                           :expected-type 'list
+                           :datum result-sequence)))
+             (if (and (= (length sequences) 1)
+                      (eq result-sequence (car sequences)))
+                 (let ((list result-sequence))
+                   (loop (typecase list
+                           (null
+                            (return))
+                           (cons
+                            (setf (car list)
+                                  (funcall really-fun (car list))))
+                           (t
+                            (not-proper)))
+                         (pop list)))
+                 (map-into-lambda sequences (&rest args)
+                   (declare (dynamic-extent args))
+                   (cond ((null node)
+                          (return))
+                         ((atom node)
+                          (not-proper)))
+                   (setf (car node) (apply really-fun args))
+                   (setf node (cdr node)))))))
+        (sequence
+         (multiple-value-bind (iter limit from-end step endp elt set)
+             (sb-sequence:make-sequence-iterator result-sequence)
+           (declare (ignore elt) (type function step endp set))
+           (map-into-lambda sequences (&rest args)
+             (declare (dynamic-extent args) (optimize speed))
+             (when (funcall endp result-sequence iter limit from-end)
+               (return))
+             (funcall set (apply really-fun args) result-sequence iter)
+             (setf iter (funcall step result-sequence iter from-end))))))))
   result-sequence)
 
 ;;;; REDUCE

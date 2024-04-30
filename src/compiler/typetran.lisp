@@ -218,14 +218,15 @@
     `(or (classoid-cell-classoid ',cell)
          (error "Class not yet defined: ~S" name))))
 
-(defoptimizer (%typep-wrapper constraint-propagate-if)
-    ((test-value variable type) node)
+(defoptimizer (%typep-wrapper constraint-propagate-if) ((test-value variable type) node)
   (aver (constant-lvar-p type))
-  (let ((type (lvar-value type)))
-    (values variable (if (ctype-p type)
-                         type
-                         (handler-case (careful-specifier-type type)
-                           (t () nil))))))
+  (let* ((type (lvar-value type))
+         (ctype (if (ctype-p type)
+                    type
+                    (handler-case (careful-specifier-type type)
+                      (t () nil)))))
+    (if (and ctype (type-for-constraints-p ctype))
+        (values variable ctype))))
 
 (deftransform %typep-wrapper ((test-value variable type) * * :node node)
   (aver (constant-lvar-p type))
@@ -342,22 +343,19 @@
 
 ;;; Return a form that tests the variable N-OBJECT for being in the
 ;;; binds specified by TYPE. BASE is the name of the base type, for
-;;; declaration. We make SAFETY locally 0 to inhibit any checking of
-;;; this assertion.
+;;; declaration.
 (defun transform-numeric-bound-test (n-object type base)
   (declare (type numeric-type type))
   (let ((low (numeric-type-low type))
         (high (numeric-type-high type)))
-    `(locally
-       (declare (optimize (safety 0)))
-       (and ,@(when low
-                (if (consp low)
-                    `((> (truly-the ,base ,n-object) ,(car low)))
-                    `((>= (truly-the ,base ,n-object) ,low))))
-            ,@(when high
-                (if (consp high)
-                    `((< (truly-the ,base ,n-object) ,(car high)))
-                    `((<= (truly-the ,base ,n-object) ,high))))))))
+    `(and ,@(when low
+              (if (consp low)
+                  `((> (truly-the ,base ,n-object) ,(car low)))
+                  `((>= (truly-the ,base ,n-object) ,low))))
+          ,@(when high
+              (if (consp high)
+                  `((< (truly-the ,base ,n-object) ,(car high)))
+                  `((<= (truly-the ,base ,n-object) ,high)))))))
 
 ;;; Do source transformation of a test of a known numeric type. We can
 ;;; assume that the type doesn't have a corresponding predicate, since
@@ -390,32 +388,7 @@
          (high (numeric-type-high type)))
     (ecase (numeric-type-complexp type)
       (:real
-       (cond #-arm64
-             ((and (eql (numeric-type-class type) 'integer)
-                   (and (fixnump low)
-                        (fixnump high)
-                        #+(or x86 x86-64 arm arm64)
-                        (/= low 0)
-                        (< (- high low) 2)))
-              ;; The fixnum-mod-p case is worse than just EQ testing with
-              ;; only 2 values in the range. (INTEGER 1 2) would have become
-              ;;   (and (not (eq x 0)) (fixnump x) (not (> x 2))).
-              ;; If exactly 1 value, it should have been picked off by TYPE-SINGLETON-P
-              ;; in %SOURCE-TRANSFORM-TYPEP, but even if it wasn't,
-              ;; the OR will drop out due to constraint propagation.
-              `(or (eq ,object ,low) (eq ,object ,high)))
-             ((and (vop-existsp :translate fixnum-mod-p)
-                   (eql (numeric-type-class type) 'integer)
-                   (or (eql low 0)
-                       (and (eql low 1)
-                            (not (eql high most-positive-fixnum))))
-                   (fixnump high))
-              (let ((mod-p `(fixnum-mod-p ,object ,high)))
-                (if (eql low 1)
-                    `(and (not (eq ,object 0))
-                          ,mod-p)
-                    mod-p)))
-             ((and (vop-existsp :translate check-range<=)
+       (cond ((and (vop-existsp :translate check-range<=)
                    (eql (numeric-type-class type) 'integer)
                    (fixnump low)
                    (fixnump high))
@@ -427,17 +400,14 @@
               `(and (typep ,object ',base)
                     ,(transform-numeric-bound-test object type base)))))
       (:complex
-       `(and (complexp ,object)
-             ,(once-only ((n-real `(realpart (truly-the complex ,object)))
-                          (n-imag `(imagpart (truly-the complex ,object))))
-                `(progn
-                   ,n-imag ; ignorable
-                   (and (typep ,n-real ',base)
-                        ,@(when (eq class 'integer)
-                            `((typep ,n-imag ',base)))
-                        ,(transform-numeric-bound-test n-real type base)
-                        ,(transform-numeric-bound-test n-imag type
-                                                       base)))))))))
+       (let ((part-type (second (type-specifier type))))
+         `(and (typep ,object '(complex ,(case base
+                                           ((double-float single-float rational) base)
+                                           (t (if (eq class 'integer)
+                                                  'rational
+                                                  '*)))))
+               (typep (realpart ,object) ',part-type)
+               (typep (imagpart ,object) ',part-type)))))))
 
 ;;; Do the source transformation for a test of a hairy type.
 ;;; SATISFIES is converted into the obvious. Otherwise, we convert
@@ -604,8 +574,8 @@
               ;; don't test a range.
               ;; (and subtype-of-integer (not (integer x y)))
               (destructuring-bind (b a) types
-                (and (eq (numeric-type-class a) 'integer)
-                     (eq (numeric-type-class b) 'integer)
+                (and (integer-type-p a)
+                     (integer-type-p b)
                      (flet ((check (a b)
                               (let* ((a-hi (numeric-type-high a))
                                      (a-lo (numeric-type-low a))
@@ -636,8 +606,8 @@
               ;; (or (integer * fixnum-x) (integer fixnum-y))
               ;; only check for bignump and not its value.
               (destructuring-bind (b a) types
-                (and (eq (numeric-type-class a) 'integer)
-                     (eq (numeric-type-class b) 'integer)
+                (and (integer-type-p a)
+                     (integer-type-p b)
                      (flet ((check (a b)
                               (let* ((a-hi (numeric-type-high a))
                                      (a-lo (numeric-type-low a))
@@ -965,7 +935,8 @@
                                                    (let ((widetag (%other-pointer-widetag data)))
                                                      (if (eq widetag ,typecode)
                                                          (return t)
-                                                         (unless (>= widetag sb-vm:complex-vector-widetag)
+                                                         (unless (or (eq widetag sb-vm:simple-array-widetag)
+                                                                     (>= widetag sb-vm:complex-vector-widetag))
                                                            (return nil)))))))))))
                               t
                               t)
@@ -980,7 +951,9 @@
                                                    (let ((widetag (%other-pointer-widetag data)))
                                                      (if (eq widetag ,typecode)
                                                          (return t)
-                                                         (unless (>= widetag sb-vm:complex-vector-widetag)
+                                                         (unless (or
+                                                                  (eq widetag sb-vm:simple-array-widetag)
+                                                                  (>= widetag sb-vm:complex-vector-widetag))
                                                            (return nil)))))))))))
                               t))))))))))
 
@@ -1473,7 +1446,7 @@
                     (error "~a is not a subtype of VECTOR." type)))))
     (simplify type)))
 
-(defun strip-array-dimensions-and-complexity (type)
+(defun strip-array-dimensions-and-complexity (type &optional simple)
   (labels ((process-compound-type (types)
              (let (array-types)
                (dolist (type types)
@@ -1489,7 +1462,9 @@
                            dim
                            (make-list (length dim)
                                       :initial-element '*))
-                       :complexp :maybe
+                       :complexp (if simple
+                                     nil
+                                     :maybe)
                        :element-type (array-type-element-type type)
                        :specialized-element-type (array-type-specialized-element-type type))))
                    ((union-type-p type)
@@ -1679,6 +1654,11 @@
 ;;; BIGNUMP is simpler than INTEGERP, so if we can rule out FIXNUM then ...
 (deftransform integerp ((x) ((not fixnum)) * :important nil) '(bignump x))
 
+(deftransform structure-typep ((object type) (t t) * :node node)
+  (if (types-equal-or-intersect (lvar-type object) (specifier-type 'instance))
+      (give-up-ir1-transform)
+      nil))
+
 (deftransform structure-typep ((object type) (t (constant-arg t)))
   (let* ((layout (lvar-value type))
          (type (case layout
@@ -1689,9 +1669,14 @@
                   (layout-classoid layout))))
          (diff (type-difference (lvar-type object) type))
          (pred (backend-type-predicate diff)))
-    (if pred
-        `(not (,pred object))
-        (give-up-ir1-transform))))
+    (cond ((not (types-equal-or-intersect (lvar-type object) type))
+           nil)
+          ((csubtypep (lvar-type object) type)
+           t)
+          (pred
+           `(not (,pred object)))
+          (t
+           (give-up-ir1-transform)))))
 
 (deftransform classoid-cell-typep ((cell object) ((constant-arg t) t))
   (let* ((type (specifier-type (classoid-cell-name (lvar-value cell))))
@@ -1700,26 +1685,6 @@
     (if pred
         `(not (,pred object))
         (give-up-ir1-transform))))
-
-(when-vop-existsp (:translate fixnum-mod-p)
-  (deftransform fixnum-mod-p ((x mod) (t (constant-arg fixnum)) * :important nil)
-    (let* ((type (lvar-type x))
-           (mod (lvar-value mod))
-           (intersect (type-intersection type (specifier-type 'fixnum)))
-           (mod-type (specifier-type `(mod ,(1+ mod)))))
-      (cond ((csubtypep intersect mod-type)
-             `(fixnump x))
-            ((and (csubtypep type (specifier-type 'fixnum))
-                  (csubtypep (type-intersection type (specifier-type 'unsigned-byte))
-                             mod-type))
-             `(>= x 0))
-            ((let ((int (type-approximate-interval intersect)))
-               (when int
-                 (let ((power-of-two (1- (ash 1 (integer-length (interval-high int))))))
-                   (when (< 0 power-of-two mod)
-                     `(fixnum-mod-p x ,power-of-two))))))
-            (t
-             (give-up-ir1-transform))))))
 
 (when-vop-existsp (:translate signed-byte-8-p)
   (macrolet ((def (bits)

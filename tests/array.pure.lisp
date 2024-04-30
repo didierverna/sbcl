@@ -779,6 +779,11 @@
    `(lambda (fn)
       (let ((s (make-string 536870910)))
         (declare (dynamic-extent s))
+        (funcall fn s))))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910 :element-type 'base-char)))
+        (declare (dynamic-extent s))
         (funcall fn s)))))
 
 (with-test (:name :hairy-aref-check-bounds)
@@ -796,3 +801,15 @@
             `(lambda (x)
                (declare ((simple-array * (*)) x))
                (setf (aref x 0) 'm))))))
+
+(with-test (:name :typep-displaced)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(vector double-float)))
+    (((make-array 1 :element-type 'double-float :displaced-to (make-array '(1 1) :element-type 'double-float))) t))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(vector t 2)))
+    (((make-array 2 :displaced-to (make-array '(2 1)))) t)))

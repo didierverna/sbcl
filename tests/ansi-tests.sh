@@ -40,12 +40,9 @@ rm -fr sandbox/scratch
  "PRINT.BACKQUOTE.RANDOM.4" "PRINT.BACKQUOTE.RANDOM.5" "PROCLAIM.ERROR.7"
  "SHIFTF.7"
  "SUBTYPEP-COMPLEX.8"
- "SUBTYPEP.EQL.1" "SUBTYPEP.EQL.2" "SUBTYPEP.MEMBER.17" "SUBTYPEP.MEMBER.18"
  "SXHASH.17" "SXHASH.18" "SXHASH.19" "PRINT-STRUCTURE.1"
  "UNION.FOLD.1"
- (append #+win32 (list "EXP.ERROR.7"
-                       "EXPT.ERROR.4" "EXPT.ERROR.5" "EXPT.ERROR.6" "EXPT.ERROR.7"
-                       "PROBE-FILE.4")
+ (append #+win32 (list "PROBE-FILE.4")
          #+x86 (list "CIS.4")
          #+(and arm64 (not darwin))
            (list "EXP.ERROR.4" "EXP.ERROR.5" "EXP.ERROR.6" "EXP.ERROR.7" "EXPT.ERROR.4"
@@ -53,7 +50,7 @@ rm -fr sandbox/scratch
          #-sb-unicode (list "MISC.638")
          (if (member :sb-fasteval sb-impl:+internal-features+)
              (list "INTERSECTION.FOLD.1" "UNION.FOLD.1" "SET-DIFFERENCE.FOLD.1"
-                   "SET-EXCLUSIVE-OR.FOLD.1" "ASH.ERROR.5"
+                   "SET-EXCLUSIVE-OR.FOLD.1"
                    "ALL-STRUCTURE-CLASSES-ARE-SUBTYPES-OF-STRUCTURE-OBJECT.2" "TRACE.8")
              (list "MAP.48" "SYMBOL-FUNCTION.ERROR.5"))
 

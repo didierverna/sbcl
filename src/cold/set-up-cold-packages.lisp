@@ -165,7 +165,7 @@
 (defparameter *shadows*
   '("FLOAT" "SHORT-FLOAT" "SINGLE-FLOAT" "DOUBLE-FLOAT" "LONG-FLOAT"
     "REAL" "COMPLEX" "NUMBER"
-    ;; "RATIONAL" is here for the same reason are the preceding:
+    ;; "RATIONAL" is here for the same reason as the preceding:
     ;; we don't want to mess up all tests of the form (IF (EQ X 'RATIONAL) ...)
     ;; or worry about the package of the symbol we're testing (since identity matters).
     ;; But we also need to logically shadow #'RATIONAL which would not be legal
@@ -178,8 +178,12 @@
     ;; RATIONALP isn't here because its behavior is unchanged.
     "FLOATP" "REALP" "COMPLEXP" "NUMBERP"
     "COERCE" "EXP" "EXPT" "LOG" "SIGNUM" "IMAGPART" "REALPART"
-    "ZEROP" "ABS" "SIGNUM" "FLOAT-SIGN"
+    "ZEROP" "ABS" "SIGNUM"
     "CEILING" "FLOOR" "ROUND" "TRUNCATE" "MOD" "REM"
+    ;; Float decoding:
+    "DECODE-FLOAT" "INTEGER-DECODE-FLOAT" "FLOAT-SIGN"
+    "FLOAT-DIGITS" "FLOAT-PRECISION" "FLOAT-RADIX"
+    "SCALE-FLOAT"
     ;; We always want irrational functions to use target floats.
     "ACOS" "ACOSH" "ASIN" "ASINH" "ATAN" "ATANH"  "CIS" "CONJUGATE"
     "COS" "COSH"  "FCEILING" "FFLOOR" "FROUND" "FTRUNCATE"
@@ -272,7 +276,6 @@
     "CONSTANTP"
     "GET-SETF-EXPANSION"
     "GENSYM"
-    "*GENSYM-COUNTER*"
     "LISP-IMPLEMENTATION-TYPE" "LISP-IMPLEMENTATION-VERSION"
     "MACRO-FUNCTION"
     "MACROEXPAND" "MACROEXPAND-1" "*MACROEXPAND-HOOK*"
@@ -284,7 +287,9 @@
     "UPGRADED-ARRAY-ELEMENT-TYPE"
     "UPGRADED-COMPLEX-PART-TYPE"
     "WITH-COMPILATION-UNIT"
-    ))
+
+    ;; Add eval-when to it
+    "DEFCONSTANT"))
 
 ;;; A symbol in the "dual personality" list refers to the symbol in CL unless
 ;;; package-prefixed with SB-XC:.  The main reason for not putting these
@@ -320,11 +325,7 @@
 ;;; see by default, so that using them by accident fails.
 (defparameter *undefineds*
   '("SYMBOL-PACKAGE"
-    "PACKAGE-NAME"
-    ;; Float decoding: don't want to see these used either.
-    "DECODE-FLOAT" "INTEGER-DECODE-FLOAT"
-    "FLOAT-DIGITS" "FLOAT-PRECISION" "FLOAT-RADIX"
-    "SCALE-FLOAT"))
+    "PACKAGE-NAME"))
 
 ;; The running-in-the-host-Lisp Python cross-compiler defines its
 ;; own versions of a number of functions which should not overwrite

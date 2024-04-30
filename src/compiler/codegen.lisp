@@ -321,7 +321,7 @@
         ;; phase (codegen has not made use of component-header-length),
         ;; so extending can be done with impunity.
         #+arm64
-        (vector-push-extend (cons :coverage-marks (length coverage-map))
+        (vector-push-extend (list :coverage-marks (length coverage-map))
                             (ir2-component-constants ir2-component))
         (vector-push-extend
          (make-constant (cons 'coverage-map
@@ -343,7 +343,7 @@
       (multiple-value-bind (segment text-length fixup-notes fun-table)
           (assemble-sections
            asmstream
-           (mapcar #'entry-info-offset (ir2-component-entries ir2-component))
+           (ir2-component-entries ir2-component)
            (make-segment :header-skew skew
                          :run-scheduler (default-segment-run-scheduler)))
         (values segment text-length fun-table

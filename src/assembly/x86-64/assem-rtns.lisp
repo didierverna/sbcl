@@ -33,13 +33,11 @@
      (:temp loop-index unsigned-reg r9-offset))
 
   ;; Pick off the cases where everything fits in register args.
-  (inst test rcx rcx)
-  (inst jmp :z ZERO-VALUES)
-  (inst cmp rcx (fixnumize 1))
+  (inst cmp :dword rcx (fixnumize 1))
   (inst jmp :e ONE-VALUE)
-  (inst cmp rcx (fixnumize 2))
-  (inst jmp :e TWO-VALUES)
-  (inst cmp rcx (fixnumize 3))
+  (inst jmp :b ZERO-VALUES)
+  (inst cmp :dword rcx (fixnumize 3))
+  (inst jmp :b TWO-VALUES)
   (inst jmp :e THREE-VALUES)
 
   ;; As per the calling convention RBX is expected to point at the SP
@@ -224,34 +222,38 @@
 
 #+sb-assembling
 (define-assembly-routine (call-symbol
+                          (:export undefined-tramp)
                           (:return-style :none))
     ((:temp fun (any-reg descriptor-reg) rax-offset) ; FUN = the symbol
-     (:temp fdefn (any-reg descriptor-reg) rbx-offset))
-  (%lea-for-lowtag-test fdefn fun other-pointer-lowtag)
-  (inst test :byte fdefn lowtag-mask)
+     (:temp tmp (any-reg descriptor-reg) rbx-offset))
+  RETRY
+  (%lea-for-lowtag-test tmp fun other-pointer-lowtag) ; test SYMBOLP
+  (inst test :byte tmp lowtag-mask)
   (inst jmp :nz not-callable)
   (inst cmp :byte (ea (- other-pointer-lowtag) fun) symbol-widetag)
   (inst jmp :ne not-callable)
 
-  (loadw fdefn fun symbol-fdefn-slot other-pointer-lowtag)
-  (inst test :dword fdefn fdefn)
-  (inst jmp :z UNDEFINED)
-  ;; I think we need this MOV because the undefined-function trap examines RAX
-  ;; to see what FDEFN you tried to call through.
-  (inst mov fun fdefn)
-  (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) fdefn))
-  UNDEFINED
-  (inst jmp (make-fixup 'undefined-tramp :assembly-routine))
+  (loadw tmp fun symbol-fdefn-slot other-pointer-lowtag)
+  (inst test :byte tmp tmp) ; if fdefn is nullptr, it has no lowtag
+  (inst jmp :z UNDEFINED-TRAMP)
+  (inst mov fun tmp) ; needed if the JMP invokes UNDEFINED-TRAMP
+  (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) tmp))
   NOT-CALLABLE
   (inst cmp fun nil-value) ;; NIL doesn't have SYMBOL-WIDETAG
-  (inst jmp :e undefined)
-
+  (inst jmp :e UNDEFINED-TRAMP)
+  ;; Not a symbol
   (inst pop (ea n-word-bytes rbp-tn))
   (cerror-call nil 'sb-kernel::object-not-callable-error fun)
   (inst push (ea n-word-bytes rbp-tn))
-  (%lea-for-lowtag-test fdefn fun fun-pointer-lowtag)
-  (inst test :byte rbx-tn lowtag-mask)
-  (inst jmp :nz (make-fixup 'call-symbol :assembly-routine))
+  (%lea-for-lowtag-test tmp fun fun-pointer-lowtag) ; test FUNCTIONP
+  (inst test :byte tmp lowtag-mask)
+  (inst jmp :nz RETRY)
+  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun))
+  (inst .align 3)
+  UNDEFINED-TRAMP
+  (inst pop (ea n-word-bytes rbp-tn))
+  (emit-error-break nil cerror-trap (error-number-or-lose 'undefined-fun-error) (list fun))
+  (inst push (ea n-word-bytes rbp-tn))
   (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
 
 

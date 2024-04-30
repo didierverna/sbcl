@@ -422,3 +422,148 @@
                (optimize speed))
       (the (signed-byte 8) (aref a 0)))
    :allow-notes nil))
+
+(with-test (:name :or-chain)
+  (checked-compile-and-assert
+   ()
+   `(lambda (b)
+      (declare (fixnum b))
+      (case b ((0 -3) 1) (t 2)))
+   ((0) 1)
+   ((-3) 1)
+   ((3) 2)
+   ((1) 2)))
+
+(with-test (:name :or-chain-types)
+  (checked-compile-and-assert
+   ()
+   `(lambda (b)
+      (declare ((integer -1 1) b))
+      (case b
+        ((-1 0) 0)
+        (t 1)))
+   ((-1) 0)
+   ((0) 0)
+   ((1) 1)))
+
+(with-test (:name :or-chain-tagging)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (or (eq x -6)
+          (eq x -2)))
+   ((-6) t)
+   ((-2) t)
+   ((6) nil)
+   ((2) nil)
+   ((-12) nil)
+   ((-4) nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (or (eq x 0)
+          (eq x -4)))
+   ((0) t)
+   ((-4) t)
+   ((4) nil)
+   ((-8) nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (or (eq x 97)
+          (eq x 65)))
+   ((-4611686018427387807) nil)
+   ((97) t)
+   ((65) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (or (eq x -65)
+          (eq x -97)))
+   ((-97) t)
+   ((-65) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (case x ((-3 -2 17) t)))
+   ((4611686018427387902) nil)
+   ((-3) t)
+   ((-2) t)
+   ((17) t)))
+
+(with-test (:name :range<=-same)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a c)
+      (declare (type fixnum a))
+      (let ((v7 (if c
+                    4611686018427387904
+                    -6)))
+        (if (> v7 a)
+            a
+            (if (<= a v7)
+                0
+                a))))
+    ((-7 nil) -7)
+    ((-7 t) -7)
+    ((-6 nil) 0)
+    ((-6 t) -6)
+    ((-3 nil) -3)))
+
+(with-test (:name :/-folding)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (a)
+         (declare (bit a))
+         (/ 1 a))
+    ((1) 1)
+    ((0) (condition 'division-by-zero)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (a)
+         (declare (bit a))
+         (= (/ 5 a) 5))
+    ((1) t)
+    ((0) (condition 'division-by-zero))))
+
+(with-test (:name :dpb-size-overflow)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((unsigned-byte 8) a))
+      (dpb a (byte 63 8)
+           81))
+   ((90) 23121)))
+
+(with-test (:name :mask-field-size-overflow)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (truly-the fixnum
+                 (mask-field (byte 78 0) a)))
+   ((35) 35)))
+(with-test (:name :ash-count-integr)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (a b)
+         (ash a b))
+    ((1 -1.0) (condition 'type-error))
+    (((expt 2 74) -1.0) (condition 'type-error))
+    ((0 1.0) (condition 'type-error))
+    (((expt 2 74) 1.0) (condition 'type-error))
+    ((1 1d0) (condition 'type-error))
+    (((expt 2 74) 1d0) (condition 'type-error))
+    ((0 -3d0) (condition 'type-error))
+    (((expt 2 74) -2d0) (condition 'type-error))))
+
+(with-test (:name :log-integer-derive-type)
+  (assert-type
+   (lambda (x)
+     (declare ((integer 0) x))
+     (log x))
+   (single-float 0.0))
+  (assert-type
+   (lambda (x)
+     (declare (integer x))
+     (log x))
+   (or (complex single-float) (single-float 0.0))))

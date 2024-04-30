@@ -15,13 +15,20 @@
 
 ;;; The initialization of these streams is performed by
 ;;; STREAM-COLD-INIT-OR-RESET.
-(defvar *terminal-io* () "terminal I/O stream")
-(defvar *standard-input* () "default input stream")
-(defvar *standard-output* () "default output stream")
-(defvar *error-output* () "error output stream")
-(defvar *query-io* () "query I/O stream")
-(defvar *trace-output* () "trace output stream")
-(defvar *debug-io* () "interactive debugging stream")
+(defvar *terminal-io*)
+(setf (documentation '*terminal-io* 'variable) "terminal I/O stream")
+(defvar *standard-input*)
+(setf (documentation '*standard-input* 'variable) "default input stream")
+(defvar *standard-output*)
+(setf (documentation '*standard-output* 'variable) "default output stream")
+(defvar *error-output*)
+(setf (documentation '*error-output* 'variable) "error output stream")
+(defvar *query-io*)
+(setf (documentation '*query-io* 'variable) "query I/O stream")
+(defvar *trace-output*)
+(setf (documentation '*trace-output* 'variable) "trace output stream")
+(defvar *debug-io*)
+(setf (documentation '*debug-io* 'variable) "interactive debugging stream")
 
 (defun stream-element-type-stream-element-mode (element-type)
   (cond ((or (not element-type)
@@ -702,6 +709,7 @@
 (macrolet
     ((define (name)
        `(defun ,name (string stream start end)
+          (declare (optimize (sb-c:verify-arg-count 0)))
           ;; unclear why the dispatch to simple and gray methods have to receive a simple-string.
           ;; I'm pretty sure the STREAM-foo methods on gray streams are not specified to be
           ;; constrained to receive only simple-string.
@@ -958,7 +966,7 @@
 ;;; function on the synonymed stream.
 (macrolet ((out-fun (name fun &rest args)
              `(defun ,name (stream ,@args)
-                (declare (optimize (safety 1)))
+                (declare (optimize (safety 1) (sb-c:verify-arg-count 0)))
                 (let ((syn (symbol-value (synonym-stream-symbol stream))))
                   (,fun ,(car args) syn ,@(cdr args))))))
   (out-fun synonym-out write-char ch)
@@ -970,7 +978,7 @@
 ;;; the In-Buffer if there is any.
 (macrolet ((in-fun (name fun &rest args)
              `(defun ,name (stream ,@args)
-                (declare (optimize (safety 1)))
+                (declare (optimize (safety 1) (sb-c:verify-arg-count 0)))
                 ,@(when (member 'sbuffer args) '((declare (ignore sbuffer))))
                 (,fun (symbol-value (synonym-stream-symbol stream))
                       ,@(remove 'sbuffer args)))))
@@ -1104,19 +1112,20 @@
                       (bin #'concatenated-bin)
                       (n-bin #'concatenated-n-bin)
                       (misc #'concatenated-misc))
-            (:constructor %make-concatenated-stream (streams))
+            (:constructor %make-concatenated-stream (list))
             (:copier nil)
             (:predicate nil))
   ;; The car of this is the substream we are reading from now.
-  (streams nil :type list))
-
+  ;; This is not named CONCATENATED-STREAM-STREAMS because user modification
+  ;; via (SETF CONCATENATED-STREAM-STREAMS) is not conforming.
+  (list nil :type list))
 (declaim (freeze-type concatenated-stream))
+(defun concatenated-stream-streams (stream) ; standard function
+  (concatenated-stream-list stream))
 
 (defmethod print-object ((x concatenated-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
-    (format stream
-            ":STREAMS ~S"
-            (concatenated-stream-streams x))))
+    (format stream ":STREAMS ~S" (concatenated-stream-list x))))
 
 (defun make-concatenated-stream (&rest streams)
   "Return a stream which takes its input from each of the streams in turn,
@@ -1130,20 +1139,20 @@
 
 (macrolet ((in-fun (name fun)
              `(defun ,name (stream eof-error-p eof-value)
-                (do ((streams (concatenated-stream-streams stream)
+                (do ((streams (concatenated-stream-list stream)
                               (cdr streams)))
                     ((null streams)
                      (eof-or-lose stream eof-error-p eof-value))
                   (let* ((stream (car streams))
                          (result (,fun stream nil nil)))
                     (when result (return result)))
-                  (pop (concatenated-stream-streams stream))))))
+                  (pop (concatenated-stream-list stream))))))
   (in-fun concatenated-in read-char)
   (in-fun concatenated-bin read-byte))
 
 (defun concatenated-n-bin (stream buffer sbuffer start numbytes eof-errorp)
   (declare (ignore sbuffer))
-  (do ((streams (concatenated-stream-streams stream) (cdr streams))
+  (do ((streams (concatenated-stream-list stream) (cdr streams))
        (current-start start)
        (remaining-bytes numbytes))
       ((null streams)
@@ -1156,10 +1165,10 @@
       (incf current-start bytes-read)
       (decf remaining-bytes bytes-read)
       (when (zerop remaining-bytes) (return numbytes)))
-    (setf (concatenated-stream-streams stream) (cdr streams))))
+    (setf (concatenated-stream-list stream) (cdr streams))))
 
 (defun concatenated-misc (stream operation arg1)
-  (let* ((left (concatenated-stream-streams stream))
+  (let* ((left (concatenated-stream-list stream))
          (current (car left)))
     (stream-misc-case (operation)
       (:listen
@@ -1171,9 +1180,8 @@
                          (stream-misc-dispatch current operation arg1))))
           (cond ((eq stuff :eof)
                  ;; Advance STREAMS, and try again.
-                 (pop (concatenated-stream-streams stream))
-                 (setf current
-                       (car (concatenated-stream-streams stream)))
+                 (pop (concatenated-stream-list stream))
+                 (setf current (car (concatenated-stream-list stream)))
                  (unless current
                    ;; No further streams. EOF.
                    (return :eof)))
@@ -2675,7 +2683,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
         (setf (ansi-stream-misc stream) misc)))
 
 (defun stdstream-external-format (fd)
-  #-win32 (declare (ignore fd))
+  (declare (ignorable fd))
   (let* ((keyword (cond #+(and win32 sb-unicode)
                         ((sb-win32::console-handle-p fd)
                          :ucs-2)

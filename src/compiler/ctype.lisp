@@ -126,20 +126,13 @@
                (max-args (+ min-args (length optional)))
                (rest (fun-type-rest type))
                (keyp (fun-type-keyp type))
-               (fun (combination-fun call))
-               (caller (loop for annotation in (lvar-annotations fun)
-                             when (typep annotation 'lvar-function-designator-annotation)
-                             do (setf *compiler-error-context* annotation)
-                                (return (lvar-function-designator-annotation-caller annotation))))
-               (name (nth-value 1 (lvar-fun-type fun))))
+               (fun (combination-fun call)))
           (cond
-            ((report-arg-count-mismatch name
-                                        caller type nargs nil
-                                        :lossage-fun #'note-lossage))
+            ((report-arg-count-mismatch fun nil type nargs nil #'note-lossage))
             (t
              (check-fixed-and-rest args (append required optional) rest)
              (when (and keyp
-                        (check-key-args name args max-args type))
+                        (check-key-args fun args max-args type))
                (setf unknown-keys t))))
 
           (when result-test
@@ -168,6 +161,44 @@
     (cond (*lossage-detected* (values nil t unknown-keys))
           (*unwinnage-detected* (values nil nil unknown-keys))
           (t (values t t unknown-keys)))))
+
+(defun valid-transform-fun (call type arg-fun result-fun)
+  (declare (function arg-fun result-fun))
+  (let ((args (combination-args call)))
+    (flet ((check (lvar type)
+             (if (constant-type-p type)
+                 (and (constant-lvar-p lvar)
+                      (ctypep (lvar-value lvar)
+                              (constant-type-type type)))
+                 (funcall arg-fun (lvar-type lvar) type))))
+      (and (or (fun-type-wild-args type)
+               (and (loop for type in (fun-type-required type)
+                          always (and args
+                                      (check (pop args) type)))
+                    (loop for type in (fun-type-optional type)
+                          always (if args
+                                     (check (pop args) type)
+                                     (return-from valid-transform-fun t)))
+                    (or (not args)
+                        ;; Assume that validate-call-type has ensured that
+                        ;; the keys are all constant.
+                        (cond ((fun-type-keyp type)
+                               (loop with keywords = (fun-type-keywords type)
+                                     for (key value) on args by #'cddr
+                                     for info = (find (lvar-value key)
+                                                      (fun-type-keywords type)
+                                                      :key #'key-info-name)
+                                     always (and info
+                                                 (check value
+                                                        (key-info-type info)))))
+                              ((let ((rest (fun-type-rest type)))
+                                 (and rest
+                                      (or (eq rest *universal-type*)
+                                          (loop for arg in args
+                                                always (csubtypep (lvar-type arg) rest))))))))))
+           (let ((return-type (fun-type-returns type)))
+             (or (eq return-type *wild-type*)
+                 (funcall result-fun (node-asserted-type call) return-type)))))))
 
 ;;;
 
@@ -291,9 +322,9 @@ and no value was provided for it." name))))))))))
 ;;; be known and the corresponding argument should be of the correct
 ;;; type. If the key isn't a constant, then we can't tell, so we can
 ;;; complain about absence of manifest winnage.
-(defun check-key-args (name args pre-key type)
+(defun check-key-args (fun args pre-key type)
   (declare (list args) (fixnum pre-key) (type fun-type type))
-  (declare (ignorable name))
+  (declare (ignorable fun))
   (let (lossages allow-other-keys
         unknown-keys)
     (do ((key (nthcdr pre-key args) (cddr key))
@@ -331,18 +362,19 @@ and no value was provided for it." name))))))))))
                                     (1+ n)))))))))
     (when (and lossages (member allow-other-keys '(nil :no)))
       (setf lossages (nreverse lossages))
-
-      (cond #-sb-xc-host
-            ((or (eq (info :function :type name) :generic-function)
-                 (eq (info :function :where-from name) :defined-method))
-             (note-key-arg-mismatch name lossages))
-            ((cdr lossages)
-             (note-lossage "~@<~{~S~^, ~} and ~S are not a known argument keywords.~:@>"
-                           (butlast lossages)
-                           (car (last lossages))))
-            (t
-             (note-lossage "~S is not a known argument keyword."
-                           (car lossages)))))
+      (let (#-sb-xc-host
+            (name (nth-value 1 (lvar-fun-type fun))))
+        (cond #-sb-xc-host
+              ((or (eq (info :function :type name) :generic-function)
+                   (eq (info :function :where-from name) :defined-method))
+               (note-key-arg-mismatch name lossages))
+              ((cdr lossages)
+               (note-lossage "~@<~{~S~^, ~} and ~S are not a known argument keywords.~:@>"
+                             (butlast lossages)
+                             (car (last lossages))))
+              (t
+               (note-lossage "~S is not a known argument keyword."
+                             (car lossages))))))
     unknown-keys))
 
 ;;; Construct a function type from a definition.
@@ -351,11 +383,11 @@ and no value was provided for it." name))))))))))
 ;;; the &REST type.
 (defun definition-type (functional)
   (declare (type functional functional)
-           #-sb-xc-host (values fun-type))
+           #-sb-xc-host (values fun-type &optional))
   (if (lambda-p functional)
       (make-fun-type
        :required (mapcar #'leaf-type (lambda-vars functional))
-       :returns (if (eq (functional-kind functional) :deleted)
+       :returns (if (functional-kind-eq functional deleted)
                     *empty-type*
                     (tail-set-type (lambda-tail-set functional))))
       (let ((rest nil))
@@ -905,19 +937,31 @@ and no value was provided for it." name))))))))))
                      :returns (fun-type-returns type))
       type))
 
+
+(defun single-value-args (call)
+  (let ((args (basic-combination-args call)))
+   (if (mv-combination-p call)
+       (loop for arg in args
+             while (type-single-value-p (lvar-derived-type arg))
+             collect arg)
+       args)))
+
 ;;; Call FUN with (arg-lvar arg-type lvars &optional annotation)
-(defun map-combination-args-and-types (fun call &optional info
-                                                          unknown-keys-fun
-                                                          defined-here
-                                                          asserted-type)
-  (declare (type function fun) (type combination call))
-  (binding* ((type (lvar-fun-type (combination-fun call) defined-here asserted-type))
+(defun map-combination-args-and-types (fun call &key info
+                                                     unknown-keys-fun
+                                                     defined-here
+                                                     asserted-type
+                                                     type)
+  (declare (type function fun)
+           (type basic-combination call))
+  (binding* ((type (or type
+                       (lvar-fun-type (basic-combination-fun call) defined-here asserted-type)))
              (nil (fun-type-p type) :exit-if-null)
              (annotation (and info
                               (fun-info-annotation info)))
+             (args (single-value-args call))
              ((arg-lvars unknown-keys)
-              (resolve-key-args (combination-args call) type))
-             (args (combination-args call))
+              (resolve-key-args args type))
              (i -1))
     (flet ((positional-annotation ()
              (and annotation
@@ -962,7 +1006,7 @@ and no value was provided for it." name))))))))))
               (call lvar (key-info-type key) (key-annotation name)))))
         (when (and unknown-keys-fun
                    unknown-keys)
-          (funcall unknown-keys-fun))))))
+          (funcall unknown-keys-fun unknown-keys))))))
 
 (defun assert-array-index-lvar-type (lvar type policy)
   (let ((internal-lvar (make-lvar))
@@ -980,7 +1024,7 @@ and no value was provided for it." name))))))))))
 
 (defun apply-type-annotation (fun-name arg type lvars policy &optional annotation context)
   (case (car annotation)
-    (function-designator
+    ((function function-designator)
      (assert-function-designator fun-name lvars arg (cdr annotation) policy)
      t)
     (t
@@ -1027,7 +1071,7 @@ and no value was provided for it." name))))))))))
                          (and (not (return-p (lvar-dest lvar)))
                               (not (mv-combination-p (lvar-dest lvar)))
                               (lvar-has-single-use-p lvar))))
-            (when (assert-lvar-type lvar returns policy 'ftype-context)
+            (when (assert-node-type call returns policy 'ftype-context)
               (reoptimize-lvar lvar)))))
     (let* ((name (lvar-fun-name (combination-fun call) t))
            (info (and name
@@ -1045,9 +1089,9 @@ and no value was provided for it." name))))))))))
                     (not trusted))
                (reoptimize-lvar arg)))
            call
-           info
-           nil
-           t))))
+           :info info
+           :defined-here t
+           :type type))))
   (values))
 
 ;;;; FIXME: Move to some other file.

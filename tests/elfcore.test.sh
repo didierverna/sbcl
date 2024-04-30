@@ -30,7 +30,7 @@ fi
 set -e # exit on error
 
 # Ensure that we're not running a stale shrinkwrap-sbcl
-(cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl ; make shrinkwrap-sbcl)
+(cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl* ; make shrinkwrap-sbcl)
 
 # Prevent style-warnings in the editcore script, but don't assume that it
 # can be compiled in the first place unless actually doing the ELFcore tests.
@@ -45,7 +45,7 @@ run_sbcl <<EOF
 EOF
 
 $SBCL_PWD/../src/runtime/shrinkwrap-sbcl --disable-debugger --no-sysinit --no-userinit --noprint <<EOF
-(sb-vm::make-immobile-symbol "junk") ; crashed 'cause I forgot to use rip-relative-EA
+(sb-vm::%alloc-immobile-symbol "junk") ; crashed 'cause I forgot to use rip-relative-EA
 ;; I think this tests immobile space exhaustion
 (dotimes (i 100000) (sb-vm::alloc-immobile-fdefn))
 

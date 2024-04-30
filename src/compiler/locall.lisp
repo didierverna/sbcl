@@ -50,7 +50,7 @@
                           (arg-info-key (lambda-var-arg-info var)))
                      (lambda-var-%source-name var))))
       (assert-lvar-type (car args) (leaf-type var) policy
-                        (if (eq (functional-kind fun) :optional)
+                        (if (functional-kind-eq fun optional)
                             (make-local-call-context fun name)
                             name))
       (unless (leaf-refs var)
@@ -101,7 +101,7 @@
   (declare (type basic-combination call) (type clambda new-fun))
   (let ((return (node-dest call)))
     (when (and (return-p return)
-               (not (memq (functional-kind new-fun) '(:deleted :zombie))))
+               (not (functional-kind-eq new-fun deleted zombie)))
       (let ((call-set (lambda-tail-set (node-home-lambda call)))
             (fun-set (lambda-tail-set new-fun)))
         (unless (eq call-set fun-set)
@@ -129,6 +129,10 @@
   (declare (type ref ref) (type combination call) (type clambda fun))
   (propagate-to-args call fun)
   (setf (basic-combination-kind call) :local)
+
+  ;; Constraint propagation needs it to be the last node.
+  ;; join-blocks-if-possible will join things eventually.
+  (node-ends-block call)
   (sset-adjoin fun (lambda-calls-or-closes (node-home-lambda call)))
   (mark-dynamic-extent-args call fun)
   (merge-tail-sets call fun)
@@ -288,7 +292,7 @@
            (xep (ir1-convert-lambda (make-xep-lambda-expression fun)
                                     :debug-name (debug-name
                                                  'xep (leaf-debug-name fun)))))
-      (setf (functional-kind xep) :external
+      (setf (functional-kind xep) (functional-kind-attributes external)
             (leaf-ever-used xep) t
             (functional-entry-fun xep) fun
             (functional-entry-fun fun) xep
@@ -318,8 +322,7 @@
   (declare (type ref ref))
   (let ((fun (ref-leaf ref)))
     (unless (or (xep-p fun)
-                (member (functional-kind fun) '(:escape :cleanup
-                                                :zombie :deleted)))
+                (functional-kind-eq fun escape cleanup zombie deleted))
       (change-ref-leaf ref (or (functional-entry-fun fun)
                                (make-xep fun))))))
 
@@ -350,7 +353,7 @@
 
                  (convert-call-if-possible ref dest)
                  ;; It might have been deleted by CONVERT-CALL-IF-POSSIBLE
-                 (when (eq (functional-kind fun) :deleted)
+                 (when (functional-kind-eq fun deleted)
                    (return-from locall-analyze-fun-1))
                  (unless (eq (basic-combination-kind dest) :local)
                    (reference-entry-point ref)))
@@ -387,8 +390,9 @@
         (return))
       (let ((kind (functional-kind fun)))
         (cond ((or (functional-somewhat-letlike-p fun)
-                   (memq kind '(:deleted :zombie))))
-              ((and (null (leaf-refs fun)) (eq kind nil)
+                   (logtest kind (functional-kind-attributes deleted zombie))))
+              ((and (null (leaf-refs fun))
+                    (eql kind (functional-kind-attributes nil))
                     (not (functional-entry-fun fun)))
                (delete-functional fun))
               (t
@@ -427,7 +431,7 @@
   (if (and (policy call
                (and (>= speed space)
                     (>= speed compilation-speed)))
-           (not (eq (functional-kind (node-home-lambda call)) :external))
+           (not (functional-kind-eq (node-home-lambda call) external))
            (inline-expansion-ok call original-functional))
       (let* ((end (component-last-block (node-component call)))
              (pred (block-prev end)))
@@ -504,8 +508,7 @@
     (aver (functional-p original-fun))
     (unless (or (member (basic-combination-kind call) '(:local :error))
                 (node-to-be-deleted-p call)
-                (member (functional-kind original-fun)
-                        '(:toplevel-xep :deleted)))
+                (functional-kind-eq original-fun toplevel-xep deleted))
       (let ((fun (if (xep-p original-fun)
                      (functional-entry-fun original-fun)
                      original-fun))
@@ -529,8 +532,7 @@
         ;; Expanding inline might move it to the current component
         (when (or (eq (component-kind component) :initial)
                   (eq (node-component (lambda-bind (main-entry fun))) component))
-          (aver (member (functional-kind fun)
-                        '(nil :escape :cleanup :optional :assignment)))
+          (aver (functional-kind-eq fun nil escape cleanup optional assignment))
           (cond ((mv-combination-p call)
                  (convert-mv-call ref call fun))
                 ((lambda-p fun)
@@ -589,6 +591,8 @@
         (sset-adjoin ep (lambda-calls-or-closes (node-home-lambda call)))
         (merge-tail-sets call ep)
         (change-ref-leaf ref ep)
+        ;; For constraints
+        (node-ends-block call)
         (if (singleton-p args)
             (assert-lvar-type
              (first args)
@@ -769,6 +773,12 @@
              (temp more-temps (cddr temp)))
             ((null key))
           (let ((lvar (first key)))
+            (unless (types-equal-or-intersect (lvar-type lvar)
+                                              (specifier-type 'symbol))
+              (setf (combination-kind call) :error)
+              (compiler-warn "Argument of type ~s cannot be used as a keyword."
+                             (type-specifier (lvar-type lvar)))
+              (return-from convert-more-call))
             (unless (constant-lvar-p lvar)
               (when flame
                 (compiler-notify "non-constant keyword in keyword call"))
@@ -794,11 +804,11 @@
                                (setq loser (list name)))))
                 (let ((info (lambda-var-arg-info var)))
                   (when (eq (arg-info-key info) name)
-                      (ignores dummy)
-                      (if (member var (supplied) :key #'car)
-                          (ignores val)
-                          (supplied (cons var val)))
-                      (return)))))))
+                    (ignores dummy)
+                    (if (member var (supplied) :key #'car)
+                        (ignores val)
+                        (supplied (cons var val)))
+                    (return)))))))
 
         (when (and loser (not (optional-dispatch-allowp fun)) (not allowp))
           (compiler-warn "function called with unknown argument keyword ~S"
@@ -1093,8 +1103,8 @@
                        (not (node-to-be-deleted-p this-call))
                        (eq (node-home-lambda this-call) fun))
               (setf (node-tail-p this-call) nil)
-              (ecase (functional-kind called)
-                ((nil :cleanup :optional)
+              (functional-kind-ecase called
+                ((nil cleanup optional)
                  (let ((block (node-block this-call))
                        (lvar (node-lvar call)))
                    (unlink-blocks block (first (block-succ block)))
@@ -1111,12 +1121,12 @@
                        ;; calls.)
                        (push this-call maybe-terminate)
                        (add-lvar-use this-call lvar))))
-                (:deleted)
+                (deleted)
                 ;; The called function might be an assignment in the
                 ;; case where we are currently converting that function.
                 ;; In steady-state, assignments never appear as a called
                 ;; function.
-                (:assignment
+                (assignment
                  (aver (eq called fun)))))))))
     maybe-terminate))
 
@@ -1313,7 +1323,7 @@
     (let ((refs (leaf-refs clambda)))
       (when (and refs
                  (null (rest refs))
-                 (memq (functional-kind clambda) '(nil :assignment))
+                 (functional-kind-eq clambda nil assignment)
                  (not (functional-entry-fun clambda)))
         (binding* ((ref (first refs))
                    (ref-lvar (node-lvar ref) :exit-if-null)
@@ -1330,11 +1340,13 @@
             (when (eq clambda (node-home-lambda dest))
               (delete-lambda clambda)
               (return-from maybe-let-convert nil))
-            (unless (eq (functional-kind clambda) :assignment)
+            (unless (functional-kind-eq clambda assignment)
               (let-convert clambda dest))
             (reoptimize-call dest)
             (setf (functional-kind clambda)
-                  (if (mv-combination-p dest) :mv-let :let))
+                  (if (mv-combination-p dest)
+                      (functional-kind-attributes mv-let)
+                      (functional-kind-attributes let)))
             (when (combination-p dest)  ;  mv-combinations are too hairy
                                         ;  for me to handle - PK 2012-05-30
               (substitute-let-funargs dest clambda component))))
@@ -1376,8 +1388,7 @@
                ;; If the call is in an XEP, we might decide to make it
                ;; non-tail so that we can use known return inside the
                ;; component.
-               (not (eq (functional-kind (node-home-lambda call))
-                        :external))
+               (not (functional-kind-eq (node-home-lambda call) external))
                (not (block-delete-p (lambda-block fun))))
       (node-ends-block call)
       (let ((block (node-block call)))
@@ -1418,7 +1429,7 @@
 ;;; same place.
 (defun maybe-convert-to-assignment (fun)
   (declare (type clambda fun))
-  (when (and (not (functional-kind fun))
+  (when (and (functional-kind-eq fun nil)
              (not (functional-entry-fun fun))
              ;; If a functional is explicitly inlined, we don't want
              ;; to assignment convert it, as more call-site
@@ -1479,7 +1490,7 @@
                              (push dest outside-calls))))))
                  (ok-initial-convert-p fun))
         (when outside-calls
-          (setf (functional-kind fun) :assignment)
+          (setf (functional-kind fun) (functional-kind-attributes assignment))
           ;; The only time OUTSIDE-CALLS contains a mix of both
           ;; tail and non-tail calls is when calls to FUN are
           ;; derived to not return, in which case it doesn't

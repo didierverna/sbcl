@@ -1,11 +1,121 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
-changes relative to sbcl-2.4.1:
+changes in sbcl-2.4.4 relative to sbcl-2.4.3:
+  * minor incompatible change: after-GC hooks are now called in the finalizer
+    thread on threaded builds.
+  * platform support:
+    ** on win32 on 64-bit systems, clear x87 state as well as SSE state after
+       an exception.  (lp#2000435, reported by David Scherfgen)
+  * enhancement: type assertions resulting from declarations involving variable
+    numbers of multiple values are now checked.
+  * enhancement: support for memory allocation arenas is now available on the
+    arm64 platform.
+  * enhancement: the cross-referencing facility is now able to handle
+    anonymous functions.
+  * enhacnement: the SB-INTROSPECT contrib finds callees in methods of generic
+    functions.
+  * bug fix: inconsistency in VOP definitions implementing DPB.  (lp#2059842)
+  * bug fix: MASK-FIELD miscompilation.  (lp#2059849)
+  * bug fix: caching a state-dependent type function leads to wrong type
+    inference further down the line.  (lp#2059888)
+  * bug fix: internal consistency violation after failing to apply a
+    MAKE-ARRAY transform.  (lp#2060083)
+  * bug fix: check the array index before constant-folding an array reference.
+    (lp#2060347)
+  * bug fix: don't try to apply type constraints from SATISFIES
+    types.  (lp#2060756)
+  * bug fix: the JOIN-THREAD-PROBLEM function is now exported from the
+    SB-THREAD package.  (lp#2063385, thanks to Benjamin Lee)
+  * bug fix: compare-and-swap works as expected on SLOT-VALUE of
+    FUNCALLABLE-STANDARD-OBJECT instances.  (reported by qhong)
+  * bug fix: on arm64, and x86-64 with some non-default build options, integer
+    rounding functions treat minus zero more consistently.
+  * bug fix: disassembly of stack allocation of vectors caused a crash.
+    (reported by bohonghuang)
+  * bug fix: don't leak memory when decompressing a compressed core.
+  * optimization: the amount of space needed for debug-info is about 50% less,
+    leading to a total default image size reduction of more than 10%.
+  * optimization: on arm64 and x86-64, encoding constants in machine code is
+    sometimes smaller.
+  * optimization: on arm64 and x86-64, list accumulation is done with less
+    space overhead.
+  * optimization: APPLY can apply a function to the REST of a &REST list
+    without additional consing.
+
+changes in sbcl-2.4.3 relative to sbcl-2.4.2:
+  * enhancement: when dumping debug information to fasl files, the system
+    respects the SOURCE_DATE_EPOCH environment variable (if set) as the latest
+    timestamp to be used.
+  * contributed module: the sb-perf contributed module, an interface
+    originally by Luke Gorrie to Linux's perf, is now included by default on
+    Linux.  (Thanks to Philipp Marek)
+  * platform support:
+    ** on Linux and BSD variants, timezone querying is now faster.
+    ** Arm64/Darwin: allow configuring the system with a relocatable static
+       space.
+    ** PPC64: allow configuring the system with fasteval.
+  * bug fix: erroneous transform of EQUALP on characters (lp#2055425)
+  * bug fix: float rounders (FTRUNCATE and related functions) handle minus
+    zero more consistently, returning minus zero as the primary value when
+    rounding to zero from a negative value.
+  * bug fix: type checks for (VECTOR T) were giving the wrong answer for
+    vectors displayed to simple multi-dimensional arrays.  (reported by
+    _death)
+  * bug fix: do not transform away division by BIT when the BIT might still
+    include 0.  (lp#2056184, reported by xizang)
+  * bug fix: various errors related to imperfections in the perfect hash
+    generator.  (lp#2055794, lp#2056341)
+  * bug fix: respect declarations for symbol macros inside defmethod.
+    (lp#2056514, reported by Jonathan Braud)
+  * bug fix: failure to set structure slots to floats on Arm64.  (lp#2058148,
+    reported by Bibek Panthi)
+  * optimization: improvements to the implementation of CASE.
+  * optimization: faster PARSE-INTEGER :radix 10/16 on word-sized integers.
+  * optimization: improvements to LOGBITP.
+
+changes in sbcl-2.4.2 relative to sbcl-2.4.1:
   * bug fix: restore the ability to inherit from both SEQUENCE and
     SB-MOP:FUNCALLABLE-STANDARD-OBJECT.  (lp#2050088, reported by Christophe
     Junke)
   * bug fix: COERCE will not convert lambda forms to functions if given a type
     naming a (strict) subclass of FUNCTION.
+  * bug fix: LOG with a double-float and a ratio argument (in either order) do
+    not lose precision through a single-float intermediate argument.
+  * bug fix: LOG to the base 2 of integer powers of 2 are more likely to get
+    the mathematically precise answer.
+  * bug fix: LOG on ratios very near 1 with numerator or denominator being
+    near a power of 2 will use log1p and so will lose less precision.
+  * bug fix: the utf-8 external format with Unix line-endings updates its
+    character size information when taking the fast path for a buffer of ascii
+    characters.  (lp#2054169, reported by John Carroll)
+  * bug fix: don't print the contents of a possibly no-longer-valid
+    dynamic-extent cons in PRINT-OBJECT method for THREAD objects.
+    (lp#2026195, reported by Jake Connor)
+  * bug fix: place external entry points for functions consistently before any
+    local functions.  (lp#2051169, reported by Fedorov Alexander)
+  * bug fix: remove unactionable optimization notes for backquoted forms and
+    ordinary calls to APPEND at high speed.  (lp#2051401, reported by Robert
+    Brown)
+  * bug fix: infinite loop in COPY-SEQ on zero-length arrays of element-type
+    NIL.  (lp#2051759, reported by Devon Sean McCullough)
+  * bug fix: fix compilation of non-top-level struct constructors.
+    (lp#2052329, reported by Robert Poitras)
+  * bug fixes in SB-SIMD:
+    ** improve bounds checking in SB-SIMD.  (lp#2012010, reported by Patrick
+       Poitras)
+    ** fix SB-SIMD AVX f64.4-reverse (lp#2012986, thanks to Ari Projansky)
+    ** fix SB-SIMD shuffles on AVX and SSE2 (lp#2012990, reported by Ari
+       Projansky)
+    ** fix lifetimes in sse+xmm0 VOPs (lp#2015329, reported by Ari Projansky)
+  * optimization: a number of internal tables, particularly those related to
+    Unicode support have been converted to use perfect hash mechanisms,
+    improving both speed and space.
+  * optimization: FIND, POSITION, ASSOC and RASSOC with constant sequence
+    arguments containing symbols as keys are compiled to perfect hash lookups.
+  * optimization: the compiler runs a jump-to-jump elimination pass on x86-64.
+  * system integrity: compiling the system itself on x86-64/linux now produces
+    bitwise-identical cross-compiled fasls whether the build host is cmucl,
+    ccl, clisp or sbcl itself.
 
 changes in sbcl-2.4.1 relative to sbcl-2.4.0:
   * enhancement: compact instance headers are partially supported with the

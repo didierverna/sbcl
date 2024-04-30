@@ -378,9 +378,8 @@
 
 ;;;; the FOP database
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; The bottom 5 bits of the opcodes above 128 encode an implicit operand.
-  (defconstant n-ordinary-fops 128))
+;; The bottom 5 bits of the opcodes above 128 encode an implicit operand.
+(defconstant n-ordinary-fops 128)
 
 ;;; a vector indexed by a FaslOP that yields a function which performs
 ;;; the operation. Most functions take 0 arguments - they only manipulate
@@ -441,6 +440,7 @@
                  (error ,(format nil "Not-host fop invoked: ~A" name)))))
        (!%define-fop ',name ,fop-code ,(length operands) ,(if pushp 1 0)))))
 
+(defglobal *fop-name-to-opcode* (make-hash-table))
 (defun !%define-fop (name opcode n-operands pushp)
   (declare (type (mod 4) n-operands))
   (let ((function (svref **fop-funs** opcode)))
@@ -454,7 +454,7 @@
       (when (and existing-opcode (/= existing-opcode opcode))
         (error "multiple codes for fop name ~S: ~D and ~D"
                name opcode existing-opcode)))
-    (setf (get name 'opcode) opcode
+    (setf (gethash name *fop-name-to-opcode*) opcode
           (svref **fop-funs** opcode) (symbol-function name)
           (aref (car **fop-signatures**) opcode) n-operands
           (sbit (cdr **fop-signatures**) opcode) pushp))
@@ -724,8 +724,11 @@
                      n-operands arg1 arg2 arg3)
              (when (functionp function)
                (format *trace-output* " ~35t~(~a~)" (%fun-name function))
-               (when (eql (%fun-name function) 'fop-push)
-                 (format *trace-output* " ~(~A~)" (ref-fop-table fasl-input arg1)))))))))))
+               (case (%fun-name function)
+                 (fop-push (format *trace-output* " ~(~A~)" (ref-fop-table fasl-input arg1)))
+                 (fop-word-integer (format *trace-output* " ~V,'0X" (* 2 sb-vm:n-word-bytes) result))
+                 (fop-byte-integer (format *trace-output* " ~2,'0X" result))
+                 (fop-integer (format *trace-output* " ~X" result)))))))))))
 
 (defun load-as-fasl (stream verbose print)
   (when (zerop (file-length stream))
@@ -783,12 +786,6 @@
               (%raw-instance-set/word res i val)))
         (incf ptr)))
     res))
-
-;;; Symbol-like entities
-(define-fop 49 :not-host (fop-debug-name-marker ((:operands kind)))
-  (ecase kind
-   (1 sb-c::*debug-name-sharp*)
-   (2 sb-c::*debug-name-ellipsis*)))
 
 (define-fop 45 :not-host (fop-layout ((:operands depthoid flags length)
                                        name bitmap inherits))
@@ -1327,14 +1324,7 @@
         (#x6d sb-c::compiled-debug-info)
         (#x6e sb-c::debug-source)
         (#x6f defstruct-description)
-        (#x70 defstruct-slot-description)
-        (#x71 sb-c::debug-fun)
-        (#x72 sb-c::compiled-debug-fun)
-        (#x73 sb-c::compiled-debug-fun-optional)
-        (#x74 sb-c::compiled-debug-fun-more)
-        (#x75 sb-c::compiled-debug-fun-external)
-        (#x76 sb-c::compiled-debug-fun-toplevel)
-        (#x77 sb-c::compiled-debug-fun-cleanup)))
+        (#x70 defstruct-slot-description)))
 
 
 ;;;; stuff for debugging/tuning by collecting statistics on FOPs (?)

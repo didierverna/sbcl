@@ -776,7 +776,7 @@
        ;; So maybe we can figure out how to bundle two lambdas together?
        (lambda ()
          (let* ((dd (layout-dd (class-wrapper class)))
-                (f (%make-structure-instance-allocator dd nil)))
+                (f (%make-structure-instance-allocator dd nil nil)))
            (if (functionp f)
                (funcall (setf (slot-value class 'defstruct-constructor) f))
                (error "Can't allocate ~S" class)))))
@@ -854,7 +854,7 @@
              (layout (classoid-layout lclass)))
         (setf (classoid-pcl-class lclass) class)
         (setf (slot-value class 'wrapper) layout)
-        (setf (sb-kernel::layout-struct-slot-map layout)
+        (setf (sb-kernel::layout-slot-mapper layout)
               (sb-kernel::make-struct-slot-map (layout-dd layout)))
         (setf (layout-slot-table layout) (make-slot-table class slots))))
     (setf (slot-value class 'finalized-p) t)

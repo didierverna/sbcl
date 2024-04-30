@@ -77,70 +77,40 @@
              (dolist (flag flags)
                (inst jmp flag dest)))))))
 
-(define-vop (multiway-branch-if-eq)
-  ;; TODO: also accept signed-reg, unsigned-reg, character-reg
-  ;; also, could probably tighten up the TN lifetime to avoid a move
-  (:args (x :scs (any-reg descriptor-reg)))
-  (:info labels otherwise key-type keys test-vop-name)
+(define-vop (jump-table)
+  (:args (index :scs (signed-reg unsigned-reg any-reg)
+                :target offset))
+  (:info targets otherwise min max)
+  (:temporary (:sc any-reg :from (:argument 0)) offset)
   (:temporary (:sc unsigned-reg) table)
-  (:temporary (:sc unsigned-reg) temp)
-  (:arg-refs x-tn-ref)
-  (:generator 10
-    (let* ((key-derived-type (tn-ref-type x-tn-ref))
-           (ea)
-           (min (car keys)) ; keys are sorted
-           (max (car (last keys)))
-           (vector (make-array (1+ (- max min)) :initial-element otherwise))
-           ;; This fixnumize won't overflow because ir2opt won't use
-           ;; a multiway-branch unless all keys are char or fixnum.
-           ;; But what if MIN is MOST-NEGATIVE-FIXNUM ????
-           (-min (fixnumize (- min))))
-      (mapc (lambda (key label) (setf (aref vector (- key min)) label))
-            keys labels)
-      (ecase key-type
-        (fixnum
-           (cond
-             ((and (typep (* min (- sb-vm:n-word-bytes)) '(signed-byte 32))
-                   (typep key-derived-type 'numeric-type)
-                   (csubtypep key-derived-type (specifier-type 'fixnum))
-                   ;; There could be some dead code if the ranges don't line up.
-                   (>= (numeric-type-low key-derived-type) min)
-                   (<= (numeric-type-high key-derived-type) max))
-              (setq ea (ea (* min (- sb-vm:n-word-bytes)) table x 4)))
-             (t
-              ;; First exclude out-of-bounds values because there's no harm
-              ;; in doing that up front regardless of the argument's lisp type.
-              (typecase -min
-                ;; TODO: if min is 0, use X directly, don't move into temp
-                ((eql 0) (move temp x))
-                ((signed-byte 32) (inst lea temp (ea -min x)))
-                (t (inst mov temp x)
-                   (inst add :qword temp (constantize -min))))
-              (inst cmp temp (constantize (fixnumize (- max min))))
-              (inst jmp :a otherwise)
-              ;; We have to check the type here because a chain of EQ tests
-              ;; does not impose a type constraint.
-              ;; If type of X was derived as fixnum, then elide this test.
-              (unless (eq test-vop-name 'sb-vm::fast-if-eq-fixnum/c)
-                (inst test :byte x fixnum-tag-mask)
-                (inst jmp :ne otherwise))
-              (setq ea (ea table temp 4))))
-            (inst lea table (register-inline-constant :jump-table vector))
-            (inst jmp ea))
-        (character
-           ;; Same as above, but test the widetag before shifting it out.
-           (unless (member test-vop-name '(fast-char=/character/c
-                                           fast-if-eq-character/c))
-             (inst cmp :byte x character-widetag)
-             (inst jmp :ne otherwise))
-           (inst mov :dword temp x)
-           (inst shr :dword temp n-widetag-bits)
-           (unless (= min 0)
-             (inst sub :dword temp min))
-           (inst cmp temp (- max min))
-           (inst jmp :a otherwise)
-           (inst lea table (register-inline-constant :jump-table vector))
-           (inst jmp (ea table temp 8)))))))
+  (:generator 0
+    (let ((fixnump (sc-is index any-reg)))
+      (flet ((fix (x)
+               (if fixnump
+                   (fixnumize x)
+                   x)))
+        (let (disp)
+          (unless (zerop min)
+            (let ((byte-disp (- (* min n-word-bytes))))
+              (if (and (not otherwise)
+                       (typep byte-disp '(signed-byte 32)))
+                  (setf disp byte-disp)
+                  (let ((diff (- (fix min))))
+                    (unless (typep diff '(signed-byte 32))
+                      (inst mov table diff)
+                      (setf diff table))
+                    (cond ((location= offset index)
+                           (inst add offset diff))
+                          (t
+                           (inst lea offset (ea diff index))
+                           (setf index offset)))))))
+          (when otherwise
+            (inst cmp index (fix (- max min)))
+            (inst jmp :a otherwise))
+          (inst lea table (register-inline-constant :jump-table targets))
+          (inst jmp (if disp
+                        (ea disp table index (if fixnump 4 8))
+                        (ea table index (if fixnump 4 8)))))))))
 
 (defun convert-conditional-move-p (dst-tn)
   (sc-case dst-tn
@@ -432,6 +402,7 @@
 (define-vop (if-eql)
   (:args (x :scs (any-reg descriptor-reg) :target rdi)
          (y :scs (any-reg descriptor-reg) :target rsi))
+  (:arg-refs x-ref y-ref)
   (:conditional :e)
   (:policy :fast-safe)
   (:translate eql)
@@ -443,39 +414,56 @@
   (:ignore asm-temp)
   (:generator 15
     (inst cmp x y)
-    (inst jmp :e done) ; affirmative
+    (inst jmp :e done)                  ; affirmative
+    (let ((x-ratiop (csubtypep (tn-ref-type x-ref) (specifier-type 'ratio)))
+          (y-ratiop (csubtypep (tn-ref-type y-ref) (specifier-type 'ratio))))
+      (cond ((and x-ratiop y-ratiop)
+             (move rdi x)
+             (move rsi y)
+             (invoke-asm-routine 'call 'eql-ratio vop))
+            ((or x-ratiop y-ratiop)
+             (let ((check (if x-ratiop
+                              y
+                              x)))
+               (%lea-for-lowtag-test rax check other-pointer-lowtag)
+               (inst test :byte rax other-pointer-lowtag)
+               (inst jmp :ne done)
+               (inst cmp :byte (ea -15 check) ratio-widetag)
+               (inst jmp :ne done))
+             (move rdi x)
+             (move rsi y)
+             (invoke-asm-routine 'call 'eql-ratio vop))
+            (t
+             ;; If they are not both OTHER-POINTER objects, return false.
+             ;; ASSUMPTION: other-pointer-lowtag = #b1111
+             ;; This ANDing trick would be wrong if, e.g., the OTHER-POINTER tag
+             ;; were #b0011 and the two inputs had lowtags #b0111 and #b1011
+             ;; which when ANDed look like #b0011.
+             ;; We use :BYTE rather than :DWORD here because byte-sized
+             ;; operations on the accumulator encode more compactly.
+             (inst mov :byte rax x)
+             (inst and :byte rax y) ; now AL = #x_F only if both lowtags were #xF
+             (inst not :byte rax)  ; now AL = #x_0 only if it was #x_F
+             (inst and :byte rax #b00001111) ; will be all 0 if ok
+             (inst jmp :ne done)             ; negative
 
-    ;; If they are not both OTHER-POINTER objects, return false.
-    ;; ASSUMPTION: other-pointer-lowtag = #b1111
-    ;; This ANDing trick would be wrong if, e.g., the OTHER-POINTER tag
-    ;; were #b0011 and the two inputs had lowtags #b0111 and #b1011
-    ;; which when ANDed look like #b0011.
-    ;; We use :BYTE rather than :DWORD here because byte-sized
-    ;; operations on the accumulator encode more compactly.
-    (inst mov :byte rax x)
-    (inst and :byte rax y) ; now AL = #x_F only if both lowtags were #xF
-    (inst not :byte rax)   ; now AL = #x_0 only if it was #x_F
-    (inst and :byte rax #b00001111) ; will be all 0 if ok
-    (inst jmp :ne done) ; negative
+             ;; If the widetags are not the same, return false.
+             ;; Using a :dword compare gets us the bignum length check almost for free
+             ;; unless the length's representation requires more 4 bytes.
+             ;; I bet nobody would mind if MAXIMUM-BIGNUM-LENGTH were #xFFFFFF.
+             (inst mov :dword rax (ea (- other-pointer-lowtag) x))
+             (inst cmp :dword rax (ea (- other-pointer-lowtag) y))
+             (inst jmp :ne done)        ; negative
 
-    ;; If the widetags are not the same, return false.
-    ;; Using a :dword compare gets us the bignum length check almost for free
-    ;; unless the length's representation requires more 4 bytes.
-    ;; I bet nobody would mind if MAXIMUM-BIGNUM-LENGTH were #xFFFFFF.
-    (inst mov :dword rax (ea (- other-pointer-lowtag) x))
-    (inst cmp :dword rax (ea (- other-pointer-lowtag) y))
-    (inst jmp :ne done) ; negative
-
-    ;; If not a numeric widetag, return false. See ASSUMPTIONS re widetag order.
-    (inst sub :byte rax bignum-widetag)
-    (inst cmp :byte rax (- complex-double-float-widetag bignum-widetag))
-    ;; "above" means CF=0 and ZF=0 so we're returning the right thing here
-    (inst jmp :a done)
-
-    ;; The hand-written assembly code receives args in the C arg registers.
-    ;; It also receives AL holding the biased down widetag.
-    ;; Anything else it needs will be callee-saved.
-    (move rdi x) ; load the C call args
-    (move rsi y)
-    (invoke-asm-routine 'call 'generic-eql vop)
+             ;; If not a numeric widetag, return false. See ASSUMPTIONS re widetag order.
+             (inst sub :byte rax bignum-widetag)
+             (inst cmp :byte rax (- complex-double-float-widetag bignum-widetag))
+             ;; "above" means CF=0 and ZF=0 so we're returning the right thing here
+             (inst jmp :a done)
+             ;; The hand-written assembly code receives args in the C arg registers.
+             ;; It also receives AL holding the biased down widetag.
+             ;; Anything else it needs will be callee-saved.
+             (move rdi x)               ; load the C call args
+             (move rsi y)
+             (invoke-asm-routine 'call 'generic-eql vop))))
     DONE))

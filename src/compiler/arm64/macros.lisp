@@ -159,11 +159,13 @@
 ;;; P-A FLAG-TN is also acceptable here.
 
 #+generational
-(defun allocation-tramp (type alloc-tn size back-label)
+(defun allocation-tramp (type alloc-tn size back-label systemp)
   (if (integerp size)
       (load-immediate-word tmp-tn size)
       (inst mov tmp-tn size))
-  (let ((asm-routine (if (eq type 'list) 'list-alloc-tramp 'alloc-tramp)))
+  (let ((asm-routine (if systemp
+                         (if (eq type 'list) 'sys-list-alloc-tramp 'sys-alloc-tramp)
+                         (if (eq type 'list) 'list-alloc-tramp 'alloc-tramp))))
     (invoke-asm-routine asm-routine alloc-tn))
   (inst b back-label))
 
@@ -172,17 +174,31 @@
 (defun allocation (type size lowtag result-tn
                    &key flag-tn
                         stack-allocate-p
-                        overflow)
+                        overflow
+                        (systemp (system-tlab-p type (sb-c::vop-node sb-assem::*current-vop*))))
   (declare (ignorable type))
   ;; Normal allocation to the heap.
   (if stack-allocate-p
       (assemble ()
-        (inst add tmp-tn csp-tn lowtag-mask)
-        (inst and tmp-tn tmp-tn (lognot lowtag-mask))
-        (inst add csp-tn tmp-tn (add-sub-immediate size result-tn))
-        (inst add result-tn tmp-tn lowtag))
+        (cond ((aligned-stack-p stack-allocate-p)
+               (assemble ()
+                 (inst tst csp-tn lowtag-mask)
+                 (inst b :eq skip)
+                 (inst add csp-tn csp-tn 8)
+                 (error-call nil 'sb-kernel::unreachable-error)
+                 skip)
+               (move tmp-tn csp-tn)
+               (inst add csp-tn csp-tn (add-sub-immediate size result-tn))
+               (inst add result-tn tmp-tn lowtag))
+              (t
+               (inst add tmp-tn csp-tn lowtag-mask)
+               (inst and tmp-tn tmp-tn (lognot lowtag-mask))
+               (inst add csp-tn tmp-tn (add-sub-immediate size result-tn))
+               (inst add result-tn tmp-tn lowtag))))
       (let ((alloc (gen-label))
-            #+sb-thread (tlab (if (eq type 'list) thread-cons-tlab-slot thread-mixed-tlab-slot))
+            #+sb-thread (tlab (if systemp
+                                  (if (eq type 'list) thread-sys-cons-tlab-slot thread-sys-mixed-tlab-slot)
+                                  (if (eq type 'list) thread-cons-tlab-slot thread-mixed-tlab-slot)))
             #-sb-thread (region-offset (if (eq type 'list)
                                            cons-region-offset
                                            mixed-region-offset))
@@ -208,7 +224,8 @@
               (allocation-tramp type
                                 result-tn
                                 size
-                                BACK-FROM-ALLOC))))))
+                                BACK-FROM-ALLOC
+                                systemp))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)

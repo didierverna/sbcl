@@ -42,7 +42,7 @@
 #include "code.h"
 #include "graphvisit.h"
 #include "genesis/instance.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 
 #include <errno.h>
 
@@ -219,6 +219,7 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
     } while (ret != 0);
 
     ZSTD_freeDStream(stream);
+    free(buf);
 }
 #endif
 
@@ -429,13 +430,17 @@ static void fix_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             }
             continue;
         case SYMBOL_WIDETAG:
-            { // Copied from scav_symbol() in gc-common
+            { // Modeled on scav_symbol() in gc-common
             struct symbol* s = (void*)where;
-            adjust_pointers(&s->value, 3, adj); // value, fdefn, info
+#ifdef LISP_FEATURE_64_BIT
+            adjust_pointers(where + 1, 4, adj);
             lispobj name = decode_symbol_name(s->name);
             lispobj adjusted_name = adjust_word(adj, name);
             // writeback the name if it changed
             if (adjusted_name != name) FIXUP(set_symbol_name(s, adjusted_name), &s->name);
+#else
+            adjust_pointers(&s->fdefn, 4, adj); // fdefn, value, info, name
+#endif
             }
             continue;
         case FDEFN_WIDETAG:
@@ -458,7 +463,7 @@ static void fix_space(uword_t start, lispobj* end, struct heap_adjust* adj)
                 adjust_word_at(fdefns_start+i, adj);
 #endif
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64 || \
-    defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
+    defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_ARM64
             // Fixup absolute jump table
             lispobj* jump_table = code_jumptable_start(code);
             int count = jumptable_count(jump_table);
@@ -1414,6 +1419,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 }
 
 #include "genesis/hash-table.h"
+#include "genesis/split-ordered-list.h"
 #include "genesis/vector.h"
 #include "genesis/cons.h"
 char* get_asm_routine_by_name(const char* name, int *index)
@@ -1495,6 +1501,14 @@ static void graph_visit(lispobj referer, lispobj ptr, struct grvisit_context* co
             struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
             for (i=0; i<(nwords-1); ++i)
                 if (bitmap_logbitp(i, bitmap)) RECURSE(obj[1+i]);
+            if (layout && finalizer_node_layout_p(LAYOUT(layout))) {
+                struct solist_node* node = (void*)obj;
+                // _node_next might have no lowtag, and so_key never does
+                if (node->_node_next && !lowtag_of(node->_node_next))
+                    RECURSE(node->_node_next | INSTANCE_POINTER_LOWTAG);
+                if (node->so_key)
+                    RECURSE(compute_lispobj((lispobj*)node->so_key));
+            }
             break;
         case CODE_HEADER_WIDETAG:
             nwords = code_header_words((struct code*)obj);
@@ -1630,7 +1644,9 @@ static uword_t visit_range(lispobj* where, lispobj* limit, uword_t arg)
         }
         lispobj ptr = compute_lispobj(obj);
         tally(ptr, v);
-        if (!hopscotch_get(v->reached, ptr, 0)) printf("unreachable: %p\n", (void*)ptr);
+        // Perhaps it's reachable via some path that this slighty-deficient
+        // tracer is unable to discover. e.g. installed Lisp signal handlers
+        if (!hopscotch_get(v->reached, ptr, 0)) printf("unreached: %p\n", (void*)ptr);
         obj = next_object(obj, object_size(obj), limit);
     }
     return 0;

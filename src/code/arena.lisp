@@ -68,6 +68,8 @@
 ;;; There are one or more large blocks of memory associated with
 ;;; an arena, obtained via malloc(). Allocations within a block are
 ;;; contiguous but the blocks can be discontiguous.
+#+system-tlabs
+(declaim (ftype (sfunction (fixnum &optional fixnum fixnum) arena) new-arena))
 (defun new-arena (size &optional (growth-amount size) (max-extensions 7))
   (declare (ignorable growth-amount max-extensions))
   (assert (>= size 65536))
@@ -75,36 +77,21 @@
 one or more times, not to exceed MAX-EXTENSIONS times"
   #-system-tlabs :placeholder
   #+system-tlabs
-  (let ((layout (find-layout 'arena))
+  (let ((layout (load-time-value (find-layout 'arena) t))
         (index (with-system-mutex (*arena-lock*) (incf *arena-index-generator*)))
-        (arena (%make-lisp-obj
-                (alien-funcall (extern-alien "sbcl_new_arena" (function unsigned unsigned))
-                               size))))
+        (arena (truly-the instance
+                          (%make-lisp-obj
+                           (alien-funcall (extern-alien "sbcl_new_arena" (function unsigned unsigned))
+                                          size)))))
     (%set-instance-layout arena layout)
-    (setf (arena-size-limit arena) (+ size (* max-extensions growth-amount))
+    (setf (arena-size-limit (truly-the arena arena))
+          (+ size (the fixnum (* max-extensions growth-amount)))
           (arena-growth-amount arena) growth-amount
           (arena-index arena) index
           (arena-hidden arena) nil
           (arena-token arena) 1
           (arena-userdata arena) nil)
     arena))
-
-(eval-when (:compile-toplevel)
-;;; Caution: this vop potentially clobbers all registers, but it doesn't declare them.
-;;; It's safe to use only from DESTROY-ARENA which, being an ordinary full call,
-;;; is presumed not to preserve registers.
-(define-vop (delete-arena)
-  (:args (x :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset rdi-offset :from (:argument 0)) rdi)
-  (:temporary (:sc unsigned-reg :offset rbx-offset) rsp-save)
-  (:vop-var vop)
-  (:generator 1
-    (move rdi x)
-    (pseudo-atomic ()
-      (inst mov rsp-save rsp-tn)
-      (inst and rsp-tn -16) ; align as required by some ABIs
-      (call-c (ea (make-fixup "sbcl_delete_arena" :foreign 8)) #+win32 rdi)
-      (inst mov rsp-tn rsp-save)))))
 
 ;;; Destroy memory associated with ARENA, unlinking it from the global chain.
 ;;; Note that we do not recycle arena IDs. It would be dangerous to do so, because a thread
@@ -113,7 +100,13 @@ one or more times, not to exceed MAX-EXTENSIONS times"
 ;;; (the way it used to work before I made tokens arena-specific)
 (defun destroy-arena (arena)
   ;; C is responsible for most of the cleanup.
+  #+x86-64
   (%primitive delete-arena arena)
+  #-x86-64
+  (alien-funcall (extern-alien "sbcl_delete_arena"
+                               (function void
+                                         unsigned-long))
+                 (get-lisp-obj-address arena))
   ;; It is illegal to access the structure now, since that was in the arena.
   ;; So return an arbitrary success indicator. It might happen that you can accidentally
   ;; refer to the structure, but technically that constitutes a use-after-free bug.
@@ -124,7 +117,7 @@ one or more times, not to exceed MAX-EXTENSIONS times"
   #-system-tlabs `(progn ,@body)
   #+system-tlabs
   `(let ((a ,arena))
-     (assert (typep a 'arena))
+     (declare (arena a))
      ;; maybe allow switching from one arena to another?
      (switch-to-arena a)
      (unwind-protect (progn ,@body) (switch-to-arena 0))))
@@ -309,7 +302,9 @@ one or more times, not to exceed MAX-EXTENSIONS times"
                     (dotimes (i len new)
                       (declare (type sb-bignum:bignum-index i))
                       (sb-bignum:%bignum-set new i (sb-bignum:%bignum-ref n i)))))
-          (double-float (%primitive sb-vm::!copy-dfloat n))
+          (double-float
+           #+x86-64 (%primitive sb-vm::!copy-dfloat n)
+           (%make-double-float (double-float-bits n)))
           ;; ratio is dynspace-p only if both parts are. copy everything to be safe
           (ratio (%make-ratio (truly-the integer (copy (%numerator n)))
                               (truly-the integer (copy (%denominator n)))))

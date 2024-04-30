@@ -1176,13 +1176,14 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "DEBUG-BLOCK" "DEBUG-BLOCK-ELSEWHERE-P" "DEBUG-BLOCK-P"
            "DEBUG-CONDITION" "DEBUG-ERROR"
            "DEBUG-FUN" "DEBUG-FUN-FUN" "DEBUG-FUN-KIND"
-           "DEBUG-FUN-LAMBDA-LIST" "DEBUG-FUN-NAME" "DEBUG-FUN-CLOSURE-NAME"
+           "DEBUG-FUN-LAMBDA-LIST" "DEBUG-FUN-MORE-ARGS"
+           "DEBUG-FUN-NAME" "DEBUG-FUN-CLOSURE-NAME"
            "DEBUG-FUN-P" "DEBUG-FUN-START-LOCATION"
            "DEBUG-FUN-SYMBOL-VARS"  "DEBUG-SOURCE"
            "DEBUG-SOURCE-CREATED" "DEBUG-SOURCE-NAMESTRING"
            "DEBUG-SOURCE-P" "DEBUG-SOURCE-START-POSITIONS"
            "DEBUG-VAR" "DEBUG-VAR-ID" "DEBUG-VAR-INFO-AVAILABLE"
-           "DEBUG-VAR-SYMBOL-NAME" "DEBUG-VAR-P" "DEBUG-VAR-PACKAGE-NAME"
+           "DEBUG-VAR-NAME" "DEBUG-VAR-P" "DEBUG-VAR-PACKAGE"
            "DEBUG-VAR-SYMBOL" "DEBUG-VAR-VALID-VALUE"
            "DEBUG-VAR-VALIDITY" "DEBUG-VAR-VALUE"
            "DELETE-BREAKPOINT"
@@ -1297,7 +1298,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "COMPARE-AND-SWAP-SLOT"
            "COMPILE-IN-LEXENV"
            "COMPILE-FILES"
-           "COMPILED-DEBUG-FUN-FORM-NUMBER"
            "%COMPILER-DEFUN" "COMPILER-ERROR" "FATAL-COMPILER-ERROR"
            "COMPILER-NOTIFY"
            "COMPILER-STYLE-WARN" "COMPILER-WARN"
@@ -1448,7 +1448,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "CHANGE-VOP-FLAGS" "CONDITIONAL-FLAGS-FLAGS"
            "IMMEDIATE-CONSTANT-SC"
            "BOXED-IMMEDIATE-SC-P"
-           "COMBINATION-IMPLEMENTATION-STYLE"
            "CONVERT-CONDITIONAL-MOVE-P"
            "LOCATION-PRINT-NAME"
            "MAKE-CALL-OUT-TNS"
@@ -1476,7 +1475,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
 
 
            "BRANCH-IF" "MULTIWAY-BRANCH-IF-EQ"
-
+           "JUMP-TABLE" "CASE-TO-JUMP-TABLE"
            ;; for SB-COVER
 
            "*CODE-COVERAGE-INFO*" "CODE-COVERAGE-RECORD-MARKED"
@@ -1484,11 +1483,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "+CODE-COVERAGE-UNMARKED+"
            ;; for SB-INTROSPECT
 
-           "MAP-PACKED-XREF-DATA" "MAP-SIMPLE-FUNS"
-
-           "DO-BLOCKS" "DO-BLOCKS-BACKWARDS"
-           "DO-NODES" "DO-NODES-BACKWARDS"
-           "DO-IR2-BLOCKS"))
+           "MAP-PACKED-XREF-DATA" "MAP-SIMPLE-FUNS"))
 
 (defpackage* "SB-REGALLOC"
   (:documentation "private: implementation of the compiler's register allocator")
@@ -1883,7 +1878,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%FIND-POSITION-VECTOR-MACRO" "%FIND-POSITION-IF"
            "%FIND-POSITION-IF-VECTOR-MACRO" "%FIND-POSITION-IF-NOT"
            "%FIND-POSITION-IF-NOT-VECTOR-MACRO"
-           "FIXNUM-MOD-P"
            "%HYPOT"
            "%INSTANCE-CAS"
            "%LDB" "%LOG" "%LOGB" "%LOG10"
@@ -1891,7 +1885,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%LAST1"
            "%LASTN/FIXNUM"
            "%LASTN/BIGNUM"
-           "%LOG1P"
+           "%LOG1P" "%LOG2"
            #+long-float "%LONG-FLOAT"
            "%MAKE-ARRAY"
            "%MAKE-COMPLEX" "%MAKE-FUNCALLABLE-INSTANCE"
@@ -1899,6 +1893,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%MAKE-INSTANCE" "%MAKE-INSTANCE/MIXED"
            "%MAKE-LISP-OBJ"
            "%MAKE-LIST"
+           "UNALIGNED-DX-CONS"
            "%MAKE-RATIO"
            #+sb-simd-pack "%MAKE-SIMD-PACK"
            #+sb-simd-pack-256 "%MAKE-SIMD-PACK-256"
@@ -1971,7 +1966,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%UNARY-TRUNCATE" "UNARY-TRUNCATE"
            "%UNARY-TRUNCATE/SINGLE-FLOAT"
            "%UNARY-TRUNCATE/DOUBLE-FLOAT"
-           "%UNARY-FTRUNCATE"
+           "%UNARY-FROUND" "%UNARY-FTRUNCATE"
            "UNARY-TRUNCATE-SINGLE-FLOAT-TO-BIGNUM"
            "UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM"
            "%UNARY-TRUNCATE-SINGLE-FLOAT-TO-BIGNUM"
@@ -1981,7 +1976,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%WITH-ARRAY-DATA"
            "%WITH-ARRAY-DATA/FP"
            "%WITH-ARRAY-DATA-MACRO"
-           "*APPROXIMATE-NUMERIC-UNIONS*"
            "*CURRENT-INTERNAL-ERROR-CONTEXT*"
            "*CURRENT-LEVEL-IN-PRINT*"
            "*EMPTY-TYPE*"
@@ -2093,7 +2087,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "FLOAT-FORMAT-NAME"
            "FLOAT-FORMAT-MAX" "FLOAT-INT-EXPONENT"
            "FLOAT-INFINITY-OR-NAN-P"
-           "FLOAT-SIGN-BIT"
+           "FLOAT-SIGN-BIT" "FLOAT-SIGN-BIT-SET-P"
            "FLOATING-POINT-EXCEPTION" "FORM" "FORMAT-CONTROL"
            "*FREE-INTERRUPT-CONTEXT-INDEX*" "FUNCALLABLE-INSTANCE-P"
            "FSC-INSTANCE-HASH"
@@ -2297,7 +2291,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "SCHWARTZIAN-STABLE-SORT-LIST" "SCHWARTZIAN-STABLE-SORT-VECTOR"
            "SCRUB-POWER-CACHE"
            "SEQUENCEP" "SEQUENCE-COUNT" "SEQUENCE-END"
-           "SEQUENCE-OF-CHECKED-LENGTH-GIVEN-TYPE"
            "SET-ARRAY-HEADER" "SET-HEADER-DATA"
            "STACK-ALLOCATED-OBJECT-OVERFLOWS-STACK-ERROR"
            "ASSIGN-VECTOR-FLAGS" "LOGIOR-HEADER-BITS" "RESET-HEADER-BITS"
@@ -2362,7 +2355,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "TWO-ARG-STRING/=" "TWO-ARG-STRING-LESSP" "TWO-ARG-STRING-GREATERP"
            "TWO-ARG-STRING-NOT-LESSP" "TWO-ARG-STRING-NOT-GREATERP" "TWO-ARG-STRING-NOT-EQUAL"
            "RANGE<" "RANGE<=" "RANGE<<=" "RANGE<=<"
-           "CHECK-RANGE<" "CHECK-RANGE<=" "CHECK-RANGE<<=" "CHECK-RANGE<=<"
+           "CHECK-RANGE<="
            "TYPE-*-TO-T"
            "TYPE-DIFFERENCE" "TYPE-INTERSECTION"
            "TYPE-INTERSECTION2" "TYPE-APPROX-INTERSECTION2"
@@ -2411,7 +2404,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "VECTOR-FILL*" "VECTOR-FILL/T"
            "VECTOR-SUBSEQ*"
            "VECTOR-TO-VECTOR*"
-           "VECTOR-OF-CHECKED-LENGTH-GIVEN-LENGTH" "WITH-ARRAY-DATA"
+           "WITH-ARRAY-DATA"
            "WITH-CIRCULARITY-DETECTION"
            "WITH-WORLD-LOCK"
 
@@ -2639,10 +2632,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "PROCLAMATION-MISMATCH-OLD"
            "TYPE-PROCLAMATION-MISMATCH"
            "TYPE-PROCLAMATION-MISMATCH-WARNING"
-           "TYPE-PROCLAMATION-MISMATCH-WARN"
            "FTYPE-PROCLAMATION-MISMATCH"
            "FTYPE-PROCLAMATION-MISMATCH-WARNING"
-           "FTYPE-PROCLAMATION-MISMATCH-WARN"
            "FTYPE-PROCLAMATION-MISMATCH-ERROR"
 
            "!COLD-INIT"
@@ -2790,6 +2781,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "JOIN-THREAD"
            "JOIN-THREAD-ERROR"
            "JOIN-THREAD-ERROR-THREAD"
+           "JOIN-THREAD-PROBLEM"
            "LIST-ALL-THREADS"
            "MAKE-THREAD"
            "SYMBOL-VALUE-IN-THREAD"
@@ -2866,53 +2858,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
 (defpackage* "SB-UNICODE"
   (:documentation "public: algorithms for Unicode data")
   (:use "CL" "SB-INT")
-  (:export "GENERAL-CATEGORY"
-           "BIDI-CLASS"
-           "COMBINING-CLASS"
-           "DECIMAL-VALUE"
-           "DIGIT-VALUE"
-           "NUMERIC-VALUE"
-           "MIRRORED-P"
-           "BIDI-MIRRORING-GLYPH"
-           "AGE"
-           "HANGUL-SYLLABLE-TYPE"
-           "EAST-ASIAN-WIDTH"
-           "SCRIPT"
-           "CHAR-BLOCK"
-           "UNICODE-1-NAME"
-           "LINE-BREAK-CLASS"
-           "PROPLIST-P"
-           "UPPERCASE-P"
-           "LOWERCASE-P"
-           "CASED-P"
-           "CASE-IGNORABLE-P"
-           "ALPHABETIC-P"
-           "IDEOGRAPHIC-P"
-           "MATH-P"
-           "WHITESPACE-P"
-           "HEX-DIGIT-P"
-           "SOFT-DOTTED-P"
-           "DEFAULT-IGNORABLE-P"
-           "NORMALIZE-STRING"
-           "NORMALIZED-P"
-           "UPPERCASE"
-           "LOWERCASE"
-           "TITLECASE"
-           "CASEFOLD"
-           "GRAPHEME-BREAK-CLASS"
-           "WORD-BREAK-CLASS"
-           "SENTENCE-BREAK-CLASS"
-           "GRAPHEMES"
-           "WORDS"
-           "SENTENCES"
-           "LINES"
-           "UNICODE="
-           "UNICODE-EQUAL"
-           "UNICODE<"
-           "UNICODE<="
-           "UNICODE>"
-           "UNICODE>="
-           "CONFUSABLE-P"))
+  (:export "NORMALIZE-STRING" "NORMALIZED-P"))
 
 (defpackage* "SB-GRAY"
   (:documentation
@@ -3052,6 +2998,7 @@ possibly temporarily, because it might be used internally.")
            "MIX" "MIXF" "WORD-MIX"
            "MURMUR-HASH-WORD/FIXNUM"
            "MURMUR-HASH-WORD/+FIXNUM"
+           "SYMBOL-NAME-HASH"
 
             ;; Macroexpansion that doesn't touch special forms
 
@@ -3196,7 +3143,7 @@ possibly temporarily, because it might be used internally.")
            "POWER-OF-TWO-CEILING"
            "PRINT-NOT-READABLE-ERROR"
            "HASH-TABLE-REPLACE"
-           "RECONS"
+           "HASH-CONS" "RECONS"
            "SET-CLOSURE-NAME"
 
             ;; ..and macros..
@@ -3290,6 +3237,7 @@ possibly temporarily, because it might be used internally.")
             ;; symbol-hacking idioms
 
            "GENSYMIFY" "GENSYMIFY*" "KEYWORDICATE" "SYMBOLICATE"
+           "SYMBOLICATE!"
            "INTERNED-SYMBOL-P" "PACKAGE-SYMBOLICATE"
            "LOGICALLY-READONLYIZE"
 
@@ -3311,6 +3259,7 @@ possibly temporarily, because it might be used internally.")
 
            "FORMAT-DECODED-TIME"
            "FORMAT-UNIVERSAL-TIME"
+           "UNIX-TO-UNIVERSAL-TIME"
 
             ;; used for FORMAT tilde paren
 
@@ -3454,12 +3403,7 @@ possibly temporarily, because it might be used internally.")
            "CLEAR-FLAG"
            "PACK-3-CODEPOINTS"
 
-            ;; Huffman trees
-
-           "HUFFMAN-ENCODE"
-           "HUFFMAN-DECODE"
-           "BINARY-SEARCH"
-           "DOUBLE-VECTOR-BINARY-SEARCH"))
+           "BINARY-SEARCH"))
 
 (defpackage* "SB-MOP"
   (:documentation

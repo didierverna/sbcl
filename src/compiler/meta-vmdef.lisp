@@ -832,13 +832,11 @@
 
 (defvar *parse-vop-operand-count*)
 (defun make-operand-parse-temp ()
-  (without-package-locks
-   (intern (format nil "OPERAND-PARSE-TEMP-~D" *parse-vop-operand-count*)
-           #.(find-package "SB-C"))))
+  (symbolicate! #.(find-package "SB-C") "OPERAND-PARSE-TEMP-"
+                *parse-vop-operand-count*))
 (defun make-operand-parse-load-tn ()
-  (without-package-locks
-   (intern (format nil "OPERAND-PARSE-LOAD-TN-~D" *parse-vop-operand-count*)
-           #.(find-package "SB-C"))))
+  (symbolicate! #.(find-package "SB-C")
+                "OPERAND-PARSE-LOAD-TN-" *parse-vop-operand-count*))
 
 ;;; Given a list of operand specifications as given to DEFINE-VOP,
 ;;; return a list of OPERAND-PARSE structures describing the fixed
@@ -1264,7 +1262,7 @@
             :result-load-scs ',result-scs
 
             :more-arg-costs ',more-arg-costs
-            :more-arg-load-scs ',(unless (eq more-arg-costs +no-loads+)
+            :more-arg-load-scs ',(unless (eq more-arg-costs +no-costs+)
                                    (substitute-if nil #'listp more-arg-scs))
 
             :more-result-costs
@@ -2012,12 +2010,18 @@
     (let ((n-head nil)
           (n-prev nil))
       (dolist (op fixed)
-        (let ((n-ref (gensym)))
-          (binds `(,n-ref (reference-tn ,op ,write-p)))
-          (if n-prev
-              (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
-              (setq n-head n-ref))
-          (setq n-prev n-ref)))
+        (multiple-value-bind (op lvar)
+            (if (typep op '(cons (eql :lvar)))
+                (values (third op) (second op))
+                op)
+          (let ((n-ref (gensym)))
+            (binds `(,n-ref (reference-tn ,op ,write-p)))
+            (when lvar
+              (forms `(setf (tn-ref-type ,n-ref) (lvar-type ,lvar))))
+            (if n-prev
+                (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
+                (setq n-head n-ref))
+            (setq n-prev n-ref))))
 
       (when more
         (let ((n-more (gensym)))

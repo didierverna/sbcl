@@ -33,9 +33,11 @@
     (let ((cup (lexenv-cleanup lexenv)))
       (when cup (return cup)))))
 
-(defun map-nested-cleanups (function block &optional return-value)
-  (declare (type cblock block))
-  (do ((cleanup (block-end-cleanup block)
+(defun map-nested-cleanups (function block-or-node &optional return-value)
+  (declare (type (or node cblock) block-or-node))
+  (do ((cleanup (if (node-p block-or-node)
+                    (node-enclosing-cleanup block-or-node)
+                    (block-end-cleanup block-or-node))
                 (node-enclosing-cleanup (cleanup-mess-up cleanup))))
       ((not cleanup) return-value)
     (funcall function cleanup)))
@@ -156,8 +158,8 @@
                    (let ((var (ref-leaf use)))
                      (if (and (lambda-var-p var)
                               (null (lambda-var-sets var)))
-                         (case (functional-kind (lambda-var-home var))
-                           (:mv-let
+                         (functional-kind-case (lambda-var-home var)
+                           (mv-let
                             (let* ((fun (lambda-var-home var))
                                    (n-value (position-or-lose var (lambda-vars fun))))
                               (loop for arg in (basic-combination-args (let-combination fun))
@@ -167,8 +169,8 @@
                                                                  (values (lvar-uses arg) n-value))
                                     do (decf n-value nvals))
                               use))
-                           (:let
-                               (recurse (let-var-initial-value var)))
+                           (let
+                            (recurse (let-var-initial-value var)))
                            (t
                             use))
                          use))
@@ -239,7 +241,7 @@
                  (refs (leaf-refs var)))
             (when (and refs
                        (not (cdr refs)))
-              (when (eq (lambda-kind fun) :mv-let)
+              (when (functional-kind-eq fun mv-let)
                 (let-lvar-dest (node-lvar (car refs)))))))))))
 
 (defun combination-matches (name args combination)
@@ -267,7 +269,7 @@
                       (loop for ref in (leaf-refs var)
                             do (derive-node-type ref *wild-type* :from-scratch t)
                                (erase-lvar-type (node-lvar ref)))))
-               (if (eq (lambda-kind fun) :mv-let)
+               (if (functional-kind-eq fun mv-let)
                    (mapc #'erase (lambda-vars fun))
                    (erase
                     (nth (position-or-lose lvar
@@ -424,7 +426,7 @@
 (defun block-to-be-deleted-p (block)
   (declare (type cblock block))
   (or (block-delete-p block)
-      (eq (functional-kind (block-home-lambda block)) :deleted)))
+      (functional-kind-eq (block-home-lambda block) deleted)))
 
 ;;; Checks whether NODE is in a block to be deleted
 (declaim (inline node-to-be-deleted-p))
@@ -534,7 +536,7 @@
     (when dynamic-extent
       (typecase leaf
         (lambda-var
-         (when (and (eq (functional-kind (lambda-var-home leaf)) :let)
+         (when (and (functional-kind-eq (lambda-var-home leaf) let)
                     ;; Make sure the let is inside the dx let
                     (lexenv-contains-lambda (lambda-var-home leaf)
                                             (node-lexenv dynamic-extent)))
@@ -608,8 +610,8 @@
                                                  (when (and (lambda-var-p leaf)
                                                             (not (lambda-var-sets leaf)))
                                                    (let ((home (lambda-var-home leaf)))
-                                                     (and (member (functional-kind home) '(:external :optional))
-                                                          (let ((entry (if (eq (functional-kind home) :external)
+                                                     (and (functional-kind-eq home external optional)
+                                                          (let ((entry (if (functional-kind-eq home external)
                                                                            (main-entry (functional-entry-fun home))
                                                                            home))
                                                                 (node-home (node-home-lambda node)))
@@ -803,6 +805,16 @@
     (reoptimize-lvar lvar)
     cast))
 
+(defun insert-cast-after (node lvar type policy &optional context)
+  (declare (type node node) (type lvar lvar) (type ctype type))
+  (with-ir1-environment-from-node node
+    (let ((cast (make-cast lvar type policy context)))
+      (let ((lvar (cast-value cast)))
+        (insert-node-after node cast)
+        (setf (lvar-dest lvar) cast)
+        (reoptimize-lvar lvar)
+        cast))))
+
 (defun insert-ref-before (leaf node)
   (let ((ref (make-ref leaf))
         (lvar (make-lvar node)))
@@ -823,7 +835,7 @@
   (declare (type node node))
   (do ((fun (lexenv-lambda (node-lexenv node))
             (lexenv-lambda (lambda-call-lexenv fun))))
-      ((not (memq (functional-kind fun) '(:deleted :zombie)))
+      ((not (functional-kind-eq fun deleted zombie))
        (lambda-home fun))
     (when (eq (lambda-home fun) fun)
       (return fun))))
@@ -953,7 +965,7 @@
               (return))
             nil))))
      combination
-     info)
+     :info info)
     t))
 
 (defun flushable-combination-p (call)
@@ -1009,7 +1021,7 @@
        (typecase leaf
          (lambda-var
           ;; LET lambda var with no SETS.
-          (when (and (eq (functional-kind (lambda-var-home leaf)) :let)
+          (when (and (functional-kind-eq (lambda-var-home leaf) let)
                      (not (lambda-var-sets leaf))
                      (lexenv-contains-lambda (lambda-var-home leaf)
                                              (node-lexenv dynamic-extent))
@@ -1020,7 +1032,7 @@
                            (return nil)))))
             (lvar-good-for-dx-p (let-var-initial-value leaf) dynamic-extent)))
          (clambda
-          (aver (eq (functional-kind leaf) :external))
+          (aver (functional-kind-eq leaf external))
           (when (and (null (rest (leaf-refs leaf)))
                      (environment-closure (get-lambda-environment leaf))
                      (lexenv-contains-lambda leaf
@@ -1336,6 +1348,20 @@
            (when (eq (if-consequent last)
                      (if-alternative last))
              (reoptimize-component (block-component block) t)))))
+      (jump-table
+       (setf (jump-table-targets last)
+             (if (eq new (component-tail comp))
+                 (delete old (jump-table-targets last) :key #'cdr :test #'eq)
+                 (prog1
+                     (loop for (index . target) in (jump-table-targets last)
+                           collect (cons index (if (eq target old)
+                                                   new
+                                                   target)))
+                   (unless (memq new (block-succ block))
+                     (link-blocks block new)))))
+       (unless (cdr (block-succ block))
+         (flush-dest (jump-table-index last))
+         (unlink-node last)))
       (t
        (unless (memq new (block-succ block))
          (link-blocks block new)))))
@@ -1346,11 +1372,11 @@
   (do-blocks (block component)
     (loop while
           (and (singleton-p (block-succ block))
-               (join-successor-if-possible block)))))
+               (join-successor-if-possible block t)))))
 
 ;;; Try to join with a successor block. If we succeed, we return true,
 ;;; otherwise false.
-(defun join-successor-if-possible (block)
+(defun join-successor-if-possible (block &optional local-calls)
   (declare (type cblock block))
   (let ((next (first (block-succ block))))
     (when (block-start next)  ; NEXT is not an END-OF-COMPONENT marker
@@ -1370,7 +1396,13 @@
               (not (eq (block-home-lambda block)
                        (block-home-lambda next)))
               (neq (block-type-check block)
-                   (block-type-check next)))
+                   (block-type-check next))
+              (and (not local-calls)
+                   (let ((last (block-last block)))
+                     (and (combination-p last)
+                          (eq (combination-kind last) :local)
+                          (functional-kind-eq (combination-lambda last)
+                                              nil assignment optional cleanup)))))
              nil)
             (t
              (join-blocks block next)
@@ -1421,7 +1453,13 @@
          ref-y
          (equal (block-succ x) (block-succ y))
          (eq (ref-lvar ref-x) (ref-lvar ref-y))
-         (eq (ref-leaf ref-x) (ref-leaf ref-y))
+         (let ((leaf-x (ref-leaf ref-x))
+               (leaf-y (ref-leaf ref-y)))
+           (or (eq leaf-x leaf-y)
+               (and (constant-p leaf-x)
+                    (constant-p leaf-y)
+                    (eq (constant-value leaf-x)
+                        (constant-value leaf-y)))))
          (eq (node-enclosing-cleanup ref-x)
              (node-enclosing-cleanup ref-y)))))
 
@@ -1649,18 +1687,18 @@
   (declare (type clambda clambda))
   (let ((original-kind (functional-kind clambda))
         (bind (lambda-bind clambda)))
-    (aver (not (member original-kind '(:deleted :toplevel))))
+    (aver (not (logtest original-kind (functional-kind-attributes deleted toplevel))))
     (aver (not (functional-has-external-references-p clambda)))
-    (aver (or (eq original-kind :zombie) bind))
-    (setf (functional-kind clambda) :deleted)
+    (aver (or (eql original-kind (functional-kind-attributes zombie)) bind))
+    (setf (functional-kind clambda) (functional-kind-attributes deleted))
     (setf (lambda-bind clambda) nil)
 
     ;; (The IF test is (FUNCTIONAL-SOMEWHAT-LETLIKE-P CLAMBDA), except
     ;; that we're using the old value of the KIND slot, not the
     ;; current slot value, which has now been set to :DELETED.)
-    (case original-kind
-      (:zombie)
-      ((:let :mv-let :assignment)
+    (cond
+      ((eql original-kind (functional-kind-attributes zombie)))
+      ((logtest original-kind (functional-kind-attributes let mv-let assignment))
        (let ((bind-block (node-block bind)))
          (mark-for-deletion bind-block))
        (let ((home (lambda-home clambda)))
@@ -1700,7 +1738,7 @@
     ;; If the lambda is an XEP, then we null out the ENTRY-FUN in its
     ;; ENTRY-FUN so that people will know that it is not an entry
     ;; point anymore.
-    (when (eq original-kind :external)
+    (when (eql original-kind (functional-kind-attributes external))
       (let ((fun (functional-entry-fun clambda)))
         (setf (functional-entry-fun fun) nil)
         (when (optional-dispatch-p fun)
@@ -1731,14 +1769,14 @@
   (let ((entry (functional-entry-fun leaf)))
     (unless (and entry
                  (or (leaf-refs entry)
-                     (eq (functional-kind entry) :external)))
-      (aver (or (not entry) (eq (functional-kind entry) :deleted)))
-      (setf (functional-kind leaf) :deleted)
+                     (functional-kind-eq entry external)))
+      (aver (or (not entry) (functional-kind-eq entry deleted)))
+      (setf (functional-kind leaf) (functional-kind-attributes deleted))
 
       (flet ((frob (fun)
-               (unless (eq (functional-kind fun) :deleted)
-                 (aver (eq (functional-kind fun) :optional))
-                 (setf (functional-kind fun) nil)
+               (unless (functional-kind-eq fun deleted)
+                 (aver (functional-kind-eq fun optional))
+                 (setf (functional-kind fun) (functional-kind-attributes nil))
                  (if (leaf-refs fun)
                      (or (maybe-let-convert fun)
                          (maybe-convert-to-assignment fun)
@@ -1753,7 +1791,7 @@
           (when entry
             (setf (functional-entry-fun entry) main)
             (setf (functional-entry-fun main) entry))
-          (when (eq (functional-kind main) :optional)
+          (when (functional-kind-eq main optional)
             (frob main))))))
 
   (values))
@@ -1790,15 +1828,15 @@
           (lambda-var
            (delete-lambda-var leaf))
           (clambda
-           (ecase (functional-kind leaf)
-             ((nil :let :mv-let :assignment :escape :cleanup)
+           (functional-kind-ecase leaf
+             ((nil let mv-let assignment escape cleanup)
               (delete-lambda leaf))
-             (:external
+             (external
               (unless (functional-has-external-references-p leaf)
                 (delete-lambda leaf)))
-             ((:deleted :zombie :optional))))
+             ((deleted zombie optional))))
           (optional-dispatch
-           (unless (eq (functional-kind leaf) :deleted)
+           (unless (functional-kind-eq leaf deleted)
              (delete-optional-dispatch leaf))))))
 
   (values))
@@ -1885,6 +1923,7 @@
     (etypecase node
       (ref (delete-ref node))
       (cif (flush-dest (if-test node)))
+      (jump-table (flush-dest (jump-table-index node)))
       ;; The next two cases serve to maintain the invariant that a LET
       ;; always has a well-formed COMBINATION, REF and BIND. We delete
       ;; the lambda whenever we delete any of these, but we must be
@@ -1905,7 +1944,7 @@
          (when arg (flush-dest arg))))
       (bind
        (let ((lambda (bind-lambda node)))
-         (unless (eq (functional-kind lambda) :deleted)
+         (unless (functional-kind-eq lambda deleted)
            (delete-lambda lambda))))
       (exit
        (let ((value (exit-value node))
@@ -1986,7 +2025,7 @@
   (let ((fun (lambda-var-home var)))
     ;; We only deal with LET variables, marking the corresponding
     ;; initial value arg as needing to be reoptimized.
-    (when (and (eq (functional-kind fun) :let)
+    (when (and (functional-kind-eq fun let)
                (leaf-refs var))
       (do ((args (basic-combination-args
                   (lvar-dest (node-lvar (first (leaf-refs fun)))))
@@ -2041,7 +2080,7 @@
 ;;;    present in all intervening actual source forms.
 (defun note-block-deletion (block)
   (let ((home (block-home-lambda block)))
-    (unless (or (eq (functional-kind home) :deleted)
+    (unless (or (functional-kind-eq home deleted)
                 (block-delete-p (lambda-block home)))
       (do-nodes (node nil block)
         (let* ((path (node-source-path node))
@@ -2225,8 +2264,8 @@
   (do-blocks (block component)
     (delete-block-lazily block))
   (dolist (fun (component-lambdas component))
-    (unless (eq (functional-kind fun) :deleted)
-      (setf (functional-kind fun) nil)
+    (unless (functional-kind-eq fun deleted)
+      (setf (functional-kind fun) (functional-kind-attributes nil))
       (setf (functional-entry-fun fun) nil)
       (setf (leaf-refs fun) nil)
       (delete-functional fun)))
@@ -2260,7 +2299,7 @@ directly to the LVAR-DEST of LVAR, which must be a combination. If FUN
 is :ANY, the function name is not checked."
   (declare (type lvar lvar)
            (type symbol fun)
-           (type index num-args))
+           (type (or index null) num-args))
   (flet ((give-up ()
            (if give-up
                (give-up-ir1-transform)
@@ -2274,9 +2313,11 @@ is :ANY, the function name is not checked."
         (unless (or (eq fun :any)
                     (eq (lvar-fun-name inside-fun) fun))
           (give-up))
+
         (let ((inside-args (combination-args inside)))
-          (unless (= (length inside-args) num-args)
-            (give-up))
+          (when num-args
+            (unless (= (length inside-args) num-args)
+              (give-up)))
           (let* ((outside-args (combination-args outside))
                  (arg-position (position lvar outside-args))
                  (before-args (subseq outside-args 0 arg-position))
@@ -2354,6 +2395,10 @@ is :ANY, the function name is not checked."
   (values))
 
 (defun replace-combination-with-constant (constant combination)
+  (when (producing-fasl-file)
+    (handler-case (maybe-emit-make-load-forms constant)
+      ((or compiler-error error) ()
+        (return-from replace-combination-with-constant))))
   (with-ir1-environment-from-node combination
     (let* ((lvar (node-lvar combination))
            (prev (node-prev combination))
@@ -2361,10 +2406,11 @@ is :ANY, the function name is not checked."
       (%delete-lvar-use combination)
       (setf (ctran-next prev) nil)
       (setf (node-prev combination) nil)
-      (reference-constant prev intermediate-ctran lvar constant)
+      (reference-constant prev intermediate-ctran lvar constant nil)
       (link-node-to-previous-ctran combination intermediate-ctran)
       (reoptimize-lvar lvar)
-      (flush-combination combination))))
+      (flush-combination combination)
+      t)))
 
 
 ;;;; leaf hackery
@@ -2376,7 +2422,8 @@ is :ANY, the function name is not checked."
     (push ref (leaf-refs leaf))
     (update-lvar-dependencies leaf ref)
     (delete-ref ref)
-    (setf (ref-leaf ref) leaf)
+    (setf (ref-leaf ref) leaf
+          (ref-same-refs ref) nil)
     (setf (leaf-ever-used leaf) t)
     (let* ((ltype (leaf-type leaf))
            (vltype (make-single-value-type ltype)))
@@ -2478,20 +2525,11 @@ is :ANY, the function name is not checked."
       y-use)))
 
 (defun refs-unchanged-p (ref1 ref2)
-  (block nil
-    (let ((node ref1))
-      (tagbody
-       :next
-         (let ((ctran (node-next node)))
-           (when ctran
-             (setf node (ctran-next ctran))
-             (if (eq node ref2)
-                 (return t)
-                 (typecase node
-                   (ref
-                    (go :next))
-                   (cast
-                    (go :next))))))))))
+  (let ((same (ref-same-refs ref1)))
+    (and same
+         (eq same
+             (ref-same-refs ref2)))))
+
 
 ;;; Return true if VAR would have to be closed over if environment
 ;;; analysis ran now (i.e. if there are any uses that have a different
@@ -2499,7 +2537,7 @@ is :ANY, the function name is not checked."
 (defun closure-var-p (var)
   (declare (type lambda-var var))
   (let ((home (lambda-var-home var)))
-    (cond ((eq (functional-kind home) :deleted)
+    (cond ((functional-kind-eq home deleted)
            nil)
           (t (let ((home (lambda-home home)))
                (flet ((frob (l)
@@ -2574,7 +2612,7 @@ is :ANY, the function name is not checked."
 (declaim (inline xep-p))
 (defun xep-p (fun)
   (declare (type functional fun))
-  (not (null (member (functional-kind fun) '(:external :toplevel)))))
+  (functional-kind-eq fun external toplevel))
 
 ;;; If LVAR's only use is a non-notinline global function reference,
 ;;; then return the referenced symbol, otherwise NIL. If NOTINLINE-OK
@@ -2685,15 +2723,15 @@ is :ANY, the function name is not checked."
 ;;; Make sure that FUNCTIONAL is not let-converted or deleted.
 (defun assure-functional-live-p (functional)
   (declare (type functional functional))
-  (when (and (or
-              ;; looks LET-converted
-              (functional-somewhat-letlike-p functional)
-              ;; It's possible for a LET-converted function to end up
-              ;; deleted later. In that case, for the purposes of this
-              ;; analysis, it is LET-converted: LET-converted functionals
-              ;; are too badly trashed to expand them inline, and deleted
-              ;; LET-converted functionals are even worse.
-              (memq (functional-kind functional) '(:deleted :zombie))))
+  (when (functional-kind-eq functional
+                            ;; looks LET-converted
+                            let mv-let assignment
+                            ;; It's possible for a LET-converted function to end up
+                            ;; deleted later. In that case, for the purposes of this
+                            ;; analysis, it is LET-converted: LET-converted functionals
+                            ;; are too badly trashed to expand them inline, and deleted
+                            ;; LET-converted functionals are even worse.
+                            deleted zombie)
     (throw 'locall-already-let-converted functional)))
 
 (defun assure-leaf-live-p (leaf)
@@ -3097,7 +3135,7 @@ is :ANY, the function name is not checked."
 
 (defun lambda-var-original-name (leaf)
   (let ((home (lambda-var-home leaf)))
-    (if (eq :external (functional-kind home))
+    (if (functional-kind-eq home external)
         (let* ((entry (functional-entry-fun home))
                (p (1- (or (position leaf (lambda-vars home))
                           (bug "can't find leaf")))))
@@ -3209,10 +3247,12 @@ is :ANY, the function name is not checked."
            (%compile-time-type-error-warn annotation (type-specifier type)
                                           (type-specifier (lvar-type lvar))
                                           (let ((path (lvar-annotation-source-path annotation)))
-                                            (list
-                                             (if (eq (car path) 'original-source-start)
-                                                 (find-original-source path)
-                                                 (car path))))
+                                            (if (eq (car path) 'detail)
+                                                (second path)
+                                                (list
+                                                 (if (eq (car path) 'original-source-start)
+                                                     (find-original-source path)
+                                                     (car path)))))
                                           :condition condition))
           ((consp uses)
            (let ((condition (case condition
@@ -3282,3 +3322,30 @@ is :ANY, the function name is not checked."
                  (node-lexenv (lvar-dest lvar)))
                 *lexenv*)))
     t))
+
+(defun compiling-p (environment)
+  (and (boundp 'sb-c:*compilation*)
+       #+sb-fasteval
+       (not (typep environment 'sb-interpreter:basic-env))
+       #+sb-eval
+       (not (typep environment 'sb-eval::eval-lexenv))))
+
+;;; Return T if SYMBOL will always have a value in its TLS cell that is
+;;; not EQ to NO-TLS-VALUE-MARKER-WIDETAG. As an optimization, set and ref
+;;; are permitted (but not required) to avoid checking for it.
+;;; This will be true of all C interface symbols, 'struct thread' slots,
+;;; and any variable defined by DEFINE-THREAD-LOCAL.
+;;;
+;;; Or if there's a binding around NODE.
+(defun sb-vm::symbol-always-has-tls-value-p (symbol node)
+  (or (typep (info :variable :wired-tls symbol)
+             '(or (eql :always-thread-local) fixnum))
+      (when node
+        (do-nested-cleanups (cleanup node)
+          (when (eq (cleanup-kind cleanup) :special-bind)
+            (let* ((node (cleanup-mess-up cleanup))
+                   (args (when (basic-combination-p node)
+                           (basic-combination-args node))))
+              (when (and args
+                         (eq (leaf-source-name (lvar-value (car args))) symbol))
+                (return t))))))))

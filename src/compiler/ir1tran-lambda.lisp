@@ -131,7 +131,8 @@
                                           :post-binding-lexenv post-binding-lexenv
                                           :debug-name (debug-name
                                                        '&aux-bindings
-                                                       aux-vars)
+                                                       (mapcar #'leaf-source-name
+                                                               aux-vars))
                                           :value-source-forms (rest value-source-forms))))
         (reference-leaf start ctran fun-lvar fun)
         (ir1-convert-combination-args fun-lvar ctran next result
@@ -285,7 +286,7 @@
 (defun register-entry-point (entry dispatcher)
   (declare (type clambda entry)
            (type optional-dispatch dispatcher))
-  (setf (functional-kind entry) :optional)
+  (setf (functional-kind entry) (functional-kind-attributes optional))
   (setf (leaf-ever-used entry) t)
   (setf (lambda-optional-dispatch entry) dispatcher)
   entry)
@@ -392,7 +393,7 @@
     (let ((name (or debug-name source-name)))
       (if (or force
               supplied-p-p ; this entry will be of kind NIL
-              (and (lambda-p ep) (eq (lambda-kind ep) nil)))
+              (and (lambda-p ep) (functional-kind-eq ep nil)))
           (convert-optional-entry ep
                                   default-vars default-vals
                                   (if supplied-p (list default nil) (list default))
@@ -1183,10 +1184,12 @@
            (let* ((where-from (leaf-where-from found))
                   (res (make-defined-fun
                         :%source-name name
-                        :where-from (if (eq where-from :declared)
+                        :where-from (if (memq where-from '(:declared :declared-verify))
                                         :declared
                                         :defined-here)
-                        :type (leaf-type found))))
+                        :type (if (eq where-from :declared-verify)
+                                  (leaf-defined-type found)
+                                  (leaf-type found)))))
              (substitute-leaf res found)
              (setf (gethash name free-funs) res)))
           ;; If FREE-FUNS has a previously converted definition
@@ -1268,18 +1271,29 @@
                      (or (fun-info-transforms info)
                          (fun-info-templates info)
                          (fun-info-ir2-convert info))))
-      (if (block-compile *compilation*)
-          (progn
-            (substitute-leaf fun var)
-            ;; If in a simple environment, then we can allow backward
-            ;; references to this function from following top-level
-            ;; forms.
-            (when simple-lexenv-p
-              (setf (defined-fun-functional var) fun)))
-          (substitute-leaf-if
-           (lambda (ref)
-             (policy ref (> recognize-self-calls 0)))
-           fun var)))
+      (let (type)
+        (if (block-compile *compilation*)
+            (progn
+              (substitute-leaf fun var)
+              ;; If in a simple environment, then we can allow backward
+              ;; references to this function from following top-level
+              ;; forms.
+              (when simple-lexenv-p
+                (setf (defined-fun-functional var) fun)))
+            (substitute-leaf-if
+             (lambda (ref)
+               (if (policy ref (> recognize-self-calls 0))
+                   t
+                   (let ((type (or type
+                                   (setf type (definition-type fun))))
+                         (call (node-dest ref)))
+                     (when (and (combination-p call)
+                                (eq (combination-fun call)
+                                    (ref-lvar ref))
+                                (fun-type-p type))
+                       (assert-call-type call type t :defined-here))
+                     nil)))
+             fun var))))
     fun))
 
 ;;; Convert a lambda for global inline expansion.

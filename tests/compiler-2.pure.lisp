@@ -2552,13 +2552,6 @@
                             :allow-style-warnings t)))
     (assert (eq (funcall f 2) :good))))
 
-(with-test (:name :symbol-case-as-jump-table
-                  :skipped-on (not (or :x86 :x86-64)))
-  ;; Assert that a prototypical example of (CASE symbol ...)
-  ;; was converted to a jump table.
-  (let ((c (sb-kernel:fun-code-header #'sb-debug::parse-trace-options)))
-    (assert (>= (sb-kernel:code-jump-table-words c) 17))))
-
 (with-test (:name :modular-arith-type-derivers
                   :fails-on :ppc64)
   (let ((f (checked-compile
@@ -2689,7 +2682,7 @@
     (((expt 2 (1- sb-vm:n-word-bits)) #xFFFFFF) -1)
     (((1- (expt 2 (1- sb-vm:n-word-bits))) #xFFFFFF) -16777216)))
 
-#+#.(cl:if (cl:gethash 'sb-c:multiway-branch-if-eq sb-c::*backend-template-names*)
+#+#.(cl:if (cl:gethash 'sb-c:jump-table sb-c::*backend-template-names*)
            '(:and)
            '(:or))
 (with-test (:name :typecase-to-case-preserves-type)
@@ -2706,7 +2699,8 @@
                 (sb-kernel:lexenv (sb-c::lexenv-vars x))
                 (broadcast-stream (broadcast-stream-streams x))
                 (t :none))))))
-    ;; There should be no #<layout> referenced directly from the code header.
+    ;; There should be no #<layout> referenced directly from the code header
+    ;; (which implies that no type-check occurs when accessing a structure instance).
     ;; There is of course a vector of layouts in there to compare against.
     (assert (not (ctu:find-code-constants f :type 'sb-kernel:layout)))
     ;; The function had better work.
@@ -3413,7 +3407,7 @@
                               913097464
                               5)))
            39)))))
-    '(values (or (integer 21 22) (integer 336 337)) (integer -38 0) &optional))))
+    '(values (or (integer 22 22) (integer 337 337)) (integer -38 -1) &optional))))
 
 (with-test (:name :boundp-ir2-optimizer)
   (checked-compile-and-assert
@@ -4402,3 +4396,11 @@
     ((#'identity .0) (condition 'type-error))
     ((#'identity 1) 1)
     ((#'identity (expt 2 1000)) (condition 'type-error))))
+
+(with-test (:name :pop-values-unused)
+  (checked-compile-and-assert
+   ()
+   `(lambda (j l r)
+      (declare ((function (fixnum &rest t)) j))
+      (apply j l r))
+   ((#'+ 1 '(2)) 3)))

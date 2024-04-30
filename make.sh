@@ -29,6 +29,11 @@ sh make-config.sh "$@" --check-host-lisp || exit $?
 . output/prefix.def
 . output/build-config
 
+echo //building host tools
+# Build the perfect-hash-generator. It's actually OK if this fails,
+# as long as xperfecthash.lisp-expr is up-to-date
+$GNUMAKE -C tools-for-build perfecthash || true
+
 build_started=`date`
 echo "//Starting build: $build_started"
 # Apparently option parsing succeeded. Print out the results.
@@ -53,7 +58,7 @@ $SBCL_XC_HOST < tools-for-build/canonicalize-whitespace.lisp || exit 1
 #     system.
 #   On the target system:
 #     sh make-target-1.sh
-#   Copy src/runtime/sbcl.nm and output/stuff-groveled-from-headers.lisp
+#   Copy output/stuff-groveled-from-headers.lisp
 #     from the target system to the host system.
 #   On the host system:
 #     SBCL_XC_HOST=<whatever> sh make-host-2.sh
@@ -107,13 +112,18 @@ src/runtime/sbcl --core output/sbcl.core --lose-on-corruption --noinform \
                  (push obj l2)))
              :all)
             (when l1 (format t "Found ~D:~%~S~%" (length l1) l1))
+            ;; Assert that a chosen few symbols not named using the ! convention are removed
+            ;; by tree-shaking. This list was made by hand-checking various macros that seemed
+            ;; not to be needed after the build. I would have thought
+            ;; (EVAL-WHEN (:COMPILE-TOPLEVEL)) to be preferable, but revision fb1ba6de5e makes
+            ;; a case for not doing that. Either way is less than fabulous.
             (sb-int:awhen
                 (mapcan (quote apropos-list)
                         (quote ("DEFINE-INFO-TYPE" "LVAR-TYPE-USING"
                                                    "TWO-ARG-+/-"
                                                    "PPRINT-TAGBODY-GUTS" "WITH-DESCRIPTOR-HANDLERS"
                                                    "SUBTRACT-BIGNUM-LOOP" "BIGNUM-REPLACE" "WITH-BIGNUM-BUFFERS"
-                                                   "GCD-ASSERT" "MODULARLY" "BIGNUM-NEGATE-LOOP"
+                                                   "GCD-ASSERT" "BIGNUM-NEGATE-LOOP"
                                                    "SHIFT-RIGHT-UNALIGNED"
                                                    "STRING-LESS-GREATER-EQUAL-TESTS")))
               (format t "~&Leftover from [disabled?] tree-shaker:~%~S~%" sb-int:it))

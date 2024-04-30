@@ -100,26 +100,6 @@ these hooks.")
   (let ((index (binary-search* value seq key)))
     (if index
         (svref seq index))))
-
-(defun double-vector-binary-search (value vector)
-  (declare (simple-vector vector)
-           (optimize speed)
-           (integer value))
-  (labels ((recurse (start end)
-             (declare (type index start end))
-             (when (< start end)
-               (let* ((i (+ start (truncate (- end start) 2)))
-                      (elt (svref vector (truly-the index (* 2 i)))))
-                 (declare (type integer elt)
-                          (type index i))
-                 (cond ((< value elt)
-                        (recurse start i))
-                       ((> value elt)
-                        (recurse (1+ i) end))
-                       (t
-                        (svref vector (truly-the index (1+ (* 2 i))))))))))
-    (recurse 0 (truncate (length vector) 2))))
-
 
 ;;;; helpers for C library calls
 
@@ -184,9 +164,6 @@ ownership of the table. If HASH-TABLE is not synchronized, BODY will
 execute with other WITH-LOCKED-HASH-TABLE bodies excluded -- exclusion
 of hash-table accesses not surrounded by WITH-LOCKED-HASH-TABLE is
 unspecified."
-  ;; Needless to say, this also excludes some internal bits, but
-  ;; getting there is too much detail when "unspecified" says what
-  ;; is important -- unpredictable, but harmless.
   `(sb-thread:with-recursive-lock ((hash-table-lock ,hash-table))
      ,@body))
 

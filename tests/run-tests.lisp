@@ -222,6 +222,8 @@
     `(sb-c::*code-serialno*
       sb-c::*compile-elapsed-time*
       sb-c::*compile-file-elapsed-time*
+      sb-c::*phash-lambda-cache*
+      ,(maybe "SB-IMPL" "*RUN-GC-HOOKS*")
       sb-impl::**finalizer-store**
       sb-impl::*finalizer-rehashlist*
       sb-impl::*finalizers-triggered*
@@ -238,6 +240,7 @@
       sb-kernel::*type-cache-nonce*
       sb-ext:*gc-run-time*
       sb-ext:*gc-real-time*
+      sb-vm::*code-alloc-count*
       sb-kernel::*gc-epoch*
       sb-int:*n-bytes-freed-or-purified*
       ,(maybe "SB-APROF" "*ALLOCATION-PROFILE-METADATA*")
@@ -256,7 +259,8 @@
       ,(maybe "SB-THREAD" "*ALLOCATOR-METRICS*")
       sb-pcl::*dfun-constructors*
       #+win32 sb-impl::*waitable-timer-handle*
-      #+win32 sb-impl::*timer-thread*)))
+      #+win32 sb-impl::*timer-thread*
+      sb-unicode::*name->char-buffers*)))
 
 (defun collect-symbol-values ()
   (let (result)

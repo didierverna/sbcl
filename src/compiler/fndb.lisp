@@ -86,11 +86,6 @@
 (defknown (eq eql) (t t) boolean
   (movable foldable flushable commutative))
 (defknown (equal equalp) (t t) boolean (foldable flushable recursive))
-
-#+(or x86 x86-64 arm arm64)
-(defknown fixnum-mod-p (t fixnum) boolean
-  (movable flushable always-translatable))
-
 
 ;;;; classes
 
@@ -187,10 +182,10 @@
 (defknown symbol-name (symbol) simple-string (movable foldable flushable))
 (defknown make-symbol (string) symbol (flushable))
 ;; %make-symbol is the internal API, but the primitive object allocator
-;; is %%make-symbol, because when immobile space feature is present,
+;; is %alloc-symbol, because when immobile space feature is present,
 ;; we dispatch to either the C allocator or the Lisp allocator.
 (defknown %make-symbol (fixnum simple-string) symbol (flushable))
-(defknown sb-vm::%%make-symbol (simple-string) symbol (flushable))
+(defknown sb-vm::%alloc-symbol (simple-string) symbol (flushable))
 (defknown copy-symbol (symbol &optional t) symbol (flushable))
 (defknown gensym (&optional (or string unsigned-byte)) symbol ())
 (defknown symbol-package (symbol) (or package null) (flushable))
@@ -283,7 +278,7 @@
     (fixnum real fixnum) boolean
     (foldable flushable movable no-verify-arg-count))
 
-(defknown (check-range< check-range<= check-range<<= check-range<=<)
+(defknown (check-range<=)
     (fixnum t fixnum) boolean
     (foldable flushable movable no-verify-arg-count))
 
@@ -308,6 +303,10 @@
 
 (defknown expt (number number) number
   (movable foldable flushable recursive))
+
+(defknown sb-kernel::intexp ((or rational (complex rational)) integer) rational
+  (movable foldable flushable recursive no-verify-arg-count))
+
 (defknown log (number &optional real) irrational
   (movable foldable flushable recursive))
 (defknown sqrt (number) irrational
@@ -416,6 +415,10 @@
   (movable foldable unsafely-flushable))
 (defknown float-radix (float) sb-kernel::%float-radix
   (movable foldable unsafely-flushable))
+(defknown float-sign-bit (float) bit
+  (movable foldable unsafely-flushable))
+(defknown float-sign-bit-set-p (float) boolean
+  (movable foldable unsafely-flushable))
 ;;; This says "unsafely flushable" as if to imply that there is a possibility
 ;;; of signaling a condition in safe code, but in practice we can never trap
 ;;; on a NaN because the implementation uses foo-FLOAT-BITS instead of
@@ -504,8 +507,8 @@
 (defknown random-state-p (t) boolean (movable foldable flushable))
 
 ;;;; from the "Characters" chapter:
-(defknown (standard-char-p graphic-char-p alpha-char-p
-                           upper-case-p lower-case-p both-case-p alphanumericp)
+(defknown (graphic-char-p alpha-char-p standard-char-p
+           upper-case-p lower-case-p both-case-p alphanumericp)
   (character) boolean (movable foldable flushable))
 
 (defknown digit-char-p (character &optional (integer 2 36))
@@ -543,7 +546,7 @@
 (defknown digit-char (unsigned-byte &optional (integer 2 36))
   (or character null) (movable foldable flushable))
 (defknown char-int (character) %char-code (movable foldable flushable))
-(defknown char-name (character) (or simple-string null)
+(defknown char-name (character) (or simple-base-string null)
   (movable foldable flushable))
 (defknown name-char (string-designator) (or character null)
   (movable foldable flushable))
@@ -647,9 +650,11 @@
                   (intern (concatenate 'string "VECTOR-MAP-INTO/"
                                        (string (sb-vm:saetp-primitive-type-name info)))
                           :sb-impl))
-    (simple-array index index function list)
+    (simple-array index index (function ((rest-args :sequence t))
+                                        (nth-arg 0 :sequence t))
+                  &rest sequence)
     index
-    (call no-verify-arg-count))
+  (call no-verify-arg-count))
 
 ;;; returns the result from the predicate...
 (defknown some (function-designator proper-sequence &rest proper-sequence) t
@@ -987,17 +992,22 @@
 
 (defknown list (&rest t) list (movable flushable))
 (defknown list* (t &rest t) t (movable flushable))
+
+;;; A stack allocated cons cell used for list accumulation routines.
+;;; The lowtag might be incorrect because it's unaligned.
+;;; Can't pass it to anything, can't take CAR, only CDR is usable.
+(defknown unaligned-dx-cons (t) cons (movable flushable always-translatable))
+
 ;;; The length constraint on MAKE-LIST is such that:
 ;;; - not every byte of addressable memory can be used up.
 ;;; - the number of bytes to allocate should be a fixnum
 ;;; - type-checking can use use efficient bit-masking approach
 ;;;   to combine the fixnum + range test into one instruction
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant make-list-limit
-    (ash most-positive-fixnum (- (+ sb-vm:word-shift 1)))))
+(defconstant make-list-limit
+  (ash most-positive-fixnum (- (+ sb-vm:word-shift 1))))
 (defknown make-list ((integer 0 #.make-list-limit) &key (:initial-element t)) list
   (movable flushable))
-(defknown %make-list ((integer 0 #.make-list-limit) t) list
+(defknown (%make-list sb-impl::%sys-make-list) ((integer 0 #.make-list-limit) t) list
   (movable flushable no-verify-arg-count))
 
 (defknown sb-impl::|List| (&rest t) list (movable flushable))
@@ -1170,6 +1180,7 @@
 (defknown (sxhash psxhash) (t) hash-code (foldable flushable))
 (defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
 (defknown sb-impl::install-hash-table-lock (hash-table) sb-thread:mutex ())
+(defknown sb-vm::quick-try-mutex (sb-thread:mutex) boolean)
 ;; To avoid emitting code to test for nil-function-returned
 (defknown (sb-impl::signal-corrupt-hash-table
            sb-impl::signal-corrupt-hash-table-bucket)
@@ -1530,6 +1541,11 @@
           (:junk-allowed t))
   (values (or integer null ()) index))
 
+(defknown (sb-impl::parse-integer10 sb-impl::parse-integer16)
+    (string index sequence-end t)
+    (values (or integer null ()) index)
+    (no-verify-arg-count))
+
 (defknown read-byte (stream &optional t t) t ()
   :derive-type (read-elt-type-deriver nil 'integer nil))
 
@@ -1574,6 +1590,7 @@
            (unsafely-flushable)))
 
 (defknown (prin1-to-string princ-to-string) (t) simple-string (unsafely-flushable))
+(defknown sb-format::princ-multiple-to-string (&rest t) simple-string (unsafely-flushable))
 (defknown sb-impl::stringify-object (t) simple-string (no-verify-arg-count))
 
 (defknown write-char (character &optional stream-designator) character ()
@@ -1908,7 +1925,7 @@
 
 ;;;; magical compiler frobs
 
-(defknown %rest-values (t t t) * (always-translatable))
+(defknown %rest-values (t t t t) * (always-translatable))
 (defknown %rest-ref (t t t t &optional boolean) * (always-translatable))
 (defknown %rest-length (t t t) * (always-translatable))
 (defknown %rest-null (t t t t) * (always-translatable))
@@ -1929,6 +1946,8 @@
 (defknown %typep-wrapper (t t (or type-specifier ctype)) t
   (movable flushable always-translatable))
 (defknown %type-constraint (t (or type-specifier ctype)) t
+    (always-translatable))
+(defknown %in-bounds-constraint (t t) t
     (always-translatable))
 
 ;;; An identity wrapper to avoid complaints about constant modification
@@ -1983,9 +2002,12 @@
 (defknown %check-bound (array index t) (values)
   (dx-safe))
 (defknown data-vector-ref (simple-array index) t
-  (foldable flushable always-translatable))
+  (foldable flushable always-translatable)
+  ;; check bounds when folding.
+  :folder (lambda (array index) (aref array index)))
 (defknown data-vector-ref-with-offset (simple-array fixnum fixnum) t
-  (foldable flushable always-translatable))
+  (foldable flushable always-translatable)
+  :folder (lambda (array index offset) (aref array (+ index offset))))
 (defknown data-nil-vector-ref (simple-array index) nil
   (always-translatable))
 ;;; The lowest-level vector SET operators should not return a value.
@@ -1993,9 +2015,11 @@
 (defknown data-vector-set (array index t) (values) (dx-safe always-translatable))
 (defknown data-vector-set-with-offset (array fixnum fixnum t) (values)
   (dx-safe always-translatable))
-(defknown hairy-data-vector-ref (array index) t (foldable flushable no-verify-arg-count))
+(defknown hairy-data-vector-ref (array index) t (foldable flushable no-verify-arg-count)
+  :folder (lambda (array index) (aref array index)))
 (defknown hairy-data-vector-set (array index t) t (no-verify-arg-count))
-(defknown hairy-data-vector-ref/check-bounds (array index) t (foldable no-verify-arg-count))
+(defknown hairy-data-vector-ref/check-bounds (array index) t (foldable no-verify-arg-count)
+  :folder (lambda (array index) (aref array index)))
 (defknown hairy-data-vector-set/check-bounds (array index t) t (no-verify-arg-count))
 
 (defknown vector-hairy-data-vector-ref (vector index) t (foldable flushable no-verify-arg-count))
@@ -2231,20 +2255,27 @@
 
 ;;; Avoid a ton of FBOUNDP checks in the string stream constructors etc,
 ;;; by wiring in the needed functions instead of dereferencing their fdefns.
-(defknown (ill-in ill-bin ill-out ill-bout
-           sb-impl::string-in-misc
-           sb-impl::string-sout
-           sb-impl::finite-base-string-ouch sb-impl::finite-base-string-out-misc
-           sb-impl::fill-pointer-ouch sb-impl::fill-pointer-sout
-           sb-impl::fill-pointer-misc
-           sb-impl::case-frob-upcase-out sb-impl::case-frob-upcase-sout
-           sb-impl::case-frob-downcase-out sb-impl::case-frob-downcase-sout
-           sb-impl::case-frob-capitalize-out sb-impl::case-frob-capitalize-sout
-           sb-impl::case-frob-capitalize-first-out sb-impl::case-frob-capitalize-first-sout
-           sb-impl::case-frob-capitalize-aux-out sb-impl::case-frob-capitalize-aux-sout
-           sb-impl::case-frob-misc
-           sb-pretty::pretty-out sb-pretty::pretty-misc) * *)
-(defknown sb-pretty::pretty-sout * * (recursive))
+(defknown (ill-in ill-bin ill-out ill-bout) (t &rest t) nil (no-verify-arg-count))
+(defknown sb-impl::string-in-misc (t t t) * (no-verify-arg-count))
+(defknown sb-impl::string-sout (t t t t) t (no-verify-arg-count))
+(defknown sb-impl::finite-base-string-ouch (t t) t (no-verify-arg-count))
+(defknown sb-impl::finite-base-string-out-misc (t t t) nil (no-verify-arg-count))
+(defknown sb-impl::fill-pointer-ouch (t t) t (no-verify-arg-count))
+(defknown sb-impl::fill-pointer-sout (t t t t) t (no-verify-arg-count))
+(defknown sb-impl::fill-pointer-misc (t t t) t (no-verify-arg-count))
+(defknown sb-impl::case-frob-upcase-out (t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-upcase-sout (t t t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-downcase-out (t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-downcase-sout (t t t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-capitalize-out (t t) t (no-verify-arg-count))
+(defknown sb-impl::case-frob-capitalize-sout (t t t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-capitalize-first-out (t t) t (no-verify-arg-count))
+(defknown sb-impl::case-frob-capitalize-first-sout (t t t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-capitalize-aux-out (t t) t (no-verify-arg-count))
+(defknown sb-impl::case-frob-capitalize-aux-sout (t t t t) * (no-verify-arg-count))
+(defknown sb-impl::case-frob-misc (t t t) * (no-verify-arg-count))
+(defknown sb-pretty::pretty-out (t t) t (no-verify-arg-count))
+(defknown sb-pretty::pretty-misc (t t t) t (no-verify-arg-count))
 
 ;;;; PCL
 
@@ -2267,19 +2298,22 @@
 (defknown (sb-impl::%with-standard-io-syntax
            sb-impl::%with-rebound-io-syntax
            sb-impl::call-with-sane-io-syntax)
-    (function) *)
-(defknown sb-debug::funcall-with-debug-io-syntax (function &rest t) *)
-(defknown sb-impl::%print-unreadable-object (t t t &optional function) null)
+    ((function ())) *)
+(defknown sb-debug::funcall-with-debug-io-syntax ((function ((rest-args))) &rest t) *)
+(defknown sb-impl::%print-unreadable-object (t t t &optional (function ())) null)
 
 #+sb-thread
 (progn
-(defknown (sb-thread::call-with-mutex sb-thread::call-with-recursive-lock)
-    (function t t t) *)
+(defknown (sb-thread::call-with-mutex-timed sb-thread::call-with-recursive-lock-timed)
+    ((function ()) t t t) *)
+(defknown (sb-thread::call-with-mutex sb-thread::call-with-recursive-lock
+           sb-thread::fast-call-with-mutex sb-thread::fast-call-with-recursive-lock)
+    ((function ()) t) *)
 (defknown (sb-thread::call-with-system-mutex
            sb-thread::call-with-system-mutex/allow-with-interrupts
            sb-thread::call-with-system-mutex/without-gcing
            sb-thread::call-with-recursive-system-lock)
-    (function t) *))
+    ((function ()) t) *))
 
 #+round-float
 (progn
@@ -2300,3 +2334,5 @@
   (integer t)
   integer
   (movable always-translatable))
+
+(defknown %coerce-to-policy (t) policy (flushable))

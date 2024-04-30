@@ -59,9 +59,6 @@ Does not affect the cases that are already controlled by *PRINT-LENGTH*")
   "Suppress printer errors when the condition is of the type designated by this
 variable: an unreadable object representing the error is printed instead.")
 
-;; duplicate defglobal because this file is compiled before "reader"
-(define-load-time-global *standard-readtable* nil)
-
 (define-load-time-global sb-pretty::*standard-pprint-dispatch-table* nil)
 (defun %with-standard-io-syntax (function)
   (declare (type function function))
@@ -1765,18 +1762,9 @@ variable: an unreadable object representing the error is printed instead.")
           (let* ((ex (locally (declare (optimize (safety 0)))
                        (the fixnum
                          (round (* exponent
-                                   ;; this is the closest double float
-                                   ;; to (log 2 10), but expressed so
-                                   ;; that we're not vulnerable to the
-                                   ;; host lisp's interpretation of
-                                   ;; arithmetic.  (FIXME: it turns
-                                   ;; out that sbcl itself is off by 1
-                                   ;; ulp in this value, which is a
-                                   ;; little unfortunate.)
-                                    #-long-float
-                                    (make-double-float 1070810131 1352628735)
-                                    #+long-float
-                                    (error "(log 2 10) not computed"))))))
+                                   #-long-float (log $2d0 10)
+                                   #+long-float
+                                   (error "(log 2 10) not computed"))))))
                  (x (if (minusp ex)
                         (if (float-denormalized-p x)
                             #-long-float
@@ -1869,7 +1857,7 @@ variable: an unreadable object representing the error is printed instead.")
            (write-string (if (float-trapping-nan-p x) " trapping" " quiet") stream)
            (write-string " NaN" stream))))
     (t
-     (when (plusp (float-sign-bit x))
+     (when (float-sign-bit-set-p x)
        (write-char #\- stream))
      (cond
        ((zerop x)
@@ -1933,8 +1921,6 @@ variable: an unreadable object representing the error is printed instead.")
     (let (dinfo)
       (cond ((eq (setq dinfo (%code-debug-info component)) :bpt-lra)
              (write-string "bpt-trap-return" stream))
-            ((functionp dinfo)
-             (format stream "trampoline ~S" dinfo))
             (t
              (format stream "code~@[ id=~x~] [~D]"
                      (%code-serialno component)

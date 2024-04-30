@@ -352,25 +352,25 @@
       (ecase y
         (-2 'a) (2 'b) (3 'c) (4 (error "no")) (5 'd) (6 'e) (7 'wat) (8 '*) (9 :hi))
       (case z
-        (#\a :a) (#\b :b) (#\e :c) (#\f :d) (#\g :e) (#\h :f) (t nil))))
+        (#\a :a) (#\b :b) (#\e :c) (#\f (print :d)) (#\g :e) (#\h :f) (t nil))))
 
 (defun try-case-known-fixnum (x)
   (declare (optimize (sb-c:verify-arg-count 0)))
   (case (the fixnum x)
-    (0 :a) (1 :b) (2 :c) (5 :d) (6 :c) (-1 :blah)))
+    (0 :a) (1 :b) (2 :c) (5 (print :d)) (6 :c) (-1 :blah)))
 (defun try-case-maybe-fixnum (x)
   (when (typep x 'fixnum)
     (case x
-      (0 :a) (1 :b) (2 :c) (5 :d) (6 :c) (-1 :blah))))
+      (0 :a) (1 :b) (2 :c) (5 :d) (6 (print :c)) (-1 :blah))))
 
 (defun try-case-known-char (x)
   (declare (optimize (sb-c:verify-arg-count 0)))
   (case (the character x)
-    (#\a :a) (#\b :b)(#\c :c) (#\d :d) (#\e :e) (#\f :b)))
+    (#\a :a) (#\b :b)(#\c :c) (#\d :d) (#\e (print :e)) (#\f :b)))
 (defun try-case-maybe-char (x)
   (declare (optimize (sb-c:verify-arg-count 0)))
   (when (characterp x)
-    (case x (#\a :a) (#\b :b)(#\c :c) (#\d :d) (#\e :e) (#\f :a))))
+    (case x (#\a :a) (#\b :b)(#\c :c) (#\d :d) (#\e :e) (#\f (print :a)))))
 
 (defun expect-n-comparisons (fun-name howmany)
   (let ((lines
@@ -382,6 +382,7 @@
 
 (with-test (:name :multiway-branch-generic-eq)
   ;; there's 1 test of NIL, 1 test of character-widetag, and 2 limit checks
+  ;; and 1 for comparing the key
   (expect-n-comparisons 'bbb 4)
   (loop for ((x y z) . expect) in '(((t 3 nil) . c)
                                     ((t 9 nil) . :hi)
@@ -403,14 +404,14 @@
              (checked-compile '(lambda (b)
                                 (case b
                                   ((0) :a) ((0) :b) ((0) :c) ((1) :d)
-                                  ((2) :e) ((3) :f)))
+                                  ((2) :e) ((3) (print :f))))
                               :allow-style-warnings t))))
-    (assert (search "MULTIWAY-BRANCH" s)))
+    (assert (search "JUMP-TABLE" s)))
   ;; There are too few cases after duplicate removal to be considered multiway
   (let ((s (with-output-to-string (sb-c::*compiler-trace-output*)
-             (checked-compile '(lambda (b) (case b ((0) :a) ((0) :b) ((0) :c) ((1) :d)))
+             (checked-compile '(lambda (b) (case b ((0) :a) ((0) :b) ((0) :c) ((1) (print :d))))
                               :allow-style-warnings t))))
-    (assert (not (search "MULTIWAY-BRANCH" s)))))
+    (assert (not (search "JUMP-TABLE" s)))))
 
 ;;; Don't crash on large constants
 ;;; https://bugs.launchpad.net/sbcl/+bug/1850701
@@ -520,7 +521,7 @@
          (lines (split-string
                  (with-output-to-string (s) (disassemble f :stream s))
                  #\newline)))
-    ;; Aside from ECASE failure, there are no other JMPs
+    ;; There is not a conditional branch per symbol
     (assert (= (count-assembly-labels lines) 1))))
 
 ;;; Assert that the ECASE-FAILURE vop emits a trap and that we don't call ERROR
@@ -560,9 +561,13 @@
                           (disassemble f :stream string))
                         #\newline)))
 
-(with-test (:name :peephole-optimizations-1)
+(with-test (:name :peephole-optimizations-1 :skipped-on :sbcl)
   ;; The test does not check that both the load and the shift
-  ;; have been sized as :dword instead of :qword, but it should.
+  ;; have been sized as :dword instead of :qword, but it should
+  ;; FIXME: this test was supposed to assert that
+  ;; "AND r, -2 ; AND r, n" combines the two ANDs into one,
+  ;; but there is no longer an AND in the symbol-hash vop
+  ;; so I need to find a different test case.
   (let ((f '(lambda (x)
              ;; eliminate arg count check, type check
              (declare (optimize speed (safety 0)))
@@ -573,6 +578,8 @@
       (assert (= (count-assembly-lines instcombined)
                  (- (count-assembly-lines unoptimized) 1)))))
 
+  ;; Likewise this was "AND RDX, -2 ; SAR RDX, 2 ; AND RDX, -2 ; AND RDX, 62"
+  ;; becoming "SHR EDX, 2 ; AND EDX, 62"
   (let ((f '(lambda (x)
              ;; eliminate arg count check, type check
              (declare (optimize speed (safety 0)))
@@ -582,39 +589,6 @@
           (instcombined (checked-compile f)))
       (assert (= (count-assembly-lines instcombined)
                  (- (count-assembly-lines unoptimized) 2))))))
-
-(with-test (:name :array-subtype-dispatch-table)
-  (assert (eql (sb-kernel:code-jump-table-words
-                (sb-kernel:fun-code-header #'sb-kernel:vector-subseq*))
-               ;; n-widetags divided by 4, plus jump table count word.
-               65)))
-
-(defstruct a)
-(defstruct (achild (:include a)))
-(defstruct (agrandchild (:include achild)))
-(defstruct (achild2 (:include a)))
-(defstruct b)
-(defstruct c)
-(defstruct d)
-(defstruct e)
-(defstruct (echild (:include e)))
-(defstruct f)
-
-(declaim (freeze-type a b c d e f))
-(defun typecase-jump-table (x)
-  (typecase x
-    (a 'is-a)
-    (b 'is-b)
-    (c 'is-c)
-    ((or d e) 'is-d-or-e)
-    (f 'is-f)))
-(compile 'typecase-jump-table)
-
-(with-test (:name :typecase-jump-table)
-  (assert (eql (sb-kernel:code-jump-table-words
-                (sb-kernel:fun-code-header #'typecase-jump-table))
-               ;; 6 cases including NIL return, plus the size
-               7)))
 
 (defun assert-thereis-line (lambda expect)
   (let ((f (checked-compile lambda)))
@@ -811,18 +785,6 @@
   ;; (AND (SB-KERNEL:%OTHER-POINTER-P #:OBJECT0)
   ;;      (EQ (SB-KERNEL:%OTHER-POINTER-WIDETAG #:OBJECT0) something))
   )
-
-(defun check-integerp-cmp-opcodes (expect type)
-  (count-cmp-opcodes type expect
-          `(lambda (x)
-             (declare (optimize (sb-c::verify-arg-count 0)
-                                #+sb-safepoint (sb-c::insert-safepoints 0)))
-             (typep x ',type))))
-
-(with-test (:name :typep-integer-doubleton)
-  ;; This was taking 3 comparisons because it was a FIXNUMP test
-  ;; and some range-based testing rather than just 2 EQ tests.
-  (check-integerp-cmp-opcodes 2 '(integer 1 2)))
 
 (defun show-pretty-lines (type lines)
   (format t ";;;; Type: ~s~%" type)
@@ -1387,3 +1349,37 @@
                   thereis (search "MOV WORD PTR" line))) ; constant #\a
     (assert (loop for line in lines
                   thereis (search "MOV DWORD PTR" line))))) ; constant NIL
+
+(defun count-labeled-instructions (function &aux (answer 0))
+  (let ((lines (disassembly-lines function)))
+    (dolist (line lines answer)
+      (when (and (>= (length line) 3)
+                 (char= (char line 0) #\L)
+                 (let ((p (position #\: line)))
+                   (every #'digit-char-p (subseq line 1 p))))
+        (incf answer)))))
+
+;;; Jump-to-jump elimination helps with conditional vops (those returning the result in EFLAGS)
+;;; which also contain an internal jump, and naturally are followed by a conditional jump.
+;;; It's usually possible to redirect the internal jump, if it has either exactly the same
+;;; sense of or is exactly the negation of the jump that follows the vop.
+(with-test (:name :jump-to-jump-elimination)
+  ;; NON-NULL SYMBOL-P tests lowtag and widetag, and thus has 2 jumps
+  ;; but there's only 1 target of a jump.
+  (assert (= (count-labeled-instructions
+              (checked-compile
+               `(lambda (x)
+                  (declare (optimize (sb-c::verify-arg-count 0)))
+                  (if (sb-kernel:non-null-symbol-p x) 'zook (foo)))))
+             1)))
+
+(with-test (:name :disassemble-instance-type-test
+            :skipped-on (not :immobile-space))
+  (let ((lines
+          (disassembly-lines
+           (compile nil '(lambda (m) (the sb-thread:mutex m))))))
+    (assert
+     (loop for line in lines
+           thereis (and (search "CMP DWORD PTR" line)
+                        (search "#<LAYOUT" line)
+                        (search "for SB-THREAD:MUTEX" line))))))

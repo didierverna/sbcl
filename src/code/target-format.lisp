@@ -185,8 +185,7 @@
 
 (defmacro def-complex-format-interpreter (char lambda-list &body body)
   (aver (not (lower-case-p char)))
-  (let ((defun-name
-            (intern (format nil "~:C-INTERPRETER" char)))
+  (let ((defun-name (directive-handler-name char "-INTERPRETER"))
         (directive '.directive) ; expose this var to the lambda. it's easiest
         (directives (if lambda-list (car (last lambda-list)) (gensym "DIRECTIVES"))))
     `(progn
@@ -587,7 +586,7 @@
      (sb-impl::string-dispatch (single-float double-float)
          number
        (let ((spaceleft w))
-         (when (and w (or atsign (= (float-sign-bit number) 1)))
+         (when (and w (or atsign (float-sign-bit-set-p number)))
            (decf spaceleft))
          (multiple-value-bind (str len lpoint tpoint)
              (sb-impl::flonum-to-string (abs number) spaceleft d k)
@@ -616,7 +615,7 @@
                   (when w
                     (dotimes (i spaceleft)
                       (write-char pad stream)))
-                  (if (= (float-sign-bit number) 1)
+                  (if (float-sign-bit-set-p number)
                       (write-char #\- stream)
                       (when atsign
                         (write-char #\+ stream)))
@@ -689,7 +688,7 @@
                spaceleft)
           (when w
             (setf spaceleft (- w 2 elen))
-            (when (or atsign (= (float-sign-bit number) 1))
+            (when (or atsign (float-sign-bit-set-p number))
               (decf spaceleft)))
           (if (and w ovf e (> elen e))  ;exponent overflow
               (dotimes (i w) (write-char ovf stream))
@@ -713,7 +712,7 @@
                          (dotimes (i w) (write-char ovf stream)))
                         (t (when w
                              (dotimes (i spaceleft) (write-char pad stream)))
-                           (if (= (float-sign-bit number) 1)
+                           (if (float-sign-bit-set-p number)
                                (write-char #\- stream)
                                (if atsign (write-char #\+ stream)))
                            (when lpoint (write-char #\0 stream))
@@ -794,7 +793,7 @@
     ;; thing, and at least the user shouldn't be surprised.
     (setq number (coerce number 'single-float)))
   (if (floatp number)
-      (let* ((signstr (if (= (float-sign-bit number) 1)
+      (let* ((signstr (if (float-sign-bit-set-p number)
                           "-"
                           (if atsign "+" "")))
              (signlen (length signstr)))
@@ -1229,6 +1228,19 @@
                                         (if atsignp orig-args arg)
                                         arg))))))
   (if atsignp nil args))
+
+(defun princ-multiple-to-string (&rest args)
+  (%with-output-to-string (str)
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (do-rest-arg ((arg) args)
+        (typecase arg
+          (string
+           (write-string arg str))
+          (character
+           (write-char arg str))
+          (t
+           (output-object arg str)))))))
 
 ;;;; format interpreter and support functions for user-defined method
 
@@ -1258,6 +1270,5 @@
 (push '("SB-FORMAT"
         def-format-directive def-complex-format-directive
         def-format-interpreter def-complex-format-interpreter
-        interpret-bind-defaults interpret-format-integer next-arg
-        %set-format-directive-expander)
+        interpret-bind-defaults interpret-format-integer next-arg)
       *!removable-symbols*)

@@ -78,6 +78,8 @@ and submit it as a patch."
 
 ;;;; GC hooks
 
+;;; N.B.: hooks need to be sufficiently uncomplicated as to be harmless,
+;;; and should not expect any particular thread context.
 (define-load-time-global *after-gc-hooks* nil
   "Called after each garbage collection, except for garbage collections
 triggered during thread exits. In a multithreaded environment these hooks may
@@ -222,14 +224,9 @@ run in any thread.")
 
 #+sb-thread
 (defun post-gc ()
-  (sb-impl::finalizer-thread-notify)
+  (sb-impl::finalizer-thread-notify 1) ; Tell it to perform post-GC hooks
   (alien-funcall (extern-alien "empty_thread_recyclebin" (function void)))
-  ;; Post-GC actions are invoked synchronously by the GCing thread,
-  ;; which is an arbitrary one. If those actions aquire any locks, or are sensitive
-  ;; to the state of *ALLOW-WITH-INTERRUPTS*, any deadlocks of what-have-you
-  ;; are user error. Hooks need to be sufficiently uncomplicated as to be harmless.
-  (sb-vm:without-arena "post-gc"
-    (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))
+  nil)
 
 #-sb-thread
 (defun post-gc ()
@@ -283,7 +280,8 @@ run in any thread.")
       (sb-thread::without-thread-waiting-for ()
         (with-interrupts
           (run-pending-finalizers)
-          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))
+          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))
+  nil)
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
@@ -299,6 +297,7 @@ used to specify the oldest generation guaranteed to be collected."
 
 (define-alien-routine scrub-control-stack void)
 
+(defglobal sb-unicode::*name->char-buffers* nil)
 (defun unsafe-clear-roots (gen)
   (declare (ignorable gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
@@ -308,6 +307,8 @@ used to specify the oldest generation guaranteed to be collected."
   ;; Power cache of the bignum printer: drops overly large bignums and
   ;; removes duplicate entries.
   (scrub-power-cache)
+  (setf sb-unicode::*name->char-buffers* nil)
+  (setf sb-c::*phash-lambda-cache* nil)
   ;; Clear caches depending on the generation being collected.
   (cond ((eql 0 gen)
          ;; Drop strings because the hash is pointer-hash

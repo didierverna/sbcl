@@ -78,8 +78,6 @@
     (def-accessor sap-ref-single)
     (def-accessor sap-ref-double))
   (def %byte-blt (src src-start dst dst-start count))
-  (def shift-towards-start (number count))
-  (def shift-towards-end (number count))
   (def get-header-data)
   (def set-header-data (x val))
   (def widetag-of)
@@ -113,7 +111,6 @@
   (def %caller-pc ())
   (def %code-debug-info)
   (def sb-vm::%code-fixups)
-  #+x86-64 (def pointerp)
   (def sb-bignum:%bignum-length)
 
   ;; instances
@@ -167,7 +164,6 @@
   (def fun-code-header)
   (def symbol-package-id)
   (def symbol-hash)
-  #+x86-64 (def hash-as-if-symbol-name)
   (def symbol-%info) ; primitive reader always needs a stub
   #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
@@ -215,3 +211,5 @@
   ;; (OR LIST SYMBOL CLASSOID CLASS), and CLASS isn't known, and you can't
   ;; define it because it's a standard symbol.
   (setq sb-c::*undefined-warnings* nil))
+
+(setf (fdefinition 'unaligned-dx-cons) #'list)

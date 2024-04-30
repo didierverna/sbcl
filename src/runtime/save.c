@@ -28,7 +28,6 @@
 #include "os.h"
 #include "core.h"
 #include "globals.h"
-#include "dynbind.h"
 #include "lispregs.h"
 #include "validate.h"
 #include "gc.h"
@@ -139,6 +138,7 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
                bytes, total_written, compression);
 
         ZSTD_freeCStream(stream);
+        free(buf);
 #endif
     } else {
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
@@ -182,7 +182,7 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
 {
     size_t words, bytes, data, compressed_flag;
     static char *names[] = {NULL, "dynamic", "static", "read-only",
-                            "fixedobj", "text"};
+      "fixedobj", "text", "permgen"};
 
     compressed_flag
             = ((core_compression_level != COMPRESSION_LEVEL_NONE)

@@ -53,20 +53,26 @@
                   (*print-pretty* nil))
               (sb-c:dis code s)))))
     (loop for line in (test-util:split-string disassembly #\newline)
-          when (search expect line) collect line)))
+          when (and (search expect line)
+                    (not (search "; Origin" line)))
+          collect line)))
 
 (defun inspect-ir (form fun &rest checked-compile-args)
   (let ((*compile-component-hook* fun))
     (apply #'test-util:checked-compile form checked-compile-args)))
 
 (defun ir1-named-calls (lambda-expression &optional (full t))
+  (declare (ignorable lambda-expression full))
+  #-sb-devel
+  (throw 'test-util::skip-test t)
+  #+sb-devel
   (let* ((calls)
          (compiled-fun
            (inspect-ir
             lambda-expression
             (lambda (component)
-              (do-blocks (block component)
-                (do-nodes (node nil block)
+              (sb-c::do-blocks (block component)
+                (sb-c::do-nodes (node nil block)
                   (when (and (sb-c::basic-combination-p node)
                              (if full
                                  (eq (sb-c::basic-combination-info node) :full)
@@ -77,27 +83,31 @@
 ;;; For any call that passes a global constant funarg - as in (FOO #'EQ) -
 ;;; return the name of the caller and the names of all such funargs.
 (defun ir1-funargs (lambda-expression)
+  (declare (ignorable lambda-expression))
+  #-sb-devel
+  (throw 'test-util::skip-test t)
+  #+sb-devel
   (let* ((calls)
          (compiled-fun
-          (inspect-ir
-           lambda-expression
-           (lambda (component)
-             (do-blocks (block component)
-               (do-nodes (node nil block)
-                 (when (and (sb-c::basic-combination-p node)
-                            (eq (sb-c::basic-combination-info node) :full))
-                   (let ((filtered
-                          (mapcan
-                           (lambda (arg &aux (uses (sb-c::lvar-uses arg)))
-                             (when (sb-c::ref-p uses)
-                               (let ((leaf (sb-c::ref-leaf uses)))
-                                 (when (and (sb-c::global-var-p leaf)
-                                            (eq (sb-c::global-var-kind leaf) :global-function))
-                                   (list (sb-c::leaf-source-name leaf))))))
-                           (sb-c::combination-args node))))
-                     (when filtered
-                       (push (cons (sb-c::combination-fun-debug-name node) filtered)
-                             calls))))))))))
+           (inspect-ir
+            lambda-expression
+            (lambda (component)
+              (sb-c::do-blocks (block component)
+                (sb-c::do-nodes (node nil block)
+                  (when (and (sb-c::basic-combination-p node)
+                             (eq (sb-c::basic-combination-info node) :full))
+                    (let ((filtered
+                            (mapcan
+                             (lambda (arg &aux (uses (sb-c::lvar-uses arg)))
+                               (when (sb-c::ref-p uses)
+                                 (let ((leaf (sb-c::ref-leaf uses)))
+                                   (when (and (sb-c::global-var-p leaf)
+                                              (eq (sb-c::global-var-kind leaf) :global-function))
+                                     (list (sb-c::leaf-source-name leaf))))))
+                             (sb-c::combination-args node))))
+                      (when filtered
+                        (push (cons (sb-c::combination-fun-debug-name node) filtered)
+                              calls))))))))))
     (values calls compiled-fun)))
 
 (defun find-named-callees (fun &key (name nil namep))
@@ -202,12 +212,16 @@
 ;;; Negative assertions (essentially "count = 0") are silently susceptible
 ;;; to spelling mistakes or a change in how we name nodes.
 (defun count-full-calls (function-name lambda-expression)
+  (declare (ignorable function-name lambda-expression))
+  #-sb-devel
+  (throw 'test-util::skip-test t)
+  #+sb-devel
   (let ((n 0))
     (inspect-ir
      lambda-expression
      (lambda (component)
-       (do-blocks (block component)
-         (do-nodes (node nil block)
+       (sb-c::do-blocks (block component)
+         (sb-c::do-nodes (node nil block)
            (when (and (sb-c::basic-combination-p node)
                       (eq (sb-c::basic-combination-info node) :full)
                       (equal (sb-c::combination-fun-debug-name node)

@@ -887,3 +887,56 @@
    (("") nil)
    ((t) t)
    ((nil) nil)))
+
+(with-test (:name :union-integer-complex)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(or (integer 36757953510256822604)
+                 (complex fixnum))))
+   ((-1) nil)
+   ((36757953510256822603) nil)
+   ((36757953510256822604) t)
+   ((36757953510256822605) t)
+   ((#C(1d0 1d0)) nil)
+   ((#C(1 1)) t)
+   ((#C(1 #.(expt 2 300))) nil)))
+
+#+(or arm64 x86-64)
+(with-test (:name :structure-typep-fold)
+  (assert-type
+   (lambda (a b)
+     (declare (character a))
+       (sb-c::structure-typep a b))
+   null)
+  (assert-type
+   (lambda (a)
+     (declare (hash-table a))
+     (sb-c::structure-typep a #.(sb-kernel:find-layout 'condition)))
+   null)
+  (assert-type
+   (lambda (a)
+     (declare (pathname a))
+     (sb-c::structure-typep a #.(sb-kernel:find-layout 'pathname)))
+   (eql t)))
+
+(with-test (:name :typep-vector-folding)
+  (assert-type
+   (lambda (p)
+     (declare (integer p))
+     (typep p '(vector t 1)))
+   null))
+
+(with-test (:name :non-null-symbol-load-widetag)
+  (checked-compile-and-assert
+   ()
+   `(lambda (p)
+     (declare ((or symbol array) p))
+     (typecase  p
+       ((and symbol (not null)) 1)
+       (simple-array 2)))
+   ((nil) nil)
+   ((t) 1)
+   ((:a) 1)
+   (("") 2)
+   (((make-array 10 :adjustable t)) nil)))

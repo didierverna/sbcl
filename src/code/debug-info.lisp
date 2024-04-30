@@ -13,12 +13,11 @@
 
 ;;;; flags for compiled debug variables
 
-;;; FIXME: old CMU CL representation follows:
 ;;;    Compiled debug variables are in a packed binary representation in the
 ;;; DEBUG-FUN-VARS:
 ;;;    single byte of boolean flags:
 ;;;     uninterned name
-;;;        packaged name
+;;;     packaged name
 ;;;     environment-live
 ;;;     has distinct save location
 ;;;     has ID (name not unique in this fun)
@@ -32,8 +31,8 @@
 ;;;    SC-Offset of primary location (as var-length integer)
 ;;;    [If has save SC, SC-OFFSET of save location (as var-length integer)]
 
-(defconstant compiled-debug-var-more-context-p         #b00000001)
-(defconstant compiled-debug-var-more-count-p           #b00000010)
+(defconstant compiled-debug-var-uninterned             #b00000001)
+(defconstant compiled-debug-var-packaged               #b00000010)
 (defconstant compiled-debug-var-environment-live       #b00000100)
 (defconstant compiled-debug-var-save-loc-p             #b00001000)
 (defconstant compiled-debug-var-same-name-p            #b00010000)
@@ -73,12 +72,6 @@
 ;;; the same.
 (defconstant compiled-code-location-equal-live       (ash #b10000 3))
 
-(defconstant debug-info-var-deleted -1)
-(defconstant debug-info-var-rest -2)
-(defconstant debug-info-var-more -3)
-(defconstant debug-info-var-optional -4)
-(defconstant debug-info-var-supplied-p -5)
-
 
 ;;;; DEBUG-FUN objects
 
@@ -101,38 +94,24 @@
   ;; figure out which DEBUG-FUN object corresponds to your FUNCTION
   ;; object, you compare the name values of each. -- WHN 2001-12-20
   (name (missing-arg) :type (or simple-string cons symbol) :read-only t)
-  ;; a description of variable locations for this function, in alphabetical
-  ;; order by name; or NIL if no information is available
-  ;; If only one variable is encoded then it's stored as is without a vector.
-  ;;
-  ;; The variable entries are alphabetically ordered. This ordering is
-  ;; used in lifetime info to refer to variables: the first entry is
-  ;; 0, the second entry is 1, etc. Variable numbers are *not* the
-  ;; byte index at which the representation of the location starts.
-  ;;
-  ;; Each entry is:
-  ;;   * a FLAGS value, which is a FIXNUM with various
-  ;;     COMPILED-DEBUG-FUN-FOO bits set
-  ;;   * the symbol which names this variable, unless debug info
-  ;;     is minimal
-  ;;   * the variable ID, when it has one
-  ;;   * SC-offset of primary location, if it has one
-  ;;   * SC-offset of save location, if it has one
-  ;; Can either be a single value or a vector for multiple values.
-  (vars nil)
+  ;; The kind of function (same as FUNCTIONAL-KIND):
+  (kind nil :type (member nil :optional :external :toplevel :cleanup :more))
+  ;; a vector of the packed binary representation of variable
+  ;; locations in this function. These are in alphabetical order by
+  ;; name. This ordering is used in lifetime info to refer to
+  ;; variables: the first entry is 0, the second entry is 1,
+  ;; etc. Variable numbers are *not* the byte index at which the
+  ;; representation of the location starts. This slot may be NIL to
+  ;; save space.
+  (vars nil :type (or (simple-array (unsigned-byte 8) (*)) null))
   ;; a vector of the packed binary representation of the
   ;; COMPILED-DEBUG-BLOCKs in this function, in the order that the
   ;; blocks were emitted. The first block is the start of the
   ;; function. This slot may be NIL to save space.
-  ;;
-  ;; FIXME: The "packed binary representation" description in the
-  ;; comment above is the same as the description of the old
-  ;; representation of VARIABLES which doesn't work properly in SBCL
-  ;; (because it doesn't transform correctly under package renaming).
-  ;; Check whether this slot's data might have the same problem that
-  ;; that slot's data did.
   (blocks nil :type (or (simple-array (unsigned-byte 8) (*))
-                        (simple-array (signed-byte 8) (*))
+                        ;; hack to pack the fun form-number here on
+                        ;; low debug.
+                        integer
                         null))
   ;; If all code locations in this function are in the same top level
   ;; form, then this is the number of that form, otherwise NIL. If
@@ -143,27 +122,27 @@
   ;; stored in within this function. The locations are represented by
   ;; the ordinal number of the entry in the VARIABLES slot value. The
   ;; locations are in the order that the arguments are actually passed
-  ;; in, but special negative numbers can be interspersed to indicate
+  ;; in, but special marker symbols can be interspersed to indicate
   ;; the original call syntax:
   ;;
-  ;;  DEBUG-INFO-VAR-DELETED
+  ;; DELETED
   ;;    There was an argument to the function in this position, but it was
   ;;    deleted due to lack of references. The value cannot be recovered.
   ;;
-  ;; DEBUG-INFO-VAR-SUPPLIED-P
+  ;; SUPPLIED-P
   ;;    The following location is the supplied-p value for the preceding
   ;;    keyword or optional.
   ;;
-  ;; DEBUG-INFO-VAR-OPTIONAL
+  ;; OPTIONAL
   ;;    Indicates that following unqualified args are optionals, not required.
   ;;
-  ;; DEBUG-INFO-VAR-REST
+  ;; REST
   ;;    The following location holds the list of rest args.
   ;;
-  ;; DEBUG-INFO-VAR-MORE
+  ;; MORE
   ;;    The following two locations are the more arg context and count.
   ;;
-  ;; <symbol>
+  ;; <any other symbol>
   ;;    The following location is the value of the &KEY argument with the
   ;;    specified name.
   ;;
@@ -173,9 +152,7 @@
   ;; VARIABLES are all required arguments, and are in the order they
   ;; appear in the VARIABLES vector. In other words, :MINIMAL stands
   ;; in for a vector where every element holds its index.
-  ;;
-  ;; Can either be a single value or a vector for multiple values.
-  (arguments nil)
+  (arguments nil :type (or (simple-array * (*)) (member :minimal nil)))
   ;; There are three alternatives for this slot:
   ;;
   ;; a VECTOR
@@ -191,157 +168,34 @@
   (returns :fixed :type (or (simple-array * (*)) (member :standard :fixed)))
   ;; SC-OFFSETs describing where the return PC and return FP are kept.
   #-fp-and-pc-standard-save
-  (return-pc (missing-arg) :type sc+offset)
+  (return-pc (missing-arg) :type sc+offset :read-only t)
   #-fp-and-pc-standard-save
-  (return-pc-pass (missing-arg) :type sc+offset)
+  (return-pc-pass (missing-arg) :type sc+offset :read-only t)
   #-fp-and-pc-standard-save
-  (old-fp (missing-arg) :type sc+offset)
-  ;; An integer which contains between 4 and 6 varint-encoded fields:
-  ;; START-PC -
-  ;; The earliest PC in this function at which the environment is properly
-  ;; initialized (arguments moved from passing locations, etc.)
-  ;; ELSEWHERE-PC -
-  ;; FORM-NUMBER
-  ;; OFFSET
+  (old-fp (missing-arg) :type sc+offset :read-only t)
+  #-fp-and-pc-standard-save
+  (lra-saved-pc (missing-arg) :type sc+offset :read-only t)
+  #-fp-and-pc-standard-save
+  (cfp-saved-pc (missing-arg) :type sc+offset :read-only t)
+  (closure-save (missing-arg) :type (or sc+offset null) :read-only t)
+  #+unwind-to-frame-and-call-vop
+  (bsp-save (missing-arg) :type (or sc+offset null) :read-only t)
+  ;; The earliest PC in this function at which the environment is
+  ;; properly initialized (arguments moved from passing locations,
+  ;; etc.)
+  (start-pc (missing-arg) :type index :read-only t)
   ;; The start of elsewhere code for this function (if any.)
-  ;; CLOSURE-SAVE, and BSP-SAVE.
-  (encoded-locs (missing-arg) :type unsigned-byte :read-only t)
-  (next))
-
-(defun cdf-encode-locs (start-pc elsewhere-pc
-                        form-number offset
-                        closure-save
-                        #+unwind-to-frame-and-call-vop bsp-save
-                        #-fp-and-pc-standard-save lra-saved-pc
-                        #-fp-and-pc-standard-save cfp-saved-pc)
-  (dx-let ((bytes (make-array (* 8 4) :fill-pointer 0
-                                      :element-type '(unsigned-byte 8))))
-    ;; OFFSET and ELSEWHERE are encoded first so that the C backtrace logic
-    ;; need not skip over all the other packed fields.
-    (write-var-integer offset bytes)
-    (write-var-integer elsewhere-pc bytes)
-    (write-var-integer form-number bytes)
-    (write-var-integer (- start-pc offset) bytes)
-    #+unwind-to-frame-and-call-vop
-    (write-var-integer (if bsp-save (1+ (sc+offset-offset bsp-save)) 0)
-                       bytes)
-    #-fp-and-pc-standard-save
-    (progn
-      (write-var-integer lra-saved-pc bytes)
-      (write-var-integer cfp-saved-pc bytes))
-    ;; More often the BSP-SAVE is non-null than CLOSURE-SAVE is non-null,
-    ;; so the encoding is potentially smaller with CLOSURE-SAVE being last.
-    (when closure-save
-      (write-var-integer (1+ (sc+offset-offset closure-save)) bytes))
-    (integer-from-octets bytes)))
-
-(defun cdf-decode-locs (cdf)
-  (let ((encoding (compiled-debug-fun-encoded-locs cdf))
-        (input-pointer 0))
-    (flet ((decode-varint (&aux (accumulator 0) (shift 0))
-             (loop
-              (let ((byte (ldb (byte 8 input-pointer) encoding)))
-                (incf input-pointer 8)
-                (setf accumulator (logior accumulator (ash (logand byte #x7f) shift)))
-                (incf shift 7)
-                (unless (logtest byte #x80) (return accumulator))))))
-      (let* ((offset (decode-varint))
-             (elsewhere-pc (decode-varint))
-             (form-number (decode-varint))
-             (start-pc (+ offset (decode-varint)))
-             #+unwind-to-frame-and-call-vop
-             ;; 0 -> NULL, 1 -> 0, ...
-             (bsp-save (let ((i (decode-varint)))
-                         (unless (zerop i)
-                           (make-sc+offset sb-vm:control-stack-sc-number (1- i)))))
-             #-fp-and-pc-standard-save
-             (lra-saved-pc (decode-varint))
-             #-fp-and-pc-standard-save
-             (cfp-saved-pc (decode-varint))
-             (closure-save (let ((i (decode-varint)))
-                             (unless (zerop i)
-                               (make-sc+offset sb-vm:control-stack-sc-number (1- i))))))
-        (values start-pc elsewhere-pc
-                form-number offset
-                closure-save
-                #-fp-and-pc-standard-save lra-saved-pc
-                #-fp-and-pc-standard-save cfp-saved-pc
-                #+unwind-to-frame-and-call-vop bsp-save)))))
-
-(macrolet ((def (&rest names)
-             `(progn
-                ,@(loop
-                     for name in names
-                     for index from 0
-                     collect
-                       `(defun ,name (cdf)
-                          (nth-value ,index (cdf-decode-locs cdf)))))))
-  (def
-    compiled-debug-fun-start-pc
-    compiled-debug-fun-elsewhere-pc
-    compiled-debug-fun-form-number
-    compiled-debug-fun-offset
-    ;; Most compiled-debug-funs don't need these
-    compiled-debug-fun-closure-save
-    #-fp-and-pc-standard-save compiled-debug-fun-lra-saved-pc
-    #-fp-and-pc-standard-save compiled-debug-fun-cfp-saved-pc
-    #+unwind-to-frame-and-call-vop compiled-debug-fun-bsp-save))
-
-;;; If you add more subtypes here, be sure to amend the set of
-;;; predefined layout FOP codes in src/code/fop
-(def!struct (compiled-debug-fun-optional (:include compiled-debug-fun)
-                                         (:pure t)
-                                         (:copier nil)
-                                         (:predicate nil)))
-(def!struct (compiled-debug-fun-more (:include compiled-debug-fun)
-                                     (:pure t)
-                                     (:copier nil)
-                                     (:predicate nil)))
-(def!struct (compiled-debug-fun-external (:include compiled-debug-fun)
-                                         (:pure t)
-                                         (:copier nil)
-                                         (:predicate nil)))
-(def!struct (compiled-debug-fun-toplevel (:include compiled-debug-fun)
-                                         (:pure t)
-                                         (:copier nil)
-                                         (:predicate nil)))
-(def!struct (compiled-debug-fun-cleanup (:include compiled-debug-fun)
-                                        (:pure t)
-                                        (:copier nil)
-                                        (:predicate nil)))
-
-(defun compiled-debug-fun-ctor (kind)
-  (ecase kind
-    (:optional #'make-compiled-debug-fun-optional)
-    (:more #'make-compiled-debug-fun-more)
-    (:external #'make-compiled-debug-fun-external)
-    (:toplevel #'make-compiled-debug-fun-toplevel)
-    (:cleanup #'make-compiled-debug-fun-cleanup)
-    ((nil) #'make-compiled-debug-fun)))
-
-(defun compiled-debug-fun-kind (debug-fun)
-  (etypecase debug-fun
-    (compiled-debug-fun-optional :optional)
-    (compiled-debug-fun-more :more)
-    (compiled-debug-fun-external :external)
-    (compiled-debug-fun-toplevel :toplevel)
-    (compiled-debug-fun-cleanup :cleanup)
-    (compiled-debug-fun nil)))
+  (elsewhere-pc (missing-arg) :type index :read-only t))
 
 
-;;;; minimal debug function
+;;;; packed debug function
 
-;;; The minimal debug info format compactly represents debug-info for some
-;;; cases where the other debug info (variables, blocks) is small enough so
-;;; that the per-function overhead becomes relatively large. The minimal
-;;; debug-info format can represent any function at level 0, and any fixed-arg
-;;; function at level 1.
+;;; The packed debug info format compactly represents debug-info for
+;;; all debug levels.
 ;;;
-;;; In the minimal format, the debug functions and function map are
+;;; In the packed format, the debug functions and function map are
 ;;; packed into a single byte-vector which is placed in the
-;;; COMPILED-DEBUG-INFO-FUN-MAP. Because of this, all functions in a
-;;; component must be representable in minimal format for any function
-;;; to actually be dumped in minimal format. The vector is a sequence
+;;; COMPILED-DEBUG-INFO-FUN-MAP. The vector is a sequence
 ;;; of records in this format:
 ;;;    name representation + kind + return convention (single byte)
 ;;;    bit flags (single byte)
@@ -380,6 +234,58 @@
 ;;; the component until you find the right one. Well, I guess you need
 ;;; to at least know which function is an XEP for the real function
 ;;; (which would be useful info anyway).
+
+;;; The following are definitions of bit-fields in the first byte of
+;;; the packed debug function:
+(defconstant-eqx packed-debug-fun-kind-byte (byte 3 2) #'equalp)
+(defconstant-eqx packed-debug-fun-kinds
+  #(nil :optional :external :toplevel :cleanup :more) #'equalp)
+(defconstant packed-debug-fun-returns-standard 0)
+(defconstant packed-debug-fun-returns-specified 1)
+(defconstant packed-debug-fun-returns-fixed 2)
+(defconstant-eqx packed-debug-fun-returns-byte (byte 2 5) #'equalp)
+
+;;; The following are bit-flags in the second byte of the packed debug
+;;; function:
+
+;;; If true, variables (hence arguments) have been dumped.
+(defconstant packed-debug-fun-variables-bit (ash 1 0))
+
+;;; If true, blocks have been dumped.
+(defconstant packed-debug-fun-blocks-bit (ash 1 1))
+
+;;; If true, non-minimal arguments have been dumped.
+(defconstant packed-debug-fun-non-minimal-arguments-bit (ash 1 2))
+
+;;; If true, a TLF number has been dumped.
+(defconstant packed-debug-fun-tlf-number-bit (ash 1 3))
+
+;;; If true, the closure save location has been dumped.
+(defconstant packed-debug-fun-closure-save-loc-bit (ash 1 4))
+
+;;; If true, the bsp save location has been dumped.
+#+unwind-to-frame-and-call-vop
+(defconstant packed-debug-fun-bsp-save-loc-bit (ash 1 5))
+
+
+(defconstant packed-debug-fun-previous-name (ash 1 6))
+
+;;; The following are codes for the marker symbols used to indicate
+;;; call syntax.
+(defconstant packed-debug-fun-arg-deleted 0)
+(defconstant packed-debug-fun-arg-supplied-p 1)
+(defconstant packed-debug-fun-arg-optional 2)
+(defconstant packed-debug-fun-arg-rest 3)
+(defconstant packed-debug-fun-arg-more 4)
+
+(defconstant packed-debug-fun-key-arg-keyword 5)
+(defconstant packed-debug-fun-key-arg-packaged 6)
+(defconstant packed-debug-fun-key-arg-uninterned 7)
+
+;;; The offset that argument indices are dumped relative to. This must
+;;; not overlap the other call syntax codes.
+(defconstant packed-debug-fun-arg-index-offset 8)
+
 
 ;;;; DEBUG SOURCE
 
@@ -414,14 +320,23 @@
              (:include debug-info)
              (:copier nil)
              (:pure t))
-  ;; COMPILED-DEBUG-FUNs linked through COMPILED-DEBUG-FUN-NEXT
-  (fun-map (missing-arg) :type compiled-debug-fun)
+  ;; The package that DEBUG-FUN-VARS were dumped relative
+  ;; to. Locations that aren't packaged are in this package.
+  (package (missing-arg) :type package :read-only t)
+  ;; A sequence of packed debug functions in a packed binary
+  ;; representation.
+  ;;
+  ;; When unpacked, a SIMPLE-VECTOR that alternates DEBUG-FUN
+  ;; structures and fixnum PCs. The function is valid between the PC
+  ;; before it (inclusive) and the PC after it (exclusive). The PCs
+  ;; are in sorted order, so we can binary-search. We omit the first
+  ;; and last PC, since their values are 0 and the length of the code
+  ;; vector.
+  (fun-map (missing-arg) :type (or (simple-array (unsigned-byte 8) (*))
+                                   (simple-array (signed-byte 8) (*))) :read-only t)
   ;; Location contexts
   ;; A (simple-array * (*)) or a context if there's only one context.
-  (contexts nil :type t :read-only t)
-  ;; An alist mapping SB-C::COMPILED-DEBUG-FUN
-  ;; to SB-DI::COMPILED-DEBUG-FUN instances.
-  (memo-cell nil :type list))
+  (contexts nil :type t :read-only t))
 
 ;;;; file reading
 ;;;;

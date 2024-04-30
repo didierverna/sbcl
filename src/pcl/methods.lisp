@@ -249,11 +249,6 @@
       (add-method generic-function new)
       new)))
 
-(define-condition find-method-length-mismatch
-    (reference-condition simple-error)
-  ()
-  (:default-initargs :references '((:ansi-cl :function find-method))))
-
 (defun real-get-method (generic-function qualifiers specializers
                         &optional (errorp t)
                                   always-check-specializers)
@@ -1286,11 +1281,6 @@
                                (t (funcall test-fun position type
                                            (do-if t) (do-if nil))))))))))
       (do-column precedence methods ()))))
-
-(defun compute-secondary-dispatch-function (generic-function net &optional
-                                            method-alist wrappers)
-  (funcall (the function (compute-secondary-dispatch-function1 generic-function net))
-           method-alist wrappers))
 
 (defvar *eq-case-table-limit* 15)
 (defvar *case-table-limit* 10)

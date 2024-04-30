@@ -332,6 +332,7 @@
 ;;; :SB-XREF-FOR-INTERNALS hangs on to more symbols. It is not also the intent
 ;;; to retain all toplevel definitions whether subsequently needed or not.
 ;;; That's an unfortunate side-effect; this macro is done being used now.
+#-sb-devel
 (fmakunbound 'typep-impl-macro)
 
 
@@ -472,11 +473,8 @@ Experimental."
                                 (specifier-type 'function))
                                (t
                                 (ctype-of cdr))))))
-      (character ; Why not return an EQL type?
-       (typecase x
-         (standard-char (specifier-type 'standard-char))
-         (base-char (specifier-type 'base-char))
-         (t (specifier-type 'extended-char))))
+      (character
+       (character-set-type-from-characters (list x)))
       #+sb-simd-pack
       (simd-pack (simd-subtype (%simd-pack-tag x) simd-pack))
       #+sb-simd-pack-256

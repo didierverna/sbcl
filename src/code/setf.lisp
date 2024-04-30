@@ -53,8 +53,7 @@
    for the new values, the setting function, and the accessing function."
   (named-let retry ((form form))
     (labels ((newvals (count)
-               (let ((*gensym-counter* 1))
-                 (make-gensym-list count "NEW")))
+               (make-gensym-list count "NEW"))
              ;; Produce the expansion of a SETF form that calls either
              ;; #'(SETF name) or an inverse given by short form DEFSETF.
              (call (call arg-maker &aux (vals (newvals 1)))
@@ -319,19 +318,17 @@
 (sb-xc:defmacro pop (place &environment env)
   "The argument is a location holding a list. Pops one item off the front
   of the list and returns it."
-  (if (symbolp (setq place (macroexpand-for-setf place env)))
-      `(prog1 (car ,place) (setq ,place (cdr ,place)))
-      (multiple-value-bind (temps vals stores setter getter)
-          (get-setf-expansion place env)
-        (let ((list (copy-symbol 'list))
-              (ret (copy-symbol 'car)))
-          `(let* (,@(mapcar #'list temps vals)
-                  (,list ,getter)
-                  (,ret (car ,list))
-                  (,(car stores) (cdr ,list))
-                  ,@(cdr stores))
-             ,setter
-             ,ret)))))
+  (multiple-value-bind (temps vals stores setter getter)
+      (get-setf-expansion place env)
+    (let ((list (copy-symbol 'list))
+          (ret (copy-symbol 'car)))
+      `(let* (,@(mapcar #'list temps vals)
+              (,list ,getter)
+              (,ret (car ,list))
+              (,(car stores) (cdr ,list))
+              ,@(cdr stores))
+         ,setter
+         ,ret))))
 
 (sb-xc:defmacro remf (place indicator &environment env)
   "Place may be any place expression acceptable to SETF, and is expected

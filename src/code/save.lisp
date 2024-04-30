@@ -69,6 +69,7 @@
 (export 'sb-kernel::*save-lisp-clobbered-globals* 'sb-kernel)
 (define-load-time-global sb-kernel::*save-lisp-clobbered-globals*
     '#(sb-impl::*exit-lock*
+       sb-vm::*allocator-mutex*
        sb-thread::*make-thread-lock*
        sb-thread::*initial-thread*
        ;; Saving *JOINABLE-THREADS* could cause catastophic failure on restart.
@@ -250,6 +251,7 @@ sufficiently motivated to do lengthy fixes."
           ;; A normal GC will leave huge amounts of storage unreclaimed
           ;; (over 50% on x86). This needs to be done by a single function
           ;; since the GC will invalidate the stack.
+          (sb-kernel::unsafe-clear-roots sb-vm:+highest-normal-generation+)
           (gc-and-save name
                        (foreign-bool executable)
                        (foreign-bool purify)
@@ -360,16 +362,18 @@ sufficiently motivated to do lengthy fixes."
 (in-package "SB-C")
 
 (defun coalesce-debug-info ()
+  ;; Discard the uncompacted fun map cache.
+  (clrhash sb-di::*uncompacted-fun-maps*)
+  ;; Discard the debugger's cached mapping of debug functions.
+  (clrhash sb-di::*compiled-debug-funs*)
   (flet ((debug-source= (a b)
            (and (equalp a b)
                 ;; Case sensitive
                 (equal (debug-source-plist a) (debug-source-plist b)))))
     ;; Coalesce the following:
-    ;;  DEBUG-INFO-SOURCE, DEBUG-FUN-NAME
-    ;;  SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
+    ;;  DEBUG-INFO-SOURCE, SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
     ;; FUN-NAMES-EQUALISH considers any two string= gensyms as EQ.
     (let ((source-ht (make-hash-table :test 'equal))
-          (name-ht (make-hash-table :test 'equal))
           (arglist-hash (make-hash-table :hash-function 'sb-impl::equal-hash
                                          :test 'sb-impl::fun-names-equalish))
           (type-hash (make-hash-table :test 'equal)))
@@ -378,10 +382,6 @@ sufficiently motivated to do lengthy fixes."
          (declare (ignore size))
          (case widetag
            (#.sb-vm:code-header-widetag
-            (let ((di (%code-debug-info obj)))
-              ;; Discard memoized debugger's debug info
-              (when (typep di 'sb-c::compiled-debug-info)
-                (setf (sb-c::compiled-debug-info-memo-cell di) nil)))
             (dotimes (i (sb-kernel:code-n-entries obj))
               (let* ((fun (sb-kernel:%code-entry-point obj i))
                      (arglist (%simple-fun-arglist fun))
@@ -410,18 +410,7 @@ sufficiently motivated to do lengthy fixes."
                              (push source (gethash namestring source-ht)))
                             ((neq source canonical-repr)
                              (setf (compiled-debug-info-source obj)
-                                   canonical-repr)))))))
-               (loop for debug-fun = (compiled-debug-info-fun-map obj) then next
-                     for next = (sb-c::compiled-debug-fun-next debug-fun)
-                     do
-                     (binding* ((name (compiled-debug-fun-name debug-fun))
-                                ((new foundp) (gethash name name-ht)))
-                       (cond ((not foundp)
-                              (setf (gethash name name-ht) name))
-                             ((neq name new)
-                              (%instance-set debug-fun (get-dsd-index compiled-debug-fun name)
-                                             new))))
-                     while next))
+                                   canonical-repr))))))))
               (sb-lockless::linked-list
                ;; In the normal course of execution, incompletely deleted nodes
                ;; exist only for a brief moment, as the next operation on the list by

@@ -92,11 +92,11 @@
           (let ((var (first vars))
                 (cases (sort cases #'type-test-order :key #'car)))
             (flet ((error-if-sub-or-supertype (type1 type2)
-                     (when (or (subtypep type1 type2)
-                               (subtypep type2 type1))
+                     (when (or (cl:subtypep type1 type2)
+                               (cl:subtypep type2 type1))
                        (error "Types not disjoint: ~S ~S." type1 type2)))
                    (error-if-supertype (type1 type2)
-                     (when (subtypep type2 type1)
+                     (when (cl:subtypep type2 type1)
                        (error "Type ~S ordered before subtype ~S."
                               type1 type2)))
                    (test-type-pairs (fun)
@@ -167,7 +167,7 @@
 (defmacro number-dispatch (var-specs &body cases)
   (let ((res (list nil))
         (vars (mapcar #'car var-specs))
-        (block (gensym)))
+        (block (gensym "NUMBER-DISPATCH")))
     (dolist (case cases)
       (if (symbolp (first case))
           (let ((cases (apply (symbol-function (first case)) (rest case))))
@@ -178,12 +178,15 @@
     (collect ((errors)
               (error-tags))
       (dolist (spec var-specs)
-        (let ((var (first spec))
-              (type (second spec))
-              (tag (gensym)))
+        (let* ((var (first spec))
+               (type (second spec))
+               (tag (gensym (symbol-name var))))
           (error-tags tag)
           (errors tag)
           (errors
+           #+sb-xc-host
+           `(error "~S is not of type ~S." ,var ',type)
+           #-sb-xc-host
            (sb-c::internal-type-error-call var type))))
 
       `(block ,block

@@ -52,8 +52,25 @@ SetSymbolValue(lispobj tagged_symbol_pointer,lispobj val, void *thread)
 # define write_TLS_index(index, val, thread, sym) \
    *(lispobj*)(index + (char*)thread) = val
 # define read_TLS(sym, thread) *(lispobj*)(sym##_tlsindex + (char*)thread)
+# define bind_variable(sym, val, th) bind_tls_cell(sym##_tlsindex, val, th)
+extern void bind_tls_cell(unsigned index, lispobj value, void *thread);
 #else
 # define write_TLS(sym, val, thread) SYMBOL(sym)->value = val
 # define write_TLS_index(index, val, thread, sym) sym->value = val
 # define read_TLS(sym, thread) SYMBOL(sym)->value
+extern void bind_variable(lispobj symbol, lispobj value,void *thread);
 #endif
+
+extern void unbind(void *thread);
+extern void unbind_to_here(lispobj *bsp,void *thread);
+
+#include "genesis/static-symbols.h"
+static lispobj __attribute__((unused)) symbol_function(struct symbol* symbol)
+{
+    if (symbol->fdefn && symbol->fdefn != NIL) return FDEFN(symbol->fdefn)->fun;
+    return NIL;
+}
+#define StaticSymbolFunction(x) FdefnFun(x##_FDEFN)
+/* Return 'fun' given a tagged pointer to an fdefn. */
+static inline lispobj FdefnFun(lispobj fdefn) { return FDEFN(fdefn)->fun; }
+extern lispobj decode_fdefn_rawfun(struct fdefn *fdefn);

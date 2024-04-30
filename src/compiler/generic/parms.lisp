@@ -192,23 +192,24 @@
 ;;; On #+sb-thread builds, these are not static, because access to them
 ;;; is via the TLS, not the symbol.
 (defconstant-eqx per-thread-c-interface-symbols
-  `((*free-interrupt-context-index* 0)
-    (sb-sys:*allow-with-interrupts* t)
-    (sb-sys:*interrupts-enabled* t)
-    sb-sys:*interrupt-pending*
-    #+sb-safepoint sb-sys:*thruption-pending*
-    *in-without-gcing*
-    *gc-inhibit*
-    *gc-pending*
-    #+sb-safepoint sb-impl::*in-safepoint*
-    #+sb-thread *stop-for-gc-pending*
-    sb-impl::*unweakened-vectors*
-    *pinned-objects*
-    (*gc-pin-code-pages* 0)
-    ;; things needed for non-local-exit
-    (*current-catch-block* 0)
-    (*current-unwind-protect-block* 0)
-    )
+    (hash-cons
+     '((*free-interrupt-context-index* 0)
+       (sb-sys:*allow-with-interrupts* t)
+       (sb-sys:*interrupts-enabled* t)
+       sb-sys:*interrupt-pending*
+       #+sb-safepoint sb-sys:*thruption-pending*
+       *in-without-gcing*
+       *gc-inhibit*
+       *gc-pending*
+       #+sb-safepoint sb-impl::*in-safepoint*
+       #+sb-thread *stop-for-gc-pending*
+       sb-impl::*unweakened-vectors*
+       *pinned-objects*
+       (*gc-pin-code-pages* 0)
+       ;; things needed for non-local-exit
+       #+ultrafutex (*current-mutex* 0)
+       (*current-catch-block* 0)
+       (*current-unwind-protect-block* 0)))
   #'equal)
 
 (defconstant-eqx +common-static-symbols+
@@ -230,6 +231,7 @@
     sb-impl::**finalizer-store**
     sb-impl::*finalizer-rehashlist*
     sb-impl::*finalizers-triggered*
+    sb-impl::*run-gc-hooks*
 
     ;; stack pointers
     #-sb-thread *binding-stack-start* ; a thread slot if #+sb-thread
@@ -416,6 +418,17 @@
 (defconstant single-float-digits 24)
 (defconstant double-float-digits 53)
 )
+
+;;; Reserve some bits of SYMBOL-HASH slot for future use
+#+64-bit
+(progn (defconstant n-symbol-hash-prng-bits 10) ; how many to randomize
+       (defconstant n-symbol-hash-discard-bits
+         (let ((precision (+ 32 n-symbol-hash-prng-bits))) ; total N bits
+           (- 64 precision)))
+       (defconstant-eqx sb-impl::symbol-hash-prng-byte
+         (byte n-symbol-hash-prng-bits (- 32 n-symbol-hash-prng-bits))
+         #'equal))
+#-64-bit (defconstant-eqx sb-impl::symbol-hash-prng-byte (byte 3 0) #'equal)
 
 (push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
       *!removable-symbols*)

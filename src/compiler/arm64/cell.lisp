@@ -77,13 +77,32 @@
   (eval-when (:compile-toplevel)
     ;; Assert that "CMN reg, 1" is the same as "CMP reg, NO-TLS-VALUE-MARKER"
     (aver (= (ldb (byte 64 0) -1) no-tls-value-marker)))
-  (defmacro compare-to-no-tls-value-marker (x) `(inst cmn ,x 1))
+  (defun no-tls-marker (x symbol set target)
+    ;; Pointers wouldn't have the sign bit set (unless they are
+    ;; tagged, which they shouldn't be)
+    (let* ((symbol (cond ((symbolp symbol)
+                          symbol)
+                         ((sc-is symbol constant)
+                          (tn-value symbol))
+                         ))
+           (pointer (and symbol
+                         (not (types-equal-or-intersect
+                               (info :variable :type symbol)
+                               (specifier-type '(or integer single-float)))))))
+      (cond (pointer
+             (if set
+                 (inst tbnz* x 63 target)
+                 (inst tbz* x 63 target)))
+            (t
+             (inst cmn x 1)
+             (inst b (if set :eq :ne) target)))))
   (define-vop (set)
     (:args (object :scs (descriptor-reg)
                    :load-if (not (and (sc-is object constant)
-                                      (symbol-always-has-tls-value-p (tn-value object)))))
+                                      (symbol-always-has-tls-value-p (tn-value object) node))))
            (value :scs (descriptor-reg any-reg zero)))
     (:temporary (:sc any-reg) tls-index)
+    (:node-var node)
     (:vop-var vop)
     (:generator 4
       (sc-case object
@@ -93,8 +112,7 @@
          (assemble ()
            (inst ldr (32-bit-reg tls-index) (tls-index-of object))
            (inst ldr tmp-tn (@ thread-tn tls-index))
-           (compare-to-no-tls-value-marker tmp-tn)
-           (inst b :ne LOCAL)
+           (no-tls-marker tmp-tn object nil LOCAL)
            (emit-gengc-barrier object nil tls-index (vop-nth-arg 1 vop) value)
            (storew value object symbol-value-slot other-pointer-lowtag)
            (inst b DONE)
@@ -113,13 +131,14 @@
     (:temporary (:sc any-reg) tls-index)
     (:variant-vars check-boundp)
     (:variant t)
+    (:node-var node)
     (:generator 9
       (let* ((known-symbol-p (sc-is symbol constant))
              (known-symbol (and known-symbol-p (tn-value symbol)))
              (fixup (and known-symbol
                          (make-fixup known-symbol :symbol-tls-index))))
         (cond
-          ((symbol-always-has-tls-value-p known-symbol)
+          ((symbol-always-has-tls-value-p known-symbol node)
            (inst ldr value (@ thread-tn fixup)))
           (t
            (cond
@@ -132,8 +151,7 @@
               (inst ldr value (@ thread-tn tls-index))))
 
            (assemble ()
-             (compare-to-no-tls-value-marker value)
-             (inst b :ne LOCAL)
+             (no-tls-marker value symbol nil LOCAL)
              (when known-symbol
                (load-constant vop symbol (setf symbol (tn-ref-load-tn symbol-tn-ref))))
              (loadw value symbol symbol-value-slot other-pointer-lowtag)
@@ -177,14 +195,13 @@
   (:translate boundp)
   #+sb-thread
   (:generator 9
-      (inst ldr (32-bit-reg value) (tls-index-of object))
-      (inst ldr value (@ thread-tn value))
-      (compare-to-no-tls-value-marker value)
-      (inst b :ne LOCAL)
-      (loadw value object symbol-value-slot other-pointer-lowtag)
-      LOCAL
-      (inst cmp value unbound-marker-widetag)
-      (inst b (if not-p :eq :ne) target))
+    (inst ldr (32-bit-reg value) (tls-index-of object))
+    (inst ldr value (@ thread-tn value))
+    (no-tls-marker value object nil LOCAL)
+    (loadw value object symbol-value-slot other-pointer-lowtag)
+    LOCAL
+    (inst cmp value unbound-marker-widetag)
+    (inst b (if not-p :eq :ne) target))
   #-sb-thread
   (:generator 9
       (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -216,17 +233,16 @@
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:arg-refs args)
-  (:results (res :scs (any-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; car slot, so we have to strip off the fixnum-tag-mask to make sure
-    ;; it is a fixnum.  The lowtag selection magic that is required to
-    ;; ensure this is explained in the comment in objdef.lisp
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (unless (not-nil-tn-ref-p args)
-      (inst and res res (bic-mask fixnum-tag-mask)))))
+    (inst lsr res res n-symbol-hash-discard-bits)))
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash #-relocatable-static-space hash-as-if-symbol-name)
+  (:generator 1 ; ASSUMPTION: little-endian
+    (inst ldr (32-bit-reg res)
+          (@ symbol (- (+ 4 (ash symbol-hash-slot word-shift)) other-pointer-lowtag)))))
 
 (define-vop ()
   (:args (symbol :scs (descriptor-reg)))
@@ -276,8 +292,7 @@
       (inst str new (@ thread-tn tls-index))
       DONT-STORE-TLS
 
-      (compare-to-no-tls-value-marker result)
-      (inst b :ne CHECK-UNBOUND))
+      (no-tls-marker result symbol nil CHECK-UNBOUND))
     (inst add-sub lip symbol (- (* symbol-value-slot n-word-bytes)
                                 other-pointer-lowtag))
     LOOP
@@ -319,8 +334,7 @@
       (inst str new (@ thread-tn tls-index))
       DONT-STORE-TLS
 
-      (compare-to-no-tls-value-marker result)
-      (inst b :ne CHECK-UNBOUND))
+      (no-tls-marker result symbol nil CHECK-UNBOUND))
     (inst add-sub lip symbol (- (* symbol-value-slot n-word-bytes)
                                 other-pointer-lowtag))
     (move result old)
@@ -412,42 +426,61 @@
     (let ((component (component-info *component-being-compiled*)))
       (ash (or (position-if (lambda (x)
                               (and (typep x '(cons (eql :tls-index)))
-                                   (eq (cdr x) symbol)))
+                                   (eq (cadr x) symbol)))
                             (ir2-component-constants component))
-               (vector-push-extend (cons :tls-index symbol)
+               (vector-push-extend (list :tls-index symbol)
                                    (ir2-component-constants component)))
            word-shift)))
+
+  (defun bind (bsp symbol tls-index tls-value)
+    (load-binding-stack-pointer bsp)
+    (inst add bsp bsp (* binding-size n-word-bytes))
+    (store-binding-stack-pointer bsp)
+    (let* ((pkg (sb-xc:symbol-package symbol))
+           ;; These symbols should have a small enough index to be
+           ;; immediately encoded.
+           (known-symbol-p (or (and pkg (system-package-p pkg))
+                               (eq pkg *cl-package*)))
+           (tls-index-reg tls-index)
+           (tls-index (if known-symbol-p
+                          (make-fixup symbol :symbol-tls-index)
+                          tls-index)))
+      (cond (known-symbol-p
+             (inst movz tls-index-reg tls-index))
+            (t
+             ;; TODO: a fixup could replace this with an immediate
+             (inst load-constant tls-index (load-time-tls-index symbol))))
+      (inst ldr tls-value (@ thread-tn tls-index))
+      (inst stp tls-value tls-index-reg
+            (@ bsp (* (- binding-value-slot binding-size)
+                      n-word-bytes)))
+      tls-index-reg))
 
   (define-vop (bind)
     (:args (value :scs (any-reg descriptor-reg zero) :to :save))
     (:temporary (:sc non-descriptor-reg) tls-index)
-    (:temporary (:sc descriptor-reg) temp)
+    (:temporary (:sc descriptor-reg) tls-value)
     (:info symbol)
     (:temporary (:scs (any-reg)) bsp)
     (:generator 5
-      (load-binding-stack-pointer bsp)
-      (inst add bsp bsp (* binding-size n-word-bytes))
-      (store-binding-stack-pointer bsp)
-      (let* ((pkg (sb-xc:symbol-package symbol))
-             ;; These symbols should have a small enough index to be
-             ;; immediately encoded.
-             (known-symbol-p (or (and pkg (system-package-p pkg))
-                                 (eq pkg *cl-package*)))
-             (tls-index-reg tls-index)
-             (tls-index (if known-symbol-p
-                            (make-fixup symbol :symbol-tls-index)
-                            tls-index)))
-        (assemble ()
-          (cond (known-symbol-p
-                 (inst movz tls-index-reg tls-index))
-                (t
-                 ;; TODO: a fixup could replace this with an immediate
-                 (inst load-constant tls-index (load-time-tls-index symbol))))
-          (inst ldr temp (@ thread-tn tls-index))
-          (inst stp temp tls-index-reg
-                (@ bsp (* (- binding-value-slot binding-size)
-                          n-word-bytes)))
-          (inst str value (@ thread-tn tls-index))))))
+      (inst str value (@ thread-tn (bind bsp symbol tls-index tls-value)))))
+
+  (define-vop (rebind)
+    (:temporary (:sc non-descriptor-reg) tls-index)
+    (:temporary (:sc descriptor-reg) value tls-value)
+    (:info symbol)
+    (:vop-var vop)
+    (:node-var node)
+    (:temporary (:scs (any-reg)) bsp)
+    (:generator 5
+      (let ((tls-index (bind bsp symbol tls-index tls-value)))
+        (unless (symbol-always-has-tls-value-p symbol node)
+          (assemble ()
+            (no-tls-marker tls-value symbol nil DONE)
+            (load-constant vop (emit-constant symbol) value)
+            (loadw value value symbol-value-slot other-pointer-lowtag)
+            (inst str value (@ thread-tn tls-index))
+            DONE)))))
 
   (define-vop (unbind-n)
     (:info symbols)
@@ -596,6 +629,7 @@
          (values :more t :scs (descriptor-reg any-reg)))
   (:temporary (:sc descriptor-reg) val-temp)
   (:info indices)
+  (:vop-var vop)
   (:generator 1
     (emit-gengc-barrier instance nil tmp-tn values)
     (do ((tn-ref values (tn-ref-across tn-ref))
@@ -603,31 +637,18 @@
         ((null tn-ref))
       (let* ((value (tn-ref-tn tn-ref))
              (source
-              (sc-case value
-               (immediate
-                ;; Pretty sure this should not be a copy-and-paste from
-                ;; LOAD-IMMEDIATE. What am I doing wrong?
-                (let ((val (tn-value value)))
-                  (etypecase val
-                    (integer
-                     ;; This is a FIXNUM, as IMMEDIATE-CONSTANT-SC only
-                     ;; accepts integers if they are FIXNUMs.
-                     (load-immediate-word val-temp (fixnumize val)))
-                    (character
-                     (let* ((codepoint (char-code val))
-                            (tagged (dpb codepoint (byte 24 8) character-widetag)))
-                       (load-immediate-word val-temp tagged)))
-                    (symbol
-                     (load-symbol val-temp val))))
-                val-temp)
-               (constant
-                (inst load-constant val-temp (tn-byte-offset value))
-                val-temp)
-               (control-stack
-                (load-stack-tn val-temp value)
-                val-temp)
-               ((any-reg descriptor-reg)
-                value))))
+               (sc-case value
+                 (immediate
+                  (load-immediate vop value val-temp)
+                  val-temp)
+                 (constant
+                  (inst load-constant val-temp (tn-byte-offset value))
+                  val-temp)
+                 (control-stack
+                  (load-stack-tn val-temp value)
+                  val-temp)
+                 ((any-reg descriptor-reg)
+                  value))))
         (inst str source
               (@ instance (load-store-offset
                            (- (ash (+ instance-slots-offset (car indices)) word-shift)

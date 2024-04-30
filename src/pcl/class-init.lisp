@@ -67,7 +67,7 @@
   (declare (layout wrapper))
   (let* ((hash (if name
                    ;; Named functions have a predictable hash
-                   (mix (sxhash name) (sxhash :generic-function)) ; arb. constant
+                   (mix (sxhash name) (symbol-hash :generic-function)) ; arb. constant
                    (sb-kernel::quasi-random-address-based-hash
                     (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte)))
                     most-positive-fixnum)))
@@ -732,6 +732,7 @@
           ((eq (car (truly-the list probe)) slot-name)
            (cdr probe)))))
 
+;;; TODO: this should just be a call to MAKE-HASH-BASED-SLOT-MAPPER.
 (defun make-slot-table (class slots &optional bootstrap)
   (unless slots
     ;; *** If changing this empty table value to something else,
@@ -749,7 +750,8 @@
                (setf (svref vector index)
                      (acons name
                             (cons (when (or bootstrap
-                                            (and (standard-class-p class)
+                                            (and (or (standard-class-p class)
+                                                     (funcallable-standard-class-p class))
                                                  (slot-accessor-std-p slot 'all)))
                                     (if bootstrap
                                         (early-slot-definition-location slot)
