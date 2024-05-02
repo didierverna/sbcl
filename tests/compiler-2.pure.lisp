@@ -4404,3 +4404,27 @@
       (declare ((function (fixnum &rest t)) j))
       (apply j l r))
    ((#'+ 1 '(2)) 3)))
+
+(with-test (:name :disabling-arg-count-checking)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x d)
+         (let ((f (lambda (x y)
+                    (< x y))))
+           (funcall d f)
+           (sort x f)))
+    ((nil #'funcall) (condition 'program-error))
+    ((nil #'list) nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda (x d f)
+         (multiple-value-bind (f key)
+             (if f
+                 (values f #'car)
+                 (values (lambda (x y)
+                           (< x y))
+                         #'cdr))
+           (funcall d f)
+           (sort x f :key key)))
+    ((nil #'funcall nil) (condition 'program-error))
+    ((nil #'list nil) nil)))

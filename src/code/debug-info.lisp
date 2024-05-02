@@ -75,12 +75,13 @@
 
 ;;;; DEBUG-FUN objects
 
-(def!struct (debug-fun (:constructor nil)
-                       (:copier nil)))
+(defstruct (debug-fun (:constructor nil)
+                      (:copier nil)))
 
-(def!struct (compiled-debug-fun (:include debug-fun)
-                                (:copier nil)
-                                (:pure t))
+(defstruct (compiled-debug-fun (:include debug-fun)
+                               (:copier nil)
+                               #-sb-xc-host
+                               (:pure t))
   ;; KLUDGE: Courtesy of more than a decade of, ah, organic growth in
   ;; CMU CL, there are two distinct -- but coupled -- mechanisms to
   ;; finding the name of a function. The slot here is one mechanism

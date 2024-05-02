@@ -133,7 +133,7 @@
          (lambda-var-p (ref-leaf ref))
          (ref-leaf ref))))
 
-;;; Look through casts and variables
+;;; Look through casts and variables, m-v-bind+values
 (defun map-all-uses (function lvar)
   (declare (dynamic-extent function))
   (labels ((recurse-lvar (lvar)
@@ -142,9 +142,31 @@
            (recurse (use)
              (cond ((ref-p use)
                     (let ((lvar (lambda-var-ref-lvar use)))
-                      (if lvar
-                          (recurse-lvar lvar)
-                          (funcall function use))))
+                      (cond (lvar
+                             (recurse-lvar lvar))
+                            ((let ((var (ref-leaf use)))
+                               (when (and (lambda-var-p var)
+                                          (not (lambda-var-sets var)))
+                                 (let ((fun (lambda-var-home var)))
+                                   (when (functional-kind-eq fun mv-let)
+                                     (let* ((fun (lambda-var-home var))
+                                            (n-value (position-or-lose var (lambda-vars fun)))
+                                            (args (basic-combination-args (let-combination fun))))
+                                       (when (singleton-p args)
+                                         (let ((all-processed t))
+                                           (do-uses (use (car args))
+                                             (unless (when (and (combination-p use)
+                                                                (eq (lvar-fun-name (combination-fun use))
+                                                                    'values))
+                                                       (let ((lvar (nth n-value (combination-args use))))
+                                                         (when lvar
+                                                           (recurse-lvar lvar)
+                                                           t)))
+                                               (setf all-processed nil)))
+                                           all-processed))))))))
+                            (t
+                             (funcall function use)))))
+
                    ((cast-p use)
                     (recurse-lvar (cast-value use)))
                    (t
@@ -3054,6 +3076,41 @@ is :ANY, the function name is not checked."
                   for arg in (combination-args combination)
                   when (eq v lambda-var)
                   do (funcall function combination arg))))))))
+
+(defun map-leaf-refs (function leaf)
+  (let ((seen-calls))
+    (labels ((recur (leaf)
+               (dolist (ref (leaf-refs leaf))
+                 (let* ((lvar (node-lvar ref))
+                        (dest (and lvar
+                                   (lvar-dest lvar))))
+                   (cond ((and (combination-p dest)
+                               (eq (combination-kind dest) :local))
+                          (let ((lambda (combination-lambda dest)))
+                            (when (cond ((functional-kind-eq lambda let))
+                                        ((memq dest seen-calls)
+                                         nil)
+                                        (t
+                                         (push dest seen-calls)))
+                              (loop for v in (lambda-vars lambda)
+                                    for arg in (combination-args dest)
+                                    when (eq arg lvar)
+                                    do (recur v)))))
+                         ((and (combination-p dest)
+                               (lvar-fun-is (combination-fun dest) '(values))
+                               (let ((mv (node-dest dest)))
+                                 (when (and (mv-combination-p mv)
+                                            (eq (basic-combination-kind mv) :local))
+                                   (let ((fun (combination-lambda mv)))
+                                     (when (and (functional-p fun)
+                                                (functional-kind-eq fun mv-let))
+                                       (let* ((arg (position lvar (combination-args dest)))
+                                              (var (and arg (nth arg (lambda-vars fun)))))
+                                         (recur var)
+                                         t)))))))
+                         (t
+                          (funcall function dest)))))))
+      (recur leaf))))
 
 (defun propagate-lvar-annotations-to-refs (lvar var)
   (when (lvar-annotations lvar)

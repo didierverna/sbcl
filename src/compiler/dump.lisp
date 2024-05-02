@@ -236,16 +236,14 @@
 
 ;; Dump a word-sized integer.
 (defun dump-word (num fasl-output)
-  (declare (type sb-vm:word num))
-  (declare (type fasl-output fasl-output))
+  (declare (type sb-vm:word num) (type fasl-output fasl-output))
   (let ((stream (fasl-output-stream fasl-output)))
     (dotimes (i sb-vm:n-word-bytes)
       (write-byte (ldb (byte 8 (* 8 i)) num) stream))))
 
 ;; Dump a 32-bit integer.
 (defun dump-unsigned-byte-32 (num fasl-output)
-  (declare (type sb-vm:word num))
-  (declare (type fasl-output fasl-output))
+  (declare (type (unsigned-byte 32) num) (type fasl-output fasl-output))
   (let ((stream (fasl-output-stream fasl-output)))
     (dotimes (i 4)
       (write-byte (ldb (byte 8 (* 8 i)) num) stream))))
@@ -926,15 +924,6 @@
             (t
              (sub-dump-object obj file))))))
 
-(macrolet (#+sb-xc-host
-           (%other-pointer-widetag (x)
-             `(if (bit-vector-p ,x)
-                  sb-vm:simple-bit-vector-widetag
-                  (sb-vm:saetp-typecode
-                   (find (sb-xc:array-element-type ,x)
-                         sb-vm:*specialized-array-element-type-properties*
-                         :key #'sb-vm:saetp-specifier :test #'equal)))))
-
 (defun dump-specialized-vector (vector file &key data-only)
   ;; The DATA-ONLY option was for the now-obsolete trace-table,
   ;; but it seems like a good option to keep around.
@@ -961,7 +950,7 @@
                             vector
                             0
                             (ceiling (* length bits-per-elt) sb-vm:n-byte-bits)
-                            #+sb-xc-host bits-per-elt))))
+                            #+sb-xc-host bits-per-elt)))
 
 ;;; Dump string-ish things.
 
