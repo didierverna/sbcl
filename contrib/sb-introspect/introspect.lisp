@@ -645,7 +645,7 @@ value."
                 (process vop fun))))))))
   (defun collect-xref (wanted-kind wanted-name)
     (let ((result '()))
-      (sb-c:map-simple-funs
+      (map-simple-funs
        (lambda (name fun)
          (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
            (sb-c:map-packed-xref-data
