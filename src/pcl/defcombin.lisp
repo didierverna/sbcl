@@ -25,9 +25,11 @@
 
 
 
-;; Boring. This should belong to documentation.lisp but we need it here first.
-;; In fact, some stuff in documentation.lisp should be spread in other files.
-;; -- dv
+;; #### NOTE: those two functions rather belong to documentation.lisp, but
+;; this file is loaded before. That's not very satisfactory. Perhaps there's a
+;; way to reorganize documentation code (load the core early, spread the rest
+;; in the relevant files)?
+;; -- didier
 
 (defun random-documentation (name type)
   (cdr (assoc type (info :random-documentation :stuff name))))
@@ -61,6 +63,7 @@
 ;;    method combination architecture is in place, but they're enough to
 ;;    bootstrap the whole thing. So we can leave them be until this file is
 ;;    loaded, and convert them to the final machinery eventually.
+;; -- didier
 
 (defclass method-combination-type (standard-class)
   ()
@@ -70,6 +73,7 @@
 ;; (that is, classes that are not meant to be registered globally) is
 ;; dangerous, especially during bootstrap. I've seen very strange errors
 ;; occurring when trying to do so. Hence the TYPE-NAME slot below.
+;; -- didier
 (defclass standard-method-combination-type (method-combination-type)
   ((type-name :initarg :type-name :reader method-combination-type-name)
    (lambda-list :initform nil :initarg :lambda-list
@@ -112,8 +116,8 @@ STANDARD-METHOD-COMBINATION-TYPE."
   "The global method combination types hash table.
 This hash table maps names to method combination types.")
 
-;; #### NOTE: Let's not define a SETF method here. We wouldn't want it to be
-;; public.
+;; #### NOTE: not SETF method here. We wouldn't want it to be public.
+;; -- didier
 (defun find-method-combination-type (name &optional (errorp t))
   "Find a NAMEd method combination type.
 If ERRORP (the default), throw an error if no such method combination type is
@@ -187,10 +191,11 @@ combination type."
 ;; These provide direct access to properties that belong to the method
 ;; combination type rather to the method combination itself.
 
-;; #### FIXME: some potentially usefull information is missing (like the
+;; #### TODO: some potentially usefull information is missing (like the
 ;; generic-function-symbol of the long form), or, maybe some of those are
 ;; actually useless. I need to verify which stuff is actually used (like, in
 ;; compute-effective-method etc.).
+;; -- didier
 
 (defmethod method-combination-type-name
     ((combination standard-method-combination))
@@ -224,10 +229,11 @@ combination type."
 ;; ---------------------------
 
 ;; #### WARNING: we work with CLOS layer 1 (the macro level) below because
-;; it's much simpler to create the specialization of COMPUTE-EFFECTIVE-METHOD
-;; this way. The unfortunate side effect of that is that the class below is
-;; defined globally, which I don't really want (all other concrete method
-;; combination classes are anonymous; even the built-in short ones).
+;; it's much simpler to create the specialization of COMPUTE-PRIMARY-METHODS
+;; this way. The unfortunate side effect is that the class below is defined
+;; globally, which I don't really want (all other concrete method combination
+;; classes are anonymous; even the built-in short ones).
+;; -- didier
 (defclass standard-standard-method-combination (standard-method-combination)
   ()
   (:metaclass standard-method-combination-type)
@@ -415,6 +421,7 @@ combination type."
      mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
+  ;; -- didier
   (let ((new (apply #'make-instance mct-class
                     'source source-location
                     :direct-superclasses (list mc-class)
@@ -755,6 +762,7 @@ combination type."
 ;; extending DEFINE-METHOD-COMBINATION with the :method-combination-class and
 ;; :method-combination-type-class options is conformant (it does not alter the
 ;; behavior of conforming code, and it is not explicitly prohibited).
+;; -- didier
 
 (defmacro define-method-combination (&whole form name . args)
   (declare (ignore args))
@@ -791,6 +799,7 @@ combination type."
 
 ;; #### NOTE: here, we need to take care of converting the two early method
 ;; combinations that were defined in the bootstrap phase (STANDARD and OR).
+;; -- didier
 
 (defun substitute-method-combination (new old)
   "Substitute NEW for OLD method combination.

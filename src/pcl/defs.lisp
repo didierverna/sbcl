@@ -386,7 +386,8 @@
 ;; initial versions of the STANDARD and OR method combinations, before the
 ;; full architecture is in place. They specifically contain information that
 ;; is required but will eventually be accessible from the method combination's
-;; metaclasses. It works because we're using the same accessor names.
+;; meta-classes. It works because we're using the same accessor names.
+;; -- didier
 (defclass early-standard-method-combination (standard-method-combination)
   ((type-name :initarg :type-name :reader method-combination-type-name)))
 

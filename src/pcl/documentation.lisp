@@ -297,6 +297,7 @@
 ;; #### NOTE: (DOCUMENTATION OBJECT T) is automatically supported on method
 ;; combination types because we set the documentation class slot when we
 ;; create them in LOAD-*-DEFCOMBIN.
+;; -- didier
 
 (defmethod documentation
     ((x method-combination-type) (doc-type (eql 'method-combination)))

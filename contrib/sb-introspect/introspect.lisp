@@ -314,11 +314,12 @@ If an unsupported TYPE is requested, the function will return NIL.
                       (not (eq type :condition)))
               (find-definition-source class)))))
        ((:method-combination)
-        ;; #### TODO: it would actually be nice here to return the source for
-        ;; the method combination type definition, but also a list of sources
-        ;; for each method combination object instantiated with a particular
-        ;; set of options. That would in fact be the source of the first
-        ;; generic function using that combination type with those options.
+        ;; #### TODO: it would be nice here to return the source for the
+        ;; method combination type definition, but also a list of sources for
+        ;; each method combination object instantiated with a particular set
+        ;; of options. That would in fact be the source of the first generic
+        ;; function using that combination type with those options.
+        ;; -- didier
         (let ((type (sb-pcl:find-method-combination-type name nil)))
           (when type (find-definition-source type))))
        ((:package)
@@ -404,6 +405,7 @@ If an unsupported TYPE is requested, the function will return NIL.
 ;; #### TODO: add a specific case in there for method combination objects,
 ;; which would return the source of the generic function at the origin of
 ;; their instantiation.
+;; -- didier
 (defun find-definition-source (object)
   (typecase object
     ((or sb-pcl::condition-class sb-pcl::structure-class)
