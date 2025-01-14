@@ -372,10 +372,22 @@
                       '(lambda () (encode-universal-time 0 0 0 1 1 1900 -1))
                       :allow-style-warnings t))))
 
-(with-test (:name :search-transform-bad-index)
-  (checked-compile
-   '(lambda (a)
-     (search '(0 1 0 2) a :start1 4 :end1 5))))
+(with-test (:name :bad-index)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (a)
+                        (search '(0 1 0 2) a :start1 4 :end1 5))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (subseq '(0) 10))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (subseq #(0) 0 10))
+                      :allow-warnings t))))
 
 (with-test (:name :bound-mismatch-union-types)
   (assert (nth-value 1
@@ -697,6 +709,20 @@
                       `(lambda (x)
                          (declare (string x))
                          (replace x '(1 2 3)))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (replace x #(1 2 3)))
+                      :allow-warnings 'warning)))
+  (checked-compile
+   `(lambda (n)
+      (replace (the (simple-array single-float) n) '(1 1.0) :start2 1)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (replace n '(1 1.0) :start2 10))
                       :allow-warnings 'warning))))
 
 (with-test (:name :fill-type-mismatch)
@@ -738,7 +764,15 @@
        :allow-warnings t)
     (declare (ignore failure))
     (assert warning)
-    (assert-error (funcall fun "abcdef") sb-kernel:bounding-indices-bad-error)))
+    (assert-error (funcall fun "abcdef") sb-kernel:bounding-indices-bad-error))
+  (multiple-value-bind (fun failure warning)
+      (checked-compile
+       `(lambda (s)
+          (position #\a (the simple-base-string s) :start 4 :end 2))
+       :allow-warnings t)
+    (declare (ignore failure))
+    (assert warning)
+    (assert-error (funcall fun (string 'list)) sb-kernel:bounding-indices-bad-error)))
 
 (with-test (:name :cast-movement-empty-types)
   (assert (nth-value 2
@@ -827,4 +861,75 @@
                      (checked-compile
                       '(lambda (n)
                         (incf (car (assoc n '((1 . 2) (3 . 4))))))
+                      :allow-warnings t))))
+
+(with-test (:name :make-array-initial-contents-warning)
+  (checked-compile
+   `(lambda (n)
+      (make-array n
+                  :element-type 'single-float
+                  :initial-contents '((1.0)))))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (make-array '(10 10)
+                                     :element-type 'single-float
+                                     :initial-contents '(1.0)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (make-array (list n n)
+                                     :element-type 'single-float
+                                     :initial-contents (list (list 1.0 1.0)
+                                                             (list 1.0 1.0 1.0))))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (make-array (list n n)
+                                     :element-type 'single-float
+                                     :initial-contents (list (list 1.0 1.0)
+                                                             1.0)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (make-array 10 :element-type 'single-float :initial-contents (list 10)))
+                      :allow-warnings t))))
+
+(with-test (:name :fun-type-intersection)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (funcall (the (and x
+                                            (function (&optional t (mod 10)))) #'aref)
+                                  x 30))
+                      :allow-warnings t
+                      :allow-style-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (j)
+                         (funcall (the (and compiled-function
+                                            (function (&optional fixnum))) j)
+                                  'a))
+                      :allow-warnings t
+                      :allow-style-warnings t))))
+
+(with-test (:name :funcall-union)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x a)
+                         (funcall (ecase x
+                                    (0 #'+)
+                                    (1 #'-))
+                                  a 'b))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x a)
+                         (funcall (case x
+                                    (0 #'+)
+                                    (1 #'-))
+                                  a 'b))
                       :allow-warnings t))))

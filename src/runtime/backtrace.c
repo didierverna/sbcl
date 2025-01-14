@@ -73,13 +73,15 @@ debug_function_name_from_pc (struct code* code, void *pc)
 
     if (instancep(code->debug_info))
         di = (void*)native_pointer(code->debug_info);
-    else if (listp(code->debug_info) && instancep(CONS(code->debug_info)->car))
-        di = (void*)native_pointer(CONS(code->debug_info)->car);
     else
         return (lispobj)NULL;
 
     if (pc >= (void*)asm_routines_start && pc < (void*)asm_routines_end) {
+#ifdef LISP_FEATURE_DARWIN_JIT
+        return asm_routine_name(pc, (struct hash_table *)(CONS(code->debug_info)->car));
+#else
         return asm_routine_name(pc, (struct hash_table *)di);
+#endif
     }
 
     uword_t offset = (char*)pc - code_text_start(code);
@@ -776,6 +778,7 @@ static bool __attribute__((unused)) print_lisp_fun_name(char* pc)
 #ifdef HAVE_LIBUNWIND
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
+int sbcl_have_libunwind() { return 1; }
 int get_sizeof_unw_context() { return sizeof (unw_context_t); }
 int get_sizeof_unw_cursor() { return sizeof (unw_cursor_t); }
 #ifdef LISP_FEATURE_DARWIN // slightly different libunwind. And it doesn't work for me
@@ -788,6 +791,7 @@ int sb_unw_get_pc(void* a, void* b) { return unw_get_reg(a, UNW_TDEP_IP, b); }
 int sb_unw_get_proc_name(void* a, void* b, int c, unw_word_t* d) { return unw_get_proc_name(a, b, c, d); }
 int sb_unw_step(void* a) { return unw_step(a); }
 #else
+int sbcl_have_libunwind() { return 0; }
 int get_sizeof_unw_context() { return 0; }
 int get_sizeof_unw_cursor() { return 0; }
 int sb_unw_init(void* a, void* b) { lose("unw_init %p %p", a, b); }

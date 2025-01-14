@@ -2577,7 +2577,7 @@ register."
                           (format nil "invalid object #x~X" val))
                          nil)))))))
 
-(defun sub-access-debug-var-slot (fp sc+offset &optional escaped)
+(defun sub-access-debug-var-slot (fp sc+offset &optional escaped integer-float)
   ;; NOTE: The long-float support in here is obviously decayed.  When
   ;; the x86oid and non-x86oid versions of this function were unified,
   ;; the behavior of long-floats was preserved, which only served to
@@ -2597,7 +2597,7 @@ register."
              (escaped-float-value (format)
                `(if escaped
                     (context-float-register escaped
-                     (sb-c:sc+offset-offset sc+offset) ',format)
+                     (sb-c:sc+offset-offset sc+offset) ',format integer-float)
                     :invalid-value-for-unescaped-register-storage))
              (with-nfp ((var) &body body)
                ;; x86oids have no separate number stack, so dummy it
@@ -2633,12 +2633,9 @@ register."
          (if (logbitp (1- n-word-bits) val)
              (logior val (ash -1 n-word-bits))
              val)))
-      (#.unsigned-reg-sc-number
+      ((#.unsigned-reg-sc-number #-(or x86 x86-64) #.non-descriptor-reg-sc-number)
        (with-escaped-value (val)
          val))
-      #-(or x86 x86-64)
-      (#.non-descriptor-reg-sc-number
-       (error "Local non-descriptor register access?"))
       #-(or x86 x86-64 arm64)
       (#.interior-reg-sc-number
        (error "Local interior register access?"))

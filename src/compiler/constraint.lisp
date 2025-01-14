@@ -331,10 +331,9 @@
   (etypecase y
     (ctype
        (awhen (lambda-var-ctype-constraints x)
-         (dolist (con (gethash (sb-kernel::type-class y) it) nil)
+         (dolist (con (gethash y it) nil)
            (when (and (eq (constraint-kind con) kind)
-                      (eq (constraint-not-p con) not-p)
-                      (type= (constraint-y con) y))
+                      (eq (constraint-not-p con) not-p))
              (return-from find-constraint con)))
          nil))
     (lvar
@@ -375,7 +374,7 @@
       (ctype
        (let ((index (ensure-hash (lambda-var-ctype-constraints x)))
              (vec   (ensure-vec  (lambda-var-inheritable-constraints x))))
-         (push con (gethash (sb-kernel::type-class y) index))
+         (push con (gethash y index))
          (vector-push-extend con vec)))
       (lvar
        (let ((index (ensure-hash (lambda-var-eq-constraints x))))
@@ -416,7 +415,7 @@
 (declaim (inline type-for-constraints-p))
 (defun type-for-constraints-p (type)
   (not (or (eq type *universal-type*)
-           (contains-hairy-type-p type))))
+           (opaque-type-p type))))
 
 ;;; Actual conset interface
 ;;;
@@ -767,7 +766,7 @@
                         (add-equality-constraints name args
                                                   constraints consequent-constraints alternative-constraints)
                         (case name
-                          ((%typep %instance-typep)
+                          ((typep %typep %instance-typep)
                            (let ((type (second args)))
                              (when (constant-lvar-p type)
                                (let ((val (lvar-value type)))
@@ -776,8 +775,9 @@
                                       (if (ctype-p val)
                                           val
                                           (let ((*compiler-error-context* node))
-                                            (specifier-type val)))
-                                      nil)))))
+                                           (specifier-type val)))
+                                      nil
+                                      (first args))))))
                           ((eq eql)
                            (let* ((arg1 (first args))
                                   (var1 (ok-lvar-lambda-var arg1 constraints))
@@ -1035,7 +1035,7 @@
                      (setf not-xset (alloc-xset)))
                    (add-to-xset x not-xset))))
            (intersect-result (other-type)
-             (setf type (type-approx-intersection2 type other-type))))
+             (setf type (type-intersection type other-type))))
       (declare (inline intersect-result))
       (do-propagatable-constraints (con (constraints variable))
         (let* ((kind (constraint-kind con))
@@ -1181,19 +1181,10 @@
       (when type
         (unless set
           (setf (lambda-var-unused-initial-value leaf) nil))
-        ;; CHANGE-CLASS can change the type, lower down to standard-object,
+        ;; CHANGE-CLASS can change the type,
         ;; type propagation for classes is not as important anyway.
-        (cond #-sb-xc-host
-              ((and
-                (eq sb-pcl::**boot-state** 'sb-pcl::complete)
-                (block nil
-                  (let ((standard-object (find-classoid 'standard-object)))
-                    (sb-kernel::map-type
-                     (lambda (type)
-                       (when (and (classoid-p type)
-                                  (csubtypep type standard-object))
-                         (return t)))
-                     type)))))
+        (cond ((logtest sb-kernel::ctype-contains-class
+                        (sb-kernel::type-flags type)))
               (t
                (derive-node-type ref
                                  (make-single-value-type type))
@@ -1207,7 +1198,13 @@
         ;; Find unchanged eql refs to a set variable.
         (when (lambda-var-sets leaf)
           (let (mark
-                (eq (lambda-var-eq-constraints leaf)))
+                (old-mark (ref-same-refs ref))
+                (eq (lambda-var-eq-constraints leaf))
+                ;; It's cheap to compute but not cheap to reoptimize
+                ;; everything if it's not needed.
+                ;; Some transforms ask for same-leaf-ref-p after :ir1-phases.
+                (compute (lambda-var-compute-same-refs leaf))
+                reoptimize)
             (when eq
               (loop for other-ref in (leaf-refs leaf)
                     unless (eq other-ref ref)
@@ -1217,9 +1214,14 @@
                            (unless mark
                              (setf mark (list 0))
                              (setf (ref-same-refs ref) mark))
+                           (when (and compute
+                                       (not (and old-mark
+                                                 (eq old-mark (ref-same-refs other-ref)))))
+                             (setf reoptimize t)
+                             (reoptimize-lvar (node-lvar other-ref)))
                            (setf (ref-same-refs other-ref) mark)))))
-            (when mark
-              (reoptimize-node ref))))))))
+            (when reoptimize
+              (reoptimize-lvar (node-lvar ref)))))))))
 
 ;;;; Flow analysis
 
@@ -1424,10 +1426,7 @@
                  (when (block-type-check (lambda-block fun))
                    ;; This is optimistic, make sure it's going to be
                    ;; processed.
-                   (setf (lambda-var-unused-initial-value var) t))
-                 (loop for ref in (lambda-var-refs var)
-
-                       do (setf (ref-same-refs ref) nil))))))
+                   (setf (lambda-var-unused-initial-value var) t))))))
       (frob fun)
       (dolist (let (lambda-lets fun))
         (frob let)))))

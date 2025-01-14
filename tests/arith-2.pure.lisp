@@ -623,3 +623,26 @@
    (lambda (a)
      (* a #c(1d0 0d0)))
     (complex double-float)))
+
+(with-test (:name :bignum-ash-modarith)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (declare (bignum a))
+         (logand (ash a -1) 1))
+    (((expt 2 129)) 0)
+    (((+ (expt 2 129) 2)) 1)))
+
+(with-test (:name :two-fixnum-eq-mask)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (declare (fixnum x))
+         (typep x '(member -1 ,most-positive-fixnum)))
+    ((-1) t)
+    ((most-positive-fixnum) t)
+    ((1) nil)
+    ((0) nil)
+    ((most-negative-fixnum) nil)
+    (((1+ most-negative-fixnum)) nil)
+    (((1- most-positive-fixnum)) nil)))

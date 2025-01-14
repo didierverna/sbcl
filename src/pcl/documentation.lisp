@@ -326,8 +326,18 @@
   (random-documentation x 'method-combination))
 
 (defmethod (setf documentation)
-    (value (x symbol) (doc-type (eql 'method-combination)))
-  (setf (random-documentation x 'method-combination) value))
+    (new-value (x method-combination) (doc-type (eql 't)))
+  (setf (slot-value x '%documentation) (possibly-base-stringize new-value))
+  new-value)
+
+(defmethod (setf documentation)
+    (new-value (x method-combination) (doc-type (eql 'method-combination)))
+  (setf (slot-value x '%documentation) (possibly-base-stringize new-value))
+  new-value)
+
+(defmethod (setf documentation)
+    (new-value (x symbol) (doc-type (eql 'method-combination)))
+  (setf (random-documentation x 'method-combination) new-value))
 
 ;;; methods
 (defmethod documentation ((x standard-method) (doc-type (eql 't)))

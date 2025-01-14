@@ -611,7 +611,6 @@ NOTE: This interface is experimental and subject to change."
        (defun ,(symbolicate name "-CACHE-CLEAR") () (setq ,var-name nil))
        ',var-name)))
 
-(eval-when (:compile-toplevel :execute) ; leave this out of the core image
 (#+sb-xc-host defmacro #-sb-xc-host sb-xc:defmacro
  with-cache ((fun-name &rest actual-args) &body computation)
   (let* ((var-name (package-symbolicate (cl:symbol-package fun-name)
@@ -715,7 +714,7 @@ NOTE: This interface is experimental and subject to change."
                                                 `((incf (aref ,statistics-name 2))))
                                             idx1)))
                      ,entry)))
-           (values ,@result-temps)))))))
+           (values ,@result-temps))))))
 
 ;;; some syntactic sugar for defining a function whose values are
 ;;; cached by !DEFINE-HASH-CACHE
@@ -937,10 +936,10 @@ NOTE: This interface is experimental and subject to change."
 ;;; The "more or less" bit is that the no-bound-at-all case is
 ;;; represented by NIL (not by * as in ANSI type specifiers); and in
 ;;; this case we return NIL.
-(declaim (ftype (sfunction (t) (or null real)) type-bound-number))
+(declaim (inline type-bound-number))
 (defun type-bound-number (x)
   (if (consp x)
-      (destructuring-bind (result) x result)
+      (car x)
       x))
 
 ;;;; utilities for two-VALUES predicates
@@ -1499,6 +1498,12 @@ NOTE: This interface is experimental and subject to change."
              (%primitive sb-vm::unsigned-word-find-first-bit (the word x)))
   #-(and x86-64 (not sb-xc-host))
   (1- (integer-length (logand x (- x)))))
+
+(defun integer-float-p (float)
+  (and (floatp float)
+       (multiple-value-bind (significand exponent) (integer-decode-float float)
+         (or (plusp exponent)
+             (<= (- exponent) (first-bit-set significand))))))
 
 
 (defvar *top-level-form-p* nil)

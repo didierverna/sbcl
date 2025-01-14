@@ -395,9 +395,16 @@
                              (not (and ;; Can this TN be boxed after the allocator?
                                    (boxed-tn-p tn)
                                    (or (eq allocator :allocator)
-                                       (and (neq (vop-name (tn-ref-vop ref)) 'instance-set-multiple)
-                                            (sb-c::set-slot-old-p (sb-c::vop-node (tn-ref-vop ref))
-                                                                  (vop-arg-position value-tn-ref (tn-ref-vop ref))))))))
+                                       (let ((vop (tn-ref-vop ref)))
+                                        (and (neq (vop-name vop) 'instance-set-multiple)
+                                             (let ((node (sb-c::vop-node (tn-ref-vop ref))))
+                                               (multiple-value-bind (nth-object nth-value)
+                                                   (if (and (eq (vop-name vop) 'set-slot)
+                                                            (typep (sb-c::combination-fun-source-name node)
+                                                                   '(cons (eql setf))))
+                                                       (values 1 0)
+                                                       (values 0 (vop-arg-position value-tn-ref vop)))
+                                                 (sb-c::set-slot-old-p node nth-object nth-value)))))))))
                     (return t))))))
         (unless any-pointer
           (return-from require-gengc-barrier-p nil))))
@@ -481,7 +488,7 @@
 (defun compute-fastrem-coefficient (d n fraction-bits)
   (multiple-value-bind (smallest-f c)
       (flet ((is-pow2 (n)
-               (declare (unsigned-byte n))
+               (declare (type unsigned-byte n))
                (let ((l (integer-length n)))
                  (= n (ash 1 (1- l))))))
         (if (is-pow2 d)
@@ -564,3 +571,22 @@
            (let ((node (sb-c::vop-node sb-assem::*current-vop*)))
              (and (sb-c::combination-p node)
                   (eq (sb-c::combination-info node) :aligned-stack))))))
+
+(defun target-heap-prezeroed-p ()
+  (eq (sb-c::allocator-target *compilation*) :mark-region-gc))
+
+(defun target-heap-large-object-size ()
+  (ecase (sb-c::allocator-target *compilation*)
+    ;; Needless to say this violates the OAOO principle as the definition
+    ;; of the "constant" for this appears in late-objdef in addition to which
+    ;; it's a crummy assumption that page-size is the same for each GC.
+    ;; For I'm just trying to solve the minimal number of issues in terms
+    ;; of having the ability to target a fasl to a different GC.
+    (:gencgc (* 4 gencgc-page-bytes))
+    (:mark-region-gc (* 3/4 gencgc-page-bytes))))
+
+;;; Print registers from VOPs
+(defmacro mprint (value)
+  `(let ((*location-context* ',value))
+     (emit-error-break sb-assem::*current-vop* cerror-trap (error-number-or-lose 'sb-kernel::mprint-error)
+                       (list ,value))))
