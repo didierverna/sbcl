@@ -2997,30 +2997,6 @@
                      (gpr-offset rn)
                      (fpr-offset rd)))))
 
-(define-instruction dup (segment rd rn size)
-  (:printer simd-copy-to-general
-            ((op 0) (imm4 1)
-                    (rn nil :fields (list (byte 5 5) (byte 1 30) (byte 5 16))
-                            :type 'simd-dup-reg))
-            '(:name :tab rn ", " rd))
-  (:emitter
-   (multiple-value-bind (q imm)
-       (ecase size
-         (:8b (values 0 #b1))
-         (:16b (values 1 #b1))
-         (:4h (values 0 #b10))
-         (:8h (values 1 #b10))
-         (:2s (values 0 #b100))
-         (:4s (values 1 #b100))
-         (:2d (values 1 #b1000)))
-     (emit-simd-copy segment
-                     q
-                     0
-                     imm
-                     1
-                     (gpr-offset rn)
-                     (fpr-offset rd)))))
-
 (def-emitter simd-across-lanes
     (#b0 1 31)
   (q 1 30)
@@ -3247,7 +3223,6 @@
           ;; Conflicts with simd-modified-imm where immh=0
           ,@(loop for (size pos) in '((4 19)
                                       (3 20)
-                                      (2 21))
                                       (2 21)
                                       (1 22))
                   collect
