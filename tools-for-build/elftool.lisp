@@ -1534,13 +1534,8 @@
         (when (eq (second inst) 'call)
           (let ((operand (third inst)))
             (when (and (integerp operand)
-<<<<<<< HEAD
-                       (>= operand alien-linkage-space-start)
-                       (< operand (+ alien-linkage-space-start alien-linkage-space-size)))
-=======
                        (>= operand target-alien-lss)
                        (< operand (+ target-alien-lss alien-linkage-space-size)))
->>>>>>> master
               (let* ((index (position (int-sap operand) *c-linkage-redirects*
                                       :key #'cdr :test #'sap=))
                      (branch-target (+ c-linkage-vector-vaddr
@@ -1623,20 +1618,13 @@
             (unless cell
               (setq cell (list linkage-index))
               (push cell indices))
-<<<<<<< HEAD
-            ;; Collect list of insts replace for the particular linkage-index.
-=======
             ;; Collect list of insts to replace for the particular linkage-index.
->>>>>>> master
             (push inst (cdr cell)))))))
   ;; Change each linkage table call to instead go directly to the target
   ;; but only if the target uniquely identifies its linkage index within
   ;; this code component for purposes of undoing the optimization.
-<<<<<<< HEAD
-=======
   ;; TODO: each load of the linkage-table base into RAX should be replaced
   ;; by a 4-byte NOP (#x0f #x1f #x40 #x00) whenever we replace the JMP/CALL.
->>>>>>> master
   (let* ((linkage-cells (linkage-space-cells (core-linkage-space-info core)))
          (indices (coerce indices 'vector))
          (values (map 'vector (lambda (x) (aref linkage-cells (car x)))
@@ -1678,17 +1666,6 @@
       (with-mapped-core (sap core-offset (core-header-total-npages parsed-header) stream)
         (let* ((spacemap (cons sap (sort (copy-list space-list) #'> :key #'space-addr)))
                (core (make-core spacemap (make-bounds 0 0) (make-bounds 0 0)
-<<<<<<< HEAD
-                                :linkage-space-info (core-header-linkage-space-info parsed-header))))
-          #-immobile-space
-          (let* ((text-space (get-space immobile-text-core-space-id spacemap))
-                 (offsets-vector (%make-lisp-obj (logior (sap-int (space-physaddr text-space spacemap))
-                                                         lowtag-mask))))
-            (assert text-space)
-            (patch-asm-codeblob core)
-            ;; offset 0 is the offset of the ASM routine codeblob which was already processed.
-            (loop for j from 1 below (length offsets-vector)
-=======
                                 :linkage-space-info (core-header-linkage-space-info parsed-header)))
                (features (detect-target-features spacemap)))
           (cond
@@ -1700,36 +1677,22 @@
                (patch-asm-codeblob core)
                ;; offset 0 is the offset of the ASM routine codeblob which was already processed.
                (loop for j from 1 below (length offsets-vector)
->>>>>>> master
                   do (let ((vaddr (+ (space-addr text-space) (aref offsets-vector j)))
                            (physobj (%make-lisp-obj
                                      (logior (sap-int (sap+ (space-physaddr text-space spacemap)
                                                             (aref offsets-vector j)))
                                              other-pointer-lowtag))))
-<<<<<<< HEAD
-                       (bypass-indirection-cells physobj vaddr core))))
-          #+immobile-space
-          (let* ((text-space (get-space immobile-text-core-space-id spacemap))
-                 (delta (- (translate-ptr (space-addr text-space) spacemap)
-                           (space-addr text-space))))
-            (walk-target-space (lambda (obj widetag size
-=======
                        (bypass-indirection-cells physobj vaddr core)))))
             (t
              (let* ((text-space (get-space immobile-text-core-space-id spacemap))
                     (delta (- (translate-ptr (space-addr text-space) spacemap)
                               (space-addr text-space))))
                (walk-target-space (lambda (obj widetag size
->>>>>>> master
                                         &aux (vaddr (- (get-lisp-obj-address obj)
                                                        other-pointer-lowtag delta)))
                                  (declare (ignore widetag size))
                                  (bypass-indirection-cells obj vaddr core))
-<<<<<<< HEAD
-                               immobile-text-core-space-id spacemap))
-=======
                                immobile-text-core-space-id spacemap))))
->>>>>>> master
           (persist-to-file spacemap core-offset stream))))))
 
 (defun split-core (input-pathname asm-pathname &rest args)
@@ -1754,9 +1717,6 @@
               (run-program "cp" `("--no-preserve=mode" ,input-pathname ,tmp)
                            :search t))
              (:mark-region-gc
-<<<<<<< HEAD
-              (move-dynamic-code-to-text-space input-pathname tmp)))
-=======
               ;; Assume that the free space in the core hasn't been squashed out yet.
               ;; I'm not sure which of these steps can operate in-place,
               ;; so use an intermediate temp file for the reorg.
@@ -1764,7 +1724,6 @@
                 (reorganize-core input-pathname other-temp)
                 (move-dynamic-code-to-text-space other-temp tmp)
                 (delete-file other-temp))))
->>>>>>> master
            #+x86-64 (redirect-text-space-calls tmp)
            (apply #'really-split-core tmp asm-pathname args))
       (delete-file tmp))))

@@ -1420,10 +1420,6 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
         remaining_len = len - 2; /* (-2 to cancel the two ++ operations) */
         switch (val) {
         case BUILD_ID_CORE_ENTRY_TYPE_CODE:
-<<<<<<< HEAD
-            // The first 2 data words are the GC selection and address of NIL,
-            // which are mainly of interest to 'editcore'. Here they are ignored.
-=======
             /* The first 2 data words are the GC strategy identifier and address of NIL.
              * The latter is mainly of interest to 'editcore' since NIL is #defined
              * in static-symbols.h (or else is relocatable).
@@ -1442,7 +1438,6 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
             if (ptr[0] != GC_STRATEGY_ID)
                 lose("GC strategy mismatch: runtime uses %d, core built for %d",
                      GC_STRATEGY_ID, (int)ptr[0]);
->>>>>>> master
             stringlen = ptr[2];
             ptr += 3; remaining_len -= 3;
             gc_assert(remaining_len * sizeof (core_entry_elt_t) >= stringlen);

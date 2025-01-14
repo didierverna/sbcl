@@ -689,18 +689,11 @@
                 (inst add char-array* char-array* (lsr string-start 1))
                 (inst mov char-array char-array*)
 
-<<<<<<< HEAD
-                (load-inline-constant bit-mask :oword (concat-ub8 (append (loop for i downfrom 7 to 0
-                                                                                collect (ash 1 i))
-                                                                          (loop for i downfrom 7 to 0
-                                                                                collect (ash 1 i)))))
-=======
                 (load-inline-constant bit-mask :oword
                                       (concat-ub 8 (append (loop for i downfrom 7 to 0
                                                                  collect (ash 1 i))
                                                            (loop for i downfrom 7 to 0
                                                                  collect (ash 1 i)))))
->>>>>>> master
                 (inst ldr next-bytes (@ byte-array))
                 (inst s-and temp next-bytes ascii-mask)
                 (inst umaxv temp temp :4s)
@@ -708,24 +701,15 @@
                 (inst cbnz tmp-tn DONE)
 
                 LOOP
-<<<<<<< HEAD
-                (inst add byte-array byte-array 16)
-                (inst s-mov bytes next-bytes)
-                (inst ldr next-bytes (@ byte-array))
-=======
                 (inst s-mov bytes next-bytes)
                 (inst ldr next-bytes (@ byte-array 16))
->>>>>>> master
 
                 (inst s-and temp next-bytes ascii-mask)
                 (inst umaxv temp temp :4s)
                 (inst umov tmp-tn temp 0 :s)
                 (inst cbnz tmp-tn DONE)
-<<<<<<< HEAD
-=======
                 (inst add byte-array byte-array 16)
 
->>>>>>> master
 
                 ;; Shift bytes right to find CRLF starting at odd indexes
                 ;; and grab the first byte from the next vector to check if it
@@ -844,18 +828,11 @@
                 (inst add char-array* char-array* (lsl string-start (- 2 1)))
                 (inst mov char-array char-array*)
 
-<<<<<<< HEAD
-                (load-inline-constant bit-mask :oword (concat-ub8 (append (loop for i downfrom 7 to 0
-                                                                                collect (ash 1 i))
-                                                                          (loop for i downfrom 7 to 0
-                                                                                collect (ash 1 i)))))
-=======
                 (load-inline-constant bit-mask :oword
                                       (concat-ub 8 (append (loop for i downfrom 7 to 0
                                                                  collect (ash 1 i))
                                                            (loop for i downfrom 7 to 0
                                                                  collect (ash 1 i)))))
->>>>>>> master
                 (inst ldr next-bytes (@ byte-array))
                 (inst s-and temp next-bytes ascii-mask)
                 (inst umaxv temp temp :4s)
@@ -863,23 +840,14 @@
                 (inst cbnz tmp-tn DONE)
 
                 LOOP
-<<<<<<< HEAD
-                (inst add byte-array byte-array 16)
-                (inst s-mov bytes next-bytes)
-                (inst ldr next-bytes (@ byte-array))
-=======
                 (inst s-mov bytes next-bytes)
                 (inst ldr next-bytes (@ byte-array 16))
->>>>>>> master
 
                 (inst s-and temp next-bytes ascii-mask)
                 (inst umaxv temp temp :4s)
                 (inst umov tmp-tn temp 0 :s)
                 (inst cbnz tmp-tn DONE)
-<<<<<<< HEAD
-=======
                 (inst add byte-array byte-array 16)
->>>>>>> master
 
                 ;; Shift bytes right to find CRLF starting at odd indexes
                 ;; and grab the first byte from the next vector to check if it
@@ -947,8 +915,6 @@
                 (inst sub new-head byte-array byte-array*))
             (setf (sb-impl::buffer-head ibuf) new-head)
             (truly-the index (+ start (ash copied -2))))))))
-<<<<<<< HEAD
-=======
 
 (defun simd-copy-character-string-to-utf8 (start end string obuf)
   (declare (type index start end)
@@ -1316,4 +1282,3 @@
       (inst sub found-bits vector vector*)
       (inst lsr res found-bits 1)
       DONE)))
->>>>>>> master

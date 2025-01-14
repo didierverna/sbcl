@@ -4803,9 +4803,6 @@
                                     'consp)
                                ,y)
                               (eq (car ,y) ',(car value))
-<<<<<<< HEAD
-                              (null (cdr ,y)))))))))
-=======
                               (null (cdr ,y))))))))
            ;; (equal x (list y))
            ;; (equal x (cons car cdr))
@@ -4820,17 +4817,13 @@
                        (and (consp x)
                             (equal (car x) car)
                             (equal (cdr x) cdr)))))))
->>>>>>> master
       (cond ((same-leaf-ref-p x y) t)
             ((array-type-dimensions-mismatch x-type y-type)
              nil)
             ((unroll-constant x 'y))
             ((unroll-constant y 'x))
-<<<<<<< HEAD
-=======
             ((unroll-list x 'x 'y))
             ((unroll-list y 'y 'x))
->>>>>>> master
             (t
              (flet ((try (x-type y-type)
                       (flet ((both-csubtypep (type)
@@ -4920,9 +4913,6 @@
                              (loop with cdr = value
                                    while (consp cdr)
                                    always (symbolp (pop cdr))))
-<<<<<<< HEAD
-                        `(equal x y)))))))
-=======
                         `(equal x y))))))
            ;; (equalp x (list y))
            ;; (equalp x (cons car cdr))
@@ -4937,17 +4927,13 @@
                        (and (consp x)
                             (equalp (car x) car)
                             (equalp (cdr x) cdr)))))))
->>>>>>> master
       (cond ((same-leaf-ref-p x y) t)
             ((array-type-dimensions-mismatch x-type y-type)
              nil)
             ((unroll-constant x 'y))
             ((unroll-constant y 'x))
-<<<<<<< HEAD
-=======
             ((unroll-list x 'x 'y))
             ((unroll-list y 'y 'x))
->>>>>>> master
             (t
              (flet ((try (x-type y-type)
                       (flet ((both-csubtypep (type)

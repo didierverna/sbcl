@@ -464,9 +464,6 @@ void sb_posix_after_fork() { // for use by sb-posix:fork
 void free_thread_struct(struct thread *th)
 {
     struct extra_thread_data *extra_data = thread_extra_data(th);
-#ifdef ZSTD_STATIC_LINKING_ONLY
-    ZSTD_freeDCtx(extra_data->zstd_dcontext);
-#endif
     if (extra_data->arena_savearea) free(extra_data->arena_savearea);
     os_deallocate((os_vm_address_t) th->os_address, THREAD_STRUCT_SIZE);
 }
@@ -1077,12 +1074,7 @@ alloc_thread_struct(void* spaces) {
     th->profile_data = (uword_t*)(alloc_profiling ? alloc_profile_buffer : 0);
 
     struct extra_thread_data *extra_data = thread_extra_data(th);
-    __attribute__((unused)) void* zstd_dcontext = extra_data->zstd_dcontext;
     memset(extra_data, 0, sizeof *extra_data);
-
-#ifdef ZSTD_STATIC_LINKING_ONLY
-    extra_data->zstd_dcontext = (is_recycled && zstd_dcontext) ? zstd_dcontext : ZSTD_createDCtx();
-#endif
 
 #if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT
     os_sem_init(&extra_data->state_sem, 1);
