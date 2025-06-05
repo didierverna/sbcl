@@ -360,6 +360,7 @@
    "*DISASSEMBLE-ANNOTATE*"
    "PRINT-SYMBOL-WITH-PREFIX"
    "*PRINT-VECTOR-LENGTH*"
+   "*PRINT-CIRCLE-NOT-SHARED*"
    "DECIMAL-WITH-GROUPED-DIGITS-WIDTH"
    ;;"OBJECT-SIZE"
 
@@ -848,7 +849,6 @@ possibly temporarily, because it might be used internally.")
    ;; placeholders in a target system
 
    "UNCROSS"
-   "!UNCROSS-FORMAT-CONTROL"
 
    ;; might as well be shared among the various files which
    ;; need it:
@@ -1427,6 +1427,8 @@ SBCL itself")
            "%HALF-BIGNUM-REF" "%HALF-BIGFLOOR"
            "UNARY-TRUNCATE-SINGLE-FLOAT-TO-BIGNUM"
            "UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM"
+           "UNARY-TRUNCATE-SINGLE-FLOAT-TO-BIGNUM-DIV"
+           "UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM-DIV"
            "%UNARY-TRUNCATE-SINGLE-FLOAT-TO-BIGNUM"
            "%UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM"))
 
@@ -1540,6 +1542,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%DOUBLE-FLOAT" "%DPB" "%EQL"
            "%EXIT"
            "%EXP" "%EXPM1"
+           "ASH-RIGHT"
            "FILL-POINTER-ERROR"
            "%FIND-POSITION"
            "%FIND-POSITION-VECTOR-MACRO" "%FIND-POSITION-IF"
@@ -1582,6 +1585,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%MEMBER-TEST"
            "%MEMBER-TEST-NOT"
            "%MULTIPLY-HIGH" "%SIGNED-MULTIPLY-HIGH"
+           "ROTATE-RIGHT-WORD"
            "%NEGATE" "%POW"
            "%NEW-INSTANCE"
            "%OTHER-POINTER-WIDETAG"
@@ -1622,7 +1626,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%SET-SIGNED-SAP-REF-32" "%SET-SIGNED-SAP-REF-64"
            "%SET-SIGNED-SAP-REF-WORD"
            "%SET-SIGNED-SAP-REF-8" "%SET-STACK-REF"
-           "%SET-SYMBOL-HASH"
            "%SIN" "%SIN-QUICK" "%SINGLE-FLOAT"
            "%SINH" "%SQRT"
            "%SXHASH-BIT-VECTOR" "%SXHASH-SIMPLE-BIT-VECTOR"
@@ -2342,14 +2345,16 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
 
            "STRING>=*" "STRING>*" "STRING=*" "STRING<=*"
            "STRING<*" "STRING/=*" "%SVSET"
-           "SIMPLE-BASE-STRING=" #+sb-unicode "SIMPLE-CHARACTER-STRING="
-                                 "%SP-STRING-COMPARE" "%SP-STRING="
-                                 "%SETNTH" "%SETELT"
-                                 "%SET-ROW-MAJOR-AREF" "%SET-FILL-POINTER"
-                                 "%SET-FDEFINITION" "%SCHARSET"
-                                 "%RPLACD" "%RPLACA" "%PUT" "%CHARSET"
-                                 "%WITH-OUTPUT-TO-STRING"
-                                 "INLINE-VOP")
+           "SIMPLE-BASE-STRING="
+           #+sb-unicode "SIMPLE-CHARACTER-STRING="
+           "%SP-STRING-COMPARE" "%SP-STRING="
+           "%SETNTH" "%SETELT"
+           "%SET-ROW-MAJOR-AREF" "%SET-FILL-POINTER"
+           "%SET-FDEFINITION" "%SCHARSET"
+           "%RPLACD" "%RPLACA" "%PUT" "%CHARSET"
+           "%WITH-OUTPUT-TO-STRING"
+           "INLINE-VOP"
+           "WRAP-IF" "COND-DISPATCH")
   #+sb-simd-pack
   (:export "SIMD-PACK"
            "SIMD-PACK-P"
@@ -2454,6 +2459,7 @@ be submitted as a CDR")
            "TOKEN-DELIMITERP" "WHITESPACE[2]P" "WITH-READ-BUFFER"
            ;; other
 
+           "INSTALL-HASH-TABLE-LOCK"
            "%MAKUNBOUND")
   (:use "CL" "SB-ALIEN" "SB-BIGNUM" "SB-EXT"
         "SB-GRAY" "SB-INT" "SB-KERNEL" "SB-SYS"))
@@ -2617,6 +2623,7 @@ be submitted as a CDR")
            "CALLEE-NFP-TN" "CALLEE-RETURN-PC-TN"
            "CATCH-BLOCK" "UNWIND-BLOCK"
            "CLOSURE-INIT" "CLOSURE-REF" "CLOSURE-INIT-FROM-FP"
+           "CODE-IMMOBILE-P"
            "COMPARE-AND-SWAP-SLOT"
            "COMPILE-IN-LEXENV"
            "COMPILE-FILES" "COMPILE-FORM-TO-FILE"
@@ -3129,7 +3136,7 @@ structure representations")
            "FIND-PAGE-INDEX"
            "NEXT-FREE-PAGE"
            "READ-ONLY-SPACE-START" "READ-ONLY-SPACE-END"
-           "STATIC-SPACE-START" "STATIC-SPACE-END" "*STATIC-SPACE-FREE-POINTER*"
+           "STATIC-SPACE-START" "STATIC-SPACE-SIZE" "*STATIC-SPACE-FREE-POINTER*"
            "STATIC-CODE-SPACE-START" "STATIC-CODE-SPACE-END" "*STATIC-CODE-SPACE-FREE-POINTER*"
            "ALIEN-LINKAGE-SPACE-START"
            "ALIEN-LINKAGE-SPACE-SIZE"
@@ -3293,7 +3300,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "CODE-LOCATION-CONTEXT"
            "CODE-LOCATION-UNKNOWN-P" "CODE-LOCATION=" "DEACTIVATE-BREAKPOINT"
            "DEBUG-BLOCK" "DEBUG-BLOCK-ELSEWHERE-P" "DEBUG-BLOCK-P"
-           "DEBUG-CONDITION" "DEBUG-ERROR"
+           "DEBUG-BLOCK-SUCCESSORS" "DEBUG-CONDITION" "DEBUG-ERROR"
            "DEBUG-FUN" "DEBUG-FUN-FUN" "DEBUG-FUN-KIND"
            "DEBUG-FUN-LAMBDA-LIST" "DEBUG-FUN-MORE-ARGS"
            "DEBUG-FUN-NAME" "DEBUG-FUN-CLOSURE-NAME"
@@ -3303,7 +3310,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "DEBUG-SOURCE-P" "DEBUG-SOURCE-START-POSITIONS"
            "DEBUG-VAR" "DEBUG-VAR-ID" "DEBUG-VAR-INFO-AVAILABLE"
            "DEBUG-VAR-NAME" "DEBUG-VAR-P" "DEBUG-VAR-PACKAGE"
-           "DEBUG-VAR-SYMBOL" "DEBUG-VAR-VALID-VALUE"
+           "DEBUG-VAR-SYMBOL"
            "DEBUG-VAR-VALIDITY" "DEBUG-VAR-VALUE"
            "DELETE-BREAKPOINT"
            "DO-DEBUG-BLOCK-LOCATIONS" "DO-DEBUG-FUN-BLOCKS"
@@ -3359,6 +3366,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "INTERRUPT-THREAD"
            "INTERRUPT-THREAD-ERROR"
            "INTERRUPT-THREAD-ERROR-THREAD"
+           "*INTERRUPT-HANDLER*"
            "RETURN-FROM-THREAD"
            "ABORT-THREAD"
            "MAIN-THREAD-P"

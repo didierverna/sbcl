@@ -1080,12 +1080,10 @@
 (defconstant-eqx +fixup-flavors+
  `#(:assembly-routine
     :card-table-index-mask :symbol-tls-index
-    :alien-code-linkage-index :alien-data-linkage-index
     :foreign :foreign-dataref
     :code-object
     :layout :immobile-symbol
-    #+linkage-space ,@'(:linkage-cell :linkage-cell-ud)
-    :symbol-value
+    #+linkage-space :linkage-cell
     :layout-id)
   #'equalp)
 
@@ -1161,8 +1159,7 @@
           (incf nelements) ; used 1 element of the fasl stack
           (let ((operand
                  (fixup-flavor-case flavor-id
-                   ((:alien-code-linkage-index :alien-data-linkage-index
-                     :foreign :foreign-dataref) (the string name))
+                   ((:foreign :foreign-dataref) (the string name))
                    (:layout
                     (if (symbolp name)
                         name
@@ -1170,12 +1167,7 @@
                    (:layout-id (the layout name))
                    ((:assembly-routine
                      :symbol-tls-index
-                     ;; Only #+immobile-space can use the following two flavors.
-                     ;; An :IMMOBILE-SYMBOL fixup references the symbol itself,
-                     ;; whereas a :SYMBOL-VALUE fixup references the value of the symbol.
-                     ;; In the latter case, the symbol's address doesn't matter,
-                     ;; but its global value must be an immobile object.
-                     :immobile-symbol :symbol-value)
+                     :immobile-symbol) ; only #+immobile-space can use
                     (the symbol name))
                    (t name)))) ; function name
             (dump-object operand fasl-output)

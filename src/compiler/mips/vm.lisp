@@ -23,12 +23,8 @@
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
-                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
+                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
-           (defregset (name &rest regs)
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
-                 (defparameter ,name
-                   (list ,@(mapcar #'(lambda (name) (symbolicate name "-OFFSET")) regs))))))
   ;; Wired zero register.
   (defreg zero 0) ; NULL
   ;; Reserved for assembler use.
@@ -258,9 +254,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
   (defregtn zero any-reg)
   (defregtn nargs any-reg)
 
@@ -340,11 +334,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.

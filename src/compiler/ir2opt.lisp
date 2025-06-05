@@ -537,7 +537,8 @@
                  ;; then we're fine to combine.
                  (or (constant-tn-p sym)
                      (not (tn-writes sym))
-                     (not (tn-ref-next (tn-writes sym))))
+                     (not (or (eq (tn-vertex sym) :alias)
+                              (tn-ref-next (tn-writes sym)))))
                  ;; Elide the SYMBOL-VALUE only if there is exactly one way to get there.
                  ;; Technically we could split the IR2 block and peel off the SYMBOL-VALUE,
                  ;; and if coming from the BRANCH-IF, jump to the block that contained
@@ -794,12 +795,16 @@
                     (unless (tn-reads tn)
                       (do ((ref (tn-writes tn) (tn-ref-next ref)))
                           ((null ref))
-                        (aver (eq (vop-name (tn-ref-vop ref))
-                                  'current-stack-pointer))
+                        (aver (memq (vop-name (tn-ref-vop ref))
+                                    '(current-stack-pointer move)))
                         (delete-vop (tn-ref-vop ref)))))
                   (return))
                  (t
                   (return)))))
+
+(defoptimizer (vop-optimize current-stack-pointer) (vop)
+  (unless (tn-reads (tn-ref-tn (vop-results vop)))
+    (delete-vop vop)))
 
 ;;; Load the WIDETAG once for a series of type tests.
 (when-vop-existsp (:named sb-vm::load-other-pointer-widetag)
@@ -988,13 +993,16 @@
          (not (and single-reader
                    (tn-ref-next reads)))
          (not (and single-writer
-                   (tn-ref-next writes)))
+                   (or
+                    (eq (tn-vertex tn) :alias)
+                    (tn-ref-next writes))))
          (tn-ref-vop reads))))
 
 (defun tn-single-writer-p (tn)
   (let ((writes (tn-writes tn)))
     (and writes
-         (not (tn-ref-next writes)))))
+         (not (tn-ref-next writes))
+         (neq (tn-vertex tn) :alias))))
 
 (defoptimizer (vop-optimize sb-vm::move-from-word/fixnum)
     (vop)
@@ -1181,7 +1189,10 @@
 (defun very-temporary-p (tn)
   (let ((writes (tn-writes tn))
         (reads (tn-reads tn)))
-    (and writes reads (not (tn-ref-next writes)) (not (tn-ref-next reads)))))
+    (and writes reads
+         (not (tn-ref-next reads))
+         (neq (tn-vertex tn) :alias)
+         (not (tn-ref-next writes)))))
 
 (defun next-vop-is (vop names)
   (let ((next (next-vop vop)))
@@ -1419,19 +1430,22 @@
                                      (compatible-scs-p (tn-sc tn) sc))
                            return tn)))
             (let ((barrier (vop-info-gc-barrier info)))
-              (when barrier
-                (destructuring-bind (object value &optional allocator) barrier
-                 (let* ((tn (tn-ref-tn (sb-vm::vop-nth-arg object vop)))
-                        (register (register-p tn)))
-                   (if (and (not (and register
-                                      (memq (tn-offset tn) 2block-gc-barriers)))
-                            (sb-vm::require-gengc-barrier-p tn
-                                                            (sb-vm::vop-nth-arg value vop)
-                                                            (and allocator
-                                                                 (nth allocator (vop-codegen-info vop)))))
-                       (when register
-                         (push (tn-offset tn) 2block-gc-barriers))
-                       (nsubst nil barrier (vop-codegen-info vop)))))))
+              (if barrier
+                  (destructuring-bind (object value &optional allocator) barrier
+                    (let* ((tn (tn-ref-tn (sb-vm::vop-nth-arg object vop)))
+                           (register (register-p tn)))
+                      (if (and
+                           (not (and register
+                                     (memq (tn-offset tn) 2block-gc-barriers)))
+                           (sb-vm::require-gengc-barrier-p tn
+                                                           (sb-vm::vop-nth-arg value vop)
+                                                           (and allocator
+                                                                (nth allocator (vop-codegen-info vop)))))
+                          (when register
+                            (push (tn-offset tn) 2block-gc-barriers))
+                          (nsubst nil barrier (vop-codegen-info vop)))))
+                  ;; FIXME: can't straddle an allocation sequences
+                  (setf 2block-gc-barriers nil)))
             (case (vop-name vop)
               ((move sb-vm::move-arg)
                (let* ((args (vop-args vop))

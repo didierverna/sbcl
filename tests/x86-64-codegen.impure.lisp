@@ -14,11 +14,6 @@
 (load "compiler-test-util.lisp")
 (import 'ctu:disassembly-lines)
 
-;;; This trivial function failed to compile due to rev 88d078fe
-(defun foo (&key k)
-  (make-list (reduce #'max (mapcar #'length k))))
-(compile 'foo)
-
 (with-test (:name :lowtag-test-elision)
   ;; This tests a certain behavior that while "undefined" should at least not
   ;; be fatal. This is important for things like hash-table :TEST where we might
@@ -29,7 +24,8 @@
   (let ((f (compile nil
                     '(lambda (x)
                       (typecase x
-                        ((or character number list sb-kernel:instance function) 1)
+                        ((or character number list sb-kernel:instance function)
+                         nil)
                         ;; After eliminating the preceding cases, the compiler knows
                         ;; that the only remaining pointer type is OTHER-POINTER,
                         ;; so it just tries to read the widetag.
@@ -37,13 +33,17 @@
                         ;; the start of static space, but it holds a zero.
                         (simple-vector 2))))))
     (assert (not (funcall f (sb-kernel:make-unbound-marker)))))
-  (assert (not (equalp (sb-kernel:make-unbound-marker) "")))
-  (let ((a (- (sb-kernel:get-lisp-obj-address (sb-kernel:make-unbound-marker))
-              sb-vm:other-pointer-lowtag)))
-    (assert (> a sb-vm:static-space-start))))
+  (let ((ubm (opaque-identity (sb-kernel:make-unbound-marker)))
+        (thing (opaque-identity "")))
+    (assert (not (eql thing ubm)))
+    (assert (not (equal thing ubm)))
+    (assert (not (equalp thing ubm)))
+    (assert (not (eql ubm thing)))
+    (assert (not (equal ubm thing)))
+    (assert (not (equalp ubm thing)))))
 
 (sb-vm::define-vop (tryme)
-    (:generator 1 (sb-assem:inst mov :byte (sb-vm::ea :gs sb-vm::rax-tn) 0)))
+  (:generator 1 (sb-assem:inst mov :byte (sb-vm::ea :gs sb-vm::rax-tn) 0)))
 (with-test (:name :try-gs-segment)
   (assert (loop for line in (disassembly-lines
                              (compile nil
@@ -179,7 +179,7 @@
          (c-call (find "os_deallocate" lines :test #'search)))
     ;; Depending on #+immobile-code it's either direct or memory indirect.
     #+immobile-code (assert (search "CALL #x" c-call))
-    #-immobile-code (assert (search "CALL [#x" c-call))))
+    #-immobile-code (assert (search "LEA RBX, [R12-" c-call))))
 
 (with-test (:name :set-symbol-value-imm)
   (let (success)
@@ -673,10 +673,12 @@
              '(lambda (x) (if (null (foo-s (truly-the foo x))) 'not 'is))))
         (f2 (disassembly-lines
              '(lambda (x) (if (stringp (foo-s (truly-the foo x))) 'is 'not)))))
-    ;; the comparison of X to NIL should be a single-byte test
-    (assert (loop for line in f1
+    ;; Comparison of X to NIL should be a single-byte test.
+    ;; Note that the disassembler always treats imm8 operands as signed
+    (let ((expect "R12"))
+      (assert (loop for line in f1
                   thereis (and (search (format nil "CMP ") line) ; register is arbitrary
-                               (search (format nil ", ~D" (logand sb-vm:nil-value #xff)) line))))
+                               (search (format nil ", ~D" expect) line)))))
     ;; the two variations of the test compile to the identical code
     (dotimes (i 4)
       (assert (string= (nth i f1) (nth i f2))))))
@@ -1169,7 +1171,7 @@
   (dolist (memspace '(:dynamic :immobile))
     (let ((sb-c::*compile-to-memory-space* memspace))
       (assert (find-in-disassembly
-               (if (eq sb-c::*compile-to-memory-space* :immobile) "lose" "&lose")
+               "lose"
                '(lambda ()
                  (declare (optimize (sb-c::alien-funcall-saves-fp-and-pc 0)))
                  (alien-funcall (extern-alien "lose" (function void))))))
@@ -1305,25 +1307,16 @@
 (with-test (:name :signed-vops) (test-signed))
 (with-test (:name :unsigned-vops) (test-unsigned))
 
-(with-test (:name :old-slot-set-no-barrier)
-  (let ((vops-with-barrier
-          (find-gc-barriers
-           '(lambda (y)
-             (let ((x (cons 0 0)))
-               (setf (car x) y)
-               x)))))
-    (assert (not vops-with-barrier))))
-
 (with-test (:name :smaller-than-qword-cons-slot-init
                   :skipped-on (:not :mark-region-gc))
   (let ((lines (disassembly-lines
-                (compile nil '(lambda (a) (list 1 a #\a))))))
+                (compile nil '(lambda (a) (list 1 a #\a #xfff000))))))
     (assert (loop for line in lines
                   thereis (search "MOV BYTE PTR" line))) ; constant 1
     (assert (loop for line in lines
                   thereis (search "MOV WORD PTR" line))) ; constant #\a
     (assert (loop for line in lines
-                  thereis (search "MOV DWORD PTR" line))))) ; constant NIL
+                  thereis (search "MOV DWORD PTR" line))))) ; constant #xfff000
 
 (defun count-labeled-instructions (function &aux (answer 0))
   (let ((lines (disassembly-lines function)))
@@ -1345,7 +1338,7 @@
               (checked-compile
                `(lambda (x)
                   (declare (optimize (sb-c::verify-arg-count 0)))
-                  (if (sb-kernel:non-null-symbol-p x) 'zook (foo)))))
+                  (if (sb-kernel:non-null-symbol-p x) 'zook (eval x)))))
              1)))
 
 (with-test (:name :disassemble-instance-type-test
@@ -1358,3 +1351,69 @@
            thereis (and (search "CMP DWORD PTR" line)
                         (search "#<LAYOUT" line)
                         (search "for SB-THREAD:MUTEX" line))))))
+
+(with-test (:name :dx-list-push-imm :skipped-on (not :immobile-space))
+  (let ((lines
+         (disassembly-lines
+          (compile nil '(lambda (f)
+                         (sb-int:dx-let ((x (list :foo))) (funcall f x)))))))
+    (assert
+     (loop for line in lines
+           thereis (and (search "PUSH #x" line) (search "':FOO" line))))))
+
+(defun check-hasnot (instructions lexpr)
+  (let ((f (compile nil lexpr)))
+    (dolist (inst (get-simple-fun-instruction-model f))
+      (let ((mnemonic (second inst)))
+        (assert (not (find mnemonic instructions :test 'string=)))))))
+
+(with-test (:name :compute-lisp-bool-from-c-bool :skipped-on (:not :sb-thread))
+  (check-hasnot '("JMP")
+                '(lambda (x)
+                  (declare (optimize (sb-c::verify-arg-count 0)))
+                  (= (truly-the fixnum x) 1))))
+
+(with-test (:name :compute-c-bool-from-lisp-bool)
+  (check-hasnot '("JMP" "CMOV")
+                '(lambda (x)
+                  (declare (optimize (sb-c::verify-arg-count 0)))
+                  (if x 1 0))))
+
+(with-test (:name :pcl-ctor-slotv-allocator)
+  (flet ((get-asm-lines (n)
+           (disassembly-lines
+            (compile nil
+             `(lambda () (make-array ,n :initial-element sb-pcl:+slot-unbound+))))))
+    (let ((lines (get-asm-lines 1)))
+      (assert (loop for line in lines
+                    thereis (and (search "MOV QWORD PTR" line)
+                                 (search "], 9" line))))) ; UNBOUND-MARKER-WIDETAG
+    (loop for nelts from 2 to 10
+          do (let ((lines (get-asm-lines nelts)))
+               (assert (loop for line in lines
+                             thereis (search "MOVDDUP XMM" line)))))
+    (let ((lines (get-asm-lines 11)))
+      (assert (loop for line in lines
+                    thereis (search "REPE STOSQ" line))))))
+
+(defconstant arb-qword-const-positive #xFFF0abcdabcd0000)
+(defconstant arb-qword-const-negative (sb-disassem::sign-extend arb-qword-const-positive 64))
+(pushnew :popcnt sb-c:*backend-subfeatures*)
+(defun same-constants-after-collapsing (uw sw)
+  (declare (sb-vm:word uw) (sb-vm:signed-word sw))
+  (values (logcount (logxor uw arb-qword-const-positive))
+          (logcount (logxor sw arb-qword-const-negative))))
+(compile 'same-constants-after-collapsing)
+(defun different-constants (uw sw)
+  (declare (sb-vm:word uw) (sb-vm:signed-word sw))
+  (values (logcount (logxor uw (logior arb-qword-const-positive 1)))
+          (logcount (logxor sw arb-qword-const-negative))))
+(compile 'different-constants)
+
+(with-test (:name :constantize-equivalence)
+  ;; two raw words: jump table count word, and one user constant
+  (assert (= 16 (sb-kernel:code-n-unboxed-data-bytes
+                 (sb-kernel:fun-code-header #'same-constants-after-collapsing))))
+  ;; four raw words: jump table count word, two user data words, and a padding word
+  (assert (= 32 (sb-kernel:code-n-unboxed-data-bytes
+                 (sb-kernel:fun-code-header #'different-constants)))))

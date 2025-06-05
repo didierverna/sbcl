@@ -18,7 +18,8 @@
 (defun parse-number-dispatch (vars result types var-types body)
   ;; Shouldn't be necessary, but avoids a warning in certain lisps that
   ;; seem to like to warn about self-calls in :COMPILE-TOPLEVEL situation.
-  (named-let parse-number-dispatch ((vars vars) (result result) (types types)
+  (named-let parse-number-dispatch ((vars vars) (result result)
+                                    (types (subst 'sb-xc:fixnum 'fixnum types))
                                     (var-types var-types) (body body))
     (cond ((null vars)
            (unless (null types) (error "More types than vars."))
@@ -48,7 +49,7 @@
 ;;; our guess for the preferred order in which to do type tests
 ;;; (cheaper and/or more probable first.)
 (defconstant-eqx +type-test-ordering+
-    '(fixnum single-float double-float integer #+long-float long-float
+    '((eql 1) sb-xc:fixnum single-float double-float integer #+long-float long-float
       sb-vm:signed-word word bignum
       complex ratio)
   #'equal)
@@ -56,8 +57,8 @@
 ;;; Should TYPE1 be tested before TYPE2?
 
 (defun type-test-order (type1 type2)
-  (let ((o1 (position type1 +type-test-ordering+))
-        (o2 (position type2 +type-test-ordering+)))
+  (let ((o1 (position type1 +type-test-ordering+ :test #'equal))
+        (o2 (position type2 +type-test-ordering+ :test #'equal)))
     (cond ((not o1) nil)
           ((not o2) t)
           (t
@@ -247,3 +248,33 @@
         (,big-op x (make-small-bignum y)))
        ((bignum bignum)
         (,big-op x y))))))
+
+(defmacro dispatch-ratio ((ratio numerator denominator) &body body)
+  `(let ((,numerator (numerator ,ratio))
+         (,denominator (denominator ,ratio)))
+     (if (and (fixnump ,numerator)
+              (fixnump ,denominator))
+         (progn ,@body)
+         (progn ,@body))))
+
+(defmacro dispatch-two-ratios ((numerator1-var numerator1)
+                               (denominator1-var denominator1)
+                               (numerator2-var numerator2)
+                               (denominator2-var denominator2)
+                               body
+                               &optional (fixnum-body body))
+  `(let ((,numerator1-var ,numerator1)
+         (,denominator1-var ,denominator1)
+         (,numerator2-var ,numerator2)
+         (,denominator2-var ,denominator2))
+     (if (and (fixnump ,numerator1-var)
+              (fixnump ,numerator2-var)
+              (fixnump ,denominator1-var)
+              (fixnump ,denominator2-var))
+         ,fixnum-body
+         ,body)))
+
+(defmacro cond-dispatch (cond &body body)
+  `(if ,cond
+       (progn ,@body)
+       (progn ,@body)))

@@ -18,7 +18,7 @@
         (seg (sb-disassem::%make-segment
               :sap-maker (lambda () (error "Bad sap maker")) :virtual-location 0))
         (dstate (make-dstate nil)))
-    (flet ((scan-function (code sap length extra-offset predicate)
+    (flet ((scan-function (is-asm code sap length extra-offset predicate)
              ;; Extra offset is the amount to add to the offset supplied in the
              ;; lambda to compute the instruction offset relative to the code base.
              ;; Defrag has already stuffed in forwarding pointers when it reads
@@ -26,13 +26,14 @@
              (scan-relative-operands
               code (sap-int sap) length dstate seg
               (lambda (offset operand inst)
-                (declare (ignore operand inst))
+                (declare (ignore inst))
                 ;; We used to have movable objects pointing to other movable objects,
-                ;; and during defrag, either or both could move.  This no longer occurs,
-                ;; so pass 0 as the pointed-to object.
-                (let ()
+                ;; and during defrag, *both* could move.  That is no longer the case,
+                ;; however asm code is allowed to point at a simple-fun entrypoint.
+                (let ((referent (cond (is-asm (+ operand (- 16) sb-vm:fun-pointer-lowtag))
+                                      (t 0))))
                   (vector-push-extend (+ offset extra-offset) relocs)
-                  (vector-push-extend 0 relocs)))
+                  (vector-push-extend referent relocs)))
                predicate))
            (finish-component (code start-relocs-index)
              (when (> (fill-pointer relocs) start-relocs-index)
@@ -45,7 +46,7 @@
         ;; The whole thing can be disassembled in one stroke since inter-routine
         ;; gaps are encoded as NOPs.
         (multiple-value-bind (start end) (sb-fasl::calc-asm-routine-bounds)
-          (scan-function code
+          (scan-function t code
                          (sap+ (code-instructions code) start)
                          (- end start)
                          ;; extra offset = header words + start
@@ -55,8 +56,8 @@
                          #'immobile-space-addr-p))
         (finish-component code relocs-index))
 
-      ;; Immobile space - code components can jump to immobile space,
-      ;; read-only space, and C runtime routines.
+      ;; Immobile space - code components can jump to immobile space
+      ;; and C runtime routines (is the latter really true?)
       (map-allocated-objects
        (lambda (code type size)
          (declare (ignore size))
@@ -66,7 +67,7 @@
                ;; simple-funs must be individually scanned to skip over header words
                (let* ((fun (%code-entry-point code i))
                       (sap (simple-fun-entry-sap fun)))
-                 (scan-function code sap
+                 (scan-function nil code sap
                                 (%simple-fun-text-len fun i)
                                 ;; Compute the offset from the base of the code
                                 (+ (ash (code-header-words code) word-shift)
@@ -125,28 +126,28 @@
                ;; If the jump is to FUN-ENTRY, change it to a linkage space indirection
                (let ((disp (truly-the (signed-byte 32) (near-jump-displacement chunk dstate))))
                  (when (= (+ disp (dstate-next-addr dstate)) fun-entry)
-                   (let ((sap (int-sap (dstate-cur-addr dstate)))
-                         (cell (sap+ sb-vm::elf-linkage-space (ash index word-shift))))
-                     (declare (ignorable cell))
+                   (let ((sap (int-sap (dstate-cur-addr dstate))))
                      #+immobile-space
-                     (cond ((eq inst jmp)
-                            (aver (= (sap-ref-8 sap 5) #x90)) ; NOP
-                            (setf (sap-ref-16 sap 0) #x25ff  ; JMP [RIP+n]
-                                  (signed-sap-ref-32 sap 2) (sap- cell (sap+ sap 6))))
-                           (t
-                            (aver (= (sap-ref-8 sap -1) #x40)) ; REX (no bits)
-                            (setf (sap-ref-16 sap -1) #x15ff   ; CALL [RIP+n]
-                                  (signed-sap-ref-32 sap 1) (sap- cell (sap+ sap 5)))))
+                     (let ((cell (sap+ sb-vm::*linkage-table* (ash index word-shift))))
+                       (cond ((eq inst jmp)
+                              (aver (= (sap-ref-8 sap 5) #x90)) ; NOP
+                              (setf (sap-ref-16 sap 0) #x25ff  ; JMP [RIP+n]
+                                    (signed-sap-ref-32 sap 2) (sap- cell (sap+ sap 6))))
+                             (t
+                              (aver (= (sap-ref-8 sap -1) #x40)) ; REX (no bits)
+                              (setf (sap-ref-16 sap -1) #x15ff   ; CALL [RIP+n]
+                                    (signed-sap-ref-32 sap 1) (sap- cell (sap+ sap 5))))))
                      #-immobile-space
-                     (cond ((eq inst jmp)
-                            (aver (= (sap-ref-32 sap -4) #xF0458B49)) ; MOV RAX, [R13-16]
-                            (aver (= (sap-ref-8 sap 5) #x90)) ; NOP
-                            (setf (sap-ref-16 sap 0) #xa0ff   ; JMP [RAX+n]
-                                  (signed-sap-ref-32 sap 2) (ash index word-shift)))
-
-                           (t
-                            (aver (= (sap-ref-32 sap -5) #xF0458B49)) ; MOV RAX, [R13-16]
-                            (aver (= (sap-ref-8 sap -1) #x40)) ; REX (no bits)
-                            (setf (sap-ref-16 sap -1) #x90ff   ; CALL [RAX+n]
-                                  (signed-sap-ref-32 sap 1) (ash index word-shift)))))))))
+                     (let ((disp (- (ash index word-shift)
+                                    (ash 1 (+ sb-vm:n-linkage-index-bits sb-vm:word-shift))
+                                    sb-vm:alien-linkage-space-size
+                                    sb-vm::nil-value-offset)))
+                       (cond ((eq inst jmp)
+                              (aver (= (ldb (byte 24 0) (sap-ref-32 sap 5)) #x001F0F)) ; NOP
+                              (setf (sap-ref-32 sap 0) #x24A4FF41))  ; JMP [R12+disp]
+                             (t
+                              (aver (= (sap-ref-32 sap -3) #xE82E2E2E)) ; CS: CS: CS: CALL rel32
+                              (setf sap (sap+ sap -3))
+                              (setf (sap-ref-32 sap 0) #x2494FF41))) ; CALL [R12+disp]
+                       (setf (signed-sap-ref-32 sap 4) disp)))))))
            seg dstate)))))))

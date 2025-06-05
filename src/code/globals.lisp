@@ -86,11 +86,53 @@
                   #+sb-thread *stop-for-gc-pending*
                   *posix-argv*
                   *default-external-format*
-                  *default-source-external-format*))
+                  *default-source-external-format*
+                  *free-interrupt-context-index*))
 (declaim (always-bound *default-external-format* *default-source-external-format*))
 
-;;; This constant is assigned by Genesis and never read by Lisp code.
-;;; (To prove that it isn't used, it's not a toplevel form)
-(let ()
-  (defconstant sb-vm::+required-foreign-symbols+
-    (symbol-value 'sb-vm::+required-foreign-symbols+)))
+;;; A unique GC id. This is supplied for code that needs to detect
+;;; whether a GC has happened since some earlier point in time. For
+;;; example:
+;;;
+;;;   (let ((epoch *gc-epoch*))
+;;;      ...
+;;;      (unless (eql epoch *gc-epoch)
+;;;        ....))
+;;;
+;;; This isn't just a fixnum counter since then we'd have theoretical
+;;; problems when exactly 2^29 GCs happen between epoch
+;;; comparisons. Unlikely, but the cost of using a cons instead is too
+;;; small to measure. -- JES, 2007-09-30
+(declaim (type cons sb-kernel::*gc-epoch*))
+(define-load-time-global sb-kernel::*gc-epoch* '(nil . nil))
+
+;;; Stores the code coverage instrumentation results. The CAR is a
+;;; hashtable. The CDR is a list of weak pointers to code objects
+;;; having coverage marks embedded in the unboxed constants. Keys in
+;;; the hashtable are namestrings, the value is a list of (CONS PATH
+;;; VISITED).
+(define-load-time-global *code-coverage-info*
+    (list (make-hash-table :test 'equal :synchronized t)))
+(declaim (type (cons hash-table) *code-coverage-info*))
+
+(in-package "SB-DEBUG")
+
+;;; This is a list of conses (fun-end-cookie . condition-satisfied),
+;;; which we use to note distinct dynamic entries into functions. When
+;;; we enter a traced function, we add a entry to this list holding
+;;; the new end-cookie and whether the trace condition was satisfied.
+;;; We must save the trace condition so that the after breakpoint
+;;; knows whether to print. The length of this list tells us the
+;;; indentation to use for printing TRACE messages.
+;;;
+;;; This list also helps us synchronize the TRACE facility dynamically
+;;; for detecting non-local flow of control. Whenever execution hits a
+;;; :FUN-END breakpoint used for TRACE'ing, we look for the
+;;; FUN-END-COOKIE at the top of *TRACED-ENTRIES*. If it is not
+;;; there, we discard any entries that come before our cookie.
+;;;
+;;; When we trace using encapsulation, we bind this variable and add
+;;; (NIL . CONDITION-SATISFIED), so a NIL "cookie" marks an
+;;; encapsulated tracing.
+(sb-impl::define-thread-local *traced-entries* ())
+(declaim (list *traced-entries*))

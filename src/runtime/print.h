@@ -12,12 +12,20 @@
 #ifndef _PRINT_H_
 #define _PRINT_H_
 
+#include <stdio.h>
 #include "genesis/sbcl.h"
 #include "runtime.h"
 
+typedef struct iochannel {
+  FILE* out;
+  FILE* in;
+} *iochannel_t;
+
 extern void print(lispobj obj);
-extern void brief_print(lispobj obj);
+extern void print_to_iochan(lispobj obj,iochannel_t);
+extern void brief_print(lispobj obj, iochannel_t);
 extern void reset_printer(void);
+extern void print_lisp_backtrace(int frames, FILE *f);
 #include "genesis/vector.h"
 #include <stdio.h>
 extern void safely_show_lstring(struct vector*, int, FILE*);

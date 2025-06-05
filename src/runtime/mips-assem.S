@@ -322,19 +322,15 @@ lra:	.word	RETURN_PC_WIDETAG
 
 /*
  * Function-end breakpoint magic. This is truely magic, the code is
- * copied and has to be relocatable. It also needs a properly aligned
- * header tag after the fun_end_breakpoint_guts symbol.
+ * copied and has to be relocatable.
  */
 
 /*
  * For an explanation of the magic involved in function-end
  * breakpoints, see the implementation in ppc-assem.S.
  */
-
-	.align  3 /* minimum alignment for a lisp object */
 	LEAF(fun_end_breakpoint_guts)
 	.set    noreorder
-	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	b       multiple_value_return
 	 nop
 	.set    reorder

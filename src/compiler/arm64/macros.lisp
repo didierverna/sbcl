@@ -143,6 +143,14 @@
 
 ;;;; Storage allocation:
 
+(defun generate-stack-overflow-check (vop size)
+  (let ((overflow (generate-error-code vop
+                                       'stack-allocated-object-overflows-stack-error
+                                       size)))
+    (loadw tmp-tn thread-tn thread-control-stack-end-slot)
+    (inst sub tmp-tn tmp-tn csp-tn)
+    (inst cmp tmp-tn size)
+    (inst b :le overflow)))
 
 ;;; This is the main mechanism for allocating memory in the lisp heap.
 ;;;
@@ -181,12 +189,6 @@
   (if stack-allocate-p
       (assemble ()
         (cond ((aligned-stack-p stack-allocate-p)
-               (assemble ()
-                 (inst tst csp-tn lowtag-mask)
-                 (inst b :eq skip)
-                 (inst add csp-tn csp-tn 8)
-                 (error-call nil 'sb-kernel::unreachable-error)
-                 skip)
                (move tmp-tn csp-tn)
                (inst add csp-tn csp-tn (add-sub-immediate size result-tn))
                (inst add result-tn tmp-tn lowtag))

@@ -489,9 +489,7 @@
     ;; here because it would conflict with the existing NFP if there
     ;; is a number-stack frame in play, but we only use it prior to
     ;; actually setting up the "real" NFP.
-    (let ((result (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'any-reg)
-                                  :offset nfp-offset))
+    (let ((result (make-random-tn (sc-or-lose 'any-reg) nfp-offset))
           (delta (- (sb-allocated-size 'control-stack) fixed)))
       (assemble ()
         ;; Compute the end of the fixed stack frame (start of the MORE
@@ -1008,7 +1006,7 @@
                                    :offset ,offset
                                    :to :result)
                                   ,name))
-                 *register-arg-names* *register-arg-offsets*))
+                 register-arg-names *register-arg-offsets*))
      ,@(when (eq return :fixed)
          '((:temporary (:scs (descriptor-reg) :from :eval) move-temp)
            (:temporary (:sc any-reg :from :eval :offset ocfp-offset) ocfp-temp)))
@@ -1043,7 +1041,7 @@
                        ,@(if variable
                              `((inst sub nargs-pass csp-tn new-fp)
                                (inst asr nargs-pass nargs-pass (- word-shift n-fixnum-tag-bits))
-                               ,@(do ((arg *register-arg-names* (cddr arg))
+                               ,@(do ((arg register-arg-names (cddr arg))
                                       (i 0 (+ i 2))
                                       (insts))
                                      ((null arg) (nreverse insts))

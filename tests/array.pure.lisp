@@ -914,3 +914,28 @@
                 :element-type 'single-float
                 :initial-contents '((1.0))))
    (simple-array single-float (* *))))
+
+(with-test (:name :multidimensional-access-no-bounds-checks)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (array i j)
+                       (array-row-major-index array i j))
+                     nil))
+             2))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (array i j)
+                       (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+                       (array-row-major-index array i j))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (v)
+                       (declare ((simple-array t (4 4)) v))
+                       (aref v 3 2))
+                     nil))
+             0)))
+
+(with-test (:name :make-simple-array-not-displaced)
+  (assert (not (array-displacement (funcall (checked-compile `(lambda (d) (make-array d))) '(1 2))))))

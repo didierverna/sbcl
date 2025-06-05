@@ -188,6 +188,10 @@
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
     (unsigned 32)
   (context (* os-context-t)))
+#+linux
+(define-alien-routine ("os_context_set_fp_control" context-set-floating-point-modes) void
+  (context (* os-context-t))
+  (value (unsigned 32)))
 
 (define-alien-routine
     ("arch_get_fp_modes" floating-point-modes) (unsigned 32))
@@ -265,8 +269,9 @@
           (let* ((asm-code (sb-fasl::get-asm-routine 'undefined-tramp))
                  (base (sap+ (int-sap (get-lisp-obj-address tramp)) (- fun-pointer-lowtag)))
                  (sap (sap+ base 23)))
-            (setf (sap-ref-16 sap 1) #x2524
-                  (sap-ref-32 sap 3) (asm-routine-indirect-address asm-code)
+            (setf (sap-ref-32 sap 0) #x24A4FF41 ; JMP [R12+disp]
+                  (signed-sap-ref-32 sap 4) (asm-routine-indirect-address asm-code)
+                  (sap-ref-32 sap 8) #x90
                   ;; The undefined function name is stored in the "function" slot.
                   ;; The slot setter doesn't like this of course.
                   (sap-ref-lispobj base (ash funcallable-instance-function-slot word-shift))
@@ -293,23 +298,6 @@
                                             (- (ash simple-fun-self-slot word-shift)
                                                fun-pointer-lowtag))))))
 
-(defun validate-asm-routine-vector ()
-  ;; If the jump table in static space does not match the jump table
-  ;; in *assembler-routines*, fix the one one in static space.
-  ;; It's OK that this is delayed until startup, because code pertinent to
-  ;; core restart always uses relative jumps to asm code.
-  #+immobile-space
-  (let* ((code sb-fasl:*assembler-routines*)
-         (external-table (truly-the (simple-array word (*))
-                                    sb-fasl::*asm-routine-vector*))
-         (insts (code-instructions code))
-         (n (sb-impl::hash-table-%count (sb-fasl::%asm-routine-table code))))
-    (declare (optimize (insert-array-bounds-checks 0)))
-    (dotimes (i n)
-      (unless (= (aref external-table i) 0)
-        (setf (aref external-table i)
-              (sap-ref-word insts (truly-the index (ash (1+ i) word-shift))))))))
-
 (defconstant cf-bit 0)
 (defconstant sf-bit 7)
 (defconstant of-bit 11)
@@ -330,3 +318,28 @@
                               (ash 1 23)) ;; popcnt
                    ecx)
            #1#))))
+
+(def-cpu-feature :bmi2
+    (multiple-value-bind (eax ebx) (sb-vm::%cpu-identification 7 0)
+      (declare (ignore eax))
+      (logtest ebx #x100)))
+
+(in-package :sb-bignum)
+
+(sb-vm::def-variant multiply-bignum-and-fixnum :bmi2 (bignum fixnum)
+  (declare (type bignum bignum) (type fixnum fixnum)
+           (optimize speed (safety 0)))
+  (let* ((bignum-plus-p (bignum-plus-p bignum))
+         (fixnum-plus-p (not (minusp fixnum)))
+         (bignum (if bignum-plus-p bignum (negate-bignum-not-fully-normalized bignum)))
+         (bignum-len (%bignum-length bignum))
+         (fixnum (if fixnum-plus-p fixnum (- fixnum)))
+         (result (%allocate-bignum (1+ bignum-len))))
+    (declare (type bignum bignum result)
+             (type bignum-element-type fixnum))
+    (sb-sys:%primitive sb-vm::bignum-mulx-and-add-word-loop bignum fixnum bignum-len result)
+    (unless (eq bignum-plus-p fixnum-plus-p)
+      (negate-bignum-in-place result))
+    (%normalize-bignum result (1+ bignum-len))))
+
+(in-package :sb-vm)

@@ -149,9 +149,7 @@
                                     (ldb (byte size 0) ub))))
       result))
   (defun reg-in-sc (tn sc)
-    (make-random-tn :kind :normal
-                    :sc (sc-or-lose sc)
-                    :offset (tn-offset tn))))
+    (make-random-tn (sc-or-lose sc) (tn-offset tn))))
 
 (def-variant simd-nreverse8 :avx2 (result vector start end)
   (declare (optimize speed (safety 0)))
@@ -1265,7 +1263,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea start byte-array*))
       (inst add end byte-array*)
@@ -1328,7 +1326,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea start byte-array*))
       (inst add end byte-array*)
@@ -1403,7 +1401,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea end byte-array*))
       (inst add start byte-array*)
@@ -1466,7 +1464,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea end byte-array*))
       (inst add start byte-array*)
@@ -1542,7 +1540,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
       (inst shl end 1)
       (inst lea 32-bit-array (ea 32-bit-array* start 2))
 
@@ -1604,7 +1602,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
       (inst shl end 1)
       (inst lea 32-bit-array (ea 32-bit-array* start 2))
 
@@ -1680,7 +1678,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst shl start 1)
       (inst lea 32-bit-array (ea 32-bit-array* end 2))
@@ -1742,7 +1740,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst shl start 1)
       (inst lea 32-bit-array (ea 32-bit-array* end 2))

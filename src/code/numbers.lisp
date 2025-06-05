@@ -312,10 +312,53 @@
   (declare (type word x y))
   (%multiply-high x y))
 
+(defmacro compare-two-ratios (op numerator-x denominator-x numerator-y denominator-y)
+  `(dispatch-two-ratios
+       (numerator-x ,numerator-x)
+       (denominator-x ,denominator-x)
+       (numerator-y ,numerator-y)
+       (denominator-y ,denominator-y)
+       (or
+        ,@(case op
+            ((<= >=)
+             `((and (eql numerator-x numerator-y)
+                    (eql denominator-x denominator-y)))))
+        (,(case op
+            (<= '<)
+            (>= '>)
+            (t op))
+         (* numerator-x denominator-y)
+         (* numerator-y denominator-x)))
+       ,@(or
+          (sb-c::when-vop-existsp (:named sb-vm::signed-multiply-low-high)
+            `((multiple-value-bind (low1 high1) (%primitive sb-vm::signed-multiply-low-high numerator-x denominator-y)
+                (multiple-value-bind (low2 high2) (%primitive sb-vm::signed-multiply-low-high numerator-y denominator-x)
+                  (cond ((= high1 high2)
+                         (,op low1
+                              low2))
+                        ((,(case op
+                             (<= '<)
+                             (>= '>)
+                             (t op))
+                          high1 high2)
+                         t))))))
+          (sb-c::when-vop-existsp (:translate %signed-multiply-high)
+            `((let ((high1 (%signed-multiply-high numerator-x denominator-y))
+                    (high2 (%signed-multiply-high numerator-y denominator-x)))
+                (cond ((= high1 high2)
+                       (,op (logand most-positive-word (* numerator-x denominator-y))
+                            (logand most-positive-word (* numerator-y denominator-x))))
+                      ((,(case op
+                           (<= '<)
+                           (>= '>)
+                           (t op))
+                        high1 high2)
+                       t))))))))
+
 
 ;;;; TRUNCATE and friends
 
-(declaim (maybe-inline truncate floor ceiling))
+(declaim (maybe-inline truncate floor ceiling round fround))
 
 (defun truncate (number &optional (divisor 1))
   "Return number (or number/divisor) as an integer, rounded toward 0.
@@ -326,33 +369,37 @@
                `(truncate (coerce number ',rtype)
                           (coerce divisor ',rtype)))
              (single-digit-bignum-p (x)
-               #+(or x86-64 x86 ppc64)
+               #+(or x86-64 x86 ppc64 arm64)
                `(or (typep ,x 'word)
                     (typep ,x 'sb-vm:signed-word))
                ;; Other backends don't have native double-word/word division,
                ;; and their bigfloor implementation doesn't handle
                ;; full-width divisors.
-               #-(or x86-64 x86 ppc64)
+               #-(or x86-64 x86 ppc64 arm64)
                `(or (typep ,x '(unsigned-byte ,(1- sb-vm:n-word-bits)))
                     (typep ,x '(integer ,(- 1 (expt 2 (- sb-vm:n-word-bits 1)))
                                 ,(1- (expt 2 (- sb-vm:n-word-bits 1))))))))
     (number-dispatch ((number real) (divisor real))
       ((fixnum fixnum) (truncate number divisor))
-      (((foreach fixnum bignum) ratio)
-       (if (= (numerator divisor) 1)
-           (values (* number (denominator divisor)) 0)
-           (multiple-value-bind (quot rem)
-               (truncate (* number (denominator divisor))
-                         (numerator divisor))
-             (values quot (/ rem (denominator divisor))))))
       ((fixnum bignum)
        (if (single-digit-bignum-p divisor)
            (bignum-truncate-single-digit (make-small-bignum number) divisor)
            (bignum-truncate (make-small-bignum number) divisor)))
-      ((ratio (or float rational))
-       (let ((q (truncate (numerator number)
-                          (* (denominator number) divisor))))
-         (values q (- number (* q divisor)))))
+      ((ratio (foreach (eql 1) fixnum bignum))
+       (dispatch-ratio (number numerator denominator)
+         (multiple-value-bind (q rem) (truncate numerator
+                                                (* denominator divisor))
+           (values q (%make-ratio rem denominator)))))
+      (((foreach fixnum bignum ratio) ratio)
+       (dispatch-two-ratios
+           (n-num (numerator number))
+           (n-den (denominator number))
+           (d-num (numerator divisor))
+           (d-den (denominator divisor))
+           (let ((q-num (* n-num d-den))
+                 (q-den (* n-den d-num)))
+             (multiple-value-bind (q rem) (truncate q-num q-den)
+               (values q (/ rem (* n-den d-den)))))))
       ((bignum fixnum)
        (bignum-truncate-single-digit number divisor))
       ((bignum bignum)
@@ -360,7 +407,7 @@
            (bignum-truncate-single-digit number divisor)
            (bignum-truncate number divisor)))
       (((foreach single-float double-float #+long-float long-float)
-        (or rational single-float))
+        (foreach fixnum rational single-float))
        (if (eql divisor 1)
            (let ((res (unary-truncate number)))
              (values res (- number (coerce res '(dispatch-type number)))))
@@ -371,7 +418,7 @@
       #+long-float
       (((foreach double-float single-float) long-float)
        (truncate-float long-float))
-      ((double-float (or single-float double-float))
+      ((double-float double-float)
        (truncate-float double-float))
       ((single-float double-float)
        (truncate-float double-float))
@@ -406,20 +453,37 @@
                       (values tru rem)))))
     (number-dispatch ((number real) (divisor real))
       ((fixnum fixnum) (floor number divisor))
-      (((foreach fixnum bignum) ratio)
-       (multiple-value-bind (quot rem)
-           (truncate (* number (denominator divisor))
-                     (numerator divisor))
-         (fixup (values quot (/ rem (denominator divisor))))))
       ((fixnum bignum)
        (fixup
         (if (single-digit-bignum-p divisor)
             (bignum-truncate-single-digit (make-small-bignum number) divisor)
             (bignum-truncate (make-small-bignum number) divisor))))
-      ((ratio (or float rational))
-       (let ((q (truncate (numerator number)
-                          (* (denominator number) divisor))))
-         (fixup (values q (- number (* q divisor))))))
+      ((ratio (foreach (eql 1) fixnum bignum))
+       (dispatch-ratio (number numerator denominator)
+         (let* ((q-num numerator)
+                (q-den (* denominator divisor))
+                (rem-den denominator))
+           (multiple-value-bind (q rem) (truncate q-num q-den)
+             (if (if (minusp divisor)
+                     (> rem 0)
+                     (< rem 0))
+                 (values (1- q) (%make-ratio (+ rem q-den) rem-den))
+                 (values q (%make-ratio rem rem-den)))))))
+      (((foreach fixnum bignum ratio) ratio)
+       (dispatch-two-ratios
+           (n-num (numerator number))
+           (n-den (denominator number))
+           (d-num (numerator divisor))
+           (d-den (denominator divisor))
+           (let ((q-num (* n-num d-den))
+                 (q-den (* n-den d-num))
+                 (rem-den (* n-den d-den)))
+             (multiple-value-bind (q rem) (truncate q-num q-den)
+               (if (if (minusp d-num)
+                       (> rem 0)
+                       (< rem 0))
+                   (values (1- q) (/ (+ rem q-den) rem-den))
+                   (values q (/ rem rem-den)))))))
       ((bignum fixnum)
        (fixup (bignum-truncate-single-digit number divisor)))
       ((bignum bignum)
@@ -427,7 +491,7 @@
                   (bignum-truncate-single-digit number divisor)
                   (bignum-truncate number divisor))))
       (((foreach single-float double-float #+long-float long-float)
-        (or rational single-float))
+        (foreach fixnum rational single-float))
        (truncate-float (dispatch-type number)))
       #+long-float
       ((long-float (or single-float double-float long-float))
@@ -435,7 +499,7 @@
       #+long-float
       (((foreach double-float single-float) long-float)
        (truncate-float long-float))
-      ((double-float (or single-float double-float))
+      ((double-float double-float)
        (truncate-float double-float))
       ((single-float double-float)
        (truncate-float double-float))
@@ -470,20 +534,37 @@
                       (values tru rem)))))
     (number-dispatch ((number real) (divisor real))
       ((fixnum fixnum) (ceiling number divisor))
-      (((foreach fixnum bignum) ratio)
-       (multiple-value-bind (quot rem)
-           (truncate (* number (denominator divisor))
-                     (numerator divisor))
-         (fixup (values quot (/ rem (denominator divisor))))))
       ((fixnum bignum)
        (fixup
         (if (single-digit-bignum-p divisor)
             (bignum-truncate-single-digit (make-small-bignum number) divisor)
             (bignum-truncate (make-small-bignum number) divisor))))
-      ((ratio (or float rational))
-       (let ((q (truncate (numerator number)
-                          (* (denominator number) divisor))))
-         (fixup (values q (- number (* q divisor))))))
+      ((ratio (foreach (eql 1) fixnum bignum))
+       (dispatch-ratio (number numerator denominator)
+         (let* ((q-num numerator)
+                (q-den (* denominator divisor))
+                (rem-den denominator))
+           (multiple-value-bind (q rem) (truncate q-num q-den)
+             (if (if (minusp divisor)
+                     (< rem 0)
+                     (> rem 0))
+                 (values (1+ q) (%make-ratio (- rem q-den) rem-den))
+                 (values q (%make-ratio rem rem-den)))))))
+      (((foreach fixnum bignum ratio) ratio)
+       (dispatch-two-ratios
+           (n-num (numerator number))
+           (n-den (denominator number))
+           (d-num (numerator divisor))
+           (d-den (denominator divisor))
+           (let ((q-num (* n-num d-den))
+                 (q-den (* n-den d-num))
+                 (rem-den (* n-den d-den)))
+             (multiple-value-bind (q rem) (truncate q-num q-den)
+               (if (if (minusp d-num)
+                       (< rem 0)
+                       (> rem 0))
+                   (values (1+ q) (/ (- rem q-den) rem-den))
+                   (values q (/ rem rem-den)))))))
       ((bignum fixnum)
        (fixup (bignum-truncate-single-digit number divisor)))
       ((bignum bignum)
@@ -492,7 +573,7 @@
             (bignum-truncate-single-digit number divisor)
             (bignum-truncate number divisor))))
       (((foreach single-float double-float #+long-float long-float)
-        (or rational single-float))
+        (foreach fixnum rational single-float))
        (truncate-float (dispatch-type number)))
       #+long-float
       ((long-float (or single-float double-float long-float))
@@ -500,13 +581,13 @@
       #+long-float
       (((foreach double-float single-float) long-float)
        (truncate-float long-float))
-      ((double-float (or single-float double-float))
+      ((double-float double-float)
        (truncate-float double-float))
       ((single-float double-float)
        (truncate-float double-float))
       (((foreach fixnum bignum ratio)
         (foreach single-float double-float #+long-float long-float))
-        (truncate-float (dispatch-type divisor))))))
+       (truncate-float (dispatch-type divisor))))))
 
 (defun truncate1 (number divisor)
   (declare (explicit-check)
@@ -523,12 +604,6 @@
            (inline ceiling))
   (values (ceiling number divisor)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (dolist (s '(truncate floor ceiling))
-    (clear-info :function :inlining-data s)
-    (clear-info :function :inlinep s)
-    (clear-info :source-location :declaration s)))
-
 (defun rem (number divisor)
   "Return second result of TRUNCATE."
   (declare (explicit-check))
@@ -542,42 +617,93 @@
 (defun round (number &optional (divisor 1))
   "Rounds number (or number/divisor) to nearest integer.
   The second returned value is the remainder."
-  (declare (explicit-check))
-  (if (eql divisor 1)
-      (round number)
-      (multiple-value-bind (tru rem) (truncate number divisor)
-        (if (zerop rem)
-            (values tru rem)
-            (let ((thresh (/ (abs divisor) 2)))
-              (cond ((or (> rem thresh)
-                         (and (= rem thresh) (oddp tru)))
-                     (if (minusp divisor)
-                         (values (- tru 1) (+ rem divisor))
-                         (values (+ tru 1) (- rem divisor))))
-                    ((let ((-thresh (- thresh)))
-                       (or (< rem -thresh)
-                           (and (= rem -thresh) (oddp tru))))
-                     (if (minusp divisor)
-                         (values (+ tru 1) (- rem divisor))
-                         (values (- tru 1) (+ rem divisor))))
-                    (t (values tru rem))))))))
+  (declare (explicit-check)
+           (maybe-inline round))
+  (macrolet ((round-float (rtype)
+               `(round (coerce number ',rtype) (coerce divisor ',rtype))))
+    (number-dispatch ((number real) (divisor real))
+      (((foreach single-float double-float)
+        (foreach single-float fixnum rational))
+       (round-float (dispatch-type number)))
+      ((double-float double-float)
+       (round-float double-float))
+      ((single-float double-float)
+       (round-float double-float))
+      (((foreach fixnum bignum ratio)
+        (foreach single-float double-float))
+       (round-float (dispatch-type divisor)))
+      ((fixnum (foreach bignum fixnum))
+       #1=
+       (multiple-value-bind (tru rem) (truncate number divisor)
+         (if (zerop rem)
+             (values tru rem)
+             (let ((thresh (* (abs rem) 2))
+                   (abs-divisor (abs divisor)))
+               (cond ((or (> thresh abs-divisor)
+                          (and (= thresh abs-divisor)
+                               (oddp tru)))
+                      (if (or (minusp tru)
+                              (and (zerop tru)
+                                   (neq (minusp number) (minusp divisor))))
+                          (values (- tru 1) (+ rem divisor))
+                          (values (+ tru 1) (- rem divisor))))
+                     (t
+                      (values tru rem)))))))
+      ((bignum integer)
+       #1#)
+      ((ratio
+        (foreach (eql 1) fixnum bignum))
+       (dispatch-two-ratios
+           (n-num (numerator number))
+           (n-den (denominator number))
+           (d-num (numerator divisor))
+           (d-den (denominator divisor))
+           (let ((q-num (* n-num d-den))
+                 (q-den (* n-den d-num)))
+             (multiple-value-bind (q rem) (round q-num q-den)
+               (values q (%make-ratio rem (* n-den d-den)))))))
+      (((foreach ratio fixnum bignum) ratio)
+       (dispatch-two-ratios
+           (n-num (numerator number))
+           (n-den (denominator number))
+           (d-num (numerator divisor))
+           (d-den (denominator divisor))
+           (let ((q-num (* n-num d-den))
+                 (q-den (* n-den d-num)))
+             (multiple-value-bind (q rem) (round q-num q-den)
+               (values q (/ rem (* n-den d-den))))))))))
+
+(defun round1 (number divisor)
+  (declare (explicit-check)
+           (inline round))
+  (values (round number divisor)))
+
+(defun %unary-round (number)
+  (declare (explicit-check)
+           (inline round))
+  (values (round number 1)))
+
+(defun %unary-truncate (number)
+  (declare (explicit-check)
+           (inline truncate))
+  (values (truncate number 1)))
+
+(defun unary-truncate (number)
+  (declare (explicit-check)
+           (inline truncate))
+  (truncate number 1))
 
 (defmacro !define-float-rounding-function (name op doc)
   `(defun ,name (number &optional (divisor 1))
-    ,doc
-    (multiple-value-bind (res rem) (,op number divisor)
-      (values (float res (if (floatp rem) rem 1.0)) rem))))
-
-;;; Declare these guys inline to let them get optimized a little.
-;;; ROUND and FROUND are not declared inline since they seem too
-;;; obscure and too big to inline-expand by default. Also, this gives
-;;; the compiler a chance to pick off the unary float case.
-(declaim (inline fceiling ffloor ftruncate))
+     ,doc
+     (multiple-value-bind (res rem) (,op number divisor)
+       (values (float res (if (floatp rem) rem 1.0)) rem))))
 
 #-round-float
 (defun fround (number &optional (divisor 1))
   "Same as ROUND, but returns first value as a float."
-  (declare (explicit-check))
+  (declare (explicit-check)
+           (maybe-inline fround))
   (macrolet ((fround-float (rtype)
                `(let* ((float-div (coerce divisor ',rtype))
                        (res (%unary-fround (/ number float-div))))
@@ -612,47 +738,63 @@
         (foreach single-float double-float #+long-float long-float))
        (fround-float (dispatch-type divisor))))))
 
-(macrolet ((def (name mode docstring)
-             `(defun ,name (number &optional (divisor 1))
-                ,docstring
+#-round-float
+(defun fround1 (number divisor)
+  (declare (explicit-check)
+           (inline fround))
+  (values (fround number divisor)))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (dolist (s '(truncate floor ceiling round fround))
+    (clear-info :function :inlining-data s)
+    (clear-info :function :inlinep s)
+    (clear-info :source-location :declaration s)))
+
+(macrolet ((def (name mode docstring &optional values)
+             `(defun ,name (number ,@(if values
+                                         `(divisor)
+                                         `(&optional (divisor 1))))
                 (declare (explicit-check))
-                (macrolet ((ftruncate-float (rtype)
-                             `(let* ((float-div (coerce divisor ',rtype))
-                                     (res (,(case rtype
-                                              (double-float 'sb-kernel:round-double)
-                                              (single-float 'sb-kernel:round-single))
-                                           (/ number float-div)
-                                           ,,mode)))
-                                (values res
-                                        (- number
-                                           (* (coerce res ',rtype) float-div)))))
-                           (unary-ftruncate-float (rtype)
-                             `(let* ((res (,(case rtype
-                                              (double-float 'sb-kernel:round-double)
-                                              (single-float 'sb-kernel:round-single))
-                                           number
-                                           ,,mode)))
-                                (values res (- number res)))))
-                  (number-dispatch ((number real) (divisor real))
-                    (((foreach fixnum bignum ratio) (or fixnum bignum ratio))
-                     (multiple-value-bind (q r)
-                         (,(find-symbol (string mode) :cl) number divisor)
-                       (if (and (zerop q) (or (and (minusp number) (not (minusp divisor)))
-                                              (and (not (minusp number)) (minusp divisor))))
-                           (values -0f0 r)
-                           (values (float q) r))))
-                    (((foreach single-float double-float)
-                      (or rational single-float))
-                     (if (eql divisor 1)
-                         (unary-ftruncate-float (dispatch-type number))
-                         (ftruncate-float (dispatch-type number))))
-                    ((double-float (or single-float double-float))
-                     (ftruncate-float double-float))
-                    ((single-float double-float)
-                     (ftruncate-float double-float))
-                    (((foreach fixnum bignum ratio)
-                      (foreach single-float double-float))
-                     (ftruncate-float (dispatch-type divisor))))))))
+                ,docstring
+                ,(wrap-if
+                  values '(values)
+                  `(macrolet ((ftruncate-float (rtype)
+                                `(let* ((float-div (coerce divisor ',rtype))
+                                        (res (,(case rtype
+                                                 (double-float 'sb-kernel:round-double)
+                                                 (single-float 'sb-kernel:round-single))
+                                              (/ number float-div)
+                                              ,,mode)))
+                                   (values res
+                                           (- number
+                                              (* (coerce res ',rtype) float-div)))))
+                              (unary-ftruncate-float (rtype)
+                                `(let* ((res (,(case rtype
+                                                 (double-float 'sb-kernel:round-double)
+                                                 (single-float 'sb-kernel:round-single))
+                                              number
+                                              ,,mode)))
+                                   (values res (- number res)))))
+                     (number-dispatch ((number real) (divisor real))
+                       (((foreach fixnum bignum ratio) (or fixnum bignum ratio))
+                        (multiple-value-bind (q r)
+                            (,(find-symbol (string mode) :cl) number divisor)
+                          (if (and (zerop q) (or (and (minusp number) (not (minusp divisor)))
+                                                 (and (not (minusp number)) (minusp divisor))))
+                              (values -0f0 r)
+                              (values (float q) r))))
+                       (((foreach single-float double-float)
+                         (foreach fixnum rational single-float))
+                        (if (eql divisor 1)
+                            (unary-ftruncate-float (dispatch-type number))
+                            (ftruncate-float (dispatch-type number))))
+                       ((double-float double-float)
+                        (ftruncate-float double-float))
+                       ((single-float double-float)
+                        (ftruncate-float double-float))
+                       (((foreach fixnum bignum ratio)
+                         (foreach single-float double-float))
+                        (ftruncate-float (dispatch-type divisor)))))))))
   (def ftruncate :truncate
     "Same as TRUNCATE, but returns first value as a float.")
 
@@ -662,19 +804,28 @@
   (def fceiling :ceiling
     "Same as CEILING, but returns first value as a float.")
 
+  (def ftruncate1 :truncate nil t)
+
+  (def ffloor1 :floor nil t)
+
+  (def fceiling1 :ceiling nil t)
+
   #+round-float
   (def fround :round
     "Same as ROUND, but returns first value as a float.")
 
-  (macrolet ((def (name)
-               `(defun ,name (x mode)
-                  (ecase mode
-                    ,@(loop for m in '(#-round-float :round :floor :ceiling :truncate)
-                            collect `(,m (,name x ,m)))))))
+  #+round-float
+  (def fround1 :round nil t))
+
+(macrolet ((def (name)
+             `(defun ,name (x mode)
+                (ecase mode
+                  ,@(loop for m in '(#-round-float :round :floor :ceiling :truncate)
+                          collect `(,m (,name x ,m)))))))
 
 
-    (def round-single)
-    (def round-double)))
+  (def round-single)
+  (def round-double))
 
 ;;;; comparisons
 
@@ -985,30 +1136,6 @@ the first."
          (,op x (rational y))))))
   )                                     ; EVAL-WHEN
 
-(defmacro dispatch-ratio ((ratio numerator denominator) &body body)
-  `(let ((,numerator (numerator ,ratio))
-         (,denominator (denominator ,ratio)))
-     (if (and (fixnump ,numerator)
-              (fixnump ,denominator))
-         (progn ,@body)
-         (progn ,@body))))
-
-(defmacro dispatch-two-ratios ((ratio1 numerator1 denominator1)
-                               (ratio2 numerator2 denominator2)
-                               body
-                               &optional (fixnum-body body))
-  `(let ((,numerator1 (numerator ,ratio1))
-         (,denominator1 (denominator ,ratio1))
-         (,numerator2 (numerator ,ratio2))
-         (,denominator2 (denominator ,ratio2)))
-     (if (and (fixnump ,numerator1)
-              (fixnump ,numerator2)
-              (fixnump ,denominator1)
-              (fixnump ,denominator2))
-         ,fixnum-body
-         ,body)))
-
-
 (macrolet ((def-two-arg-</> (name op ratio-arg1 ratio-arg2 &rest cases)
              `(defun ,name (x y)
                 (declare (explicit-check))
@@ -1037,45 +1164,8 @@ the first."
                                    denominator)
                       y)))
                   ((ratio ratio)
-                   (dispatch-two-ratios
-                       (x numerator-x denominator-x)
-                       (y numerator-y denominator-y)
-                       (or
-                        ,@(case op
-                            ((<= >=)
-                             `((and (eql numerator-x numerator-y)
-                                    (eql denominator-x denominator-y)))))
-                        (,(case op
-                            (<= '<)
-                            (>= '>)
-                            (t op))
-                         (* numerator-x denominator-y)
-                         (* numerator-y denominator-x)))
-                       ,@(or
-                          (sb-c::when-vop-existsp (:named sb-vm::signed-multiply-low-high)
-                            `((multiple-value-bind (low1 high1) (%primitive sb-vm::signed-multiply-low-high numerator-x denominator-y)
-                                (multiple-value-bind (low2 high2) (%primitive sb-vm::signed-multiply-low-high numerator-y denominator-x)
-                                  (cond ((= high1 high2)
-                                         (,op low1
-                                              low2))
-                                        ((,(case op
-                                             (<= '<)
-                                             (>= '>)
-                                             (t op))
-                                          high1 high2)
-                                         t))))))
-                          (sb-c::when-vop-existsp (:translate %signed-multiply-high)
-                            `((let ((high1 (%signed-multiply-high numerator-x denominator-y))
-                                    (high2 (%signed-multiply-high numerator-y denominator-x)))
-                                (cond ((= high1 high2)
-                                       (,op (logand most-positive-word (* numerator-x denominator-y))
-                                            (logand most-positive-word (* numerator-y denominator-x))))
-                                      ((,(case op
-                                           (<= '<)
-                                           (>= '>)
-                                           (t op))
-                                        high1 high2)
-                                       t))))))))
+                   (compare-two-ratios ,op (numerator x) (denominator x)
+                                       (numerator y) (denominator y)))
                   ,@cases))))
   (def-two-arg-</> two-arg-< < floor ceiling
     ((fixnum bignum)
@@ -1355,6 +1445,14 @@ and the number of 0 bits if INTEGER is negative."
          (bignum-ashift-left integer count)
          (bignum-ashift-right integer (- count))))))
 
+(defun ash-right (integer count)
+  (declare (explicit-check))
+  (number-dispatch ((integer integer))
+    ((fixnum)
+     (ash integer (- (truly-the (mod #.sb-vm:n-word-bits) count))))
+    ((bignum)
+     (bignum-ashift-right integer count))))
+
 (defun integer-length (integer)
   "Return the number of non-sign bits in the twos-complement representation
   of INTEGER."
@@ -1550,7 +1648,26 @@ and the number of 0 bits if INTEGER is negative."
                 (values n m))
           (* (truncate max (gcd n m)) min)))))
 
+;;; Actually do a simple Euclidean algorithm instead of a binary GCD,
+;;; binary GCD is slow on large numbers, using count-trailing-zeros
+;;; helps, but only when there's a lot of trailing zeros.
+;;; Using division before doing binary GCD, like some sources suggest,
+;;; doesn't speed things up uniformly.
 (declaim (maybe-inline fixnum-gcd))
+#-arm
+(defun fixnum-gcd (u v)
+  (declare (optimize (safety 0) speed)
+           (fixnum u v))
+  (let ((u (abs u))
+        (v (abs v)))
+    (declare (sb-vm:signed-word u v))
+    (loop (setf (values u v)
+                (values v (rem u (the (not (eql 0)) v))))
+          (if (zerop v)
+              (return u)))))
+
+;;; But 32-bit arm has no division instruction
+#+arm
 (defun fixnum-gcd (u v)
   (declare (optimize (safety 0)))
   (locally
@@ -1573,9 +1690,8 @@ and the number of 0 bits if INTEGER is negative."
       (declare (type (mod #.sb-vm:n-word-bits) k)
                (type sb-vm:signed-word u v)))))
 
-;;; Do the GCD of two integer arguments. With fixnum arguments, we use the
-;;; binary GCD algorithm from Knuth's seminumerical algorithms (slightly
-;;; structurified), otherwise we call BIGNUM-GCD. We pick off the special case
+;;; Do the GCD of two integer arguments.
+;;; We pick off the special case
 ;;; of 0 before the dispatch so that the bignum code doesn't have to worry
 ;;; about "small bignum" zeros.
 (defun two-arg-gcd (u v)
@@ -1599,17 +1715,34 @@ and the number of 0 bits if INTEGER is negative."
 ;;; bignum case, we don't bother, since bignum division is expensive,
 ;;; and the test is not very likely to succeed.
 (defun integer-/-integer (x y)
-  (declare (explicit-check))
+  (declare (explicit-check)
+           (inline fixnum-gcd))
   (if (and (typep x 'fixnum) (typep y 'fixnum))
-      (multiple-value-bind (quo rem) (truncate x y)
-        (if (zerop rem)
-            quo
-            (let* ((gcd (gcd (truly-the (not (eql 0)) x) y)))
-              (multiple-value-bind (num den)
-                  (if (eql gcd 1)
-                      (values x y)
-                      (values (truncate x gcd) (truncate y gcd)))
-                (build-ratio num (truly-the (not (integer 0 1)) den))))))
+      (cond ((= x 0)
+             0)
+            (t
+             (let ((abs-x (abs x))
+                   (abs-y (abs y)))
+               (if (> abs-y abs-x)
+                   ;; It is a ratio, truncate anyway, leaving less work for GCD.
+                   (multiple-value-bind (quo rem) (truncate y x)
+                     (if (zerop rem)
+                         (build-ratio 1 (truly-the (not (integer 0 1)) quo))
+                         (let* ((gcd (gcd x rem)))
+                           (multiple-value-bind (num den)
+                               (if (eql gcd 1)
+                                   (values x y)
+                                   (values (truncate x gcd) (truncate y gcd)))
+                             (build-ratio num (truly-the (not (integer 0 1)) den))))))
+                   (multiple-value-bind (quo rem) (truncate x y)
+                     (if (zerop rem)
+                         quo
+                         (let* ((gcd (gcd y rem)))
+                           (multiple-value-bind (num den)
+                               (if (eql gcd 1)
+                                   (values x y)
+                                   (values (truncate x gcd) (truncate y gcd)))
+                             (build-ratio num (truly-the (not (integer 0 1)) den))))))))))
       (let ((gcd (gcd x y)))
         (multiple-value-bind (num den)
             (if (eql gcd 1)
@@ -1680,65 +1813,62 @@ and the number of 0 bits if INTEGER is negative."
        (build-ratio (maybe-truncate nx gcd)
                     (* (maybe-truncate y gcd) (denominator x)))))))
 
-;;; from Robert Smith; changed not to cons unnecessarily, and tuned for
-;;; faster operation on fixnum inputs by compiling the central recursive
-;;; algorithm twice, once using generic and once fixnum arithmetic, and
-;;; dispatching on function entry into the applicable part. For maximum
-;;; speed, the fixnum part recurs into itself, thereby avoiding further
-;;; type dispatching. This pattern is not supported by NUMBER-DISPATCH
-;;; thus some special-purpose macrology is needed.
+;;; This uses the algorithm employed by python in
+;;; https://github.com/python/cpython/blob/3.13/Modules/mathmodule.c#L1494
 (defun isqrt (n)
   "Return the greatest integer less than or equal to the square root of N."
-  (declare (type unsigned-byte n) (explicit-check))
-  (macrolet
-      ((isqrt-recursion (arg recurse fixnum-p)
-         ;; Expands into code for the recursive step of the ISQRT
-         ;; calculation. ARG is the input variable and RECURSE the name
-         ;; of the function to recur into. If FIXNUM-P is true, some
-         ;; type declarations are added that, together with ARG being
-         ;; declared as a fixnum outside of here, make the resulting code
-         ;; compile into fixnum-specialized code without any calls to
-         ;; generic arithmetic. Else, the code works for bignums, too.
-         ;; The input must be at least 16 to ensure that RECURSE is called
-         ;; with a strictly smaller number and that the result is correct
-         ;; (provided that RECURSE correctly implements ISQRT, itself).
-         `(macrolet ((if-fixnum-p-truly-the (type expr)
-                       ,@(if fixnum-p
-                             '(`(truly-the ,type ,expr))
-                             '((declare (ignore type))
-                               expr))))
-            (let* ((fourth-size (ash (1- (integer-length ,arg)) -2))
-                   (significant-half (ash ,arg (- (ash fourth-size 1))))
-                   (significant-half-isqrt
-                     (if-fixnum-p-truly-the
-                      (integer 1 #.(isqrt most-positive-fixnum))
-                      (,recurse significant-half)))
-                   (zeroth-iteration (ash significant-half-isqrt
-                                          fourth-size)))
-              (multiple-value-bind (quot rem)
-                  (floor ,arg zeroth-iteration)
-                (let ((first-iteration (ash (+ zeroth-iteration quot) -1)))
-                  (cond ((oddp quot)
-                         first-iteration)
-                        ((> (if-fixnum-p-truly-the
-                             fixnum
-                             (expt (- first-iteration zeroth-iteration) 2))
-                            rem)
-                         (1- first-iteration))
-                        (t
-                         first-iteration))))))))
-    (typecase n
-      (fixnum (labels ((fixnum-isqrt (n)
-                         (declare (type fixnum n))
-                         (cond ((> n 24)
-                                (isqrt-recursion n fixnum-isqrt t))
-                               ((> n 15) 4)
-                               ((> n  8) 3)
-                               ((> n  3) 2)
-                               ((> n  0) 1)
-                               ((= n  0) 0))))
-                (fixnum-isqrt n)))
-      (bignum (isqrt-recursion n isqrt nil)))))
+  (declare (explicit-check))
+  (labels ((approximate-isqrt (n)
+             (declare ((unsigned-byte 64) n))
+             (let ((table #.(coerce (loop for i from 64 below 256
+                                          collect (min (round (sqrt (+ (* i 256) 128))) 255))
+                                    '(vector (unsigned-byte 8)))))
+
+               (let* ((u (aref table (truly-the index (- (ash n -56) 64))))
+                      (u (+ (ash u 7)
+                            (truncate (ash n -41) u))))
+                 (+ (ash u 15)
+                    (truncate (ash n -17) u))))))
+    (declare (inline approximate-isqrt))
+    (macrolet ((word-sized-sqrt (type)
+                 `(let* ((c (truncate (1- (integer-length n)) 2))
+                         (shift (- 31 c))
+                         (approximate (truly-the ,type
+                                                 (ash (approximate-isqrt
+                                                       (truly-the (unsigned-byte 64) (ash n (* shift 2))))
+                                                      (- shift)))))
+                    (if (> (truly-the ,type (* approximate approximate)) n)
+                        (1- approximate)
+                        approximate))))
+
+      (number-dispatch ((n unsigned-byte))
+        ((fixnum)
+         (cond ((zerop n)
+                0)
+               (t
+                (word-sized-sqrt fixnum))))
+        ((word)
+         (word-sized-sqrt (unsigned-byte 64)))
+        ((unsigned-byte)
+         (let* ((bit-length (integer-length n))
+                (c (floor (1- bit-length) 2))
+                (c-bit-length (integer-length c))
+                (d (ash c (- 5 c-bit-length)))
+                (m #-64-bit (ash n (- 62 (* 2 c)))
+                   #+64-bit (sb-bignum::last-bignum-part=>word (logand bit-length 1) (- (* 2 c) 62) n))
+                (a (ash (approximate-isqrt m) (truly-the (integer * 0) (- d 31)))))
+           (loop for s from (- c-bit-length 6) downto 0
+                 for e = d
+                 do
+                 (setf d (ash c (- s)))
+                 (let* ((shift-amount (- (+ (* 2 c) 1) d e))
+                        (n-shifted (ash n (- shift-amount)))
+                        (q (truncate n-shifted a)))
+
+                   (setf a (+ (ash a (- d 1 e)) q))))
+           (when (< n (* a a))
+             (decf a))
+           a))))))
 
 ;;;; miscellaneous number predicates
 
@@ -1822,3 +1952,7 @@ and the number of 0 bits if INTEGER is negative."
     (if (minusp integer)
         (sb-c::mask-signed-field sb-vm:n-fixnum-bits (ash integer amount))
         (logand most-positive-fixnum (ash integer amount)))))
+
+(defun sb-vm::truncate-mod64 (a b)
+  (multiple-value-bind (q r) (truncate a b)
+    (values (ldb (byte 64 0) q) r)))

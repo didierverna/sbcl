@@ -34,18 +34,44 @@
 
 ;;;; routines for dealing with static symbols
 
-;;; the byte offset of the static symbol SYMBOL
+;;; the distance from tagged ptr to NIL to tagged ptr to static SYMBOL, in bytes
 (defun static-symbol-offset (symbol)
   (if symbol
-      ;; This predicate returns a generalized boolean, integer indicating truth
-      ;; and also the index, or T if the argument is NIL, or NIL if non-static.
+      ;; STATIC-SYMBOL-P returns a generalized boolean: an integer indicating
+      ;; the index, or T if the argument is NIL, or NIL if non-static.
       (let ((posn (static-symbol-p symbol)))
-        (unless posn (error "~S is not a static symbol." symbol))
+        (unless (fixnump posn) (error "~S is not a static symbol." symbol))
+        #+x86-64
+        (case symbol
+          ((t) (- t-nil-offset))
+          (t (+ (* (1- posn) (pad-data-block symbol-size))
+                (- nil-value-offset)
+                (ash 258 word-shift) ; **PRIMITIVE-OBJECT-LAYOUTS**
+                other-pointer-lowtag)))
+        #-x86-64
         (+ (* posn (pad-data-block symbol-size))
            (pad-data-block (1- symbol-size))
            other-pointer-lowtag
            (- list-pointer-lowtag)))
       0))
+
+;; Return T if SYMBOL will have a nonzero TLS index at load time or sooner.
+;; True of all specials exported from CL:, all which expose slots of the thread
+;; structure, and any symbol that the compiler decides will eventually have a
+;; nonzero TLS index due to compiling a dynamic binding of it.
+;; A reason why you should prefer eager TLS assignment (for a slight reduction
+;; in number of instructions executed) - is that in well-crafted code, the user
+;; ought to have used DEFGLOBAL (or -LOAD-TIME) to define specials which are NOT
+;; thread-locally bound. Therefore all other special vars must have the expectation
+;; of at some point getting thread-locally bound. Assuming that to be the case,
+;; it is advantageous to wire in the TLS index for all non-globals.
+;; However, some applications - those which create symbols as data - create too
+;; many symbols to eagerly assign TLS indices, and so the default is NIL.
+(defparameter *eager-tls-assignment* nil)
+(defun symbol-always-has-tls-index-p (symbol)
+  (if *eager-tls-assignment*
+      (not (static-symbol-p symbol))
+      (not (null (info :variable :wired-tls symbol)))))
 
 (symbol-macrolet ((space-end (+ alien-linkage-space-start alien-linkage-space-size)))
 ;;; the address of the linkage table entry for table index I.
@@ -59,22 +85,6 @@
   (ecase alien-linkage-table-growth-direction
     (:up   (floor (- addr alien-linkage-space-start) alien-linkage-table-entry-size))
     (:down (1- (floor (- space-end addr) space-end))))))
-
-;;; Return absolute address of the 'fun' slot in static fdefn NAME.
-(defun static-fdefn-fun-addr (name)
-  (+ nil-value
-     (static-fdefn-offset name)
-     (- other-pointer-lowtag)
-     (ash fdefn-fun-slot word-shift)))
-
-;;; Return the (byte) offset from NIL to the raw-addr slot of the
-;;; fdefn object for the static function NAME.
-(defun static-fun-offset (name)
-  #+linkage-space (error "Can't compute static-fun-offset to ~S" name)
-  #-linkage-space
-  (+ (static-fdefn-offset name)
-     (- other-pointer-lowtag)
-     (* fdefn-raw-addr-slot n-word-bytes)))
 
 
 ;;;; interfaces to IR2 conversion
@@ -106,16 +116,18 @@
                       (nth n *register-arg-offsets*))
       (make-sc+offset control-stack-sc-number n)))
 
-(defstruct fixed-call-args-state
+(defstruct (fixed-call-args-state
+            (:copier nil)
+            (:predicate nil)
+            (:constructor make-fixed-call-args-state ()))
   (descriptors -1 :type fixnum)
   #-c-stack-is-control-stack
   (non-descriptors -1 :type fixnum)
   (float -1 :type fixnum))
 
-(declaim (#+sb-xc-host special
-          #-sb-xc-host sb-ext:global
-          *float-regs* *descriptor-args*
-          #-c-stack-is-control-stack *non-descriptor-args*))
+#-(or arm64 x86-64) (defvar *descriptor-args*)
+#-(or arm64 c-stack-is-control-stack) (defvar *non-descriptor-args*)
+#-(or x86 arm64 x86-64) (defvar *float-regs*)
 
 (defun fixed-call-arg-location (type state)
   (let* ((primtype (if (typep type 'primitive-type)
@@ -240,7 +252,15 @@
        (not (types-equal-or-intersect
              (tn-ref-type tn-ref)
              (if permit-nil
-                 (specifier-type '(or cons . #1=(#+64-bit single-float function cons instance character)))
+                 (specifier-type '(or cons . #1=(#+64-bit single-float function instance character)))
+                 (specifier-type '(or list . #1#)))))))
+
+(defun number-or-other-pointer-tn-ref-p (tn-ref &optional permit-nil)
+  (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
+       (not (types-equal-or-intersect
+             (tn-ref-type tn-ref)
+             (if permit-nil
+                 (specifier-type '(or cons . #1=(function instance character)))
                  (specifier-type '(or list . #1#)))))))
 
 ;;; Can LOWTAG be distinguished from other tn lowtags by testing a single bit?
@@ -532,8 +552,11 @@
                             ((sb-kernel::defstruct-description-p type)
                              (dd-name type)))))
         (when (and typename (sb-xc:subtypep typename 'ctype))
-          (error "~S instance constructor called in a non-system file"
-                 typename)))
+          ;; If stack-allocation occurs, we should never have to
+          ;; call this predicate to inquire which TLAB to use.
+          (#.(cl:if sb-ext:*stack-allocate-dynamic-extent* 'error 'sb-c:compiler-notify)
+             "~S instance constructor called" typename))
+        nil)
       (and node
            (env-system-tlab-p (sb-c::node-lexenv node)))))
 

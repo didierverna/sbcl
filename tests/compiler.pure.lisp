@@ -2085,7 +2085,7 @@
                                      (declare (optimize (speed 3)))
                                      (+ x 2))))))
     ;; forced-to-do GENERIC-+, etc, possible word -> bignum conversion note
-    (assert (> (length notes) 1)))
+    (assert (> (length notes) 0)))
 
   (let ((notes (nth-value
                 4 (checked-compile '(lambda (x)
@@ -3101,6 +3101,15 @@
            (setq x (make-array '(4 4)))
            (adjust-array y '(3 5))
            (array-dimension y 0)))
+    (((make-array '(4 4) :initial-element nil :adjustable t)) 3))
+  (checked-compile-and-assert (:optimize nil)
+      `(lambda (x)
+         (declare (optimize speed))
+         (declare (type (array * (4 4)) x))
+         (let ((y x))
+           (setq x (make-array '(4 4)))
+           (adjust-array y '(3 5))
+           (array-dimension (the (array t) y) 0)))
     (((make-array '(4 4) :initial-element nil :adjustable t)) 3)))
 
 (with-test (:name :with-timeout-code-deletion-note)
@@ -4339,26 +4348,6 @@
                                (type (and fixnum a) x))
                       x)
                    :allow-style-warnings t))
-
-(with-test (:name (compile :bug-959687))
-  (flet ((test (form)
-           (multiple-value-bind (fun failure-p warnings style-warnings)
-               (checked-compile form :allow-failure t :allow-style-warnings t)
-             (declare (ignore warnings))
-             (assert (and failure-p style-warnings))
-             (assert-error(funcall fun t)))))
-    (test `(lambda (x)
-             (case x
-               (t
-                :its-a-t)
-               (otherwise
-                :somethign-else))))
-    (test `(lambda (x)
-             (case x
-               (otherwise
-                :its-an-otherwise)
-               (t
-                :somethign-else))))))
 
 (with-test (:name (compile :bug-924276))
   (assert (nth-value

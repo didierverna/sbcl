@@ -375,23 +375,24 @@ not supported."
     ;;   To be totally safe you should restrict yourself to only executing async-signal safe
     ;;   operations until such time as one of the exec functions is called.
     #+sb-thread
-    (when (cdr (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
-                 (sb-impl::finalizer-thread-stop)
-                 ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
-                 ;; Do that now so that the forked process has only the main thread
-                 ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
-                 (sb-thread::%dispose-thread-structs)
-                 ;; Threads are added to ALL-THREADS before they have an OS thread,
-                 ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
-                 ;; So we need to go lower-level to sense whether any exist.
-                 (sb-thread:avltree-list sb-thread::*all-threads*)))
+    (when (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
+            (sb-impl::finalizer-thread-stop)
+            ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
+            ;; Do that now so that the forked process has only the main thread
+            ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
+            (sb-thread::%dispose-thread-structs)
+            ;; Threads are added to ALL-THREADS before they have an OS thread,
+            ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
+            ;; So we need to go lower-level to sense whether any exist.
+            (> (sb-thread::avl-count sb-thread::*all-threads*) 1))
       (sb-impl::finalizer-thread-start)
       (error "Cannot fork with multiple threads running."))
-    (let ((pid (posix-fork)))
-      (when (= pid 0) ; child
-        (alien-funcall (extern-alien "sb_posix_after_fork" (function void))))
-      #+sb-thread (sb-impl::finalizer-thread-start)
-      pid))
+    (sb-sys:without-interrupts
+      (let ((pid (posix-fork)))
+        (when (= pid 0)                 ; child
+          (alien-funcall (extern-alien "sb_posix_after_fork" (function void))))
+        #+sb-thread (sb-impl::finalizer-thread-start)
+        pid)))
   (export 'fork :sb-posix)
 
   (define-call "getpgid" pid-t minusp (pid pid-t))
@@ -744,11 +745,13 @@ not supported."
 (defmacro define-stat-call (name arg designator-fun type)
   ;; FIXME: this isn't the documented way of doing this, surely?
   (let ((lisp-name (lisp-for-c-symbol name))
-        (real-name #+inode64 (format nil "~A$INODE64" name)
-                   #-inode64 name))
+        (real-name (or #+inode64
+                       (format nil "~A$INODE64" name)
+                       #+(and ucrt 64-bit)
+                       (format nil "~A64" name)
+                       name)))
     `(progn
       (export ',lisp-name :sb-posix)
-      (declaim (inline ,lisp-name))
       (defun ,lisp-name (,arg &optional stat)
         (declare (type (or null stat) stat))
         (with-alien-stat a-stat ()
@@ -908,7 +911,8 @@ not supported."
 (progn
   (export 'time :sb-posix)
   (defun time ()
-    (let ((result (alien-funcall (extern-alien "time"
+    (let ((result (alien-funcall (extern-alien #-64-bit-time "time"
+                                               #+64-bit-time "__time64"
                                                (function time-t (* time-t)))
                                  nil)))
       (if (minusp result)
@@ -916,18 +920,19 @@ not supported."
           result)))
   (export 'utime :sb-posix)
   (defun utime (filename &optional access-time modification-time)
-  (with-alien ((fun (function int (c-string :not-null t) (* alien-utimbuf))
-                    :extern #-netbsd "utime" #+netbsd "_utime"))
-    (let ((name (filename filename)))
-      (if (not (and access-time modification-time))
-          (alien-funcall fun name nil)
-          (with-alien ((utimbuf (struct alien-utimbuf)))
-            (setf (slot utimbuf 'actime) (or access-time 0)
-                  (slot utimbuf 'modtime) (or modification-time 0))
-            (let ((result (alien-funcall fun name (alien-sap utimbuf))))
-              (if (minusp result)
-                  (syscall-error 'utime)
-                  result)))))))
+    (with-alien ((fun (function int (c-string :not-null t) (* alien-utimbuf))
+                      :extern #-(or 64-bit-time netbsd) "utime" #+netbsd "_utime"
+                      #+64-bit-time "__utime64"))
+      (let ((name (filename filename)))
+        (if (not (and access-time modification-time))
+            (alien-funcall fun name nil)
+            (with-alien ((utimbuf (struct alien-utimbuf)))
+              (setf (slot utimbuf 'actime) (or access-time 0)
+                    (slot utimbuf 'modtime) (or modification-time 0))
+              (let ((result (alien-funcall fun name (alien-sap utimbuf))))
+                (if (minusp result)
+                    (syscall-error 'utime)
+                    result)))))))
   (export 'utimes :sb-posix)
   (defun utimes (filename &optional access-time modification-time)
     (flet ((seconds-and-useconds (time)
@@ -938,22 +943,22 @@ not supported."
              (if (minusp value)
                  (syscall-error 'utimes)
                  value)))
-   (with-alien ((fun (function int (c-string :not-null t) (* (array alien-timeval 2)))
-                     :extern #-netbsd "utimes" #+netbsd "sb_utimes"))
-     (let ((name (filename filename)))
-        (if (not (and access-time modification-time))
-            (maybe-syscall-error (alien-funcall fun name nil))
-            (with-alien ((buf (array alien-timeval 2)))
-              (let ((actime (deref buf 0))
-                    (modtime (deref buf 1)))
-                (setf (values (slot actime 'sec)
-                              (slot actime 'usec))
-                      (seconds-and-useconds (or access-time 0))
-                      (values (slot modtime 'sec)
-                              (slot modtime 'usec))
-                      (seconds-and-useconds (or modification-time 0)))
-                (maybe-syscall-error (alien-funcall fun name
-                                                    (alien-sap buf)))))))))))
+      (with-alien ((fun (function int (c-string :not-null t) (* (array alien-timeval 2)))
+                        :extern #-(or netbsd 64-bit-time) "utimes" #+(or netbsd 64-bit-time) "sb_utimes"))
+        (let ((name (filename filename)))
+          (if (not (and access-time modification-time))
+              (maybe-syscall-error (alien-funcall fun name nil))
+              (with-alien ((buf (array alien-timeval 2)))
+                (let ((actime (deref buf 0))
+                      (modtime (deref buf 1)))
+                  (setf (values (slot actime 'sec)
+                                (slot actime 'usec))
+                        (seconds-and-useconds (or access-time 0))
+                        (values (slot modtime 'sec)
+                                (slot modtime 'usec))
+                        (seconds-and-useconds (or modification-time 0)))
+                  (maybe-syscall-error (alien-funcall fun name
+                                                      (alien-sap buf)))))))))))
 
 
 ;;; environment

@@ -637,7 +637,7 @@
       (setf (combination-info node) 'array-in-bounds-p)))
   :give-up)
 
-(deftransform %check-bound ((array dimension index) ((simple-array * (*)) t t) * :node node)
+(deftransform %check-bound ((array dimension index) (simple-array t t) * :node node)
   (if (or (eq (combination-info node) 'array-in-bounds-p)
           (let ((index (type-approximate-interval (lvar-type index)))
                 (dim (type-approximate-interval (lvar-type dimension))))
@@ -1031,8 +1031,8 @@
     type))
 
 (defun sequence-type-from-item (item-type)
-  (if (and item-type
-           (types-equal-or-intersect item-type (specifier-type '(or number character))))
+  (if (or (not item-type)
+          (types-equal-or-intersect item-type (specifier-type '(or number character))))
       (specifier-type '(not null))
       (specifier-type '(and (not null) (or (not array) (vector t))))))
 

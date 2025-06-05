@@ -646,3 +646,86 @@
     ((most-negative-fixnum) nil)
     (((1+ most-negative-fixnum)) nil)
     (((1- most-positive-fixnum)) nil)))
+
+(with-test (:name :logior-derive-negative)
+  (assert-type
+   (lambda (x)
+     (declare (fixnum x))
+     (logior x 1))
+   (or (integer #.(1+ most-negative-fixnum) -1)
+       (integer 1 #.most-positive-fixnum)))
+  (assert-type
+   (lambda (x y)
+     (declare (fixnum x)
+              ((and (signed-byte 16) (not (eql 0))) y))
+     (logior y x))
+   (or (integer #.(1+ most-negative-fixnum) -1)
+       (integer 1 #.most-positive-fixnum)))
+  (assert-type
+   (lambda (x)
+     (declare (fixnum x))
+     (logior x 10))
+   (or (integer #.(+ most-negative-fixnum 10) -1)
+       (integer 10 #.most-positive-fixnum))))
+
+(with-test (:name :range<=low-address)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (typep a '(integer 1 13)))
+    ((0.0) nil)
+    ((0) nil)
+    ((1) t)
+    ((6) t)
+    ((13) t)
+    ((14) nil)))
+
+(with-test (:name :ratio+integer-type)
+  (assert-type
+   (lambda (x r)
+     (declare (integer x)
+              (ratio r))
+     (+ x r))
+   ratio)
+  (assert-type
+   (lambda (x r)
+     (declare (integer x)
+              (ratio r))
+     (+ r x))
+   ratio)
+  (assert-type
+   (lambda (x r)
+     (declare (integer x)
+              (ratio r))
+     (/ r x))
+   ratio))
+
+(with-test (:name :fixnum-gcd-overflow)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (gcd a b))
+    ((most-negative-fixnum most-negative-fixnum) (- most-negative-fixnum))
+    ((most-negative-fixnum 48) 16)))
+
+(with-test (:name :signed-word-minus1-division)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (truncate
+          (the sb-vm:signed-word a)
+          (the (member -8 -1) b)))
+    ((-2 -1) (values 2 0))
+    ((-2 -8) (values 0 -2))
+    (((- #1=(expt 2 (1- sb-vm:n-word-bits))) -1) (values #1# 0))
+    (((- #1#) -8) (values (- (ash (- #1#) -3))
+                          0))))
+
+(with-test (:name :integer-length-minus1)
+  (checked-compile-and-assert
+      ()
+      `(lambda (c)
+         (declare ((and sb-vm:signed-word (integer * -1)) c))
+         (integer-length c))
+    ((-1) 0)
+    ((-2) 1)))

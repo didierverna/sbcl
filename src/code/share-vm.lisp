@@ -18,9 +18,9 @@
     ((&optional (context '*current-internal-error-context*))
      &body body)
   (declare (ignorable context))
-  #+(or x86 x86-64 arm64)
+  #+(or x86 x86-64 arm64 riscv)
   `(progn ,@body)
-  #-(or x86 x86-64 arm64)
+  #-(or x86 x86-64 arm64 riscv)
   `(with-pinned-objects ((with-code-pages-pinned (:dynamic)
                            (sb-di::code-object-from-context ,context)))
      ,@body))
@@ -162,7 +162,8 @@
   ;; eval-when doesn't work correctly in the XC
   (setf (getf *cpu-features* name) detect)
   `(progn
-     (defglobal ,(symbolicate '+ name '-routines+) ())
+     (eval-when (:compile-toplevel :load-toplevel :execute)
+       (define-load-time-global ,(symbolicate '+ name '-routines+) ()))
      (setf (getf *cpu-features* ',name) ',detect)))
 
 (defmacro def-variant (name cpu-feature lambda-list &body body)
@@ -177,7 +178,7 @@
        ;; Avoid STATICALLY-LINK-CORE from making it harder to redefine.
        (proclaim '(notinline ,name))
        (let ((fun #',variant))
-         (setf (getf ,(symbolicate '+ cpu-feature '-routines+) ',name) fun)
+         (setf (getf ,(package-symbolicate "SB-VM" '+ cpu-feature '-routines+) ',name) fun)
          ;; Redefinition at run-time.
          (when (eq (%fun-name #',name) ',variant)
            (setf (%symbol-function ',name) fun))))))

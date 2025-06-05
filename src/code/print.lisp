@@ -30,13 +30,18 @@
   "How many levels should be printed before abbreviating with \"#\"?")
 (defvar *print-length* nil
   "How many elements at any level should be printed before abbreviating
-  with \"...\"?")
+with \"...\"?")
 (defvar *print-vector-length* nil
   "Like *PRINT-LENGTH* but works on strings and bit-vectors.
 Does not affect the cases that are already controlled by *PRINT-LENGTH*")
 (defvar *print-circle* nil
   "Should we use #n= and #n# notation to preserve uniqueness in general (and
-  circularity in particular) when printing?")
+circularity in particular) when printing?")
+
+(defvar *print-circle-not-shared* nil
+  "If this variable and *PRINT-CIRCLE* are both T only circular
+structures are printed with #n#.")
+
 (defvar *print-case* :upcase
   "What case should the printer should use default?")
 (defvar *print-array* t
@@ -86,7 +91,8 @@ variable: an unreadable object representing the error is printed instead.")
         (*read-suppress* nil)
         (*readtable* *standard-readtable*)
         (*suppress-print-errors* nil)
-        (*print-vector-length* nil))
+        (*print-vector-length* nil)
+        (*print-circle-not-shared* nil))
     (funcall function)))
 
 ;;;; routines to print objects
@@ -336,7 +342,7 @@ variable: an unreadable object representing the error is printed instead.")
   (let ((circularity-hash-table *circularity-hash-table*))
     (cond
         ((null circularity-hash-table)
-          (values nil :initiate))
+            (values nil :initiate))
         ((null *circularity-counter*)
          (ecase (gethash object circularity-hash-table)
            ((nil)
@@ -434,28 +440,43 @@ variable: an unreadable object representing the error is printed instead.")
             (write-char #\= stream)
             t)))))
 
-(defmacro with-circularity-detection ((object stream) &body body)
+(defmacro with-circularity-detection ((object stream state) &body body)
   (with-unique-names (marker body-name)
-    `(labels ((,body-name ()
+    `(labels ((,body-name (stream ,state)
                 ,@body))
        (cond ((or (not *print-circle*)
                   (uniquely-identified-by-print-p ,object))
-              (,body-name))
+              (,body-name stream ,state))
              (*circularity-hash-table*
               (let ((,marker (check-for-circularity ,object t :logical-block)))
-                (if ,marker
-                    (when (handle-circularity ,marker ,stream)
-                      (,body-name))
-                    (,body-name))))
+                (cond (,marker
+                       (when (handle-circularity ,marker ,stream)
+                         (,body-name stream ,state)))
+                      (t
+                       (,body-name stream ,state)
+                       (when (and *print-circle-not-shared*
+                                  (eql (gethash ,object *circularity-hash-table*) :logical-block))
+                         (if (listp ,object)
+                             (let ((list ,object))
+                               (loop until (or (atom list)
+                                               (not (memq (gethash list *circularity-hash-table*) '(t :logical-block))))
+                                     do
+                                     (remhash list *circularity-hash-table*)
+                                     (pop list)))
+                             (remhash ,object *circularity-hash-table*)))))))
              (t
               (let ((*circularity-hash-table* (make-hash-table :test 'eq)))
-                (output-object ,object *null-broadcast-stream*)
+                (let* ((stream (sb-pretty::make-pretty-stream *null-broadcast-stream*))
+                       (state (cons 0 stream)))
+                  (declare (inline sb-pretty::make-pretty-stream))
+                  (declare (dynamic-extent state stream))
+                  (,body-name stream state))
                 (let ((*circularity-counter* 0))
                   (let ((,marker (check-for-circularity ,object t
                                                         :logical-block)))
                     (when ,marker
                       (handle-circularity ,marker ,stream)))
-                  (,body-name))))))))
+                  (,body-name stream ,state))))))))
 
 ;;;; level and length abbreviations
 
@@ -540,19 +561,28 @@ variable: an unreadable object representing the error is printed instead.")
                    (print-it stream))
                  (print-it stream)))
            (check-it (stream)
-             (multiple-value-bind (marker initiate)
-                 (check-for-circularity object t)
-               (if (eq initiate :initiate)
-                   (let ((*circularity-hash-table*
-                          (make-hash-table :test 'eq)))
-                     (check-it *null-broadcast-stream*)
-                     (let ((*circularity-counter* 0))
-                       (check-it stream)))
-                   ;; otherwise
-                   (if marker
-                       (when (handle-circularity marker stream)
-                         (handle-it stream))
-                       (handle-it stream))))))
+             (multiple-value-bind (marker initiate) (check-for-circularity object t)
+               (cond ((eq initiate :initiate)
+                      (let ((*circularity-hash-table*
+                              (make-hash-table :test 'eq)))
+                        (check-it *null-broadcast-stream*)
+                        (let ((*circularity-counter* 0))
+                          (check-it stream))))
+                     (marker
+                      (when (handle-circularity marker stream)
+                        (handle-it stream)))
+                     (t
+                      (handle-it stream)
+                      (when (and *print-circle-not-shared*
+                                 (memq (gethash object *circularity-hash-table*) '(t :logical-block)))
+                        (if (listp object)
+                            (let ((list object))
+                              (loop until (or (atom list)
+                                              (not (memq (gethash list *circularity-hash-table*) '(t :logical-block))))
+                                    do
+                                    (remhash list *circularity-hash-table*)
+                                    (pop list)))
+                            (remhash object *circularity-hash-table*))))))))
     (cond (;; Maybe we don't need to bother with circularity detection.
            (or (not *print-circle*)
                (uniquely-identified-by-print-p object))
@@ -1308,6 +1338,15 @@ variable: an unreadable object representing the error is printed instead.")
                                                    sb-vm:other-pointer-lowtag)))))
            ,@body)))))
 
+(defmacro with-string-buffer ((size buffer) &body body)
+  #+c-stack-is-control-stack
+  `(let* ((,buffer (make-array ,size :element-type 'base-char)))
+     (declare (dynamic-extent ,buffer))
+     ,@body)
+  #-c-stack-is-control-stack
+  `(with-lisp-string-on-alien-stack (,buffer ,size)
+     ,@body))
+
 ;;; Using specialized routines for the various cases seems to work nicely.
 ;;;
 ;;; Testing with 100,000 random integers, output to a sink stream, x86-64:
@@ -1329,45 +1368,17 @@ variable: an unreadable object representing the error is printed instead.")
   ;; but a symbol-macrolet is ok. This is a FIXME except I don't care.
   (symbol-macrolet ((chars "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     (declare (optimize (sb-c:insert-array-bounds-checks 0) speed))
-    (macrolet ((iterative-algorithm ()
-                 `(loop (multiple-value-bind (q r)
-                            (truncate (truly-the word integer) base)
-                          (decf ptr)
-                          (setf (aref buffer ptr) (schar chars r))
-                          (when (zerop (setq integer q)) (return)))))
-               (recursive-algorithm (dividend-type)
-                 `(named-let recurse ((n integer))
-                    (multiple-value-bind (q r) (truncate (truly-the ,dividend-type n) base)
-                      ;; Recurse until you have all the digits pushed on
-                      ;; the stack.
-                      (unless (zerop q) (recurse q))
-                      ;; Then as each recursive call unwinds, turn the
-                      ;; digit (in remainder) into a character and output
-                      ;; the character.
-                      (write-char (schar chars r) stream)))))
+    (macrolet ((iterative-algorithm (integer)
+                 `(let ((integer ,integer))
+                    (loop (multiple-value-bind (q r)
+                              (truncate (truly-the word integer) base)
+                            (decf ptr)
+                            (setf (aref buffer ptr) (schar chars r))
+                            (when (zerop (setq integer q)) (return)))))))
       (cond ((typep integer 'word) ; Division vops can handle this all inline.
-             #+c-stack-is-control-stack ; strings can be DX-allocated
-             ;; For bases exceeding 10 we know how many characters (at most)
-             ;; will be output. This allows for a single %WRITE-STRING call.
-             ;; There's diminishing payback for other bases because the fixed array
-             ;; size increases, and we don't have a way to elide initial 0-fill.
-             ;; Calling APPROX-CHARS-IN-REPL doesn't help much - we still 0-fill.
-             (if (< base 10)
-                 (recursive-algorithm word)
-                 (let* ((ptr #.(length (write-to-string sb-ext:most-positive-word
-                                                        :base 10)))
-                        (buffer (make-array ptr :element-type 'base-char)))
-                   (declare (dynamic-extent buffer))
-                   (iterative-algorithm)
-                   (%write-string buffer stream ptr (length buffer))))
-             #-c-stack-is-control-stack ; strings can't be DX-allocated
-             ;; Use the alien stack, which is not as fast as using the control stack
-             ;; (when we can). Even the absence of 0-fill doesn't make up for it.
-             ;; Since we've no choice in the matter, might as well allow
-             ;; any value of BASE - it's just a few more words of storage.
-             (let ((ptr sb-vm:n-word-bits))
-               (with-lisp-string-on-alien-stack (buffer sb-vm:n-word-bits)
-                 (iterative-algorithm)
+             (with-string-buffer (sb-vm:n-word-bits buffer)
+               (let ((ptr sb-vm:n-word-bits))
+                 (iterative-algorithm integer)
                  (%write-string buffer stream ptr sb-vm:n-word-bits))))
             ((eql base 16)
              ;; No division is involved at all.
@@ -1377,12 +1388,57 @@ variable: an unreadable object representing the error is printed instead.")
                    do (write-char (schar chars (sb-bignum::ldb-bignum=>fixnum 4 pos
                                                                               integer))
                                   stream)))
-            ;; The ideal cutoff point between this and the "huge" algorithm
-            ;; might be platform-specific, and it also could depend on the output base.
-            ;; Nobody has cared to tweak it in so many years that I think we can
-            ;; arbitrarily say 3 bigdigits is fine.
-            ((<= (sb-bignum:%bignum-length (truly-the bignum integer)) 3)
-             (recursive-algorithm integer))
+            ;; Divide by the largest base^n that produces a word remainder
+            ;; then process the remainder using word arithmetic
+            ((let ((len (sb-bignum:%bignum-length (truly-the bignum integer))))
+               (when (<= len 32)
+                 (when (zerop (sb-bignum:%bignum-ref integer (1- len)))
+                   ;; Ignore sign extension
+                   (decf len))
+                 (let ((q (%allocate-bignum len))) ; this will be reused
+                   (with-string-buffer (sb-vm:n-word-bits buffer)
+                     (cond-dispatch (= base 10)
+                       (let* ((divisors #.(coerce (loop for b to 36
+                                                        collect (if (< b 2)
+                                                                    1
+                                                                    (loop for i from 2
+                                                                          when (> (expt b i)
+                                                                                  (1- (expt 2 (+ sb-vm:n-word-bits
+                                                                                                 ;; Others have a deficient %bignum-floor
+                                                                                                 #-(or x86-64 x86 ppc64 arm64) -1))))
+                                                                          return (expt b (1- i)))))
+                                                  `(vector (unsigned-byte ,sb-vm:n-word-bits))))
+                              (zeros #.(coerce (loop for b to 36
+                                                     collect (loop for i from 1
+                                                                   when (or (< b 2)
+                                                                            (> (expt b i)
+                                                                               (1- (expt 2 (+ sb-vm:n-word-bits
+                                                                                              #-(or x86-64 x86 ppc64 arm64) -1)))))
+                                                                   return (1- i)))
+                                               '(vector (unsigned-byte 8))))
+                              (divisor (aref divisors base))
+                              (zeros (aref zeros base)))
+                         (named-let recurse
+                             ((n integer)
+                              (len len))
+                           (multiple-value-bind (q r new-len) (truly-the (values unsigned-byte word index &optional)
+                                                                         (sb-bignum::bignum-truncate-single-digit-to n divisor q len))
+                             (tagbody
+                                (when (= new-len 1)
+                                  (let ((ptr sb-vm:n-word-bits))
+                                    (iterative-algorithm (truly-the word q))
+                                    ;; Don't pad the most significant digits
+                                    (%write-string buffer stream ptr sb-vm:n-word-bits)
+                                    (go remainder)))
+                                (recurse q new-len)
+                              REMAINDER
+                                (let ((ptr sb-vm:n-word-bits))
+                                  (iterative-algorithm r)
+                                  (let ((pad (- ptr (- sb-vm:n-word-bits zeros))))
+                                    (loop for i below pad
+                                          do (setf (char buffer (decf ptr)) #\0)))
+                                  (%write-string buffer stream ptr sb-vm:n-word-bits)))))))))
+                 t)))
             (t
              (%output-huge-integer-in-base integer base stream)))))
   nil)

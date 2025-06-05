@@ -571,6 +571,11 @@ unregister_thread(struct thread *th,
     int i;
     for (i = 0; i<NUM_PRIVATE_EVENTS; ++i)
         CloseHandle(thread_private_events(th,i));
+#else
+    /* Thread structs are reused and their guard pages are not
+     * reestablished. */
+    if (!th->state_word.control_stack_guard_page_protected)
+        reset_thread_control_stack_guard_page(th);
 #endif
 
     /* Undo the association of the current pthread to its `struct thread',
@@ -880,17 +885,7 @@ extern void funcall_alien_callback(lispobj arg1, lispobj arg2, lispobj arg0,
 /* This function's address is assigned into a static symbol's value slot,
  * so it has to look like a fixnum. lp#1991485 */
 void __attribute__((aligned(8)))
-callback_wrapper_trampoline(
-#if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
-    /* On the x86oid backends, the assembly wrapper happens to not pass
-     * in ENTER_ALIEN_CALLBACK explicitly for safepoints.  However, the
-     * platforms with precise GC are tricky enough already, and I want
-     * to minimize the read-time conditionals.  For those platforms, I'm
-     * only replacing funcall3 with callback_wrapper_trampoline while
-     * keeping the arguments unchanged. --DFL */
-    lispobj __attribute__((__unused__)) fun,
-#endif
-    lispobj arg0, lispobj arg1, lispobj arg2)
+callback_wrapper_trampoline(lispobj arg0, lispobj arg1, lispobj arg2)
 {
     struct thread* th = get_sb_vm_thread();
     if (!th) {                  /* callback invoked in non-lisp thread */
@@ -1009,25 +1004,6 @@ alloc_thread_struct(void* spaces) {
 #endif
 
     __attribute((unused)) lispobj* tls = (lispobj*)th;
-#ifdef THREAD_T_NIL_CONSTANTS_SLOT
-    tls[THREAD_T_NIL_CONSTANTS_SLOT] = (NIL << 32) | LISP_T;
-#endif
-#if defined LISP_FEATURE_LINKAGE_SPACE && defined LISP_FEATURE_X86_64
-    tls[THREAD_LINKAGE_TABLE_SLOT] = (lispobj)linkage_space;
-    tls[THREAD_ALIEN_LINKAGE_TABLE_BASE_SLOT] = (lispobj)ALIEN_LINKAGE_SPACE_START;
-#endif
-#if defined LISP_FEATURE_X86_64 && defined LISP_FEATURE_LINUX
-    tls[THREAD_MSAN_XOR_CONSTANT_SLOT] = 0x500000000000;
-#endif
-#ifdef LAYOUT_OF_FUNCTION
-    tls[THREAD_FUNCTION_LAYOUT_SLOT] = LAYOUT_OF_FUNCTION << 32;
-#endif
-#ifdef THREAD_TEXT_CARD_MARKS_SLOT
-    extern unsigned int* text_page_touched_bits;
-    tls[THREAD_TEXT_SPACE_ADDR_SLOT] = TEXT_SPACE_START;
-    tls[THREAD_TEXT_CARD_COUNT_SLOT] = text_space_size / IMMOBILE_CARD_BYTES;
-    tls[THREAD_TEXT_CARD_MARKS_SLOT] = (lispobj)text_page_touched_bits;
-#endif
 
     th->os_address = spaces;
     th->control_stack_start = (lispobj*)aligned_spaces;
@@ -1182,9 +1158,11 @@ uword_t create_lisp_thread(struct thread* th)
     struct extra_thread_data *data = thread_extra_data(th);
     data->blocked_signal_set = deferrable_sigset;
     // It's somewhat customary in the win32 API to start threads as suspended.
+    // Don't use STACK_SIZE_PARAM_IS_A_RESERVATION because
+    // dx-allocation accesses the stack non-linearly.
     th->os_thread =
       _beginthreadex(NULL, thread_control_stack_size, new_thread_trampoline, th,
-                     CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, &tid);
+                     CREATE_SUSPENDED, &tid);
     bool success = th->os_thread != 0;
     if (success) {
         th->os_kernel_tid = tid;
@@ -1396,67 +1374,6 @@ thread_yield()
     return 0;
 #endif
 }
-
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-/* If the thread id given does not belong to a running thread (it has
- * exited or never even existed) pthread_kill _may_ fail with ESRCH,
- * but it is also allowed to just segfault, see
- * <http://udrepper.livejournal.com/16844.html>.
- *
- * Relying on thread ids can easily backfire since ids are recycled
- * (NPTL recycles them extremely fast) so a signal can be sent to
- * another process if the one it was sent to exited.
- *
- * For these reasons, we must make sure that the thread is still alive
- * when the pthread_kill is called and return if the thread is
- * exiting.
- *
- * Note (DFL, 2011-06-22): At the time of writing, this function is only
- * used for INTERRUPT-THREAD, hence the wake_thread special-case for
- * Windows is OK. */
-void wake_thread(struct thread_instance* lispthread)
-{
-#ifdef LISP_FEATURE_WIN32
-        /* META: why is this comment about safepoint builds mentioning
-         * gc_stop_the_world() ? Never the twain shall meet. */
-
-        /* Kludge (on safepoint builds): At the moment, this isn't just
-         * an optimization; rather it masks the fact that
-         * gc_stop_the_world() grabs the all_threads mutex without
-         * releasing it, and since we're not using recursive pthread
-         * mutexes, the pthread_mutex_lock() around the all_threads loop
-         * would go wrong.  Why are we running interruptions while
-         * stopping the world though?  Test case is (:ASYNC-UNWIND
-         * :SPECIALS), especially with s/10/100/ in both loops. */
-
-        /* Frequent special case: resignalling to self.  The idea is
-         * that leave_region safepoint will acknowledge the signal, so
-         * there is no need to take locks, roll thread to safepoint
-         * etc. */
-        struct thread* thread = (void*)lispthread->uw_primitive_thread;
-        if (thread == get_sb_vm_thread()) {
-            sb_pthr_kill(thread, 1); // can't fail
-            check_pending_thruptions(NULL);
-            return;
-        }
-        // block_deferrables + mutex_lock looks very unnecessary here,
-        // but without them, make-target-contrib hangs in bsd-sockets.
-        sigset_t oldset;
-        block_deferrable_signals(&oldset);
-        mutex_acquire(&all_threads_lock);
-        sb_pthr_kill(thread, 1); // can't fail
-# ifdef LISP_FEATURE_SB_SAFEPOINT
-        wake_thread_impl(lispthread);
-# endif
-        mutex_release(&all_threads_lock);
-        thread_sigmask(SIG_SETMASK,&oldset,0);
-#elif defined LISP_FEATURE_SB_SAFEPOINT
-    wake_thread_impl(lispthread);
-#else
-    pthread_kill(lispthread->uw_os_thread, SIGURG);
-#endif
-}
-#endif
 
 #ifdef LISP_FEATURE_ULTRAFUTEX
 extern int futex_wake(int *lock_word, int n);

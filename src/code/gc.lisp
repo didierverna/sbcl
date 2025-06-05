@@ -65,6 +65,7 @@ and submit it as a patch."
   (+ (dynamic-usage)
      *n-bytes-freed-or-purified*))
 
+(declaim (ftype (sfunction (t) sb-vm:word) primitive-object-size))
 (defun primitive-object-size (object)
   "Return number of bytes of heap or stack directly consumed by OBJECT"
   (cond ((not (sb-vm:is-lisp-pointer (get-lisp-obj-address object))) 0)
@@ -297,7 +298,7 @@ used to specify the oldest generation guaranteed to be collected."
 
 (define-alien-routine scrub-control-stack void)
 
-(defglobal sb-unicode::*name->char-buffers* nil)
+(define-load-time-global sb-unicode::*name->char-buffers* nil)
 (defun unsafe-clear-roots (gen)
   (declare (ignorable gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
@@ -309,6 +310,7 @@ used to specify the oldest generation guaranteed to be collected."
   (scrub-power-cache)
   (setf sb-unicode::*name->char-buffers* nil)
   (setf sb-c::*phash-lambda-cache* nil)
+  (setf sb-impl::*read-line-buffers* nil)
   ;; Clear caches depending on the generation being collected.
   (cond ((eql 0 gen)
          ;; Drop strings because the hash is address-based, but there
@@ -540,8 +542,10 @@ Experimental: interface subject to change."
                     ((< sb-vm:text-space-start addr
                         (sap-int sb-vm:*text-space-free-pointer*))
                      :static)
-                    ((< sb-vm:static-space-start addr
-                        (sap-int sb-vm:*static-space-free-pointer*))
+                    ((or #+x86-64 (< (extern-alien "static_space_trailer_start" unsigned)
+                                     addr sb-vm::static-space-end)
+                         (< sb-vm:static-space-start addr
+                            (sap-int sb-vm:*static-space-free-pointer*)))
                      :static))))
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)
@@ -553,10 +557,6 @@ Experimental: interface subject to change."
     (let ((addr (get-lisp-obj-address x)))
       (and (sb-vm:is-lisp-pointer addr)
            (cases)))))
-
-;;; Internal use only. FIXME: I think this duplicates code that exists
-;;; somewhere else which I could not find.
-(defun lisp-space-p (sap &aux (addr (sap-int sap))) (cases))
 ) ; end MACROLET
 
 (define-condition memory-fault-error (system-condition error) ()

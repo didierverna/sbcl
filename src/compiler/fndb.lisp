@@ -332,15 +332,18 @@
 (defknown denominator (rational) (integer 1)
   (movable foldable flushable))
 
-(defknown (floor ceiling round)
+(defknown (floor ceiling)
   (real &optional real) (values integer real)
   (movable foldable flushable))
 
-(defknown truncate
+(defknown (truncate round)
   (real &optional real) (values integer real)
   (movable foldable flushable recursive))
 
-(defknown (sb-kernel::truncate1 sb-kernel::floor1 sb-kernel::ceiling1) (real real) integer
+(defknown (sb-kernel::truncate1 sb-kernel::floor1 sb-kernel::ceiling1 sb-kernel::round1) (real real) integer
+  (movable foldable flushable recursive no-verify-arg-count))
+
+(defknown (sb-kernel::ftruncate1 sb-kernel::ffloor1 sb-kernel::fceiling1 sb-kernel::fround1) (real real) float
   (movable foldable flushable recursive no-verify-arg-count))
 
 (defknown unary-truncate (real) (values integer real)
@@ -353,8 +356,19 @@
 (defknown unary-truncate-double-float-to-bignum (double-float)
     (values (and integer #+64-bit bignum)
             (and double-float #+64-bit (eql 0d0)))
-   (foldable movable flushable fixed-args)
+   (foldable movable flushable fixed-args unboxed-return)
   :folder #'truncate)
+
+(defknown unary-truncate-single-float-to-bignum-div
+    (single-float single-float single-float) (values bignum single-float)
+    (foldable movable flushable fixed-args unboxed-return)
+  :folder (lambda (quot number div) (values (truncate quot) (- number (* quot div)))))
+
+(defknown unary-truncate-double-float-to-bignum-div
+    (double-float double-float double-float) (values (and integer #+64-bit bignum)
+                                                     double-float)
+   (foldable movable flushable fixed-args unboxed-return)
+  :folder (lambda (quot number div) (values (truncate quot) (- number (* quot div)))))
 
 (defknown %unary-truncate-single-float-to-bignum (single-float) bignum
    (foldable movable flushable fixed-args)
@@ -378,11 +392,14 @@
 (defknown %multiply-high (word word) word
     (movable foldable flushable))
 
-(defknown multiply-fixnums (fixnum fixnum) integer
-  (movable foldable flushable no-verify-arg-count))
-
 (defknown %signed-multiply-high (sb-vm:signed-word sb-vm:signed-word) sb-vm:signed-word
     (movable foldable flushable))
+
+(defknown rotate-right-word (word (mod #.sb-vm:n-word-bits)) word
+    (movable foldable flushable always-translatable))
+
+(defknown multiply-fixnums (fixnum fixnum) integer
+  (movable foldable flushable no-verify-arg-count))
 
 (defknown (mod rem) (real real) real
     (movable foldable flushable))
@@ -454,6 +471,10 @@
 (defknown %ash/right ((or word sb-vm:signed-word) (mod #.sb-vm:n-word-bits))
   (or word sb-vm:signed-word)
   (movable foldable flushable always-translatable))
+
+(defknown ash-right (integer (mod #.sb-vm:n-word-bits))
+  integer
+  (movable foldable flushable no-verify-arg-count))
 
 (defknown (logcount integer-length) (integer) bit-index
   (movable foldable flushable))
@@ -1202,7 +1223,7 @@
 (defknown hash-table-test (hash-table) function-designator (foldable flushable))
 (defknown (sxhash psxhash) (t) hash-code (foldable flushable))
 (defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
-(defknown sb-impl::install-hash-table-lock (hash-table) sb-thread:mutex ())
+(defknown sb-impl:install-hash-table-lock (hash-table) sb-thread:mutex ())
 (defknown sb-vm::quick-try-mutex (sb-thread:mutex) boolean)
 ;; To avoid emitting code to test for nil-function-returned
 (defknown (sb-impl::signal-corrupt-hash-table
@@ -1235,13 +1256,25 @@
                        (:displaced-index-offset index))
     array (flushable foldable-read-only no-verify-arg-count))
 
+(defknown sb-vm::%make-simple-array ((or index list)
+                                     (unsigned-byte #.sb-vm:n-widetag-bits)
+                                     (mod #.sb-vm:n-word-bits))
+    simple-array (flushable foldable-read-only no-verify-arg-count))
+
 (defknown sb-vm::array-underlying-widetag-and-shift (array)
     (values (integer 128 255) (integer 0 7))
     (flushable foldable))
 
 (defknown sb-vm::%vector-widetag-and-n-bits-shift (type-specifier)
     (values (integer 128 255) (integer 0 7))
-    (flushable foldable recursive))
+    (flushable foldable recursive no-verify-arg-count))
+
+(defknown sb-vm::%string-widetag-and-n-bits-shift (type-specifier)
+    (values (member #+sb-unicode #.sb-vm:simple-character-string-widetag
+                    #.sb-vm:simple-base-string-widetag)
+            (member #+sb-unicode 5
+                    3))
+    (flushable foldable recursive no-verify-arg-count))
 
 (defknown sb-vm::initial-contents-error (t t) nil (no-verify-arg-count))
 (defknown fill-data-vector (vector list sequence) vector (no-verify-arg-count)
@@ -1937,7 +1970,7 @@
 
 (defknown symbol-global-value (symbol) t ()
   :derive-type #'symbol-value-derive-type)
-(defknown set-symbol-global-value (symbol t) t ()
+(defknown set-symbol-global-value ((and symbol (not null)) t) t ()
   :derive-type #'result-type-last-arg)
 
 (defknown get-bytes-consed () unsigned-byte (flushable))
@@ -1971,6 +2004,9 @@
 (defknown %rest-length (t t t) * (always-translatable))
 (defknown %rest-null (t t t t) * (always-translatable))
 (defknown %rest-true (t t t) * (always-translatable))
+(defknown %rest-list (t) * (always-translatable))
+(defknown %rest-listify (t t t) * (always-translatable))
+(defknown %rest-context (t) * (always-translatable))
 
 (defknown %unary-truncate/single-float (single-float) integer
    (movable foldable flushable no-verify-arg-count))
@@ -2021,7 +2057,7 @@
 (defknown %nip-values (t t &rest t) (values))
 (defknown %type-check-error (t t t) nil)
 (defknown %type-check-error/c (t t t) nil)
-
+(defknown sb-vm::op-not-type2-error (t t t) nil)
 ;; %compile-time-type-error does not return, but due to the implementation
 ;; of FILTER-LVAR we cannot write it here.
 (defknown (%compile-time-type-error %compile-time-type-style-warn) (t t t t t t) *)
@@ -2079,7 +2115,7 @@
 (defknown %with-array-data/fp (array index (or index null))
   (values (simple-array * (*)) index index index)
   (foldable flushable no-verify-arg-count))
-(defknown %set-symbol-package (symbol t) t ())
+(defknown %set-symbol-package ((and symbol (not null)) (or package null)) t ())
 (defknown (%coerce-callable-to-fun %coerce-callable-for-call)
     (function-designator)
     function (flushable no-verify-arg-count))
@@ -2185,7 +2221,6 @@
 (defknown (setf sbit) (bit (modifying (simple-array bit)) &rest index) bit ())
 (defknown %charset ((modifying string) index character) character ())
 (defknown %scharset ((modifying simple-string) index character) character ())
-(defknown %set-symbol-value (symbol t) t ())
 (defknown (setf symbol-function) (function symbol) function ())
 ;; Does this really need a type deriver? It's inline, and returns its 1st arg,
 ;; i.e. we know exactly what object it returns, which is more precise than
@@ -2384,3 +2419,9 @@
   (movable always-translatable))
 
 (defknown %coerce-to-policy (t) policy (flushable))
+(defknown (check-ds-list check-ds-list/&rest) (t index index t)
+    t
+    (movable foldable))
+(defknown check-ds-list/&key (t index index t t)
+    t
+    (movable foldable))

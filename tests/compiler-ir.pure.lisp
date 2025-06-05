@@ -446,7 +446,8 @@
                          (pop s))))
       1)))
 
-(with-test (:name :overflow+make-array)
+(with-test (:name :overflow+make-array
+                  :fails-on (not :64-bit))
   (assert
    (= (count 'sb-vm::overflow+t
              (ir2-vops '(lambda (y)
@@ -470,3 +471,36 @@
                                   (optimize speed))
                          (+ a b)))
                      :key (lambda (x) (combination-fun-source-name x nil))))))
+
+(with-test (:name :consecutive-casts)
+  (assert (= (count 'sb-c::%type-check-error/c
+                    (ir-calls
+                     `(lambda (x)
+                        (the fixnum (the integer x))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1)))
+
+(with-test (:name :sign-extend)
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 32) a))
+                        (logior a (- (mask-field (byte 1 31) a)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1))
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 32) a))
+                        (logior (- (mask-field (byte 1 31) a)) a)))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1))
+  #+64-bit
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 64) a))
+                        (logior a (- (mask-field (byte 1 63) a)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1)))
+

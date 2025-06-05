@@ -126,7 +126,6 @@
  ("src/code/ansi-stream" :not-host)
  ("src/code/restart" :not-host)
  ("src/code/early-pprint" :not-host)
- ("src/code/early-impl" :not-host)
 
  ;; Needed before the first use of WITH-SINGLE-PACKAGE-LOCKED-ERROR.
  ("src/code/early-package" :not-host)
@@ -441,6 +440,7 @@
  ("src/compiler/{arch}/subprim")
  ("src/compiler/{arch}/debug")
  ("src/compiler/{arch}/cell")
+ #+(and x86-64 sb-thread) ("src/compiler/{arch}/tls")
  ("src/compiler/{arch}/call")
  ("src/compiler/{arch}/nlx")
  ("src/compiler/generic/late-nlx")
@@ -547,7 +547,6 @@
  ("src/code/filesys"           :not-host) ; needs HOST from "code/pathname"
 
  ("src/code/target-misc"       :not-host) ; dribble-stream, used by "save"
- ("src/code/sharpm"            :not-host) ; uses stuff from "code/reader"
 
  ("src/code/early-step")                  ; target-thread needs *STEP-OUT*
 
@@ -560,6 +559,8 @@
  ("src/code/gc"                :not-host)
 
  ("src/code/interr" :not-host)
+
+ ("src/code/sharpm"            :not-host) ; uses stuff from "code/reader"
 
  ("src/code/target-load" :not-host) ; for *assembler-routines*, needed by target-disassem
 
@@ -612,13 +613,13 @@
  ("src/code/late-globaldb" :not-host))
 
 ;;; make-target-2 build steps
-(("src/code/early-ntrace" ; lets PCL hook into tracing
-  "src/code/room" ; for MAP-ALLOCATED-OBJECTS
+(("src/code/room" ; for MAP-ALLOCATED-OBJECTS
   #+x86-64 "src/code/text-space" ; needs src/code/room
   "src/code/warm-error"
   ;; Redefine some functions that contributed to far too numerous
   ;; xperfecthash entries due to variation by build configuration.
   "src/compiler/generic/static-syms"
+ #+(and sb-futex (or arm64 x86-64)) "src/code/rwlock"
   "src/code/icf"
   "src/code/defpackage")
 

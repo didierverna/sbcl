@@ -35,7 +35,7 @@
 (defevent make-value-cell-event "Allocate heap value cell for lexical var.")
 (defun emit-make-value-cell (node block value res)
   (event make-value-cell-event node)
-  (vop make-value-cell node block value nil res))
+  (vop make-value-cell node block value res))
 
 ;;;; leaf reference
 
@@ -130,13 +130,13 @@
       ((:special :unknown)
        (aver (symbolp name))
        (let ((name-tn (emit-constant name)))
-         (if (or unsafe (always-boundp name))
+         (if (or unsafe (always-boundp name node))
              (vop fast-symbol-value node block name-tn res)
              (vop symbol-value node block name-tn res))))
       (:global
        (aver (symbolp name))
        (let ((name-tn (emit-constant name)))
-         (if (or unsafe (always-boundp name))
+         (if (or unsafe (always-boundp name node))
              (vop fast-symbol-global-value node block name-tn res)
              (vop symbol-global-value node block name-tn res))))
       (:global-function
@@ -1103,7 +1103,7 @@
            (let ((name (uncross (lvar-fun-name lvar t))))
              ;; Always pass name as a literal symbol or list if #+linkage-space,
              ;; otherwise do so only if the fdefn is static.
-             (values (if (or #+linkage-space t (sb-vm::static-fdefn-offset name))
+             (values (if (or #+linkage-space t (static-fdefn-p name))
                          name
                          (make-load-time-constant-tn :fdefinition name))
                      name)))
@@ -1839,19 +1839,29 @@
          (first (lvar-value last-preserved))
          (2first (lvar-info first))
 
-         (moved-tns '()))
+         (moved-tns '())
+         (movep t))
+    (aver (memq (ir2-lvar-kind 2after) '(:unknown :stack)))
     (dolist (moved-lvar moved)
       (let ((2lvar (lvar-info (lvar-value moved-lvar))))
-        ;; we cannot move stack-allocated DX objects
-        (aver (eq (ir2-lvar-kind 2lvar) :unknown))
-        (push (first (ir2-lvar-locs 2lvar)) moved-tns)))
-    (aver (memq (ir2-lvar-kind 2after) '(:unknown :stack)))
-    (aver (eq (ir2-lvar-kind 2first) :unknown))
-    (vop* %%nip-values node block
-          ((first (ir2-lvar-locs 2after))
-           (first (ir2-lvar-locs 2first))
-           (reference-tn-list moved-tns nil))
-          ((reference-tn-list moved-tns t)))))
+        (ecase (ir2-lvar-kind 2lvar)
+          (:unknown
+           (push (first (ir2-lvar-locs 2lvar)) moved-tns))
+          (:stack
+           ;; Stack objects can't move, so instead, set the stack lvar
+           ;; so that resetting it cleans the nipped values as well.
+           (emit-move node block
+                      (first (ir2-lvar-locs 2lvar))
+                      (first (ir2-lvar-locs 2after)))
+           (setq movep nil)
+           (return)))))
+    (when movep
+      (aver (eq (ir2-lvar-kind 2first) :unknown))
+      (vop* %%nip-values node block
+            ((first (ir2-lvar-locs 2after))
+             (first (ir2-lvar-locs 2first))
+             (reference-tn-list moved-tns nil))
+            ((reference-tn-list moved-tns t))))))
 
 ;;; Deliver the values TNs to LVAR using MOVE-LVAR-RESULT.
 (defoptimizer (values ir2-convert) ((&rest values) node block)
@@ -1937,10 +1947,11 @@
 (defoptimizer (%dynamic-extent-start ir2-convert) (() node block)
   (let* ((lvar (node-lvar node))
          (2lvar (lvar-info lvar)))
-    (aver (eq (ir2-lvar-kind 2lvar) :stack))
-    (when (leaf-refs (find-constant lvar))
-      (vop current-stack-pointer node block
-           (first (ir2-lvar-locs 2lvar))))))
+    (unless (eq (ir2-lvar-kind 2lvar) :unused)
+      (aver (eq (ir2-lvar-kind 2lvar) :stack))
+      (when (leaf-refs (find-constant lvar))
+        (vop current-stack-pointer node block
+             (first (ir2-lvar-locs 2lvar)))))))
 
 ;;;; special binding
 
@@ -2408,8 +2419,7 @@
                              (policy first-node (/= insert-safepoints 0)))
                     (vop sb-vm::insert-safepoint first-node 2block))))
             (ir2-convert-block block)
-            (incf num))))
-      (setf (component-max-block-number component) num)))
+            (incf num))))))
   (values))
 
 ;;; If necessary, emit a terminal unconditional branch to go to the

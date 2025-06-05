@@ -46,15 +46,16 @@
                               (and (eq (sb-c::undefined-warning-kind x) :function)
                                    (equal (sb-c::undefined-warning-name x) name))))
                         sb-c::*undefined-warnings*))))
-    (make-fixup name (if lt-warn
-                         :linkage-cell-ud  ; was undefined at compile-time
-                         :linkage-cell))))
+    ;; The "addend" field of the fixup is used as a boolean flag.
+    (make-fixup name :linkage-cell (if lt-warn 1 0))))
 
 (defun compute-linkage-cell (node name res)
-  (cond ((sb-c::code-immobile-p node)
+  #-immobile-space (inst lea res (ea (linkage-cell-fixup name node) null-tn))
+  #+immobile-space ; this is ironically worse than #-immobile-space
+  (cond ((code-immobile-p node)
          (inst lea res (rip-relative-ea (linkage-cell-fixup name node))))
         (t
-         (inst mov res (thread-slot-ea sb-vm::thread-linkage-table-slot))
+         (inst mov res (static-constant-ea lisp-linkage-table))
          (inst lea res (ea (linkage-cell-fixup name node) res)))))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
@@ -350,16 +351,18 @@
                      (2nd-tn (tn-ref-tn 2nd-tn-ref))
                      (2nd-tn-live (neq (tn-kind 2nd-tn) :unused)))
                 (when 2nd-tn-live
-                  (inst mov 2nd-tn nil-value))
+                  (inst mov 2nd-tn null-tn))
                 (when (> nvals 2)
+                  ;; FIXME: simplify this logic- don't use 2nd-tn as a proxy
+                  ;; for NIL now that NULL-TN is a thing.
                   (loop
                     for tn-ref = (tn-ref-across 2nd-tn-ref)
                     then (tn-ref-across tn-ref)
                     for count from 2 below register-arg-count
                     unless (eq (tn-kind (tn-ref-tn tn-ref)) :unused)
                     do
-                    (inst mov :dword (tn-ref-tn tn-ref)
-                          (if 2nd-tn-live 2nd-tn nil-value)))))
+                    (inst mov (tn-ref-tn tn-ref)
+                          (if 2nd-tn-live 2nd-tn null-tn)))))
               (inst mov rbx rsp-tn)
               regs-defaulted))
 
@@ -397,9 +400,8 @@
                        (inst jmp :nc default-stack-slots))
                       (t
                        (inst jmp :c regs-defaulted)
-                       (loop for null = nil-value then (car used-registers)
-                             for reg in used-registers
-                             do (inst mov :dword reg null))
+                       (loop for reg in used-registers
+                             do (inst mov reg null-tn))
                        (inst jmp done)))
                 REGS-DEFAULTED
                 (do ((i register-arg-count (1+ i))
@@ -432,13 +434,12 @@
                       (when (or (not trust)
                                 (<= min-values 1))
                         (emit-label default-stack-slots)
-                        (loop for null = nil-value then (car used-registers)
-                              for reg in used-registers
-                              do (inst mov :dword reg null))
+                        (loop for reg in used-registers
+                              do (inst mov reg null-tn))
                         (move rbx rsp-tn))
                       (dolist (default defaults)
                         (emit-label (car default))
-                        (inst mov (cdr default) nil-value))
+                        (inst mov (cdr default) null-tn))
                       (inst jmp defaulting-done)))))))))))))
 
 ;;;; unknown values receiving
@@ -484,7 +485,7 @@
     ;; stack values. In this case quickly reallocate sufficient space.
     (when (<= (sb-kernel:values-type-min-value-count type)
               register-arg-count)
-      (inst cmp nargs (fixnumize register-arg-count))
+      (inst cmp :dword nargs (fixnumize register-arg-count))
       (inst jmp :g stack-values)
       #+#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
       (inst sub rsp-tn nargs)
@@ -763,7 +764,7 @@
                                  :from (:argument 0)
                                  :to :eval)
                                 ,name))
-                 *register-arg-names* *register-arg-offsets*))
+                 register-arg-names *register-arg-offsets*))
 
      ,@(when (eq return :tail)
          '((:temporary (:sc unsigned-reg :from (:argument 1) :to (:argument 2))
@@ -793,7 +794,7 @@
                  ;; Move the necessary args to registers,
                  ;; this moves them all even if they are
                  ;; not all needed.
-                 ,@(loop for name in *register-arg-names*
+                 ,@(loop for name in register-arg-names
                          for index downfrom -1
                          collect `(loadw ,name new-fp ,index)))
                '((cond ((listp nargs)) ;; no-verify-arg-count
@@ -901,18 +902,20 @@
   (cond (step-instrumenting
          ;; If step-instrumenting, then RAX points to the linkage table cell
          (inst* instruction (ea rax-tn)))
-        ((sb-c::code-immobile-p node)
+        ((code-immobile-p node)
          (inst* instruction (rip-relative-ea (linkage-cell-fixup name node))))
+        #-immobile-space
+        (t (inst* instruction (ea (linkage-cell-fixup name node) null-tn)))
+        #+immobile-space ; again, this should not be worse than #-immobile-space, but it is
         (t
          ;; get the linkage table base into RAX
-         (inst mov rax-tn (thread-slot-ea sb-vm::thread-linkage-table-slot))
+         (inst mov rax-tn (static-constant-ea lisp-linkage-table))
          (inst* instruction (ea (linkage-cell-fixup name node) rax-tn)))))
 
 ;;; Invoke the function-designator FUN.
 (defun tail-call-unnamed (fun type vop)
-  (let ((relative-call (sb-c::code-immobile-p vop))
-        (fun-ea (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
-                    fun)))
+  (let ((relative-call (code-immobile-p vop))
+        (fun-ea (object-slot-ea fun closure-fun-slot fun-pointer-lowtag)))
     (case type
       (:designator
        (assemble ()
@@ -943,8 +946,7 @@
          (invoke-asm-routine 'call 'call-symbol vop)
          (inst jmp ret))
        call
-       (inst call (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
-                      fun))
+       (inst call (object-slot-ea fun closure-fun-slot fun-pointer-lowtag))
        ret))))
 
 ;;; This is defined separately, since it needs special code that BLT's
@@ -1036,14 +1038,14 @@
     (when (< nvals register-arg-count)
       (let* ((arg-tns (nthcdr nvals (list a0 a1 a2)))
              (first (first arg-tns)))
-        (inst mov first nil-value)
+        (inst mov first null-tn)
         (dolist (tn (cdr arg-tns))
           (inst mov tn first))))
     ;; Set the multiple value return flag.
     (inst stc)
     ;; And away we go. Except that return-pc is still on the
-    ;; stack and we've changed the stack pointer. So we have to
-    ;; tell it to index off of RBX instead of RBP.
+    ;; stack and we've changed the stack pointer. So we might have to
+    ;; tell it to index off of RBX instead of RBP, depending on nvals.
     (cond ((<= nvals register-arg-count)
            (inst leave)
            (inst ret))
@@ -1057,10 +1059,8 @@
            (inst lea rsp-tn
                  (ea (frame-byte-offset (1- nvals)) rbp-tn))
            (move rbp-tn old-fp)
-           (inst push (ea (frame-byte-offset
-                           (+ sp->fp-offset (tn-offset return-pc)))
-                          rbx))
-           (inst ret)))))
+           (emit-mv-return
+            (ea (frame-byte-offset (+ sp->fp-offset (tn-offset return-pc))) rbx))))))
 
 ;;; Do unknown-values return of an arbitrary number of values (passed
 ;;; on the stack.) We check for the common case of a single return
@@ -1087,7 +1087,7 @@
     (unless (policy node (> space speed))
       ;; Check for the single case.
       (let ((not-single (gen-label)))
-        (inst cmp nvals (fixnumize 1))
+        (inst cmp :dword nvals (fixnumize 1))
         (inst jmp :ne not-single)
         ;; Return with one value.
         (loadw a0 vals -1)
@@ -1295,25 +1295,16 @@
   (:results (value :scs (descriptor-reg any-reg)))
   (:result-types *)
   (:generator 3
-    (inst mov value nil-value)
+    (inst mov value null-tn)
     (inst cmp count (fixnumize index))
     (inst jmp :be done)
     (inst mov value (ea (- (* index n-word-bytes)) object))
     done))
 
 ;;; Turn more arg (context, count) into a list.
-;;; Cons cells will be filled in right-to-left.
-;;; This has a slight advantage in code size, and eliminates an initial
-;;; forward jump into the loop. it also admits an interesting possibility
-;;; to reduce the scope of the pseudo-atomic section so as not to
-;;; encompass construction of the list. To do that, we will need to invent
-;;; a new widetag for "contiguous CONS block" which has a header conveying
-;;; the total payload length. Initially we would store that into the CAR of the
-;;; first cons cell. Upon seeing such header, GC shall treat that entire object
-;;; as a boxed payload of specified length. It will be implicitly pinned
-;;; (if conservative) or transported as a whole (if precise). Then when the CAR
-;;; of the first cons is overwritten, the object changes to a linked list.
-(define-vop ()
+;;; Cons cells will be filled in right-to-left which has a minor advantage
+;;; in code size.
+(define-allocator (%listify-rest-args)
   (:translate %listify-rest-args)
   (:policy :safe)
   ;; CONTEXT is used throughout the copying loop
@@ -1327,9 +1318,7 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) rcx)
   ;; Note that DST conflicts with RESULT because we use both as temps
   (:temporary (:sc unsigned-reg) value dst)
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
   (:results (result :scs (descriptor-reg)))
-  (:node-var node)
   (:generator 20
 #|
     ;; TODO: if instrumenting, just revert to the older way of precomputing
@@ -1343,7 +1332,7 @@
 |#
     (move rcx count :dword)
     ;; Setup for the CDR of the last cons (or the entire result) being NIL.
-    (inst mov result nil-value)
+    (inst mov result null-tn)
     (cond ((not (member :allocation-size-histogram sb-xc:*features*))
            (inst jrcxz DONE))
           (t ; jumps too far for JRCXZ sometimes
@@ -1351,9 +1340,9 @@
            (inst jmp :z done)))
     (when (and (not (node-stack-allocate-p node)) (instrument-alloc-policy-p node))
       (inst shl :dword rcx word-shift) ; compute byte count
-      (instrument-alloc +cons-primtype+ rcx node (list value dst) thread-tn)
+      (instrument-alloc +cons-primtype+ rcx (list value dst))
       (inst shr :dword rcx word-shift)) ; undo the computation
-    (pseudo-atomic (:elide-if (node-stack-allocate-p node) :thread-tn thread-tn)
+    (allocating (:elide-if (node-stack-allocate-p node))
        ;; Produce an untagged pointer into DST
       (let ((scale
              (cond ((node-stack-allocate-p node)
@@ -1363,7 +1352,7 @@
                     (stack-allocation rcx 0 dst)
                     1)
                    (t
-                    (allocation +cons-primtype+ rcx 0 dst node value thread-tn
+                    (allocation +cons-primtype+ rcx 0 dst value
                        :scale 8
                        :overflow
                        (lambda ()

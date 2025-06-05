@@ -123,9 +123,6 @@
 ;;; not only symbols. The value is reliable only if the object is a symbol.
 (defknown hash-as-if-symbol-name (t) symbol-name-hash (flushable movable always-translatable))
 
-(defknown %set-symbol-hash (symbol hash-code)
-  t ())
-
 ;;; SYMBOL-PACKAGE-ID for #+compact-symbol demands a vop which avoids loading
 ;;; a raw bit value in a descriptor register (the SLOT vop returns a descriptor)
 (defknown symbol-package-id (symbol) (unsigned-byte 16))
@@ -291,16 +288,18 @@
                            word index
                            ;; The number of words is later converted
                            ;; to bytes, make sure it fits.
-                           (and index
-                                (mod #.(- (expt 2
-                                                (- sb-vm:n-word-bits
-                                                   sb-vm:word-shift
-                                                   ;; all the allocation routines expect a signed word
-                                                   1))
-                                          ;; The size is double-word aligned, which is done by adding
-                                          ;; (1- (/ sb-vm:n-word-bits 2)) and then masking.
-                                          ;; Make sure addition doesn't overflow.
-                                          3))))
+                           #.(if (fixnump (ash array-dimension-limit 7))
+                                 `(and unsigned-byte fixnum)
+                                 `(and index
+                                       (mod ,(- (expt 2
+                                                      (- sb-vm:n-word-bits
+                                                         sb-vm:word-shift
+                                                         ;; all the allocation routines expect a signed word
+                                                         1))
+                                                ;; The size is double-word aligned, which is done by adding
+                                                ;; (1- (/ sb-vm:n-word-bits 2)) and then masking.
+                                                ;; Make sure addition doesn't overflow.
+                                                3)))))
     (simple-array * (*))
     (flushable movable))
 
@@ -759,10 +758,10 @@
   (movable foldable unboxed-return))
 
 (defknown make-single-float ((signed-byte 32)) single-float
-  (movable flushable))
+  (movable flushable foldable))
 
 (defknown make-double-float ((signed-byte 32) (unsigned-byte 32)) double-float
-  (movable flushable))
+  (movable flushable foldable))
 
 (defknown single-float-bits (single-float) (signed-byte 32)
   (movable foldable flushable))
@@ -770,7 +769,7 @@
 #+64-bit
 (progn
 (defknown %make-double-float ((signed-byte 64)) double-float
-  (movable flushable))
+  (movable flushable foldable))
 (defknown double-float-bits (double-float) (signed-byte 64)
   (movable foldable flushable)))
 

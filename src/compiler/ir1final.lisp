@@ -30,7 +30,14 @@
             (compiler-notify "~@<unable to ~2I~_~A ~I~_because: ~2I~_~?~:>"
                              note (first what) (rest what)))
            ((valid-fun-use node what
-                           :argument-test #'types-equal-or-intersect
+                           :argument-test (lambda (arg-type type)
+                                            ;; Don't bother with LIST not matching (OR NULL ...)
+                                            (unless (and (eq arg-type (specifier-type 'list))
+                                                         (neq type (specifier-type 'list))
+                                                         (and (union-type-p type)
+                                                              (find (specifier-type 'null)
+                                                                    (union-type-types type))))
+                                              (types-equal-or-intersect arg-type type)))
                            :result-test #'values-types-equal-or-intersect)
             (collect ((messages))
               (flet ((give-grief (string &rest stuff)
@@ -320,23 +327,28 @@
                        (mv-bind-unused-p lvar 1))
                (let ((single-value-fun (getf '(truncate sb-kernel::truncate1
                                                floor sb-kernel::floor1
-                                               ceiling sb-kernel::ceiling1)
+                                               ceiling sb-kernel::ceiling1
+                                               round sb-kernel::round1
+                                               ftruncate sb-kernel::ftruncate1
+                                               ffloor sb-kernel::ffloor1
+                                               fceiling sb-kernel::fceiling1
+                                               fround sb-kernel::fround1)
                                              combination-name)))
                  (when single-value-fun
                    (unless (cdr args)
-                     (let* ((leaf (find-constant 1))
-                            (ref (make-ref leaf))
-                            (lvar (make-lvar combination)))
-                       (use-lvar ref lvar)
-                       (push ref (leaf-refs leaf))
-                       (insert-ref-before ref combination-name)
-                       (setf (cdr args) (list lvar))))
+                     (setf (cdr args)
+                           (list (insert-ref-before (find-constant 1) combination))))
                    (change-full-call combination single-value-fun)
                    (setf (node-derived-type combination)
                          (make-single-value-type (single-value-type (node-derived-type combination)))))))))
           ((and (eq (combination-kind combination) :full)
                 (not (fun-lexically-notinline-p combination-name (node-lexenv combination))))
-           (let ((specialized (info :function :specialized-xep combination-name)))
+           (let ((specialized (or (info :function :specialized-xep combination-name)
+                                  (let ((specialized (assoc 'sb-impl::specialized-xep
+                                                            (lexenv-user-data (node-lexenv combination)))))
+                                    (when (eq (cadr specialized) combination-name)
+                                      (cddr specialized))))))
+
              (when (and specialized
                         (= (length args)
                            (length (first specialized))))

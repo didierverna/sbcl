@@ -21,7 +21,6 @@
 #include "genesis/sbcl.h"
 #include "validate.h"
 #include "genesis/closure.h"
-#include "genesis/symbol.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
 
@@ -70,8 +69,8 @@
 #define TRAP int3
 #endif
 
-#define CARD_TABLE_REG %r12
 #define THREAD_BASE_REG %r13
+#define reg_NULL %r12
 
 #ifdef LISP_FEATURE_WIN32
 #define CARG1 %rcx
@@ -193,7 +192,8 @@ Lzero:
 	push	%rbp		# fp in save location S1
 	mov	%rsp,%rbp	# The current sp marks start of new frame.
 Lcall:
-	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
+	LOAD_PIC_VAR(gc_card_mark, reg_NULL)
+	sub	NIL_CARDTABLE_DISP, reg_NULL
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 	/* If the function returned multiple values, the carry flag will be set.
@@ -253,7 +253,8 @@ GNAME(funcall_alien_callback):
         push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
         mov	%rsp,%rbp
-	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
+	LOAD_PIC_VAR(gc_card_mark, reg_NULL)
+	sub	NIL_CARDTABLE_DISP, reg_NULL
 	LOAD_PIC_VAR(linkage_space, %rax)
 	call	*(8*ENTER_ALIEN_CALLBACK_fname_index)(%rax)
 
@@ -280,7 +281,6 @@ GNAME(funcall_alien_callback):
 
 	.text
 	.globl 	GNAME(fun_end_breakpoint_guts)
-	.align	align_16byte
 GNAME(fun_end_breakpoint_guts):
 	/* Multiple Value return */
 	jc	multiple_value_return
@@ -290,8 +290,8 @@ GNAME(fun_end_breakpoint_guts):
 	mov	%rsp,%rbx	# Setup ebx - the ofp.
 	sub	$8,%rsp		# Allocate one stack slot for the return value
 	mov	$(1 << N_FIXNUM_TAG_BITS),%rcx		# Setup ecx for one return value.
-	mov	$(NIL),%rdi	# default second value
-	mov	$(NIL),%rsi	# default third value
+	mov	reg_NULL,%rdi	# default second value
+	mov	reg_NULL,%rsi	# default third value
 multiple_value_return:
 
 	.globl  GNAME(fun_end_breakpoint_trap)

@@ -385,64 +385,69 @@
     (declare (type bignum-length len-a len-b len-res)) ;Test len-res for bounds?
     (subtract-bignum-loop a len-a b len-b res len-res %normalize-bignum)))
 
-
 (defun subtract-bignum-fixnum (a b)
   (declare (type bignum a)
            (fixnum b))
   (let* ((len-a (%bignum-length a))
-         (len-b 1)
          (len-res (1+ len-a))
          (res (%allocate-bignum len-res)))
-    (declare (type bignum-length len-a len-b len-res))
-    (let* ((borrow 1)
-           (a-sign (%sign-digit a len-a))
-           (b-sign (ash b (- 1 digit-size))))
-      (declare (type bignum-element-type a-sign b-sign))
-      (dotimes (i len-res)
-        (declare (type bignum-index i))
-        (let ((a-digit
-                (if (< i len-a)
-                    (%bignum-ref a i)
-                    a-sign))
-              (b-digit
-                (if (< i len-b)
-                    b
-                    b-sign)))
-          (declare (type bignum-element-type a-digit b-digit))
-          (multiple-value-bind (v k)
-              (%subtract-with-borrow a-digit b-digit borrow)
-            (setf (%bignum-ref res i) v)
-            (setf borrow k))))
-      (%normalize-bignum res len-res))))
+    (declare (type bignum-length len-a len-res))
+    (sb-c::if-vop-existsp (:named sb-vm::bignum-sub-word-loop)
+      (sb-sys:%primitive sb-vm::bignum-sub-word-loop a (ldb (byte sb-vm:n-word-bits 0) b)
+                         len-a res)
+      (let* ((borrow 1)
+             (len-b 1)
+             (a-sign (%sign-digit a len-a))
+             (b-sign (ash b (- 1 digit-size))))
+        (declare (type bignum-element-type a-sign b-sign))
+        (dotimes (i len-res)
+          (declare (type bignum-index i))
+          (let ((a-digit
+                  (if (< i len-a)
+                      (%bignum-ref a i)
+                      a-sign))
+                (b-digit
+                  (if (< i len-b)
+                      b
+                      b-sign)))
+            (declare (type bignum-element-type a-digit b-digit))
+            (multiple-value-bind (v k)
+                (%subtract-with-borrow a-digit b-digit borrow)
+              (setf (%bignum-ref res i) v)
+              (setf borrow k))))))
+    (%normalize-bignum res len-res)))
 
 (defun subtract-fixnum-bignum (a b)
   (declare (fixnum a)
            (type bignum b))
-  (let* ((len-a 1)
-         (len-b (%bignum-length b))
+  (let* ((len-b (%bignum-length b))
          (len-res (1+ len-b))
          (res (%allocate-bignum len-res)))
-    (declare (type bignum-length len-a len-b len-res))
-    (let* ((borrow 1)
-           (a-sign (ash a (- 1 digit-size)))
-           (b-sign (%sign-digit b len-b)))
-      (declare (type bignum-element-type a-sign b-sign))
-      (dotimes (i len-res)
-        (declare (type bignum-index i))
-        (let ((a-digit
-                (if (< i len-a)
-                    a
-                    a-sign))
-              (b-digit
-                (if (< i len-b)
-                    (%bignum-ref b i)
-                    b-sign)))
-          (declare (type bignum-element-type a-digit b-digit))
-          (multiple-value-bind (v k)
-              (%subtract-with-borrow a-digit b-digit borrow)
-            (setf (%bignum-ref res i) v)
-            (setf borrow k))))
-      (%normalize-bignum res len-res))))
+    (declare (type bignum-length  len-b len-res))
+    (sb-c::if-vop-existsp (:named sb-vm::word-sub-bignum-loop)
+      (sb-sys:%primitive sb-vm::word-sub-bignum-loop (ldb (byte sb-vm:n-word-bits 0) a) b
+                         len-b res)
+      (let* ((len-a 1)
+             (borrow 1)
+             (a-sign (ash a (- 1 digit-size)))
+             (b-sign (%sign-digit b len-b)))
+        (declare (type bignum-element-type a-sign b-sign))
+        (dotimes (i len-res)
+          (declare (type bignum-index i))
+          (let ((a-digit
+                  (if (< i len-a)
+                      a
+                      a-sign))
+                (b-digit
+                  (if (< i len-b)
+                      (%bignum-ref b i)
+                      b-sign)))
+            (declare (type bignum-element-type a-digit b-digit))
+            (multiple-value-bind (v k)
+                (%subtract-with-borrow a-digit b-digit borrow)
+              (setf (%bignum-ref res i) v)
+              (setf borrow k))))))
+    (%normalize-bignum res len-res)))
 
 ;;; Operations requiring a subtraction without the overhead of intermediate
 ;;; results, such as GCD, use this. It assumes Result is big enough for the
@@ -462,7 +467,8 @@
 ;;;; multiplication
 
 (defun multiply-bignums (a b)
-  (declare (type bignum a b))
+  (declare (type bignum a b)
+           (optimize speed (safety 0)))
   (let* ((a-plusp (bignum-plus-p a))
          (b-plusp (bignum-plus-p b))
          (a (if a-plusp a (negate-bignum-not-fully-normalized a)))
@@ -470,49 +476,65 @@
          (len-a (%bignum-length a))
          (len-b (%bignum-length b))
          (len-res (+ len-a len-b))
-         (res (alloc-zeroing len-res))
+         (res (%allocate-bignum len-res))
          (negate-res (not (eq a-plusp b-plusp))))
     (declare (type bignum-length len-a len-b len-res))
-    (dotimes (i len-a)
-      (declare (type bignum-index i))
-      (let ((carry-digit 0)
-            (x (%bignum-ref a i))
-            (k i))
-        (declare (type bignum-index k)
-                 (type bignum-element-type carry-digit x))
-        (dotimes (j len-b)
-          (multiple-value-bind (big-carry res-digit)
-              (%multiply-and-add x
-                                 (%bignum-ref b j)
-                                 (%bignum-ref res k)
-                                 carry-digit)
-            (declare (type bignum-element-type big-carry res-digit))
-            (setf (%bignum-ref res k) res-digit)
-            (setf carry-digit big-carry)
-            (incf k)))
-        (setf (%bignum-ref res k) carry-digit)))
+    (when (> len-a len-b)
+      (rotatef a b)
+      (rotatef len-a len-b))
+
+    ;; The partial result is zero on the first iteration,
+    ;; so don't include it. And no need to zero when allocating it.
+    (let ((x (%bignum-ref a 0)))
+      (sb-c::if-vop-existsp (:named sb-vm::bignum-mult-and-add-word-loop)
+        (sb-sys:%primitive sb-vm::bignum-mult-and-add-word-loop b x len-b res)
+        (let ((carry-digit 0))
+          (declare (fixnum carry-digit))
+          (dotimes (index len-b)
+            (declare (type bignum-index index))
+            (setf (values carry-digit
+                          (%bignum-ref res index))
+                  (%multiply-and-add (%bignum-ref b index) x carry-digit)))
+          (setf (%bignum-ref res len-b) carry-digit))))
+
+    (loop for i of-type bignum-index from 1 below len-a
+          do
+          (let ((x (%bignum-ref a i))
+                (k i)
+                (carry-digit 0))
+            (declare (type bignum-index k))
+            (dotimes (j len-b)
+              (setf (values carry-digit (%bignum-ref res k))
+                    (%multiply-and-add x
+                                       (%bignum-ref b j)
+                                       (%bignum-ref res k)
+                                       carry-digit))
+              (incf k))
+            (setf (%bignum-ref res k) carry-digit)))
     (when negate-res (negate-bignum-in-place res))
     (%normalize-bignum res len-res)))
 
 (defun multiply-bignum-and-fixnum (bignum fixnum)
-  (declare (type bignum bignum) (type fixnum fixnum))
+  (declare (type bignum bignum) (type fixnum fixnum)
+           (optimize speed (safety 0)))
   (let* ((bignum-plus-p (bignum-plus-p bignum))
          (fixnum-plus-p (not (minusp fixnum)))
          (bignum (if bignum-plus-p bignum (negate-bignum-not-fully-normalized bignum)))
          (bignum-len (%bignum-length bignum))
          (fixnum (if fixnum-plus-p fixnum (- fixnum)))
-         (result (%allocate-bignum (1+ bignum-len)))
-         (carry-digit 0))
+         (result (%allocate-bignum (1+ bignum-len))))
     (declare (type bignum bignum result)
-             (type bignum-element-type fixnum carry-digit))
-    (dotimes (index bignum-len)
-      (declare (type bignum-index index))
-      (multiple-value-bind (next-digit low)
-          (%multiply-and-add (%bignum-ref bignum index) fixnum carry-digit)
-        (declare (type bignum-element-type next-digit low))
-        (setf carry-digit next-digit)
-        (setf (%bignum-ref result index) low)))
-    (setf (%bignum-ref result bignum-len) carry-digit)
+             (type bignum-element-type fixnum))
+    (sb-c::if-vop-existsp (:named sb-vm::bignum-mult-and-add-word-loop)
+      (sb-sys:%primitive sb-vm::bignum-mult-and-add-word-loop bignum fixnum bignum-len result)
+      (let ((carry-digit 0))
+        (declare (fixnum carry-digit))
+        (dotimes (index bignum-len)
+          (declare (type bignum-index index))
+          (setf (values carry-digit
+                        (%bignum-ref result index))
+                (%multiply-and-add (%bignum-ref bignum index) fixnum carry-digit)))
+        (setf (%bignum-ref result bignum-len) carry-digit)))
     (unless (eq bignum-plus-p fixnum-plus-p)
       (negate-bignum-in-place result))
     (%normalize-bignum result (1+ bignum-len))))
@@ -1450,13 +1472,13 @@
                   (double-float 'sb-kernel:%make-double-float))
                (if (%bignum-0-or-plusp bignum bignum-length)
                    (let* ((length (truly-the bignum-length (bignum-buffer-integer-length bignum bignum-length)))
-                          (shift (- length ,(const 'digits)))
-                          ;; Get one more bit for rounding
+                          (shift (- length ,(const 'digits) 1)) ;; Get one more bit for rounding
                           (shifted (truly-the fixnum
                                               (last-bignum-part=>fixnum (- sb-bignum::digit-size ,(const 'digits))
-                                                                        (1- shift) bignum)))
-                          ;; Cut off the hidden bit
-                          (signif (ldb ,(const 'significand-byte) (ash shifted -1)))
+                                                                        shift bignum)))
+                          (signif (ldb (byte (byte-size ,(const 'significand-byte)) ; Cut off the hidden bit
+                                             1) ; and the rounding bit
+                                       shifted))
                           (exp (truly-the (unsigned-byte ,(byte-size sb-vm:double-float-exponent-byte))
                                           (+ ,(const 'bias) length)))
                           (bits (ash exp
@@ -1478,8 +1500,8 @@
                    (multiple-value-bind (last1 last2) (bignum-negate-last-two bignum bignum-length)
                      (let* ((last2-length (integer-length last2))
                             (length (+ last2-length (* (1- bignum-length) digit-size)))
-                            (shift (- length ,(const 'digits)))
-                            (bit-index (rem (1- shift) digit-size))
+                            (shift (- length ,(const 'digits) 1))
+                            (bit-index (rem shift digit-size))
                             (shifted (cond ((zerop last2)
                                             (truly-the word (ash last1 (- bit-index))))
                                            ((<= bit-index (- digit-size (1+ ,(const 'digits))))
@@ -1747,6 +1769,25 @@
                                        (ash (%bignum-ref bignum (1+ word-index))
                                             (truly-the (integer 0 (#.digit-size)) (- digit-size bit-index)))
                                        (ash one (- bit-index)))))))))
+
+(declaim (inline last-bignum-part=>word))
+(defun last-bignum-part=>word (byte-size-left byte-pos bignum)
+  (declare (type bit-index byte-pos)
+           (type (integer 0 #.sb-vm:n-word-bits) byte-size-left)
+           (bignum bignum)
+           (optimize speed))
+  (multiple-value-bind (word-index bit-index) (floor byte-pos digit-size)
+    (let ((one (%bignum-ref bignum word-index)))
+      (cond ((<= bit-index byte-size-left) ; contained in one word
+             (truly-the word (ash one (- bit-index))))
+            (t
+             ;; At least one bit is obtained from each of two words,
+             ;; and not more than two words.
+             (truly-the word (logior
+                              (truly-the word (ash (%bignum-ref bignum (1+ word-index))
+                                                   (truly-the (integer 0 (#.digit-size)) (- digit-size bit-index))))
+                              (ash one (- bit-index)))))))))
+
 
 ;;;; TRUNCATE
 
@@ -2146,12 +2187,9 @@
                          (r 0))
                         ((minusp i)
                          (values q r))
-                      (declare (type bignum-element-type r))
-                      (multiple-value-bind (q-digit r-digit)
-                          (%bigfloor r (%bignum-ref x i) y)
-                        (declare (type bignum-element-type q-digit r-digit))
-                        (setf (%bignum-ref q i) q-digit)
-                        (setf r r-digit))))))))
+                      (setf (values (%bignum-ref q i)
+                                    r)
+                            (%bigfloor r (%bignum-ref x i) y))))))))
     (let* ((x-plusp (bignum-plus-p x))
            (y-plusp t)
            (x (if x-plusp x (negate-bignum-not-fully-normalized x)))
@@ -2182,6 +2220,29 @@
           (values (%normalize-bignum quotient (%bignum-length quotient))
                   rem))))))
 
+;;; This is used by %output-integer-in-base for repeatedly dividing a
+;;; bignum by a base into a preallocated quotient bignum.
+(declaim (inline bignum-truncate-single-digit-to))
+(defun bignum-truncate-single-digit-to (x y q len)
+  (declare (muffle-conditions compiler-note)
+           (type bignum x q)
+           (type word y)
+           (bignum-index len)
+           (optimize speed (safety 0)))
+  (let ((rem 0)
+        (res-len len)
+        (i (1- len)))
+    (declare (bignum-index res-len))
+    (when (zerop (setf (values (%bignum-ref q i)
+                               rem)
+                       (truncate (%bignum-ref x i) y)))
+      (decf res-len))
+    (loop while (>= (decf i) 0)
+          do (setf (values (%bignum-ref q i)
+                           rem)
+                   (%bigfloor rem (%bignum-ref x i) y)))
+    (values q rem res-len)))
+
 (macrolet ((def (type)
              (let ((decode (package-symbolicate "SB-KERNEL" 'integer-decode- type)))
                `(defun ,(symbolicate 'unary-truncate- type '-to-bignum) (number)
@@ -2209,6 +2270,52 @@
                            `(- number (coerce truncated ',type)))))))))))
   (def double-float)
   (def single-float))
+
+(macrolet ((def (type)
+             (let ((decode (package-symbolicate "SB-KERNEL" 'integer-decode- type)))
+               `(defun ,(symbolicate 'unary-truncate- type '-to-bignum-div) (quot number divisor)
+                  (declare (inline ,decode))
+                  (multiple-value-bind (bits exp sign) (,decode quot)
+                    (let ((truncated ,(case type
+                                        #-64-bit
+                                        (double-float
+                                         ;; Shifting negatives right is different
+                                         `(let ((truncated (ash bits exp)))
+                                            (if (minusp sign)
+                                                (- truncated)
+                                                truncated)))
+                                        (t
+                                         `(bignum-ashift-left-fixnum (if (minusp sign)
+                                                                         (- bits)
+                                                                         bits)
+                                                                     exp)))))
+                      (values
+                       truncated
+                       (- number (* quot divisor)))))))))
+  (def double-float)
+  (def single-float))
+
+#-64-bit
+(defun round-double-float-to-bignum (number)
+  (declare (double-float number))
+  (multiple-value-bind (tru rem) (truncate number)
+    (if (zerop rem)
+        (values tru rem)
+        (let ((thresh 0.5d0))
+          (cond ((or (> rem thresh)
+                     (and (= rem thresh) (oddp tru)))
+                 (values (+ tru 1) (- rem 1d0)))
+                ((let ((-thresh (- thresh)))
+                   (or (< rem -thresh)
+                       (and (= rem -thresh) (oddp tru))))
+                 (values (- tru 1) (+ rem 1d0)))
+                (t (values tru rem)))))))
+
+#-64-bit
+(defun round-double-float-to-bignum-div (quot number divisor)
+  (declare (double-float number))
+  (let ((rounded (round-double-float-to-bignum quot)))
+    (values rounded (- number (* rounded divisor)))))
 
 (macrolet ((def (type)
              (let ((decode (package-symbolicate "SB-KERNEL" 'integer-decode- type)))

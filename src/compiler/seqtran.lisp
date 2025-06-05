@@ -97,11 +97,14 @@
                             #-sb-xc-host
                             (declare (muffle-conditions compiler-note))
                             (unaligned-dx-cons nil))))
-                   (declare (dynamic-extent ,map-result))
+                   (declare (dynamic-extent ,map-result)
+                            (no-debug ,map-result))
                    (do-anonymous ((,temp ,map-result) . ,(do-clauses))
                      (,endtest
                       (%rplacd ,temp nil) ;; replace the 0
                       (truly-the list (cdr ,map-result)))
+                     (declare (no-debug ,temp))
+
                      ;; Accumulate using %RPLACD. RPLACD becomes (SETF CDR)
                      ;; which becomes %RPLACD but relies on "defsetfs".
                      ;; This is for effect, not value, so makes no difference.
@@ -394,13 +397,13 @@
          result)))
 
 
-;;; FIXME: once the confusion over doing transforms with known-complex
-;;; arrays is over, we should also transform the calls to (AND (ARRAY
-;;; * (*)) (NOT (SIMPLE-ARRAY * (*)))) objects.
-(deftransform elt ((s i) ((simple-array * (*)) t) *)
+;;; Arrays with a fill-pointer check bounds differently in ELT.
+(deftransform elt ((s i) (simple-array t) *)
   '(aref s i))
 
 (deftransform elt ((s i) (list t) * :policy (< safety 3))
+  (when (eql (lvar-type s) (specifier-type 'null))
+    (give-up-ir1-transform))
   '(nth i s))
 
 (deftransform %setelt ((s i v) ((simple-array * (*)) t t) *)
@@ -869,9 +872,9 @@
                                       (typep (lvar-value item) 'base-char))
                                  (* multiplier (char-code (lvar-value item)))
                                  ;; Use multiplication if it's known to be cheap
-                                 #+(or x86 x86-64)
+                                 #+(or x86 x86-64 arm64)
                                  `(* ,multiplier (char-code (the base-char item)))
-                                 #-(or x86 x86-64)
+                                 #-(or x86 x86-64 arm64)
                                  '(let ((code (char-code (the base-char item))))
                                    (setf code (dpb code (byte 8 8) code))
                                    (setf code (dpb code (byte 16 16) code))
@@ -913,7 +916,8 @@
                     (and (constant-lvar-p start)
                          (eql (lvar-value start) 0)))
                 (not end)
-                (typep (array-type-dimensions type) '(cons number null))
+                (or (typep (array-type-dimensions type) '(cons number null))
+                    (delay-ir1-transform node :constraint))
                 (<= (car (array-type-dimensions type))
                     (cond #+soft-card-marks
                           ((eq element-ctype *universal-type*)
@@ -2226,45 +2230,46 @@
 
 (defun find-derive-type (item sequence key test start end from-end &optional test-not)
   (declare (ignore start end from-end))
-  (unless test-not
-    (let ((type *universal-type*)
-          (key-identity-p (or (not key)
-                              (lvar-value-is key nil)
-                              (lvar-fun-is key '(identity)))))
-      (flet ((fun-accepts-type (fun-lvar argument)
-               (when fun-lvar
-                 (let ((fun-type (lvar-fun-type fun-lvar t t)))
-                   (when (fun-type-p fun-type)
-                     (let ((arg (nth argument (fun-type-n-arg-types (1+ argument) fun-type))))
-                       (when arg
-                         (setf type
-                               (type-intersection type arg)))))))))
-        (when (and item
-                   key-identity-p)
-          ;; Maybe FIND returns ITEM itself or a comparable type
-          (cond ((or (not test)
-                     (lvar-fun-is test '(eq eql char=))
-                     (lvar-value-is test nil))
-                 (setf type (lvar-type item)))
-                ((lvar-fun-is test '(equal))
-                 (setf type (equal-type (lvar-type item))))
-                ((lvar-fun-is test '(equalp char-equal))
-                 (setf type (equalp-type (lvar-type item))))))
-        ;; Should return something the functions can accept
-        (if key-identity-p
-            (fun-accepts-type test (if item 1 0)) ;; the -if variants.
-            (fun-accepts-type key 0)))
-      (let ((upgraded-type (type-array-element-type (lvar-type sequence))))
-        (unless (eq upgraded-type *wild-type*)
-          (setf type
-                (type-intersection type upgraded-type))))
-      (unless (eq type *empty-type*)
-        (type-union type
-                    (specifier-type 'null))))))
+  (let ((type *universal-type*)
+        (key-identity-p (or (not key)
+                            (lvar-value-is key nil)
+                            (lvar-fun-is key '(identity)))))
+    (flet ((fun-accepts-type (fun-lvar argument)
+             (when fun-lvar
+               (let ((fun-type (lvar-fun-type fun-lvar t t)))
+                 (when (fun-type-p fun-type)
+                   (let ((arg (nth argument (fun-type-n-arg-types (1+ argument) fun-type))))
+                     (when arg
+                       (setf type
+                             (type-intersection type arg)))))))))
+      (when (and item
+                 key-identity-p
+                 (not test-not))
+        ;; Maybe FIND returns ITEM itself or a comparable type
+        (cond ((or (not test)
+                   (lvar-fun-is test '(eq eql char=))
+                   (lvar-value-is test nil))
+               (setf type (lvar-type item)))
+              ((lvar-fun-is test '(equal))
+               (setf type (equal-type (lvar-type item))))
+              ((lvar-fun-is test '(equalp char-equal))
+               (setf type (equalp-type (lvar-type item))))))
+      ;; Should return something the functions can accept
+      (if key-identity-p
+          (unless (and test-not test)
+            (fun-accepts-type (or test-not test) (if item 1 0))) ;; the -if variants.
+          (fun-accepts-type key 0)))
+    (let ((upgraded-type (type-array-element-type (lvar-type sequence))))
+      (unless (eq upgraded-type *wild-type*)
+        (setf type
+              (type-intersection type upgraded-type))))
+    (unless (eq type *empty-type*)
+      (type-union type
+                  (specifier-type 'null)))))
 
-(defoptimizer (find derive-type) ((item sequence &key key test
+(defoptimizer (find derive-type) ((item sequence &key key test test-not
                                         start end from-end))
-  (find-derive-type item sequence key test start end from-end))
+  (find-derive-type item sequence key test start end from-end test-not))
 
 (defoptimizer (find-if derive-type) ((predicate sequence &key key start end from-end))
   (find-derive-type nil sequence key predicate start end from-end))
@@ -2632,15 +2637,64 @@
 
 ;;;; CONS accessor DERIVE-TYPE optimizers
 
+;;; Find a possible CAR type a variable bound to a constant list with
+;;; all sets in the form of (setf x (cdr x))
+(defun cons-var-car-type (lvar)
+  (let ((ref (principal-lvar-use lvar))
+        constant-lvar
+        value)
+    (when (and (ref-p ref)
+               (let ((leaf (ref-leaf ref)))
+                 (and
+                  (lambda-var-p leaf)
+                  (let ((lvar (lambda-var-ref-lvar ref t)))
+                    (flet ((good-lvar-p (lvar)
+                             (and lvar
+                                  (setf value (lvar-constant (setf constant-lvar lvar)))
+                                  (proper-or-dotted-list-p (setf value (constant-value value))))))
+                      (cond ((and (lambda-var-sets leaf)
+                                  (good-lvar-p lvar)))
+                            ;; (pop x) goes through a variable
+                            ((let* ((next-ref (principal-lvar-ref lvar))
+                                    (next-leaf (and (ref-p next-ref)
+                                                    (ref-leaf next-ref))))
+                               (when (and (lambda-var-p next-leaf)
+                                          (lambda-var-sets next-leaf))
+                                 (let ((lvar (lambda-var-ref-lvar next-ref t)))
+                                   (when (good-lvar-p lvar)
+                                     (setf leaf next-leaf)))))))))
+                  (loop for set in (lambda-var-sets leaf)
+                        for combination = (principal-lvar-ref-use (set-value set))
+                        always (and (combination-is combination '(cdr))
+                                    (let ((ref (principal-lvar-ref (car (combination-args combination)) t)))
+                                      (when ref
+                                        (eq (ref-leaf ref) leaf))))))))
+      (let ((type (sequence-elements-type constant-lvar)))
+        (if (cdr (last value))
+            type
+            (type-union type (specifier-type 'null)))))))
+
 (defoptimizer (car derive-type) ((cons))
   ;; This and CDR needs to use LVAR-CONSERVATIVE-TYPE because type inference
   ;; gets confused by things like (SETF CAR).
-  (let ((type (lvar-conservative-type cons))
-        (null-type (specifier-type 'null)))
-    (cond ((eq type null-type)
-           null-type)
-          ((cons-type-p type)
-           (cons-type-car-type type)))))
+  (or (cons-var-car-type cons)
+      (let ((type (lvar-conservative-type cons))
+            (null-type (specifier-type 'null)))
+        (cond ((eq type null-type)
+               null-type)
+              ((cons-type-p type)
+               (cons-type-car-type type))
+              ((union-type-p type)
+               (loop with cars
+                     for type in (union-type-types type)
+                     do (cond
+                          ((eq type null-type)
+                           (push type cars))
+                          ((cons-type-p type)
+                           (push (cons-type-car-type type) cars))
+                          (t
+                           (return)))
+                     finally (return (sb-kernel::%type-union cars))))))))
 
 (defoptimizer (cdr derive-type) ((cons))
   (let ((type (lvar-conservative-type cons))
@@ -2648,7 +2702,18 @@
     (cond ((eq type null-type)
            null-type)
           ((cons-type-p type)
-           (cons-type-cdr-type type)))))
+           (cons-type-cdr-type type))
+          ((union-type-p type)
+           (loop with cdrs
+                 for type in (union-type-types type)
+                 do (cond
+                      ((eq type null-type)
+                       (push type cdrs))
+                      ((cons-type-p type)
+                       (push (cons-type-cdr-type type) cdrs))
+                      (t
+                       (return)))
+                 finally (return (sb-kernel::%type-union cdrs)))))))
 
 ;;;; FIND, POSITION, and their -IF and -IF-NOT variants
 
@@ -2657,7 +2722,7 @@
 ;;; expansion, so we factor out the condition into this function.
 (defun check-inlineability-of-find-position-if (sequence from-end)
   (let ((ctype (lvar-type sequence)))
-    (cond ((csubtypep ctype (specifier-type 'vector))
+    (cond ((csubtypep ctype (specifier-type '(or null vector)))
            ;; It's not worth trying to inline vector code unless we
            ;; know a fair amount about it at compile time.
            (upgraded-element-type-specifier-or-give-up sequence)
@@ -2943,134 +3008,142 @@
                                        from-end start end key))
 
 (deftransform %find-position ((item sequence from-end start end key test)
-                              (t vector t t t function function)
+                              (t (or null vector) t t t function function)
                               *
                               :node node)
   "expand inline"
+  (when (eq (lvar-type sequence) (specifier-type 'null))
+    (give-up-ir1-transform))
   (check-inlineability-of-find-position-if sequence from-end)
   (when (check-sequence-ranges sequence start end node :warn nil)
     (give-up-ir1-transform))
-  (block nil
-    (unless
-        (or
-         ;; These have compact inline expansion
-         (and (or (not key)
-                  (lvar-fun-is key '(identity)))
-              (let* ((element-type (array-type-upgraded-element-type (lvar-type sequence)))
-                     (et-specifier (type-specifier element-type))
-                     (test (lvar-fun-name* test))
-                     (item (lvar-type item))
-                     (simple (csubtypep (lvar-type sequence) (specifier-type 'simple-array))))
-                (when (and (neq element-type *wild-type*)
-                           (case et-specifier
-                             ((double-float single-float)
-                              (and (csubtypep item element-type)
-                                   (memq test '(= eql equal equalp))))
-                             ((t)
-                              (eq test 'eq))
-                             (character
-                              (or (memq test '(eq eql equal char=))
-                                  (and (eq test 'char-equal)
-                                       (or (csubtypep item (specifier-type 'base-char))
-                                           (and (constant-lvar-p sequence)
-                                                (every (lambda (x) (typep x 'base-char))
-                                                       (lvar-value sequence)))))))
-                             (base-char
-                              (memq test '(eq eql equal char= char-equal)))
-                             (t
-                              (and (csubtypep element-type (specifier-type 'integer))
-                                   (or
-                                    (and (memq test '(= equalp))
-                                         (csubtypep item element-type))
-                                    (memq test '(eq eql equal)))))))
-                  (cond #+(or arm64 x86-64)
-                        ((and (member et-specifier '(base-char character
-                                                     (unsigned-byte 8)
-                                                     (signed-byte 8)
-                                                     (unsigned-byte 32)
-                                                     (signed-byte 32))
-                                      :test #'equal)
-                              (constant-lvar-p from-end)
-                              (neq test 'char-equal)
-                              (not (and (eq test 'char=)
-                                        (not (csubtypep item (specifier-type 'character))))))
-                         (flet ((gen (end &optional offset)
-                                  (multiple-value-bind (size test value)
-                                      (cond
-                                        ((eq et-specifier 'character)
-                                         (values #+sb-unicode 32  #-sb-unicode 8
-                                                 '(characterp item)
-                                                 '(char-code (truly-the character item))))
-                                        #+sb-unicode
-                                        ((eq et-specifier 'base-char)
-                                         (values 8 '(base-char-p item)
-                                                 '(char-code (truly-the base-char item))))
-                                        ((equal et-specifier '(unsigned-byte 8))
-                                         (values 8 '(typep item '(unsigned-byte 8))
-                                                 '(truly-the (unsigned-byte 8) item)))
-                                        ((equal et-specifier '(signed-byte 8))
-                                         (values 8 '(typep item '(signed-byte 8))
-                                                 '(truly-the (unsigned-byte 8)
-                                                   (ldb (byte 8 0)
-                                                    (truly-the (signed-byte 8) item)))))
-                                        ((equal et-specifier '(unsigned-byte 32))
-                                         (values 32 '(typep item '(unsigned-byte 32))
-                                                 '(truly-the (unsigned-byte 32) item)))
-                                        ((equal et-specifier '(signed-byte 32))
-                                         (values 32 '(typep item '(signed-byte 32))
-                                                 '(truly-the (unsigned-byte 32)
-                                                   (ldb (byte 32 0)
-                                                    (truly-the (signed-byte 32) item))))))
-                                    `(let ((pos (and ,test
-                                                     (,(if (= size 8)
-                                                           (if (lvar-value from-end)
-                                                               'sb-vm::simd-position8-from-end
-                                                               'sb-vm::simd-position8)
-                                                           (if (lvar-value from-end)
-                                                               'sb-vm::simd-position32-from-end
-                                                               'sb-vm::simd-position32))
-                                                      ,value
-                                                      sequence start ,end))))
-                                       (truly-the ,(node-derived-type node)
-                                                  (if pos
-                                                      (values item ,(if offset
-                                                                        `(- pos offset)
-                                                                        `pos))
-                                                      (values nil nil)))))))
-                           (cond (simple
-                                  (delay-ir1-transform node :constraint)
-                                  (return
-                                    (if (policy node (zerop insert-array-bounds-checks))
-                                        (gen '(or end (length sequence)))
-                                        `
-                                        (let* ((length (length sequence))
-                                               (end (or end length)))
-                                          (unless
-                                              (<= 0 start end length)
-                                            (sequence-bounding-indices-bad-error sequence start end))
-                                          ,(gen 'end)))))
-                                 ((policy node (> speed space))
-                                  (delay-ir1-transform node :constraint)
-                                  (return
-                                    `(with-array-data ((sequence sequence  :offset-var offset)
-                                                       (start start)
-                                                       (end end)
-                                                       :check-fill-pointer t)
-                                       ,(gen 'end 'offset)))))))
-                        ((and simple
-                              (or
-                               (policy node (zerop insert-array-bounds-checks))
-                               (and (constant-lvar-p start)
-                                    (eql (lvar-value start) 0)
-                                    (constant-lvar-p end)
-                                    (null (lvar-value end)))))
-                         t)))))
-         (policy node (> speed space)))
-      (give-up-ir1-transform))
-    ;; Delay to prefer the string and bit-vector transforms
-    (delay-ir1-transform node :constraint)
-    '(%find-position-vector-macro item sequence
-      from-end start end key test)))
+  (let ((null-p (types-equal-or-intersect (lvar-type sequence)
+                                          (specifier-type 'null))))
+    (wrap-if
+     null-p
+     '(if (not sequence) (values nil nil))
+     (block nil
+       (unless
+           (or
+            ;; These have compact inline expansion
+            (and (or (not key)
+                     (lvar-fun-is key '(identity)))
+                 (let* ((sequence-type (type-intersection (lvar-type sequence)
+                                                          (specifier-type 'array)))
+                        (element-type (array-type-upgraded-element-type sequence-type))
+                        (et-specifier (type-specifier element-type))
+                        (test (lvar-fun-name* test))
+                        (item (lvar-type item))
+                        (simple (csubtypep sequence-type (specifier-type 'simple-array))))
+                   (when (and (neq element-type *wild-type*)
+                              (case et-specifier
+                                ((double-float single-float)
+                                 (and (csubtypep item element-type)
+                                      (memq test '(= eql equal equalp))))
+                                ((t)
+                                 (eq test 'eq))
+                                (character
+                                 (or (memq test '(eq eql equal char=))
+                                     (and (eq test 'char-equal)
+                                          (or (csubtypep item (specifier-type 'base-char))
+                                              (and (constant-lvar-p sequence)
+                                                   (every (lambda (x) (typep x 'base-char))
+                                                          (lvar-value sequence)))))))
+                                (base-char
+                                 (memq test '(eq eql equal char= char-equal)))
+                                (t
+                                 (and (csubtypep element-type (specifier-type 'integer))
+                                      (or
+                                       (and (memq test '(= equalp))
+                                            (csubtypep item element-type))
+                                       (memq test '(eq eql equal)))))))
+                     (cond #+(or arm64 x86-64)
+                           ((and (member et-specifier '(base-char character
+                                                        (unsigned-byte 8)
+                                                        (signed-byte 8)
+                                                        (unsigned-byte 32)
+                                                        (signed-byte 32))
+                                         :test #'equal)
+                                 (constant-lvar-p from-end)
+                                 (neq test 'char-equal)
+                                 (not (and (eq test 'char=)
+                                           (not (csubtypep item (specifier-type 'character))))))
+                            (flet ((gen (end &optional offset)
+                                     (multiple-value-bind (size test value)
+                                         (cond
+                                           ((eq et-specifier 'character)
+                                            (values #+sb-unicode 32  #-sb-unicode 8
+                                                    '(characterp item)
+                                                    '(char-code (truly-the character item))))
+                                           #+sb-unicode
+                                           ((eq et-specifier 'base-char)
+                                            (values 8 '(base-char-p item)
+                                                    '(char-code (truly-the base-char item))))
+                                           ((equal et-specifier '(unsigned-byte 8))
+                                            (values 8 '(typep item '(unsigned-byte 8))
+                                                    '(truly-the (unsigned-byte 8) item)))
+                                           ((equal et-specifier '(signed-byte 8))
+                                            (values 8 '(typep item '(signed-byte 8))
+                                                    '(truly-the (unsigned-byte 8)
+                                                      (ldb (byte 8 0)
+                                                       (truly-the (signed-byte 8) item)))))
+                                           ((equal et-specifier '(unsigned-byte 32))
+                                            (values 32 '(typep item '(unsigned-byte 32))
+                                                    '(truly-the (unsigned-byte 32) item)))
+                                           ((equal et-specifier '(signed-byte 32))
+                                            (values 32 '(typep item '(signed-byte 32))
+                                                    '(truly-the (unsigned-byte 32)
+                                                      (ldb (byte 32 0)
+                                                       (truly-the (signed-byte 32) item))))))
+                                       `(let ((pos (and ,test
+                                                        (,(if (= size 8)
+                                                              (if (lvar-value from-end)
+                                                                  'sb-vm::simd-position8-from-end
+                                                                  'sb-vm::simd-position8)
+                                                              (if (lvar-value from-end)
+                                                                  'sb-vm::simd-position32-from-end
+                                                                  'sb-vm::simd-position32))
+                                                         ,value
+                                                         sequence start ,end))))
+                                          (truly-the ,(node-derived-type node)
+                                                     (if pos
+                                                         (values item ,(if offset
+                                                                           `(- pos offset)
+                                                                           `pos))
+                                                         (values nil nil)))))))
+                              (cond (simple
+                                     (delay-ir1-transform node :constraint)
+                                     (return
+                                       (if (policy node (zerop insert-array-bounds-checks))
+                                           (gen '(or end (length sequence)))
+                                           `(let* ((length (length sequence))
+                                                   (end (or end length)))
+                                              (unless
+                                                  (<= 0 start end length)
+                                                (sequence-bounding-indices-bad-error sequence start end))
+                                              ,(gen 'end)))))
+                                    ((policy node (> speed space))
+                                     (delay-ir1-transform node :constraint)
+                                     (return
+                                       `(with-array-data ((sequence sequence  :offset-var offset)
+                                                          (start start)
+                                                          (end end)
+                                                          :check-fill-pointer t)
+                                          ,(gen 'end 'offset)))))))
+                           ((and simple
+                                 (or
+                                  (policy node (zerop insert-array-bounds-checks))
+                                  (and (constant-lvar-p start)
+                                       (eql (lvar-value start) 0)
+                                       (constant-lvar-p end)
+                                       (null (lvar-value end)))))
+                            t)))))
+            (policy node (> speed space)))
+         (give-up-ir1-transform))
+       ;; Delay to prefer the string and bit-vector transforms
+       (delay-ir1-transform node :constraint)
+       `(%find-position-vector-macro item sequence
+                                     from-end start end key test)))))
 
 (deftransform %find-position ((item sequence from-end start end key test)
                               (t string t t t function function)
@@ -3912,7 +3985,7 @@
     ((array index &optional offset))
   array)
 
-(defoptimizer (nth constants) ((index list))
+(defoptimizers constants (nth nthcdr) ((index list))
   list)
 (defoptimizers constants (car cdr) ((cons))
   cons)

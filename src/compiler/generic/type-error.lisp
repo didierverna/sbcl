@@ -134,7 +134,8 @@
   (def "NIL-FUN-RETURNED"        nil-fun-returned-error       nil fun)
   (def "UNREACHABLE"             sb-impl::unreachable         nil)
   (def "FAILED-AVER"             sb-impl::%failed-aver        nil form)
-  (def "FILL-POINTER"            fill-pointer-error           nil array))
+  (def "FILL-POINTER"            fill-pointer-error           nil array)
+  (def "OP-NOT-TYPE2"            op-not-type2-error           t a b))
 
 
 (defun emit-internal-error (kind code values &key trap-emitter)
@@ -175,9 +176,7 @@
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset
-       (cond ((consp where)
-              (make-sc+offset immediate-sc-number (car where)))
-             ((not (tn-p where))
+       (cond ((not (tn-p where))
               where)
              ((and (sc-is where immediate)
                    (fixnump (tn-value where)))

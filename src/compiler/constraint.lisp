@@ -769,15 +769,17 @@
                           ((typep %typep %instance-typep)
                            (let ((type (second args)))
                              (when (constant-lvar-p type)
-                               (let ((val (lvar-value type)))
-                                 (add 'typep
-                                      (ok-lvar-lambda-var (first args) constraints)
-                                      (if (ctype-p val)
-                                          val
-                                          (let ((*compiler-error-context* node))
-                                           (specifier-type val)))
-                                      nil
-                                      (first args))))))
+                               (let* ((val (lvar-value type))
+                                      (ctype (if (ctype-p val)
+                                                 val
+                                                 (careful-specifier-type val))))
+                                 (when (and ctype
+                                            (type-for-constraints-p ctype))
+                                   (add 'typep
+                                        (ok-lvar-lambda-var (first args) constraints)
+                                        ctype
+                                        nil
+                                        (first args)))))))
                           ((eq eql)
                            (let* ((arg1 (first args))
                                   (var1 (ok-lvar-lambda-var arg1 constraints))
@@ -855,6 +857,13 @@
        (eq (numeric-type-class x) 'integer)
        (eq (numeric-type-complexp x) :real)))
 
+(defun ratio-type-p (x)
+  (declare (type ctype x))
+  (and (numeric-type-p x)
+       (eq (numeric-type-class x) 'rational)
+       (eq (numeric-type-complexp x) :real)
+       (csubtypep x (specifier-type 'ratio))))
+
 ;;; Given that an inequality holds on values of type X and Y, return a
 ;;; new type for X. If GREATER is true, then X was greater than Y,
 ;;; otherwise less. If OR-EQUAL is true, then the inequality was
@@ -920,14 +929,16 @@
                     (sb-xc:> (type-bound-number ref) (type-bound-number x))))))
     (let* ((x-bound (bound x))
            (y-bound (exclude (bound y)))
-           (new-bound (cond ((not x-bound)
-                             y-bound)
-                            ((not y-bound)
-                             x-bound)
-                            ((tighter-p y-bound x-bound)
-                             y-bound)
-                            (t
-                             x-bound))))
+           (new-bound (coerce-for-bound
+                       (cond ((not x-bound)
+                              y-bound)
+                             ((not y-bound)
+                              x-bound)
+                             ((tighter-p y-bound x-bound)
+                              y-bound)
+                             (t
+                              x-bound))
+                       (numeric-type-format x))))
       (if greater
           (modified-numeric-type x :low new-bound)
           (modified-numeric-type x :high new-bound)))))
@@ -1058,6 +1069,8 @@
                       (when (and ref
                                  (constant-p other))
                         (change-ref-leaf ref other)
+                        (when (eq (node-derived-type ref) *empty-type*)
+                          (pushnew ref *blocks-to-terminate*))
                         (return-from type-from-constraints))
                       (intersect-result other-type))
                      ((constant-p other)
@@ -1255,15 +1268,23 @@
        (let ((fun (bind-lambda node)))
          (functional-kind-case fun
            (let
-            (loop with call = (lvar-dest (node-lvar (first (lambda-refs fun))))
-                  for var in (lambda-vars fun)
-                  and val in (combination-args call)
-                  when (and val (lambda-var-constraints var))
-                  do (let ((type (lvar-type val)))
-                       (when (type-for-constraints-p type)
-                         (conset-add-constraint gen 'typep var type nil)))
-                     (maybe-add-eql-var-var-constraint var val gen)
-                     (add-var-result-constraints var val gen)))
+               (loop with call = (lvar-dest (node-lvar (first (lambda-refs fun))))
+                     for var in (lambda-vars fun)
+                     and val in (combination-args call)
+                     when (and val (lambda-var-constraints var))
+                     do (let ((type (lvar-type val)))
+                          (when (type-for-constraints-p type)
+                            (conset-add-constraint gen 'typep var type nil)))
+                        (maybe-add-eql-var-var-constraint var val gen)
+                        (add-var-result-constraints var val gen)))
+           ((nil optional)
+            (loop for var in (lambda-vars fun)
+                  for type = (leaf-defined-type var)
+                  do
+                  (when (and (lambda-var-constraints var)
+                             (type-for-constraints-p type)
+                             (not (lambda-var-arg-info var)))
+                    (conset-add-constraint gen 'typep var type nil))))
            (mv-let
             (add-mv-let-result-constraints (lvar-dest (node-lvar (first (lambda-refs fun)))) fun gen)))))
       (ref

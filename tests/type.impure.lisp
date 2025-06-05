@@ -66,6 +66,12 @@
   (assert-error (upgraded-complex-part-type 'some-undef-type))
   (assert (subtypep (upgraded-complex-part-type 'fixnum) 'real)))
 
+(with-test (:name (upgraded-complex-part-type nil))
+  (assert (type-evidently-= 'nil (upgraded-complex-part-type nil))))
+
+(with-test (:name (upgraded-complex-part-type (eql 0)))
+  (assert (subtypep '(eql 0) (upgraded-complex-part-type '(eql 0)))))
+
 ;;; Do reasonable things with undefined types, and with compound types
 ;;; built from undefined types.
 (with-test (:name (typep :undefined :compound))
@@ -858,10 +864,6 @@
   (disunity-test (:array-type-union :element-subtypes :dont-unite-across-saetp)
                  (array (unsigned-byte 7))
                  (array (unsigned-byte 3)))
-
-  (disunity-test (:array-type-union :disjoint-element-types :dont-unite)
-                 (array (integer 15 27))
-                 (array (integer 17 30)))
 
   (unity-test (:array-type-union :wild-element-type :unites)
               array

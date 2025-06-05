@@ -335,13 +335,14 @@
             (progn (done-with-fast-read-char)
                    (eof-or-lose stream eof-error-p (values eof-value t))))))))
 
-;; to potentially avoid consing a bufer on sucessive calls to read-line
+;; to potentially avoid consing a buffer on successive calls to read-line
 ;; (just consing the result string)
 (define-load-time-global *read-line-buffers* nil)
 (declaim (list *read-line-buffers*))
 
 (declaim (inline ansi-stream-read-line))
 (defun ansi-stream-read-line (stream eof-error-p eof-value)
+  (declare (sb-c::tlab :system))
   (if (ansi-stream-cin-buffer stream)
       ;; Stream has a fast-read-char buffer. Copy large chunks directly
       ;; out of the buffer.
@@ -983,8 +984,8 @@
   ;; CLHS 21.1.4 implies that CLOSE on a synonym stream closes the synonym stream in that
   ;; "The consequences are undefined if the synonym stream symbol is not bound to an open
   ;;  stream from the time of the synonym stream's creation until the time it is closed."
-  ;;         The antecent of this "it" is the synonym stream --------------^
-  ;; which means that there exist a way to close synonym streams.
+  ;;       The antecedent of this "it" is the synonym stream --------------^
+  ;; which means that there exists a way to close synonym streams.
   ;; We can presume that CLOSE is that way, despite some text seemingly to the contrary
   ;;  "Any operations on a synonym stream will be performed on the stream that is then
   ;;   the value of the dynamic variable named by the synonym stream symbol."
@@ -1282,7 +1283,7 @@
   (limit nil :type index :read-only t)
   ;; Backing string after following displaced array chain
   (string nil :type simple-string :read-only t)
-  ;; So that we know what string index FILE-POSITION 0 correponds to
+  ;; So that we know what string index FILE-POSITION 0 corresponds to
   (start nil :type index :read-only t))
 
 (declaim (freeze-type string-input-stream))
@@ -2425,9 +2426,6 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                           (funcall set-elt object seq iterator))
                         (setf iterator (funcall step seq iterator from-end))
                      finally (return i)))))
-    (declare (dynamic-extent #'compute-read-function
-                             #'read-list #'read-vector/fast #'read-vector
-                             #'read-generic-sequence))
     (cond
       ((typep seq 'list)
        (read-list (compute-read-function nil)))
@@ -2524,9 +2522,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                        for object = (funcall element seq iterator)
                        do (funcall write-function stream object)
                           (setf iterator (funcall step seq iterator from-end))))))
-      (declare (dynamic-extent #'compute-write-function
-                               #'write-element/bivalent #'write-list
-                               #'write-vector  #'write-generic-sequence))
+      (declare (dynamic-extent #'write-element/bivalent))
       (etypecase seq
         (list
          (write-list (compute-write-function nil)))
@@ -2671,7 +2667,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
 
 (defun stream-deinit ()
   (setq *tty* nil *stdin* nil *stdout* nil *stderr* nil)
-  ;; Unbind to make sure we're not accidently dealing with it
+  ;; Unbind to make sure we're not accidentally dealing with it
   ;; before we're ready (or after we think it's been deinitialized).
   ;; This uses the internal %MAKUNBOUND because the CL: function would
   ;; rightly complain that *AVAILABLE-BUFFERS* is proclaimed always bound.

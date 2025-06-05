@@ -147,25 +147,10 @@
       `(combined-method ,(generic-function-name gf))))
 
 (defun maybe-trace-method (gf method fun fmf-p)
-  (let ((m-name (when (plusp (hash-table-count sb-debug::*traced-funs*))
-                  ;; KLUDGE: testing if *TRACE-FUNS* has anything anything to
-                  ;; avoid calling METHOD-TRACE-NAME during PCL bootstrapping
-                  ;; when the generic-function type is not yet defined.)
-                  (method-trace-name gf method))))
-    (when m-name
-      (sb-debug::retrace-local-funs m-name))
-    (let ((info (when m-name
-                  (or (gethash m-name sb-debug::*traced-funs*)
-                      (let ((gf-info (gethash (or (generic-function-name gf) gf)
-                                              sb-debug::*traced-funs*)))
-                        (when (and gf-info (sb-debug::trace-info-methods gf-info))
-                          (let ((copy (copy-structure gf-info)))
-                            (setf (sb-debug::trace-info-what copy) m-name)
-                            copy)))))))
-      (if info
-          (lambda (&rest args)
-            (apply #'sb-debug::trace-method-call info fun fmf-p args))
-          fun))))
+  (declare (ignore gf method fmf-p))
+  ;; Bootstrap definition that does nothing until the GENERIC-FUNCTION
+  ;; type is defined.
+  fun)
 
 (defun make-emf-from-method
     (gf method cm-args fmf-p &optional method-alist wrappers)
@@ -287,11 +272,7 @@
         (mc-args-p
          (let* ((required (make-dfun-required-args nreq))
                 (gf-args (if applyp
-                             `(list* ,@required
-                                     (sb-c::%listify-rest-args
-                                      .dfun-more-context.
-                                      (the (and unsigned-byte fixnum)
-                                        .dfun-more-count.)))
+                             `(list* ,@required (sb-c::%rest-list .rest.))
                              `(list ,@required))))
            `(named-lambda ,name ,ll
               (declare (ignore .pv. .next-method-call.))
@@ -302,7 +283,7 @@
          `(named-lambda ,name ,ll
             (declare (ignore .pv. .next-method-call.))
             (declare (ignorable ,@(make-dfun-required-args nreq)
-                                ,@(when applyp '(.dfun-more-context. .dfun-more-count.))))
+                                ,@(when applyp '(.rest.))))
             ,effective-method))))))
 
 (defun expand-emf-call-method (gf form metatypes applyp env)
@@ -623,8 +604,9 @@
 (defun wrap-with-applicable-keyword-check (effective valid-keys keyargs-start)
   `(let ((.valid-keys. ',valid-keys)
          (.keyargs-start. ',keyargs-start))
-     (check-applicable-keywords
-      .keyargs-start. .valid-keys. .dfun-more-context. .dfun-more-count.)
+     (multiple-value-bind (.more-context. .more-count.) (sb-c::%rest-context .rest.)
+      (check-applicable-keywords
+       .keyargs-start. .valid-keys. .more-context. .more-count.))
      ,effective))
 
 ;;;; the STANDARD method combination type. This is coded by hand

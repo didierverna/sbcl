@@ -401,8 +401,36 @@
   (assert (nth-value 3
                      (checked-compile
                       '(lambda (x)
-                        (the integer (if x 10)))
-                      :allow-style-warnings t))))
+                        (the integer (if x 10 t)))
+                      :allow-style-warnings t)))
+  (assert (nth-value 3
+                     (checked-compile
+                      '(lambda (c)
+                        (the integer
+                         (if c (map nil #'1+ c) 1)))
+                      :allow-style-warnings t)))
+  (checked-compile
+   '(lambda (x)
+     (the integer (if x 10))))
+  (checked-compile
+   '(lambda (c m)
+     (char-code (block nil (labels ((j (c)
+                                      (if c
+                                          #\c
+                                          (return nil))))
+                             (j c)
+                             (j m))))))
+  (checked-compile
+   '(lambda (c)
+     (the integer
+      (or (position c "AB") (position c "CD")))))
+  (checked-compile
+   '(lambda (x)
+     (multiple-value-bind (a b) (if x
+                                    (values nil 2)
+                                    (values 2 3))
+       (declare (integer a))
+       (list a b)))))
 
 (with-test (:name :constant-modification-local-function)
   (assert (= (length (nth-value 2
@@ -933,3 +961,105 @@
                                     (1 #'-))
                                   a 'b))
                       :allow-warnings t))))
+
+(with-test (:name :check-type-compile-time)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (let ((x 10))
+                           (check-type x list)))
+                      :allow-warnings t))))
+
+(with-test (:name :code-deletion-macros)
+  (assert
+   (nth-value 4
+              (checked-compile `(lambda ()
+                                  (when nil
+                                    (setf * 10)))
+                               :allow-notes 'code-deletion-note)))
+  (checked-compile `(lambda (x)
+                      (unless x
+                        (or)))
+                   :allow-notes nil))
+
+
+(with-test (:name :check-type-bad-type)
+  (assert
+   (nth-value 2
+              (checked-compile `(lambda (x)
+                                  (check-type x (values t)))
+                               :allow-warnings t))))
+
+(with-test (:name :constant-modification-functions-debug)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (declare (optimize (debug 2)))
+                        (let ((l '((0) 0 0)))
+                          (incf (car (car l)))
+                          l))
+                      :allow-warnings t)))
+  (checked-compile
+   `(lambda ()
+      (flet ((x (x)
+               (when x
+                 (setf (cadr x) 10))))
+        (x nil)
+        (x (list 1 2))))))
+
+(with-test (:name :the-bad-type-no-runtime-error)
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (the (nil) x))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1))))
+
+(with-test (:name :case-duplicate-t-no-runtime-error)
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (case x
+           (t 1)
+           (t 2)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1)))
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (case x
+           (otherwise 1)
+           (t 2)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1)))
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (typecase x
+           (otherwise 1)
+           (otherwise 2)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1)))
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (case x
+           ()
+           (t 1)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1))))
+
+(with-test (:name :typecase-nonfinal-otherwise-warns)
+  (assert-signal
+      (macroexpand-1 '(typecase x (cons 1) (otherwise 2) (t 3)))
+      warning))

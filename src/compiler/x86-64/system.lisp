@@ -86,16 +86,13 @@
 ;;;  50000108: 000000000000012D = package-id #x0001 | symbol-widetag
 ;;;  50000110: 0000000050000117 = NIL-VALUE
 ;;;  50000118: 0000000050000117
-      (inst cmp  object nil-value)
+      (inst cmp  object null-tn)
       (inst mov :byte rax sb-kernel::index-of-layout-for-NULL)
       (inst cmov :dword :ne rax object)
       (inst movzx '(:byte :dword) rax rax) ; same as "AND EAX,255" but shorter encoding
       LOAD-FROM-VECTOR
-      (inst mov :dword result
-            (ea (make-fixup '**primitive-object-layouts** :symbol-value
-                           (- (ash vector-data-offset word-shift)
-                              other-pointer-lowtag))
-                nil rax 8)) ; no base register
+      (inst mov :dword result (ea (- (ash vector-data-offset word-shift) nil-value-offset)
+                                  null-tn rax 8))
       DONE))
 (define-vop ()
     (:policy :fast-safe)
@@ -243,7 +240,7 @@
   (:result-types system-area-pointer)
   (:generator 10
     ;; load boxed header size in bytes
-    (inst mov :dword sap (ea (- n-word-bytes other-pointer-lowtag) code))
+    (inst mov :dword sap (object-slot-ea code code-boxed-size-slot other-pointer-lowtag))
     (inst lea sap (ea (- other-pointer-lowtag) code sap))))
 
 (define-vop (code-trailer-ref)
@@ -273,7 +270,7 @@
   (:generator 3
     (move func offset)
     ;; add boxed header size in bytes
-    (inst add :dword func (ea (- n-word-bytes other-pointer-lowtag) code))
+    (inst add :dword func (object-slot-ea code code-boxed-size-slot other-pointer-lowtag))
     (inst lea func (ea (- fun-pointer-lowtag other-pointer-lowtag) code func))))
 
 ;;; This vop is quite magical - because 'closure-fun' is a raw program counter,
@@ -300,28 +297,21 @@
   (:generator 1
     (inst break pending-interrupt-trap)))
 
-(define-vop (current-thread-offset-sap/c)
-  (:results (sap :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate current-thread-offset-sap)
-  (:info n)
-  (:arg-types (:constant signed-byte))
-  (:policy :fast-safe)
-  (:generator 1
-    #-gs-seg (inst mov sap (if (= n thread-this-slot) thread-tn (thread-slot-ea n)))
-    #+gs-seg (inst mov sap (thread-slot-ea n))))
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (index :scs (any-reg) :target sap))
+  (:args (index :scs (any-reg immediate) :target sap))
   (:arg-types tagged-num)
   (:policy :fast-safe)
   (:generator 2
     (let (#+gs-seg (thread-tn nil))
       (inst mov sap
-            (ea thread-segment-reg thread-tn
-                index (ash 1 (- word-shift n-fixnum-tag-bits)))))))
+            (if (sc-is index immediate)
+                (let ((n (tn-value index)))
+                  (if (or #-gs-seg (= n thread-this-slot)) thread-tn (thread-slot-ea n)))
+                (ea thread-segment-reg thread-tn
+                    index (ash 1 (- word-shift n-fixnum-tag-bits))))))))
 
 (define-vop (halt)
   (:generator 1

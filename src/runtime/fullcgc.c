@@ -117,8 +117,8 @@ static inline lispobj canonical_ptr(lispobj pointer)
     return pointer;
 }
 
-sword_t fixedobj_index_bit_bias, text_index_bit_bias;
-uword_t *fullcgcmarks;
+static __attribute__((unused)) sword_t fixedobj_index_bit_bias, text_index_bit_bias;
+static uword_t *fullcgcmarks;
 static size_t markbits_size;
 static inline sword_t ptr_to_bit_index(lispobj pointer) {
     if (pointer == NIL) return -1;
@@ -282,7 +282,10 @@ void execute_full_mark_phase()
     struct rusage before, after;
     getrusage(RUSAGE_SELF, &before);
 #endif
-    trace_object((lispobj*)NIL_SYMBOL_SLOTS_START);
+#ifdef T_SYMBOL_SLOTS_START
+    trace_object(T_SYMBOL_SLOTS_START);
+#endif
+    trace_object(NIL_SYMBOL_SLOTS_START);
     scav_static_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer);
     scav_static_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer);
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
@@ -358,7 +361,7 @@ static void sweep_fixedobj_pages()
     low_page_index_t page;
     uword_t space_base = FIXEDOBJ_SPACE_START;
     sword_t bitmap_index_bias = fixedobj_index_bit_bias;
-    for (page = FIXEDOBJ_RESERVED_PAGES ; ; ++page) {
+    for (page = 0 ; ; ++page) {
         lispobj *obj = fixedobj_page_address(page);
         if (obj >= fixedobj_free_pointer)
             break;
@@ -414,7 +417,7 @@ static void clobber_headered_object(lispobj* addr, sword_t nwords)
 
 __attribute__((unused))
 static uword_t sweep(lispobj* where, lispobj* end,
-                     __attribute__((unused)) uword_t arg)
+                     __attribute__((unused)) void* arg)
 {
     sword_t nwords;
     uword_t space_base = DYNAMIC_SPACE_START;
@@ -445,7 +448,7 @@ static uword_t sweep(lispobj* where, lispobj* end,
 
 #ifndef LISP_FEATURE_MARK_REGION_GC
 static uword_t sweep_possibly_large(lispobj* where, lispobj* end,
-                                    __attribute__((unused)) uword_t arg)
+                                    __attribute__((unused)) void* arg)
 {
     extern void free_large_object(lispobj*, lispobj*);
     if (page_single_obj_p(find_page_index(where))) {
@@ -484,8 +487,7 @@ void execute_full_sweep_phase()
     memset(words_zeroed, 0, sizeof words_zeroed);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     sweep_fixedobj_pages();
-    sweep((lispobj*)TEXT_SPACE_START, text_space_highwatermark,
-          (uword_t)words_zeroed);
+    sweep((lispobj*)TEXT_SPACE_START, text_space_highwatermark, words_zeroed);
     // Recompute generation masks for text space
     int npages = (ALIGN_UP((uword_t)text_space_highwatermark, IMMOBILE_CARD_BYTES)
                   - TEXT_SPACE_START) / IMMOBILE_CARD_BYTES;
@@ -496,7 +498,7 @@ void execute_full_sweep_phase()
             text_page_genmask[find_text_page_index(where)]
                 |= (1 << immobile_obj_gen_bits(where));
 #endif
-    walk_generation(sweep_possibly_large, -1, (uword_t)words_zeroed);
+    walk_generation(sweep_possibly_large, -1, words_zeroed);
     if (gencgc_verbose) {
         fprintf(stderr, "[Sweep phase: ");
         int i;

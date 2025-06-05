@@ -410,8 +410,8 @@
 
 ;;; The LOOP structure holds information about a loop.
 (defstruct (cloop (:conc-name loop-)
-                  (:predicate loop-p)
-                  (:constructor make-loop (&key kind head tail))
+                  (:predicate nil)
+                  (:constructor make-loop (kind head &optional tail))
                   (:copier nil))
   ;; The kind of loop that this is.  These values are legal:
   ;;
@@ -427,7 +427,7 @@
   (kind (missing-arg) :type (member :outer :natural :strange))
   ;; The first and last blocks in the loop.  There may be more than one tail,
   ;; since there may be multiple back branches to the same head.
-  (head nil :type (or cblock null))
+  (head (missing-arg) :type cblock :read-only t)
   (tail nil :type list)
   ;; A list of all the blocks in this loop or its inferiors that have a
   ;; successor outside of the loop.
@@ -551,7 +551,10 @@
 ;;;   component.
 (defstruct (component (:copier nil)
                       (:constructor make-component
-                       (head tail &aux (last-block tail))))
+                       (head tail &aux (last-block tail)
+                                       (outer-loop
+                                        (make-loop :outer head (list tail)))))
+                      #-sb-xc-host :no-constructor-defun)
   ;; space where this component will be allocated in
   ;; :auto won't make any codegen optimizations pertinent to immobile space,
   ;; but will place the code there given sufficient available space.
@@ -592,8 +595,8 @@
   ;; tail. Until environment analysis links NLX entry stubs to the
   ;; component head, every successor of the head is a function start
   ;; (i.e. begins with a BIND node.)
-  (head (missing-arg) :type cblock)
-  (tail (missing-arg) :type cblock)
+  (head (missing-arg) :type cblock :read-only t)
+  (tail (missing-arg) :type cblock :read-only t)
   ;; New blocks are inserted before this.
   (last-block (missing-arg) :type cblock)
   ;; This becomes a list of the CLAMBDA structures for all functions
@@ -646,9 +649,8 @@
   (reanalyze-functionals nil :type list)
   (delete-blocks nil :type list)
   ;; The default LOOP in the component.
-  (outer-loop (make-loop :kind :outer :head head :tail (list tail)) :type cloop)
-  (max-block-number 0 :type fixnum)
-  (dominators-computed nil))
+  (outer-loop (missing-arg) :type cloop)
+  (renumber-p nil))
 
 (defprinter (component :identity t)
   name
@@ -697,7 +699,10 @@
   (mess-up nil :type (or node null))
   ;; a list of all the NLX-INFO structures whose NLX-INFO-CLEANUP is
   ;; this cleanup.
-  (nlx-info nil :type list))
+  (nlx-info nil :type list)
+  ;; Lexenv entries for the BLOCK special form, to be fixed up when
+  ;; deleting blocks to allow inlining to find it again.
+  (block nil))
 (defprinter (cleanup :identity t)
   kind
   mess-up
@@ -705,7 +710,8 @@
 
 ;;; The ENVIRONMENT structure represents the result of environment analysis.
 (defstruct (environment (:copier nil)
-                        (:constructor make-environment (lambda)))
+                        (:constructor make-environment (lambda))
+                        #-sb-xc-host :no-constructor-defun)
   ;; the function that allocates this environment
   (lambda (missing-arg) :type clambda :read-only t)
   ;; a list of all the LAMBDA-VARs and NLX-INFOs needed from enclosing
@@ -755,7 +761,8 @@
 ;;; ENVIRONMENT-NLX-INFO.
 (defstruct (nlx-info
             (:copier nil)
-            (:constructor make-nlx-info (cleanup block)))
+            (:constructor make-nlx-info (cleanup block))
+            #-sb-xc-host :no-constructor-defun)
   ;; the cleanup associated with this exit. In a catch or
   ;; unwind-protect, this is the :CATCH or :UNWIND-PROTECT cleanup,
   ;; and not the cleanup for the escape block. The CLEANUP-KIND of
@@ -1155,7 +1162,7 @@
 
 (defun pretty-print-functional (functional stream)
   (let ((name (functional-debug-name functional)))
-    (princ `(function
+    (prin1 `(function
              ,(if (typep name '(cons (member xep tl-xep)))
                   (cadr name)
                   name))
@@ -1321,7 +1328,8 @@
 (defstruct (optional-dispatch
             (:include functional) (:copier nil)
             (:constructor make-optional-dispatch
-                (arglist allowp keyp %source-name %debug-name source-path)))
+                (arglist allowp keyp %source-name %debug-name source-path))
+            #-sb-xc-host :no-constructor-defun)
   ;; the original parsed argument list, for anyone who cares
   (arglist nil :type list)
   ;; true if &ALLOW-OTHER-KEYS was supplied
@@ -1432,11 +1440,12 @@
   explicit-value-cell
   ;; Do not propagate constraints for this var
   no-constraints
-  ;; Does it hold a constant that should't be destructively modified
+  ;; Does it hold a constant that shouldn't be destructively modified
   constant
   unused-initial-value
   ;; Instruct constraint propagation to do some work.
-  compute-same-refs)
+  compute-same-refs
+  no-debug)
 
 (defstruct (lambda-var
             (:include basic-var) (:copier nil)
@@ -1494,7 +1503,8 @@
   `(lambda-var-attributep (lambda-var-flags ,var) constant))
 (defmacro lambda-var-unused-initial-value (var)
   `(lambda-var-attributep (lambda-var-flags ,var) unused-initial-value))
-
+(defmacro lambda-var-no-debug (var)
+  `(lambda-var-attributep (lambda-var-flags ,var) no-debug))
 (defmacro lambda-var-compute-same-refs (var)
   `(lambda-var-attributep (lambda-var-flags ,var) compute-same-refs))
 
@@ -1550,7 +1560,8 @@
 
 (defstruct (jump-table (:include multiple-successors-node)
                        (:constructor make-jump-table (index))
-                       (:copier nil))
+                       (:copier nil)
+                       #-sb-xc-host :no-constructor-defun)
   (index (missing-arg) :type lvar)
   (targets nil :type list))
 
@@ -1559,12 +1570,12 @@
   targets)
 
 (defstruct (cset (:include valued-node
-                           (derived-type (make-single-value-type
-                                          *universal-type*)))
+                           (derived-type (make-single-value-type *universal-type*)))
                  (:conc-name set-)
                  (:predicate set-p)
                  (:constructor make-set (var value))
-                 (:copier nil))
+                 (:copier nil)
+                 #-sb-xc-host :no-constructor-defun)
   ;; descriptor for the variable set
   (var (missing-arg) :type basic-var)
   ;; LVAR for the value form
@@ -1641,7 +1652,8 @@
 ;;; receiving forms.
 (defstruct (mv-combination (:include basic-combination)
                            (:constructor make-mv-combination (fun))
-                           (:copier nil)))
+                           (:copier nil)
+                           #-sb-xc-host :no-constructor-defun))
 (defprinter (mv-combination)
   (fun :prin1 (lvar-uses fun))
   (args :prin1 (mapcar #'lvar-uses args)))
@@ -1665,7 +1677,8 @@
                     (:conc-name return-)
                     (:predicate return-p)
                     (:constructor make-return (result lambda))
-                    (:copier nil))
+                    (:copier nil)
+                    #-sb-xc-host :no-constructor-defun)
   ;; the lambda we are returning from. Null temporarily during
   ;; ir1tran.
   (lambda nil :type (or clambda null))
@@ -1686,7 +1699,8 @@
 (defstruct (cast (:include valued-node)
                  (:copier nil)
                  (:constructor %make-cast
-                     (asserted-type type-to-check value derived-type context)))
+                     (asserted-type type-to-check value derived-type context))
+                 #-sb-xc-host :no-constructor-defun)
   (asserted-type (missing-arg) :type ctype)
   (type-to-check (missing-arg) :type ctype)
   ;; an indication of what we have proven about how this type
@@ -1779,7 +1793,11 @@
   (funs nil :type list)
   ;; The dynamic extent for this enclose if any of its functionals are
   ;; declared dynamic extent.
-  (dynamic-extent nil :type (or null cdynamic-extent)))
+  (dynamic-extent nil :type (or null cdynamic-extent))
+  ;; The union of all dynamic extents inferred by the compiler for
+  ;; this enclose's functionals. NULL when there is a declared dynamic
+  ;; extent.
+  (derived-dynamic-extents () :type list))
 (defprinter (enclose :identity t)
   funs)
 
@@ -1793,12 +1811,10 @@
                             (:copier nil))
   ;; the values explicitly declared with this dynamic extent.
   (values nil :type list)
-  ;; the cleanup for this extent. NULL indicates that this dynamic
-  ;; extent is over the environment and hence needs no cleanup code.
+  ;; the cleanup for this extent.
   (cleanup nil :type (or cleanup null))
   ;; some kind of info used by the back end
-  (info nil)
-  (preserve-info nil))
+  (info nil))
 
 (defprinter (cdynamic-extent :conc-name dynamic-extent-
                              :identity t)

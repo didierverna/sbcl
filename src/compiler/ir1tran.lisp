@@ -129,7 +129,7 @@
         (when (typep info '(cons defstruct-description (eql :constructor)))
           (let* ((dd (car info)) (spec (assq fun-name (dd-constructors dd))))
             (aver spec)
-            (setq answer `(lambda ,@(structure-ctor-lambda-parts dd (cdr spec))))))))
+            (setq answer `(lambda ,@(structure-ctor-lambda-parts dd (cdr spec) t)))))))
     (values answer winp)))
 (defun fun-name-dx-args (fun-name)
   (let ((answer (info :function :inlining-data fun-name)))
@@ -325,7 +325,7 @@
                  (let ((value (symbol-value name)))
                    (make-constant value (ctype-of value) name)))
                 (t
-                 (make-global-var kind name where-from type)))))))
+                 (make-global-var kind name where-from (sb-kernel::maybe-reparse-specifier type))))))))
 
 ;;; Return T if and only if OBJ's nature as an externalizable thing renders
 ;;; it a leaf for dumping purposes. Symbols are leaflike despite havings slots
@@ -877,6 +877,8 @@
   ;; happens with lexically-defined (MACROLET) macros here, anyway?
   (ecase (info :function :kind fun)
     (:macro
+     (when (eq (car *current-path*) 'original-source-start)
+       (setf (ctran-source-path start) *current-path*))
      (ir1-convert start next result
                   (careful-expand-macro (info :function :macro-function fun)
                                         form))
@@ -1323,7 +1325,6 @@
            (found
             (setf (leaf-type found) type)
             (assert-definition-type found type
-                                    :unwinnage-fun #'compiler-notify
                                     :where "FTYPE declaration"))
            (t
             (res (cons (find-lexically-apparent-fun
@@ -1409,6 +1410,15 @@
          (warn "No ~s variable" name))
         (t
          (setf (lambda-var-constant var) t))))))
+
+(defun process-no-debug-decl (spec vars)
+  (dolist (name (rest spec))
+    (let ((var (find-in-bindings vars name)))
+      (cond
+        ((not var)
+         (style-warn "No ~s variable" name))
+        (t
+         (setf (lambda-var-no-debug var) t))))))
 
 ;;; Return a DEFINED-FUN which copies a GLOBAL-VAR but for its INLINEP
 ;;; (and TYPE if notinline), plus type-restrictions from the lexenv.
@@ -1539,11 +1549,6 @@
         (t
          (setf (lambda-var-ignorep var) t)))))
   (values))
-
-(defvar *stack-allocate-dynamic-extent* t
-  "If true (the default), the compiler believes DYNAMIC-EXTENT declarations
-and stack allocates otherwise inaccessible parts of the object whenever
-possible.")
 
 (defun process-dynamic-extent-decl (names vars fvars)
   (if *stack-allocate-dynamic-extent*
@@ -1678,6 +1683,9 @@ possible.")
         res)
        (constant-value
         (process-constant-decl spec vars)
+        res)
+       (no-debug
+        (process-no-debug-decl spec vars)
         res)
        ;; We may want to detect LAMBDA-LIST and VALUES decls here,
        ;; and report them as "Misplaced" rather than "Unrecognized".
@@ -1874,14 +1882,13 @@ possible.")
          (let ((fun (defined-fun-functional var)))
            (when fun
              (assert-definition-type fun type
-                                     :unwinnage-fun #'compiler-notify
                                      :where "this declaration"))))))))
 
 (defun process-ftype-proclamation (spec names)
   (declare (list names))
   (let ((type (specifier-type spec)))
     (unless (csubtypep type (specifier-type 'function))
-      (error "Not a function type: ~/sb-impl:print-type/" spec))
+      (error "Not a function type: ~/sb-impl:print-type-specifier/" spec))
     (dolist (name names)
       (process-1-ftype-proclamation name type))))
 

@@ -351,9 +351,7 @@
     ;; here because it would conflict with the existing NFP if there
     ;; is a number-stack frame in play, but we only use it prior to
     ;; actually setting up the "real" NFP.
-    (let ((result (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'any-reg)
-                                  :offset nfp-offset)))
+    (let ((result (make-random-tn (sc-or-lose 'any-reg) nfp-offset)))
       ;; And we use ASSEMBLE here so that we get "implcit labels"
       ;; rather than having to use GEN-LABEL and EMIT-LABEL.
       (assemble ()
@@ -842,7 +840,7 @@
                                    :offset ,offset
                                    :to :eval)
                          ,name))
-                 *register-arg-names* *register-arg-offsets*))
+                 register-arg-names *register-arg-offsets*))
      ,@(when (eq return :fixed)
          '((:temporary (:scs (descriptor-reg) :from :eval) move-temp)
            (:temporary (:sc non-descriptor-reg :from :eval :offset ocfp-offset) ocfp-temp)))
@@ -866,9 +864,7 @@
                        (list :load-nargs
                              ,@(if (eq return :tail)
                                    '((unless (location= return-pc
-                                                        (make-random-tn :kind :normal
-                                                                        :sc (sc-or-lose 'control-stack)
-                                                                        :offset lra-save-offset))
+                                                        (make-random-tn (sc-or-lose 'control-stack) lra-save-offset))
                                        :load-return-pc)
                                      (when cur-nfp
                                        :frob-nfp))
@@ -896,7 +892,7 @@
                                    (mapcar #'(lambda (name)
                                                `(loadw ,name new-fp
                                                     ,(incf index)))
-                                           *register-arg-names*))
+                                           register-arg-names))
                                (storew cfp-tn new-fp ocfp-save-offset))
                              '((load-immediate-word nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)

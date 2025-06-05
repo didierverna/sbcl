@@ -152,18 +152,14 @@
 ;;;; Complex float move functions
 
 (defun complex-single-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'single-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'single-reg) (tn-offset x)))
 (defun complex-single-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'single-reg)
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose 'single-reg) (1+ (tn-offset x))))
 
 (defun complex-double-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'double-reg) (tn-offset x)))
 (defun complex-double-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg)
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose 'double-reg) (1+ (tn-offset x))))
 
 
 (define-move-fun (load-complex-single 2) (vop x y)
@@ -431,8 +427,12 @@
   (frob abs/single-float fabs abs single-reg single-float)
   (frob abs/double-float fabs abs double-reg double-float)
   (frob %negate/single-float fneg %negate single-reg single-float)
-  (frob %negate/double-float fneg %negate double-reg double-float))
+  (frob %negate/double-float fneg %negate double-reg double-float)
+  (frob sqrt/single-float fsqrts %sqrt single-reg single-float)
+  (frob sqrt/double-float fsqrt %sqrt double-reg double-float))
 
+(deftransform %sqrt ((x) * * :vop t)
+  (memq :fsqrt *backend-subfeatures*))
 
 ;;;; Comparison:
 

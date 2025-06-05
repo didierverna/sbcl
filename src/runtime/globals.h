@@ -52,7 +52,7 @@ extern os_vm_size_t dynamic_space_size;
 extern os_vm_size_t thread_control_stack_size;
 
 #ifdef LISP_FEATURE_RELOCATABLE_STATIC_SPACE
-extern uword_t STATIC_SPACE_START, STATIC_SPACE_END;
+extern uword_t STATIC_SPACE_START;
 #endif
 
 extern uword_t READ_ONLY_SPACE_START, READ_ONLY_SPACE_END;
@@ -91,6 +91,7 @@ extern lispobj *current_binding_stack_pointer;
 
 extern lispobj *read_only_space_free_pointer;
 extern lispobj *static_space_free_pointer;
+extern lispobj *static_space_trailer_start;
 extern lispobj *permgen_space_free_pointer;
 extern uword_t permgen_bounds[2];
 #define PERMGEN_SPACE_START permgen_bounds[0]
@@ -108,12 +109,15 @@ extern lispobj *static_code_space_free_pointer;
 #endif
 
 extern lispobj *text_space_highwatermark;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-extern lispobj *fixedobj_free_pointer;
+#if defined LISP_FEATURE_X86_64 || defined LISP_FEATURE_IMMOBILE_SPACE
 extern lispobj ALIEN_LINKAGE_SPACE_START;
 #endif
-extern lispobj *linkage_space, *elf_linkage_space;
-extern int linkage_table_count, elf_linkage_table_count;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+extern lispobj *fixedobj_free_pointer;
+#endif
+#define FIRST_USABLE_LINKAGE_ELT 1
+extern lispobj *linkage_space;
+extern int linkage_table_count;
 extern os_vm_address_t anon_dynamic_space_start;
 extern lispobj* tlsf_mem_start; // meaningful only if immobile space
 

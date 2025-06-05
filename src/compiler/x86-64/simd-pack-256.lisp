@@ -89,15 +89,13 @@
 (macrolet ((define-move-from-avx2 (type tag &rest scs)
              (let ((name (symbolicate "MOVE-FROM-AVX2/" type)))
                `(progn
-                  (define-vop (,name)
+                  (define-allocator (,name)
                     (:args (x :scs ,scs))
                     (:results (y :scs (descriptor-reg)))
-                    #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
-                    (:node-var node)
                     (:arg-types ,type)
                     (:note "AVX2 to pointer coercion")
                     (:generator 13
-                      (alloc-other simd-pack-256-widetag simd-pack-256-size y node nil thread-tn)
+                      (alloc-other simd-pack-256-widetag simd-pack-256-size y)
                       (storew (fixnumize ,tag)
                               y simd-pack-256-tag-slot other-pointer-lowtag)
                       (let ((ea (object-slot-ea
@@ -185,7 +183,7 @@
   (:generator 3
     (loadw dst x simd-pack-256-p3-slot other-pointer-lowtag)))
 
-(define-vop (%make-simd-pack-256)
+(define-allocator (%make-simd-pack-256)
   (:translate %make-simd-pack-256)
   (:policy :fast-safe)
   (:args (tag :scs (any-reg))
@@ -196,10 +194,8 @@
   (:arg-types tagged-num unsigned-num unsigned-num unsigned-num unsigned-num)
   (:results (dst :scs (descriptor-reg) :from :load))
   (:result-types t)
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
-  (:node-var node)
   (:generator 13
-    (alloc-other simd-pack-256-widetag simd-pack-256-size dst node nil thread-tn)
+    (alloc-other simd-pack-256-widetag simd-pack-256-size dst)
     ;; see +simd-pack-element-types+
     (storew tag dst simd-pack-256-tag-slot other-pointer-lowtag)
     (storew p0 dst simd-pack-256-p0-slot other-pointer-lowtag)

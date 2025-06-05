@@ -44,14 +44,6 @@
 
 ;;;; Computation of live lvar sets
 
-;;; Add LVARs from LATE to EARLY; use EQ to check whether EARLY has
-;;; been changed.
-(defun merge-lvar-live-sets (early late)
-  (declare (type list early late))
-  ;; FIXME: O(N^2)
-  (dolist (e late early)
-    (pushnew e early)))
-
 ;;; Update information on stacks of unknown-values and stack LVARs on
 ;;; the boundaries of BLOCK. Return true if the start stack has been
 ;;; changed.
@@ -59,55 +51,29 @@
 ;;; An LVAR is live at the end iff it is live at any of blocks which
 ;;; BLOCK can transfer control to, or it is a stack lvar kept live
 ;;; within the extent of its cleanup. There are two kind of control
-;;; transfers: normal, expressed with BLOCK-SUCC, and NLX.  We also
-;;; preserve any stack lvars on the stack when an lvar in a
-;;; PRESERVE-INFO set (representing a stack allocated object, not
-;;; necessarily a stack lvar) gets pushed on the stack. PUSHED does
-;;; not track this set because it only tracks stack lvars to make
-;;; liveness analysis feasible with conditional stack allocation. We
-;;; must do this because stack allocated objects can't move; object
-;;; identity must be preserved and we can't in general track all
-;;; references.
+;;; transfers: normal, expressed with BLOCK-SUCC, and NLX.
 (defun update-lvar-live-sets (block)
   (declare (type cblock block))
   (let* ((2block (block-info block))
-         (original-start (ir2-block-start-stack 2block))
-         (end (ir2-block-end-stack 2block))
-         (new-end end))
+         (end (ir2-block-end-stack 2block)))
     (dolist (succ (block-succ block))
-      (setq new-end (merge-lvar-live-sets new-end
-                                          (ir2-block-start-stack (block-info succ)))))
+      (let ((2succ (block-info succ)))
+        (setq end (union end (ir2-block-start-stack 2succ)))))
     (do-nested-cleanups (cleanup block)
-      (case (cleanup-kind cleanup)
-        ((:block :tagbody :catch :unwind-protect)
-         (dolist (nlx-info (cleanup-nlx-info cleanup))
-           (let* ((target (nlx-info-target nlx-info))
-                  (target-start-stack (ir2-block-start-stack
-                                       (block-info target)))
-                  (exit-lvar (nlx-info-lvar nlx-info))
-                  (next-stack (if exit-lvar
-                                  (remove exit-lvar target-start-stack)
-                                  target-start-stack)))
-             (setq new-end (merge-lvar-live-sets
-                            new-end next-stack)))))
-        (:dynamic-extent
-         (let* ((dynamic-extent (cleanup-mess-up cleanup))
-                (info (dynamic-extent-info dynamic-extent)))
-           (when info
-             (pushnew info new-end))
-           (dolist (preserve (dynamic-extent-preserve-info dynamic-extent))
-             (when (memq preserve (ir2-block-stack-mess-up 2block))
-               (pushnew preserve new-end)))))))
+      (dolist (nlx-info (cleanup-nlx-info cleanup))
+        (let ((2target (block-info (nlx-info-target nlx-info))))
+          (setq end (union end (ir2-block-start-stack 2target)))))
+      (when (eq (cleanup-kind cleanup) :dynamic-extent)
+        (let ((info (dynamic-extent-info (cleanup-mess-up cleanup))))
+          (when info
+            (pushnew info end)))))
 
-    (setf (ir2-block-end-stack 2block) new-end)
+    (setf (ir2-block-end-stack 2block) end)
 
-    (let ((start new-end))
-      (setq start (set-difference start (ir2-block-pushed 2block)))
-      (setq start (merge-lvar-live-sets start (ir2-block-popped 2block)))
-
-      (when *check-consistency*
-        (aver (subsetp original-start start)))
-      (cond ((subsetp start original-start)
+    (let ((start (union (set-difference end (ir2-block-pushed 2block))
+                        (ir2-block-popped 2block))))
+      (aver (subsetp (ir2-block-start-stack 2block) start))
+      (cond ((subsetp start (ir2-block-start-stack 2block))
              nil)
             (t
              (setf (ir2-block-start-stack 2block) start)
@@ -119,23 +85,16 @@
 ;;; Do a forward walk in the flow graph and put LVARs on the start/end
 ;;; stacks of BLOCK in the right order. STACK is an already sorted
 ;;; stack coming from a predecessor of BLOCK. Because all LVARs live
-;;; at the start of BLOCK are on STACK, we just need to remove dead
-;;; LVARs. As an optimization we only do this above the top-most stack
-;;; LVAR, since nothing allocated before it can be dead.
+;;; at the start of BLOCK are on STACK, we just need to remove the
+;;; dead LVARs in STACK to compute BLOCK's ordered start stack.
 (defun order-lvar-sets-walk (block stack)
   (unless (block-flag block)
     (setf (block-flag block) t)
     (let* ((2block (block-info block))
            (start (ir2-block-start-stack 2block))
-           (start-stack
-             (collect ((prefix))
-               (do ((tail stack (cdr tail)))
-                   ((null tail) (prefix))
-                 (let ((lvar (car tail)))
-                   (when (memq lvar start)
-                     (when (eq (ir2-lvar-kind (lvar-info lvar)) :stack)
-                       (return (append (prefix) tail)))
-                     (prefix lvar)))))))
+           (start-stack (remove-if-not (lambda (lvar)
+                                         (memq lvar start))
+                                       stack)))
       (aver (subsetp start start-stack))
       (setf (ir2-block-start-stack 2block) start-stack)
 
@@ -175,41 +134,46 @@
   (declare (type cblock block) (list stack))
   (unless (block-flag block)
     (setf (block-flag block) t)
-    (setf (ir2-block-stack-mess-up (block-info block)) stack)
     (let ((2comp (component-info (block-component block))))
       (do-nodes (node lvar block)
         (let ((dynamic-extent
                 (typecase node
-                  (enclose (enclose-dynamic-extent node))
+                  (enclose (or (enclose-dynamic-extent node)
+                               ;; They all share the same stack lvar.
+                               (first
+                                (enclose-derived-dynamic-extents node))))
                   (cdynamic-extent node)
                   (t (and lvar (lvar-dynamic-extent lvar))))))
           (when dynamic-extent
             (let ((info (dynamic-extent-info dynamic-extent)))
-              (when info
-                (cond
-                  ((eq info (first stack)))
-                  ;; Preserve any intervening dynamic-extents.
-                  ((memq info stack)
-                   (do ((cleanup (node-enclosing-cleanup node)
-                                 (node-enclosing-cleanup
-                                  (cleanup-mess-up cleanup))))
-                       ((null cleanup))
+              (cond
+                ((null info))
+                ((eq info (first stack)))
+                ;; Preserve any intervening dynamic-extents by sharing
+                ;; the stack lvar (and hence the lifetime). We must do
+                ;; this because stack allocated objects can't move;
+                ;; object identity must be preserved and we can't in
+                ;; general track all references.
+                ((memq info stack)
+                 (when (or (enclose-p node) (combination-p node))
+                   (do-nested-cleanups (cleanup node)
                      (when (eq (cleanup-kind cleanup) :dynamic-extent)
                        (let ((mess-up (cleanup-mess-up cleanup)))
                          (when (eq dynamic-extent mess-up)
                            (return))
-                         (let ((preserve (dynamic-extent-info mess-up)))
-                           (pushnew preserve
-                                    (dynamic-extent-preserve-info dynamic-extent)))))))
-                  (t
-                   (pushnew block (ir2-component-stack-mess-ups 2comp))
-                   (setf (ctran-next (node-prev node)) nil)
-                   (let ((ctran (make-ctran)))
-                     (with-ir1-environment-from-node node
-                       (ir1-convert (node-prev node) ctran info
-                                    '(%dynamic-extent-start)))
-                     (link-node-to-previous-ctran node ctran))
-                   (push info stack)))))))
+                         (let ((old (dynamic-extent-info mess-up)))
+                           (when (and old (not (eq info old)))
+                             (setf (ir2-lvar-kind (lvar-info old)) :unused)
+                             (setf (dynamic-extent-info mess-up) info))))))))
+                (t
+                 (pushnew block (ir2-component-stack-mess-ups 2comp))
+                 (setf (ctran-next (node-prev node)) nil)
+                 (let ((ctran (make-ctran)))
+                   (with-ir1-environment-from-node node
+                     (ir1-convert (node-prev node) ctran info
+                                  '(%dynamic-extent-start)))
+                   (link-node-to-previous-ctran node ctran))
+                 (push info stack))))))
         (when (entry-p node)
           (dolist (nlx-info (cleanup-nlx-info (entry-cleanup node)))
             (stack-mess-up-walk (nlx-info-target nlx-info) stack)))))
@@ -235,8 +199,8 @@
 ;;; wastes only space.
 (defun discard-unused-values (block1 block2)
   (declare (type cblock block1 block2))
-  (let* ((end-stack (ir2-block-end-stack (block-info block1)))
-         (start-stack (ir2-block-start-stack (block-info block2))))
+  (let ((end-stack (ir2-block-end-stack (block-info block1)))
+        (start-stack (ir2-block-start-stack (block-info block2))))
     (collect ((cleanup-code))
       (labels ((find-popped (before after)
                  ;; Return (VALUES last-popped rest), where

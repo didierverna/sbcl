@@ -61,74 +61,69 @@
           &key ((:dynamic-space-start dynamic-space-start*))
                ((:dynamic-space-size dynamic-space-size*))
                ((:fixedobj-space-start fixedobj-space-start*))
-               ((:fixedobj-space-size  fixedobj-space-size*) (* 48 1024 1024))
+               ((:fixedobj-space-size  fixedobj-space-size*))
                ((:text-space-start text-space-start*))
-               ((:text-space-size  text-space-size*) (* 160 1024 1024))
+               ((:text-space-size  text-space-size*))
                (small-space-size #x100000)
                ((:read-only-space-size ro-space-size)
                 #+darwin-jit small-space-size
                 #-darwin-jit 0))
   (declare (ignorable dynamic-space-start*)) ; might be unused in make-host-2
+  (declare (ignorable fixedobj-space-start* text-space-start* text-space-size*)) ; ditto
   (flet ((defconstantish (relocatable symbol value)
            (if (not relocatable) ; easy case
                `(defconstant ,symbol ,value)
                ;; Genesis needs to know the gspace start, but it's not constant.
                ;; This value will not be exposed to C code.
                #+sb-xc-host `(defparameter ,symbol ,value)
-               ;; Ideally the #-sb-xc-host code be a DEFINE-ALIEN-VARIABLE,
+               ;; Ideally the #-sb-xc-host would be a DEFINE-ALIEN-VARIABLE here,
                ;; but can't be due to dependency order problem.
                )))
     (let*
-        ((spaces (append `((read-only ,ro-space-size)
-                           #+(and win32 x86-64)
-                           (seh-data ,(symbol-value '+backend-page-bytes+) win64-seh-data-addr)
-                           #-immobile-space (alien-linkage ,alien-linkage-space-size)
-                           ;; safepoint on 64-bit uses a relocatable trap page just below the card mark
-                           ;; table, which works nicely assuming a register is wired to the card table
-                           #+(and sb-safepoint (not x86-64))
-                           ;; Must be just before NIL.
-                           (safepoint ,(symbol-value '+backend-page-bytes+))
-                           (static ,small-space-size)
-                           (permgen 33554432) ; 32MiB
-                           #+darwin-jit
-                           (static-code ,small-space-size))
-                         #+immobile-space
-                         `((fixedobj ,fixedobj-space-size*)
-                           (text ,text-space-size*))))
+        ((spaces `((read-only ,ro-space-size)
+                   ;; #+immobile-space implies a relocatable alien linkage space. And x86-64 always
+                   ;; has relocatable linkage tables
+                   #-(or x86-64 immobile-space) (alien-linkage ,alien-linkage-space-size)
+                   ;; safepoint on 64-bit uses a relocatable trap page just below the card mark
+                   ;; table, which works nicely assuming a register is wired to the card table
+                   #+(and sb-safepoint (not x86-64))
+                   ;; Must be just before NIL.
+                   (safepoint ,(symbol-value '+backend-page-bytes+))
+                   (static ,small-space-size)
+                   #+darwin-jit (static-code ,small-space-size)))
          (ptr small-spaces-start)
          (small-space-forms
-           (loop for (space size var-name) in spaces
-                 appending
-                 (let* ((relocatable
-                          (member space '(fixedobj text permgen
-                                          #+relocatable-static-space safepoint
-                                          #+relocatable-static-space static
-                                          read-only)))
-                        (start ptr)
-                        (end (+ ptr size)))
-                   (setf ptr end)
-                   (if var-name
-                       `((defconstant ,var-name ,start))
-                       (let ((start-sym (symbolicate space "-SPACE-START")))
-                         ;; Allow expressly given addresses / sizes for immobile space.
-                         ;; The addresses are for testing only - you should not need them.
-                         (case space
-                           (text (setq start (or text-space-start* start)
-                                       end (+ start text-space-size*)))
-                           (fixedobj (setq start (or fixedobj-space-start* start)
-                                           end (+ start fixedobj-space-size*))))
-                         `(,(defconstantish relocatable start-sym start)
-                           ,(cond ((eq space 'alien-linkage-table)) ; nothing for the -END
-                                  ((not relocatable)
-                                   `(defconstant ,(symbolicate space "-SPACE-END") ,end))
-                                  #-sb-xc-host ((eq space 'text)) ; don't emit anything
-                                  (t
-                                   `(defconstant ,(symbolicate space "-SPACE-SIZE")
-                                      ,(- end start)))))))))))
+          (mapcan
+           (lambda (name-and-size)
+             (declare (notinline member)) ; no xperfecthash
+             (destructuring-bind (space size) name-and-size
+               (let* ((relocatable
+                       (member space `(#+relocatable-static-space ,@'(safepoint static)
+                                       read-only)))
+                      (start (prog1 ptr (incf ptr size))))
+                 (list (defconstantish relocatable (symbolicate space "-SPACE-START") start)
+                       ;; alien-linkage-space-size is DEFCONSTANTed outside of the loop
+                       ;; no #define of STATIC-SPACE-END is wanted in genesis/sbcl.h
+                       (cond ((eq space 'alien-linkage) nil) ; emit neither -END nor -SIZE
+                             ((or (eq space 'static) relocatable)
+                              `(defconstant ,(symbolicate space "-SPACE-SIZE") ,size))
+                             (t
+                              `(defconstant ,(symbolicate space "-SPACE-END") ,ptr)))))))
+             spaces)))
       `(progn
          ,@small-space-forms
          ,(defconstantish t 'dynamic-space-start
             (or dynamic-space-start* ptr))
+         ;; FIXEDOBJ-SPACE-START is an alien var in alloc.lisp
+         ;; On the host it's not a "constant" otherwise genesis would put it in sbcl.h
+         ,@(when fixedobj-space-size*
+             `((defconstant fixedobj-space-size ,fixedobj-space-size*)
+               #+sb-xc-host (defparameter fixedobj-space-start ,fixedobj-space-start*)))
+         #+sb-xc-host
+         ,@(when text-space-size*
+             ;; TEXT-SPACE-SIZE is an alien var (ELF core can set a size) in alloc.lisp
+             `((defconstant text-space-size ,text-space-size*)
+               (defparameter text-space-start ,text-space-start*))) ; in misc-aliens (why there?)
          (defconstant default-dynamic-space-size
            ;; Build-time make-config.sh option "--dynamic-space-size" overrides
            ;; keyword argument :dynamic-space-size which overrides general default.
@@ -224,7 +219,6 @@
     *immobile-codeblob-vector* ; for pseudo-static-generation
     *dynspace-codeblob-tree*
     *linkage-name-map*
-    *elf-linkage-cell-modified*
     sb-impl::**finalizer-store**
     sb-impl::*finalizer-rehashlist*
     sb-impl::*finalizers-triggered*
@@ -425,12 +419,21 @@
        (defconstant n-symbol-hash-discard-bits
          (let ((precision (+ 32 n-symbol-hash-prng-bits))) ; total N bits
            (- 64 precision)))
-       ;; Allow .5 million global names, expandable to 4 million (22 bits)
        (defconstant n-linkage-index-bits (or #+linkage-space 19 0))
+       (defconstant symbol-linkage-index-pos 3) ; low 3 bits are reserved
        (defconstant-eqx sb-impl::symbol-hash-prng-byte
          (byte n-symbol-hash-prng-bits (- 32 n-symbol-hash-prng-bits))
          #'equal))
 #-64-bit (defconstant-eqx sb-impl::symbol-hash-prng-byte (byte 3 0) #'equal)
+
+(defmacro symhash-xor-constant (tagged-nil)
+  (declare (ignorable tagged-nil))
+  (or #+(or arm64 x86-64)
+      ;; Leave a 20-bit field untouched. LINKAGE-INDEX generally gets 19 bits starting
+      ;; at index 3, but N-LINKAGE-INDEX-BITS is 0 on arm64.
+      ;; The lowest 3 bits are flags, which are initialized to #b011
+      `(dpb 0 (byte 20 2) ,tagged-nil)
+      0))
 
 (push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
       *!removable-symbols*)

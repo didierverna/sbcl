@@ -24,14 +24,12 @@
   (descriptor-reg) (sap-reg))
 
 ;;; Move an untagged SAP to a tagged representation.
-(define-vop (move-from-sap)
+(define-allocator (move-from-sap)
   (:args (sap :scs (sap-reg) :to :result))
   (:results (res :scs (descriptor-reg) :from :argument))
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
   (:note "SAP to pointer coercion")
-  (:node-var node)
   (:generator 20
-    (alloc-other sap-widetag sap-size res node nil thread-tn)
+    (alloc-other sap-widetag sap-size res)
     (storew sap res sap-pointer-slot other-pointer-lowtag)))
 (define-move-vop move-from-sap :move
   (sap-reg) (descriptor-reg))
@@ -180,7 +178,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
     (aver (not (location= temp result)))
     (inst lea temp ea)
     (sb-assem:inst* insn modifier result (ea temp))
-    (inst xor temp (thread-slot-ea thread-msan-xor-constant-slot))
+    (inst xor temp (static-constant-ea msan-xor-constant))
     ;; Per the documentation, shadow is tested _after_
     (let ((mask (sb-c::masked-memory-load-p vop))
           (good (gen-label))
@@ -217,7 +215,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
   #+linux
   (when (sb-c:msan-unpoison sb-c:*compilation*)
     (inst lea temp ea)
-    (inst xor temp (thread-slot-ea thread-msan-xor-constant-slot))
+    (inst xor temp (static-constant-ea msan-xor-constant))
     (inst mov size (ea temp) 0))
   (when (sc-is value constant immediate)
     (cond ((plausible-signed-imm32-operand-p (tn-value value))

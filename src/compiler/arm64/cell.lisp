@@ -126,6 +126,7 @@
     (:translate symbol-value)
     (:args (symbol :scs (descriptor-reg) :to :save
                    :load-if (not (and (sc-is symbol constant)
+                                      (constant-tn-p symbol)
                                       (let ((pkg (sb-xc:symbol-package (tn-value symbol))))
                                         (or (and pkg (system-package-p pkg))
                                             (eq pkg *cl-package*)))))))
@@ -135,7 +136,8 @@
     (:variant t)
     (:node-var node)
     (:generator 9
-      (let* ((known-symbol-p (sc-is symbol constant))
+      (let* ((known-symbol-p (and (sc-is symbol constant)
+                                  (constant-tn-p symbol)))
              (known-symbol (and known-symbol-p (tn-value symbol)))
              (fixup (and known-symbol
                          (make-fixup known-symbol :symbol-tls-index))))
@@ -235,12 +237,14 @@
   (:result-types positive-fixnum)
   (:generator 2
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst eor res null-tn res)
     (inst lsr res res n-symbol-hash-discard-bits)))
 (define-vop (symbol-name-hash symbol-hash)
-  (:translate symbol-name-hash #-relocatable-static-space hash-as-if-symbol-name)
+  (:translate symbol-name-hash hash-as-if-symbol-name)
   (:generator 1 ; ASSUMPTION: little-endian
-    (inst ldr (32-bit-reg res)
-          (@ symbol (- (+ 4 (ash symbol-hash-slot word-shift)) other-pointer-lowtag)))))
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst eor res null-tn res)
+    (inst lsr res res 32)))
 
 (define-vop ()
   (:args (symbol :scs (descriptor-reg)))
@@ -694,15 +698,16 @@
     (pseudo-atomic (pa-flag)
       #+immobile-space
       (progn
-        #-sb-thread
-        (error "doesn't work yet")
-        (loadw temp thread-tn thread-text-space-addr-slot)
-        (inst sub temp object temp)
-        (inst lsr card temp (1- (integer-length immobile-card-bytes)))
-        (loadw temp thread-tn thread-text-card-count-slot)
+        (load-foreign-symbol temp "TEXT_SPACE_START" :dataref t)
+        (inst ldr temp (@ temp))
+        (inst sub card object temp) ; CARD is the space-relative pointer
+        (load-foreign-symbol temp "text_space_size" :dataref t)
+        (inst ldr (32-bit-reg temp) (@ temp)) ; 4-byte int
         (inst cmp card temp)
         (inst b :hs try-dynamic-space)
-        (loadw temp thread-tn thread-text-card-marks-slot)
+        (load-foreign-symbol temp "text_page_touched_bits" :dataref t)
+        (inst ldr temp (@ temp))
+        (inst lsr card card (1- (integer-length immobile-card-bytes)))
 
         ;; compute &((unsigned long*)text_page_touched_bits)[page_index/64]
         (inst lsr pa-flag card 6)

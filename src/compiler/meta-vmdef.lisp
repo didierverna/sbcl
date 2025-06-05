@@ -201,10 +201,6 @@
        (declare (ignorable ,(car lambda-list)))
        (sb-assem:assemble ()
          ,@body))))
-
-(defglobal *sc-vop-slots*
-    '((:move . sc-move-vops)
-      (:move-arg . sc-move-arg-vops)))
 
 ;;;; primitive type definition
 
@@ -218,9 +214,7 @@
        (/show "doing !DEF-PRIMITIVE-TYPE" ,(string name))
        (assert (not (gethash ',name *backend-primitive-type-names*)))
        (setf (gethash ',name *backend-primitive-type-names*)
-             (make-primitive-type :name ',name
-                                  :scs ',scns
-                                  :specifier ',type))
+             (make-primitive-type ',name ',scns ',type))
        (/show0 "done with !DEF-PRIMITIVE-TYPE")
        ',name)))
 
@@ -402,8 +396,9 @@
 (defmacro define-move-vop (name kind &rest scs)
   (when (or (oddp (length scs)) (null scs))
     (error "malformed SCs spec: ~S" scs))
-  (let ((accessor (or (cdr (assoc kind *sc-vop-slots*))
-                      (error "unknown kind ~S" kind))))
+  (let ((accessor (ecase kind
+                    (:move 'sc-move-vops)
+                    (:move-arg 'sc-move-arg-vops))))
     `(progn
        ,@(when (eq kind :move)
            `((eval-when (:compile-toplevel :load-toplevel :execute)
@@ -1489,9 +1484,9 @@
 
 ;;;; setting up VOP-INFO
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *slot-inherit-alist*
-    '((:generator-function . vop-info-generator-function))))
+(defconstant-eqx +slot-inherit-alist+
+    '((:generator-function . vop-info-generator-function))
+  #'equal)
 
 ;;; This is something to help with inheriting VOP-INFO slots. We
 ;;; return a keyword/value pair that can be passed to the constructor.
@@ -1503,7 +1498,7 @@
 ;;; the FORM so that the slot is recomputed.
 (defmacro inherit-vop-info (slot parse test form)
   `(if (and ,parse ,test)
-       (list ,slot `(,',(or (cdr (assoc slot *slot-inherit-alist*))
+       (list ,slot `(,',(or (cdr (assoc slot +slot-inherit-alist+))
                             (error "unknown slot ~S" slot))
                      (template-or-lose ',(vop-parse-name ,parse))))
        (list ,slot ,form)))
@@ -1978,14 +1973,10 @@
       (try-coalescing vop-info-temps)
       (try-coalescing vop-info-ref-ordering)
       (try-coalescing vop-info-targets)))
-  ;; vop rdefinition should be allowed, but a dup in the cross-compiler
-  ;; is probably a mistake. REGISTER-VOP-PARSE is the wrong place
-  ;; to check this, because parsing has both compile-time and load-time
-  ;; effects, since inheritance is computed at compile-time.
-  ;; And there are false positives with any DEFINE-VOP in an assembler file
-  ;; because those are processed twice. I don't know what to do.
-  #+nil (when (gethash (vop-info-name vop-info) *backend-template-names*)
-                 (warn "Duplicate vop name: ~s" vop-info))
+  ;; redefinition is allowed, but a dup in the cross-compiler is a mistake
+  #+sb-xc-host
+  (when (gethash (vop-info-name vop-info) *backend-template-names*)
+    (error "Duplicate vop name: ~s" vop-info))
   (setf (gethash (vop-info-name vop-info) *backend-template-names*)
         vop-info))
 

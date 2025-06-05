@@ -13,6 +13,16 @@
 
 (in-package "SB-IMPL")
 
+;;; Default evaluator mode (interpreter / compiler)
+
+(declaim (type (member :compile #+(or sb-eval sb-fasteval) :interpret)
+               *evaluator-mode*))
+(defparameter *evaluator-mode* :compile
+  "Toggle between different evaluator implementations. If set to :COMPILE,
+an implementation of EVAL that calls the compiler will be used. If set
+to :INTERPRET, an interpreter will be used.")
+(declaim (always-bound *evaluator-mode*))
+
 ;;; Like DEFUN, but hides itself in the backtrace. This is meant for
 ;;; trivial functions which just do some argument parsing and call
 ;;; ERROR for real. Hence, having them and their locals in the
@@ -224,52 +234,63 @@
   (let ((macros ())
         (binds ())
         (dx ())
-        (ignores ()))
+        (ignores ())
+        (declares))
     (dolist (spec collections)
-      (destructuring-bind (name &optional initial-value (collector nil collectorp)
-                                &aux (n-value (copy-symbol name)))
-          spec
-        (push `(,n-value ,(if (or initial-value collectorp)
-                              initial-value
-                              `(#-sb-xc-host unaligned-dx-cons
-                                #+sb-xc-host list
-                                nil)))
-              binds)
-        (let ((macro-body
-               (cond
-                 (collectorp
-                   ``(progn
-                       ,@(mapcar (lambda (x)
-                                   `(setq ,',n-value (,',collector ,x ,',n-value)))
-                                 args)
-                       ,',n-value))
-                 ((not initial-value)
-                  ;; Use a dummy cons to skip the test for TAIL being NIL with each
-                  ;; inserted item.
-                  (push n-value dx)
-                  (let ((n-tail (gensymify* name "-TAIL")))
-                    (push n-tail ignores)
-                    (push `(,n-tail ,n-value) binds)
-                    `(if args
-                         `(progn
+      (destructuring-bind (name &optional initial-value (collector nil collectorp)) spec
+        (multiple-value-bind (name append-tail)
+            (if (consp name)
+                (values (first name) (second name))
+                (values name nil))
+          (let ((n-value (copy-symbol name))
+                (n-tail (gensymify* name "-TAIL")))
+            (push `(,n-value ,(cond ((or initial-value collectorp)
+                                     initial-value)
+                                    (t
+                                     #-sb-xc-host (push `(sb-c::no-debug ,n-value ,n-tail) declares)
+                                     `(#-sb-xc-host unaligned-dx-cons
+                                       #+sb-xc-host list
+                                       nil))))
+                  binds)
+            ;; Hide unaligned-dx-cons
+
+            (let* ((macro-body
+                     (cond
+                       (collectorp
+                        ``(progn
                             ,@(mapcar (lambda (x)
-                                        `(setf ,',n-tail (setf (cdr ,',n-tail)
-                                                               (list ,x))))
-                                      args))
-                         `(cdr ,',n-value))))
-                 ;; collecting a list given a list to start with.
-                 ;; It's possible to use the "fancy" strategy to avoid testing for NIL
-                 ;; at each step but I choose not to.  The initializer would have to be
-                 ;; (cons nil initial-value). It's unimportant.
-                 (initial-value
-                  (let ((n-tail (gensymify* name "-TAIL")))
-                    (push n-tail ignores)
-                    (push `(,n-tail (last ,n-value)) binds)
-                    `(collect-list-expander ',n-value ',n-tail args))))))
-          (push `(,name (&rest args) ,macro-body) macros))))
+                                        `(setq ,',n-value (,',collector ,x ,',n-value)))
+                                      args)
+                            ,',n-value))
+                       ((not initial-value)
+                        ;; Use a dummy cons to skip the test for TAIL being NIL with each
+                        ;; inserted item.
+                        (push n-value dx)
+                        (push n-tail ignores)
+                        (push `(,n-tail ,n-value) binds)
+                        `(if args
+                             `(progn
+                                ,@(mapcar (lambda (x)
+                                            `(setf ,',n-tail (setf (cdr ,',n-tail)
+                                                                   (list ,x))))
+                                          args))
+                             `(cdr ,',n-value)))
+                       ;; collecting a list given a list to start with.
+                       ;; It's possible to use the "fancy" strategy to avoid testing for NIL
+                       ;; at each step but I choose not to.  The initializer would have to be
+                       ;; (cons nil initial-value). It's unimportant.
+                       (initial-value
+                        (let ((n-tail (gensymify* name "-TAIL")))
+                          (push n-tail ignores)
+                          (push `(,n-tail (last ,n-value)) binds)
+                          `(collect-list-expander ',n-value ',n-tail args))))))
+              (push `(,name (&rest args) ,macro-body) macros)
+              (when append-tail
+                (push `(,append-tail (x) `(setf (cdr ,',n-tail) ,x)) macros)))))))
     `(macrolet ,macros
        (let* ,(nreverse binds)
-         ,@(if dx `((declare (dynamic-extent ,@dx))))
+         ,@(if dx `((declare (dynamic-extent ,@dx)
+                             ,@declares)))
          ;; Even if the user reads each collection result,
          ;; reader conditionals might statically eliminate all writes.
          ;; Since we don't know, all the -n-tail variable are ignorable.
@@ -509,7 +530,9 @@ NOTE: This interface is experimental and subject to change."
 (defun drop-all-hash-caches ()
   #+sb-xc-host (values-specifier-type-cache-clear) ; it's not like the rest
   (dolist (name *cache-vector-symbols*)
-    (set name nil)))
+    ;; We really don't need to call ABOUT-TO-MODIFY-SYMBOL-VALUE 18 times
+    ;; just to clear the caches.
+    (%set-symbol-global-value name nil)))
 
 (defmacro sb-int-package () (find-package "SB-INT"))
 
@@ -520,11 +543,7 @@ NOTE: This interface is experimental and subject to change."
   (let (cache)
     ;; It took me a while to figure out why infinite recursion could occur
     ;; in VALUES-SPECIFIER-TYPE. It's because SET calls VALUES-SPECIFIER-TYPE.
-    (macrolet ((set! (symbol value)
-                 `(#+sb-xc-host set
-                   #-sb-xc-host sb-kernel:%set-symbol-global-value
-                   ,symbol ,value))
-               (reset-stats ()
+    (macrolet ((reset-stats ()
                  ;; If statistics gathering is not not compiled-in,
                  ;; no sense in setting a symbol that is never used.
                  ;; While this uses SYMBOLICATE at runtime,
@@ -533,7 +552,7 @@ NOTE: This interface is experimental and subject to change."
                      `(let ((statistics
                              (package-symbolicate (sb-int-package) symbol "-STATS")))
                         (unless (boundp statistics)
-                          (set! statistics
+                          (%set-symbol-global-value statistics
                                 (make-array 3 :element-type 'fixnum
                                               :initial-contents '(1 0 0))))))))
       ;; It would be bad if another thread sees MAKE-ARRAY's result in the
@@ -543,7 +562,8 @@ NOTE: This interface is experimental and subject to change."
       (sb-thread:barrier (:write)
         (reset-stats)
         (setq cache (make-array size :initial-element 0)))
-      (set! symbol cache))))
+      (%set-symbol-global-value symbol cache)
+      cache)))
 
 ;; At present we make a new vector every time a line is re-written,
 ;; to make it thread-safe and interrupt-safe. A multi-word compare-and-swap
@@ -1285,11 +1305,6 @@ NOTE: This interface is experimental and subject to change."
               (normalize-deprecation-replacements replacement-spec))))
    nil))
 
-(defun setup-type-in-final-deprecation
-    (software version name replacement-spec)
-  (declare (ignore software version replacement-spec))
-  (%deftype name (constant-type-expander name t) nil))
-
 ;; Given DECLS as returned by from parse-body, and SYMBOLS to be bound
 ;; (with LET, MULTIPLE-VALUE-BIND, etc) return two sets of declarations:
 ;; those which pertain to the variables and those which don't.
@@ -1309,7 +1324,8 @@ NOTE: This interface is experimental and subject to change."
                                      (memq id '(special ignorable ignore
                                                 dynamic-extent
                                                 sb-c::constant-value
-                                                sb-c::no-constraints))
+                                                sb-c::no-constraints
+                                                sb-c::no-debug))
                                      (info :type :kind id))
                                  (cdr decl))))))
            (partition (spec)
@@ -1395,7 +1411,9 @@ NOTE: This interface is experimental and subject to change."
 ;; slightly more abstract and yet at the same time more concrete to say
 ;; "memoized-function-caches". "hash-caches" is pretty nonspecific.
 #.(if *profile-hash-cache*
-'(defun show-hash-cache-statistics ()
+'(progn
+(export 'show-hash-cache-statistics) ; protect from tree-shaker
+(defun show-hash-cache-statistics ()
   (flet ((cache-stats (symbol)
            (let* ((name (string symbol))
                   (statistics (package-symbolicate (sb-int-package) symbol "-STATS"))
@@ -1425,7 +1443,7 @@ NOTE: This interface is experimental and subject to change."
                   (if (plusp (length cache))
                       (* 100 (/ (count-if-not #'fixnump cache)
                                 (length cache))))
-                  short-name))))))
+                  short-name)))))))
 
 ;;; some commonly-occurring CONSTANTLY forms
 (macrolet ((def-constantly-fun (name constant-expr)

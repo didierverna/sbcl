@@ -70,11 +70,47 @@ static void xgetbv(unsigned *eax, unsigned *edx)
 }
 
 #define VECTOR_FILL_T "VECTOR-FILL/T"
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+// the store to card table takes 3 bytes more encode
+static const int vector_fill_offset_to_check = 0x53;
+static const int vector_fill_offset_to_poke  = 0x5A;
+#else
+static const int vector_fill_offset_to_check = 0x50;
+static const int vector_fill_offset_to_poke  = 0x57;
+#endif
+static const unsigned char vector_fill_expect_bytes[] = {
+  0x48, 0x81, 0xF9, 0xBC, 0x02, 0x00, 0x00,
+  0xEB, 0x07
+};
 
 // Poke in a byte that changes an opcode to enable faster vector fill.
 // Using fixed offsets and bytes is no worse than what we do elsewhere.
 void tune_asm_routines_for_microarch(void)
 {
+    // Assign the static lisp symbol's value the address of the C function
+    // that assists calling C from Lisp.
+#ifdef LISP_FEATURE_SB_THREAD
+    extern void callback_wrapper_trampoline();
+    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = (lispobj)callback_wrapper_trampoline;
+#else
+    extern void funcall_alien_callback();
+    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = (lispobj)funcall_alien_callback;
+#endif
+
+    struct static_trailer_constants* consts =
+      (void*)((char*)STATIC_SPACE_END - sizeof (struct static_trailer_constants));
+#ifdef LAYOUT_OF_FUNCTION
+    consts->function_layout = LAYOUT_OF_FUNCTION << 32;
+#endif
+    consts->lisp_linkage_table = (uword_t)linkage_space;
+    consts->alien_linkage_table = ALIEN_LINKAGE_SPACE_START;
+    consts->msan_xor_constant = (uword_t)0x500000000000;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    consts->text_space_addr = TEXT_SPACE_START;
+    consts->text_card_count = text_space_size / IMMOBILE_CARD_BYTES;
+    consts->text_card_marks = (lispobj)text_page_touched_bits;
+#endif
+
     unsigned int eax, ebx, ecx, edx;
     unsigned int cpuid_fn1_ecx = 0;
 
@@ -95,11 +131,26 @@ void tune_asm_routines_for_microarch(void)
         }
     }
     int our_cpu_feature_bits = 0;
-    // avx2_supported gets copied into bit 1 of *CPU-FEATURE-BITS*
+    // avx2_supported gets copied into bit 1 of cpu_feature_bits
     if (avx2_supported) our_cpu_feature_bits |= 1;
-    // POPCNT = ECX bit 23, which gets copied into bit 2 in *CPU-FEATURE-BITS*
+    // POPCNT = ECX bit 23, which gets copied into bit 2 in cpu_feature_bits
     if (cpuid_fn1_ecx & (1<<23)) our_cpu_feature_bits |= 2;
-    SetSymbolValue(CPU_FEATURE_BITS, make_fixnum(our_cpu_feature_bits), 0);
+    consts->cpu_feature_bits = our_cpu_feature_bits;
+
+#ifdef LISP_FEATURE_WIN32
+    extern void set_up_win64_seh_thunk(lispobj*);
+    set_up_win64_seh_thunk((lispobj*)get_asm_routine_by_name("SEH-TRAMPOLINE", 0));
+#endif
+
+    unsigned char* asm_routine = (void*)get_asm_routine_by_name(VECTOR_FILL_T, 0);
+    if (!asm_routine) return;
+    // Since a particular runtime expects a particular core,
+    // mismatch of the ASM routine is a fatal error.
+    if (memcmp(asm_routine + vector_fill_offset_to_check,
+               vector_fill_expect_bytes,
+               sizeof vector_fill_expect_bytes))
+        lose("%s does not match expectation @ %p",
+             VECTOR_FILL_T, asm_routine + vector_fill_offset_to_check);
 
     // I don't know if this works on Windows
 #ifndef _MSC_VER
@@ -107,7 +158,8 @@ void tune_asm_routines_for_microarch(void)
     if (eax >= 7) {
         cpuid(7, 0, &eax, &ebx, &ecx, &edx);
         if (ebx & (1<<9)) // Enhanced Repeat Movs/Stos
-          asm_routine_poke(VECTOR_FILL_T, 0x12, 0x7C); // Change JMP to JL
+          asm_routine_poke(VECTOR_FILL_T, vector_fill_offset_to_poke,
+                           0x7C); // Change JMP to JL
     }
 #endif
 }
@@ -118,8 +170,16 @@ void tune_asm_routines_for_microarch(void)
    instructions that don't exist on some cpu family members */
 void untune_asm_routines_for_microarch(void)
 {
-    asm_routine_poke(VECTOR_FILL_T, 0x12, 0xEB); // Change JL to JMP
-    SetSymbolValue(CPU_FEATURE_BITS, 0, 0);
+    char* jmp_inst = get_asm_routine_by_name("SEH-TRAMPOLINE", 0) + 8;
+    char* indirect_addr = jmp_inst + 6 + (int32_t)UNALIGNED_LOAD32(jmp_inst+2);
+    memset(indirect_addr - 16, 0, 24); // erase foreign data
+    asm_routine_poke(VECTOR_FILL_T, vector_fill_offset_to_poke,
+                     0xEB); // Change JL to JMP
+    // ensure no random value lingering in static space on image save
+    struct static_trailer_constants* consts =
+      (void*)((char*)STATIC_SPACE_END - sizeof (struct static_trailer_constants));
+    memset(consts, 0, sizeof *consts);
+    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = 0;
 }
 
 #ifndef _WIN64
@@ -755,6 +815,80 @@ lispobj call_into_lisp_first_time(lispobj fun, lispobj *args, int nargs) {
     extern lispobj call_into_lisp_first_time_(lispobj, lispobj *, int, struct thread *)
         __attribute__((sysv_abi));
     return call_into_lisp_first_time_(fun, args, nargs, get_sb_vm_thread());
+}
+
+/*
+ * On x86-64 we try to place the alien and lisp linkage tables in such a way
+ * that avoids extra load instructions when calling, but also allows those tables
+ * to be fully relocatable. It is best achieved by using PC-relative addressng,
+ * which works only for immobile text space. Failing that, we can place the
+ * linkage tables below NIL and use NIL-relative addressing.
+ * The core file makes no indication of the "effective size" of static space
+ * or text space, so we have to oversize them.
+ * It's a little confusing, so here are the possibilities:
+ *
+ * Supports           |   extra allocation amount
+ * Immobile | elfcode |      text         | static
+ * ---------|-----------------------------|-------------------------------------
+ *   Yes    |   No    | +AL +LL below     | none
+ *   Yes    |   Yes   |     n/a           | +AL below, +GC cards above
+ *   No     |   No    |     none          | +AL+LL below, +GC cards above
+ *   No     |   Yes   |     n/a           | +AL below, +GC cards above
+ *
+ * AL = alien linkage
+ * LL = lisp linkage
+ * n/a means the call does not occur for that space
+ *
+ * For #+immobile-space we want to end up with text space having both linkage subspaces
+ * (unless code-in-ELF)
+ *   | LISP LINKAGE | ALIEN LINKAGE | CODE OBJECTS ...
+ *   |<------------>|<------------->| ....
+ * For code-in-ELF then the lisp linkage space was preallocated to a .bss section,
+ * so we only oversize the static space by the alien linkage space size.
+ * If there is no text space (i.e. for #-immobile-space) then the linkage tables
+ * are below static space.
+ */
+os_vm_address_t coreparse_alloc_space(int space_id, int attr,
+                                      os_vm_address_t addr, os_vm_size_t size)
+{
+    if (size == 0) return addr;
+
+    int extra_below = 0, extra_above = 0;
+    extern int lisp_code_in_elf();
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (!lisp_code_in_elf()) { // a normal core
+        if (space_id == IMMOBILE_TEXT_CORE_SPACE_ID)
+            extra_below = LISP_LINKAGE_SPACE_SIZE + ALIEN_LINKAGE_SPACE_SIZE;
+    } else { // code-in-ELF core
+        if (space_id == STATIC_CORE_SPACE_ID)
+            extra_below = ALIEN_LINKAGE_SPACE_SIZE;
+    }
+#else
+    if (space_id == STATIC_CORE_SPACE_ID)
+        extra_below = LISP_LINKAGE_SPACE_SIZE + ALIEN_LINKAGE_SPACE_SIZE;
+#endif
+
+    if (space_id == STATIC_CORE_SPACE_ID) {
+        extra_above =
+# ifdef LISP_FEATURE_SB_SAFEPOINT // should just add 1 OS page but instead
+            BACKEND_PAGE_BYTES +  // it's a ridiculously generous bump up
+# endif
+                ALIGN_UP((1+gc_card_table_mask), os_reported_page_size);
+    }
+
+    addr -= extra_below; // endeavor to return the requested address as it was
+    size += extra_below + extra_above;
+    //fprintf(stderr, "requesting space for space_id %d, below=%x above=%x\n", space_id, extra_below, extra_above);
+    addr = os_alloc_gc_space(space_id, attr, addr, size);
+    if (!addr) lose("Can't allocate %#"OBJ_FMTX" bytes for space %d", size, space_id);
+
+    if (extra_below) { // it contains at least alien linkage if not also lisp linkage
+        if (extra_below > ALIEN_LINKAGE_SPACE_SIZE) linkage_space = (void*)addr;
+        addr += extra_below;
+        ALIEN_LINKAGE_SPACE_START = (uword_t)addr - ALIEN_LINKAGE_SPACE_SIZE;
+    }
+    return addr;
 }
 
 #include "x86-arch-shared.inc"

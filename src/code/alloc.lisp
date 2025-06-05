@@ -113,15 +113,19 @@
     (values (%primitive alloc-immobile-fixedobj size-class aligned-nwords header))))
 
 (defun %alloc-immobile-symbol (name)
-  (let ((symbol (truly-the symbol
+  (let ((symbol (truly-the (and symbol (not null))
                  (or #+x86-64 (%primitive !fast-alloc-immobile-symbol)
                      (alloc-immobile-fixedobj
                       symbol-size
-                      (compute-object-header (1- symbol-size) symbol-widetag))))))
+                      #.(compute-object-header (1- symbol-size) symbol-widetag))))))
     ;; symbol-hash and package ID start out as 0
-    (%primitive set-slot symbol name 'make-symbol symbol-name-slot other-pointer-lowtag)
+    (with-pinned-objects (symbol)
+      ;; set-slot vop wasn't figuring out that it didn't need a GC barrier for NAME
+      (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address symbol))
+                             (- (ash symbol-name-slot word-shift) other-pointer-lowtag))
+            name))
     (%primitive set-slot symbol nil 'make-symbol symbol-info-slot other-pointer-lowtag)
-    (%set-symbol-global-value symbol (make-unbound-marker))
+    (%primitive %set-symbol-global-value symbol (make-unbound-marker))
     symbol))
 
 ) ; end PROGN
@@ -174,7 +178,7 @@
               (let ((oldval (cas *dynspace-codeblob-tree* tree newtree)))
                 (if (eq oldval tree) (return) (setq tree oldval))))))))
 
-(defglobal *code-alloc-count* 0) ; frlock: bump once on entry, again on exit
+(define-load-time-global *code-alloc-count* 0) ; frlock: bump once on entry, again on exit
 (declaim (fixnum *code-alloc-count*))
 
 ;;; Allocate a code component with BOXED words in the header
@@ -196,22 +200,16 @@
         ;; CODE needs to have a heap or TLS reference to it prior to adding it to the tree
         ;; since implicit pinning uses the tree to find pinned ojects.
         (declare (special holder))
-        (with-alien ((tlsf-alloc-codeblob (function unsigned system-area-pointer unsigned)
-                                          :extern)
+        (with-alien ((tlsf-alloc-codeblob
+                      (function unsigned system-area-pointer unsigned-int unsigned-int) :extern)
                      (tlsf-control system-area-pointer :extern))
           (with-system-mutex (*allocator-mutex* :without-gcing t)
             (unless (zerop (setq addr (alien-funcall tlsf-alloc-codeblob
-                                                     tlsf-control total-words)))
+                                                     tlsf-control total-words boxed)))
               (setf code (%make-lisp-obj (logior addr other-pointer-lowtag))
                     holder code))))
         ;; GC is allowed to run now because HOLDER references CODE
         (when code
-          (alien-funcall (extern-alien "memset" (function void system-area-pointer int unsigned))
-                         (sap+ (int-sap addr) n-word-bytes) 0 (ash (1- boxed) word-shift))
-          ;; BOXED-SIZE is a raw slot holding a byte count, but SET-SLOT takes its VALUE
-          ;; arg as a descriptor-reg, so just cleverly make it right by shifting.
-          (%primitive set-slot code (ash boxed (- word-shift n-fixnum-tag-bits))
-                      '(setf %code-boxed-size) code-boxed-size-slot other-pointer-lowtag)
           (aver (= (sap-ref-8 (int-sap addr) 0) code-header-widetag)) ; wasn't trashed
           (let ((tree *immobile-codeblob-tree*))
             (loop (when (eq tree (setq tree (cas *immobile-codeblob-tree* tree

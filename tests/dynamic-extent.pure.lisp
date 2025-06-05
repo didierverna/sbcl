@@ -1403,8 +1403,9 @@
   (funcall pred (funcall key arg)))
 
 (defun autodxclosure1 (&optional (x 4))
-  ;; Calling a higher-order function will only implicitly DXify a funarg
-  ;; if the callee is trusted (a CL: function) or the caller is unsafe.
+  ;; Calling a higher-order function will only implicitly
+  ;; stack-allocate a funarg if the callee is trusted (a CL: function)
+  ;; or the caller is unsafe.
   (declare (optimize speed (safety 0) (debug 0)))
   (trivial-hof (lambda (a b) (+ a b x)) 92))
 
@@ -1526,17 +1527,16 @@
     ((33) 33)))
 
 (with-test (:name :dominators-recomputation)
-  (let (sb-c::*check-consistency*)
-    (checked-compile-and-assert
-     ()
-     `(lambda (x)
-        (let ((m (if x
-                     (make-array 2 :initial-element 1)
-                     (make-array 2 :initial-element 2))))
-          (declare (dynamic-extent m))
-          (elt m 0)))
-     ((t) 1)
-     ((nil) 2))))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (let ((m (if x
+                   (make-array 2 :initial-element 1)
+                   (make-array 2 :initial-element 2))))
+        (declare (dynamic-extent m))
+        (elt m 0)))
+   ((t) 1)
+   ((nil) 2)))
 
 (with-test (:name :notes-in-deleted-code)
   (checked-compile
@@ -1768,6 +1768,39 @@
        (funcall x)))
    ((3) 3)))
 
+(with-test (:name :dx-flet-substitution-multiple-refs)
+  (checked-compile-and-assert
+   ()
+   '(lambda (z)
+     (flet ((y (a)
+              (incf z a)))
+       (let ((x #'y))
+         (declare (dynamic-extent x))
+         (funcall x 5)
+         (funcall x 6)
+         (assert (sb-ext:stack-allocated-p x))
+         (funcall x 7))
+       (map nil #'y '(1 2 3))
+       z))
+   ((3) 27)))
+
+(with-test (:name :dx-flet-substitution-different-frame)
+  (checked-compile-and-assert
+   ()
+   '(lambda (z)
+     (labels ((y (a)
+                (incf z a))
+              (g ()
+                (let ((x #'y))
+                  (declare (dynamic-extent x))
+                  (funcall x 5)
+                  (print-nothing x)
+                  (funcall x 6))))
+       (map nil #'y '(1 2 3))
+       (g)
+       (g)))
+   ((3) 31)))
+
 (with-test (:name :dx-anonymous-closure-otherwise-inaccessible)
   (checked-compile-and-assert
    ()
@@ -1820,7 +1853,6 @@
   (let ((array (make-array 4)))
     (declare (dynamic-extent array))
     (assert (equalp (known-function-autodx-transform-2 array 3 '(1 2 3 4)) #(4 5 6 7)))
-    #+(or) ; appears to not work on some platforms for some reason?
     (assert-no-consing (known-function-autodx-transform-2 array 3 '(1 2 3 4)))))
 
 (defun auto-dx-cleaned-up-too-many-times (off array)
@@ -1832,6 +1864,9 @@
 
 (with-test (:name :auto-dx-cleaned-up-too-many-times)
   (assert (= (auto-dx-cleaned-up-too-many-times 1 #(-1 2 3)) 10)))
+
+(with-test (:name :auto-dx-with-single-ref-flet)
+  (assert-no-consing (auto-dx-cleaned-up-too-many-times 1 #(-1 2 3))))
 
 (with-test (:name :auto-dx-correct-mess-up)
   (checked-compile-and-assert
@@ -1850,317 +1885,345 @@
 (declaim (notinline dxf))
 
 (with-test (:name :dynamic-extent-lp2031224)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile
-     '(lambda (a b)
-       (let ((v
-               (list
-                (list (vector 0 0) a
-                      (restart-bind nil a))
-                (block b2 b))))
-         (declare (dynamic-extent v))
-         (dxf (dxf v 0) 2))))))
+  (checked-compile
+   '(lambda (a b)
+     (let ((v
+             (list
+              (list (vector 0 0) a
+                    (restart-bind nil a))
+              (block b2 b))))
+       (declare (dynamic-extent v))
+       (dxf (dxf v 0) 2)))))
 
 (with-test (:name :dynamic-extent-lp2031399)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile
-     '(lambda ()
-       (declare (notinline funcall not))
-       (labels ((%f1 ()
-                  (labels ((%f2 (&key (key1
-                                       (if (not t)
-                                           (ignore-errors 0)
-                                           0)))
-                             (declare (ignore key1))
-                             0))
-                    (funcall #'%f2))))
-         (%f1))))))
+  (checked-compile
+   '(lambda ()
+     (declare (notinline funcall not))
+     (labels ((%f1 ()
+                (labels ((%f2 (&key (key1
+                                     (if (not t)
+                                         (ignore-errors 0)
+                                         0)))
+                           (declare (ignore key1))
+                           0))
+                  (funcall #'%f2))))
+       (%f1)))))
 
 (with-test (:name :dynamic-extent-conditional-allocation.partial)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (test y z)
-       (let ((x (if test
-                    (cons (cons y y) z)
-                    nil)))
-         (declare (dynamic-extent x))
-         (when test
-           (assert (sb-ext:stack-allocated-p x)))
-         (and x
-              (* (car (car x)) (cdr x)))))
-     ((t 4 5) 20)
-     ((nil 4 5) nil))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (test y z)
+     (let ((x (if test
+                  (cons (cons y y) z)
+                  nil)))
+       (declare (dynamic-extent x))
+       (when test
+         (assert (sb-ext:stack-allocated-p x)))
+       (and x
+            (* (car (car x)) (cdr x)))))
+   ((t 4 5) 20)
+   ((nil 4 5) nil)))
 
 (with-test (:name :dynamic-extent-conditional-allocation.partial.2)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (test y z)
-       (let (res)
-         (dotimes (i 3)
-           (let ((x (if test
-                        (cons (cons y y) z)
-                        nil)))
-             (declare (dynamic-extent x))
-             (when test
-               (assert (sb-ext:stack-allocated-p x)))
-             (setq res (and x
-                            (* (car (car x)) (cdr x))))))
-         res))
-     ((t 4 5) 20)
-     ((nil 4 5) nil))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (test y z)
+     (let (res)
+       (dotimes (i 3)
+         (let ((x (if test
+                      (cons (cons y y) z)
+                      nil)))
+           (declare (dynamic-extent x))
+           (when test
+             (assert (sb-ext:stack-allocated-p x)))
+           (setq res (and x
+                          (* (car (car x)) (cdr x))))))
+       res))
+   ((t 4 5) 20)
+   ((nil 4 5) nil)))
 
 (with-test (:name :dynamic-extent-mess-up)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (x)
-       (let ((y (list (cons 1 2)
-                      (progn
-                        (if x
-                            (print-nothing 2)
-                            (print-nothing 3))
-                        (cons 3 4))
-                      (progn
-                        (if x
-                            (print-nothing 2)
-                            (print-nothing 3))
-                        (cons 3 4)))))
-         (declare (dynamic-extent y))
-         (assert (sb-ext:stack-allocated-p y))
-         (copy-tree y)))
-     ((t) '((1 . 2) (3 . 4) (3 . 4)) :test #'tree-equal))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (let ((y (list (cons 1 2)
+                    (progn
+                      (if x
+                          (print-nothing 2)
+                          (print-nothing 3))
+                      (cons 3 4))
+                    (progn
+                      (if x
+                          (print-nothing 2)
+                          (print-nothing 3))
+                      (cons 3 4)))))
+       (declare (dynamic-extent y))
+       (assert (sb-ext:stack-allocated-p y))
+       (copy-tree y)))
+   ((t) '((1 . 2) (3 . 4) (3 . 4)) :test #'tree-equal)))
 
 (with-test (:name :stack-analysis-graph-walk-nlx)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile
-     '(lambda ()
-       (let ((+++ 3))
-         (multiple-value-bind (result error)
-             (ignore-errors (eval 1))
-           (declare (ignore result error)))
-         (catch 'foo
-           (error "bar"))
-         (multiple-value-bind (result error)
-             (ignore-errors (eval 1))
-           (declare (ignore result error))))))))
+  (checked-compile
+   '(lambda ()
+     (let ((+++ 3))
+       (multiple-value-bind (result error)
+           (ignore-errors (eval 1))
+         (declare (ignore result error)))
+       (catch 'foo
+         (error "bar"))
+       (multiple-value-bind (result error)
+           (ignore-errors (eval 1))
+         (declare (ignore result error)))))))
 
 (with-test (:name :stack-analysis-graph-walk-nlx.2)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile
-     '(lambda ()
-       (declare (optimize (speed 0) (debug 1)))
-       (tagbody
-        a
-          (flet ((f ()
-                   (go tag)))
-            (f))
-        tag
-          (let ((m (list 1)))
+  (checked-compile
+   '(lambda ()
+     (declare (optimize (speed 0) (debug 1)))
+     (tagbody
+      a
+        (flet ((f ()
+                 (go tag)))
+          (f))
+      tag
+        (let ((m (list 1)))
+          (declare (dynamic-extent m))
+          (eval m)
+          (let ((m (list 2)))
             (declare (dynamic-extent m))
-            (eval m)
-            (let ((m (list 2)))
-              (declare (dynamic-extent m))
-              (eval m))))))))
+            (eval m)))))))
 
 (defstruct thing
   (times-v nil :type simple-vector :read-only t)
   (fringe nil))
 
 (with-test (:name :dx-propagation-existing-dynamic-extent)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda ()
-       (declare (inline make-thing))
-       (let ((times-v (make-array 2))
-             (result nil))
-         (declare (dynamic-extent times-v))
-         (dolist (portion '(1 2 3))
-           (let ((scratchpad (make-thing :times-v times-v)))
-             (declare (dynamic-extent scratchpad))
-             (setq result (nconc result (thing-fringe scratchpad)))))
-         result))
-     (() nil))))
+  (checked-compile-and-assert
+   ()
+   '(lambda ()
+     (declare (inline make-thing))
+     (let ((times-v (make-array 2))
+           (result nil))
+       (declare (dynamic-extent times-v))
+       (dolist (portion '(1 2 3))
+         (let ((scratchpad (make-thing :times-v times-v)))
+           (declare (dynamic-extent scratchpad))
+           (setq result (nconc result (thing-fringe scratchpad)))))
+       result))
+   (() nil)))
 
 (with-test (:name :dynamic-extent-setq-let)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (x)
-       (dotimes (i 2)
-         (let ((y (cons x x)))
-           (declare (dynamic-extent y))
-           (assert (sb-ext:stack-allocated-p y))
-           (setq y (list x x x))
-           (assert (equal y (list x x x)))
-           (assert (sb-ext:stack-allocated-p y))
-           (setq y (make-array 20 :initial-element nil))
-           (assert (equalp y (make-array 20 :initial-element nil)))
-           (assert (sb-ext:stack-allocated-p y))
-           (setq y (list (cons x i) (cons x i)))
-           (assert (tree-equal y (list (cons x i) (cons x i))))
-           (assert (sb-ext:stack-allocated-p y))
-           (assert (sb-ext:stack-allocated-p (first y) (second y))))))
-     ((6) nil))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (dotimes (i 2)
+       (let ((y (cons x x)))
+         (declare (dynamic-extent y))
+         (assert (sb-ext:stack-allocated-p y))
+         (setq y (list x x x))
+         (assert (equal y (list x x x)))
+         (assert (sb-ext:stack-allocated-p y))
+         (setq y (make-array 20 :initial-element nil))
+         (assert (equalp y (make-array 20 :initial-element nil)))
+         (assert (sb-ext:stack-allocated-p y))
+         (setq y (list (cons x i) (cons x i)))
+         (assert (tree-equal y (list (cons x i) (cons x i))))
+         (assert (sb-ext:stack-allocated-p y))
+         (assert (sb-ext:stack-allocated-p (first y) (second y))))))
+   ((6) nil)))
 
 (with-test (:name :dynamic-extent-setq-local-calls)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (x y)
-       (labels ((f (a b)
-                  (declare (dynamic-extent a b))
+  (checked-compile-and-assert
+   ()
+   '(lambda (x y)
+     (labels ((f (a b)
+                (declare (dynamic-extent a b))
+                (setq a (cons x y))
+                (assert (sb-ext:stack-allocated-p a))
+                (setq b (vector x y))
+                (assert (sb-ext:stack-allocated-p b))
+                (assert (equal a (cons x y)))
+                (assert (equalp b (vector x y)))))
+       (dotimes (i 4)
+         (cond (x
+                (f nil nil)
+                (print-nothing x))
+               (t
+                (f t t)
+                (print-nothing y))))))
+   ((nil 2) nil)
+   ((t 2) nil)))
+
+(with-test (:name :dynamic-extent-setq-local-calls.interleave)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x y)
+     (labels ((f (a b)
+                (declare (dynamic-extent a b))
+                (let ((z (cons a b)))
+                  (declare (dynamic-extent z))
                   (setq a (cons x y))
-                  (assert (sb-ext:stack-allocated-p a))
-                  (setq b (vector x y))
-                  (assert (sb-ext:stack-allocated-p b))
-                  (assert (equal a (cons x y)))
-                  (assert (equalp b (vector x y)))))
-         (dotimes (i 4)
-           (cond (x
-                  (f nil nil)
-                  (print-nothing x))
-                 (t
-                  (f t t)
-                  (print-nothing y))))))
-     ((nil 2) nil)
-     ((t 2) nil))))
+                  (print-nothing z))
+                (let ((z (cons a b)))
+                  (declare (dynamic-extent z))
+                  (print-nothing z))
+                (assert (sb-ext:stack-allocated-p a))
+                (assert (equal a (cons x y)))
+                (setq b (vector x y))
+                (assert (sb-ext:stack-allocated-p b))
+                (assert (equal a (cons x y)))
+                (assert (equalp b (vector x y)))))
+       (dotimes (i 4)
+         (cond (x
+                (f nil nil)
+                (print-nothing x))
+               (t
+                (f t t)
+                (print-nothing y))))))
+   ((nil 2) nil)
+   ((t 2) nil)))
 
 (with-test (:name :dynamic-extent-setq-different-environments)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (test)
-       (let ((list nil))
-         (declare (dynamic-extent list))
-         (flet ((body ()
-                  (setq list (cons nil list))))
-           (if test
-               (progn
-                 (body)
-                 (print-nothing 'foo))
-               (body)))))
-     ((t) 'foo)
-     ((nil) '(nil)))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (test)
+     (let ((list nil))
+       (declare (dynamic-extent list))
+       (flet ((body ()
+                (setq list (cons nil list))))
+         (if test
+             (progn
+               (body)
+               (print-nothing 'foo))
+             (body)))))
+   ((t) 'foo)
+   ((nil) '(nil))))
 
 (with-test (:name :dynamic-extent-nested)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (a)
-       (let ((v (list (vector 0 0)
-                      (let ((x (cons 1 2)))
-                        (declare (dynamic-extent x))
-                        (print-nothing x)
-                        (list 1 2)))))
-         (declare (dynamic-extent v))
-         (copy-list (elt v a))))
-     ((1) '(1 2)))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (a)
+     (let ((v (list (vector 0 0)
+                    (let ((x (cons 1 2)))
+                      (declare (dynamic-extent x))
+                      (print-nothing x)
+                      (list 1 2)))))
+       (declare (dynamic-extent v))
+       (copy-list (elt v a))))
+   ((1) '(1 2))))
 
 (with-test (:name :dynamic-extent-setq-nested)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda ()
-       (dotimes (i 2)
-         (let ((y (cons 1 2)))
-           (declare (dynamic-extent y))
-           (assert (equal y (cons 1 2)))
-           (assert (sb-ext:stack-allocated-p y))
-           (let ((z (cons 3 4)))
-             (declare (dynamic-extent z))
-             (assert (equal z (cons 3 4)))
-             (assert (sb-ext:stack-allocated-p z))
-             (setq y (cons 2 1))
-             (assert (equal y (cons 2 1)))
-             (assert (sb-ext:stack-allocated-p y)))
-           (let ((z (list 9 9 9 9 9)))
-             (declare (dynamic-extent z))
-             (assert (equal z (list 9 9 9 9 9)))
-             (assert (sb-ext:stack-allocated-p z))
-             (assert (equal y (cons 2 1)))
-             (assert (sb-ext:stack-allocated-p y))))))
-     (() nil))))
+  (checked-compile-and-assert
+   ()
+   '(lambda ()
+     (dotimes (i 2)
+       (let ((y (cons 1 2)))
+         (declare (dynamic-extent y))
+         (assert (equal y (cons 1 2)))
+         (assert (sb-ext:stack-allocated-p y))
+         (let ((z (cons 3 4)))
+           (declare (dynamic-extent z))
+           (assert (equal z (cons 3 4)))
+           (assert (sb-ext:stack-allocated-p z))
+           (setq y (cons 2 1))
+           (assert (equal y (cons 2 1)))
+           (assert (sb-ext:stack-allocated-p y)))
+         (let ((z (list 9 9 9 9 9)))
+           (declare (dynamic-extent z))
+           (assert (equal z (list 9 9 9 9 9)))
+           (assert (sb-ext:stack-allocated-p z))
+           (assert (equal y (cons 2 1)))
+           (assert (sb-ext:stack-allocated-p y))))))
+   (() nil)))
 
 (with-test (:name :dynamic-extent-start-later)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (x)
-       (let ((bar))
-         (declare (dynamic-extent bar))
-         (print-nothing (if x 1 2))
-         (push 12 bar)
-         (assert (sb-ext:stack-allocated-p bar))
-         (assert (equal bar '(12)))
-         nil))
-     ((t) nil)
-     ((nil) nil))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (let ((bar))
+       (declare (dynamic-extent bar))
+       (print-nothing (if x 1 2))
+       (push 12 bar)
+       (assert (sb-ext:stack-allocated-p bar))
+       (assert (equal bar '(12)))
+       nil))
+   ((t) nil)
+   ((nil) nil)))
 
 (with-test (:name :dynamic-extent-preserve.unreferenced-tn)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (b)
-       (let ((v nil))
-         (declare (dynamic-extent v))
-         (case b
-           (0 (setq v (vector 3)))
-           (1 (setq v (vector 0 (let ((x (cons 1 2)))
-                                  (declare (dynamic-extent x))
-                                  (print-nothing x)
-                                  2)))))
-         (elt v 0)))
-     ((0) 3)
-     ((1) 0))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (b)
+     (let ((v nil))
+       (declare (dynamic-extent v))
+       (case b
+         (0 (setq v (vector 3)))
+         (1 (setq v (vector 0 (let ((x (cons 1 2)))
+                                (declare (dynamic-extent x))
+                                (print-nothing x)
+                                2)))))
+       (elt v 0)))
+   ((0) 3)
+   ((1) 0)))
+
+(with-test (:name :dynamic-extent-interleave.bogus-unused)
+  (checked-compile-and-assert
+   ()
+   '(lambda (as xs)
+     (flet ((pred (a)
+              (print-nothing xs)
+              a))
+       (mapcar #'print-nothing (remove-if #'pred as))))
+   (('(1 2 3) '(3 4 5)) nil)))
 
 (with-test (:name :dynamic-extent-preserve.heap-exhaustion)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (a b c)
-       (let ((v nil))
-         (declare (dynamic-extent v))
-         (case a
-           (0 (setq v (list (prog2 b (restart-bind nil -17607) c) 17632849286127)))
-           (1 (setq v (list -17532189700714087747 b c))))
-         (case a (0 (elt v 1)) (1 (elt v 2)))))
-     ((1 2 3) 3))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (a b c)
+     (let ((v nil))
+       (declare (dynamic-extent v))
+       (case a
+         (0 (setq v (list (prog2 b (restart-bind nil -17607) c) 17632849286127)))
+         (1 (setq v (list -17532189700714087747 b c))))
+       (case a (0 (elt v 1)) (1 (elt v 2)))))
+   ((1 2 3) 3)))
 
 (with-test (:name :dynamic-extent-setq-already-existing)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda (a)
-       (let ((x (eval a)))
-         (declare (dynamic-extent x))
-         (let ((y 0))
-           (declare (dynamic-extent y))
-           (let ((z y))
-             (setq y x)
-             (values z)))))
-     ((1) 0))))
+  (checked-compile-and-assert
+   ()
+   '(lambda (a)
+     (let ((x (eval a)))
+       (declare (dynamic-extent x))
+       (let ((y 0))
+         (declare (dynamic-extent y))
+         (let ((z y))
+           (setq y x)
+           (values z)))))
+   ((1) 0)))
 
-(with-test (:name :stack-allocated-vector-checks-overflow
-            :broken-on (not (and :x86-64 :linux)))
+(with-test (:name :stack-allocated-vector-checks-overflow)
   (checked-compile-and-assert
    (:optimize :safe)
    '(lambda ()
-     (let ((x (make-array
-               ;; guaranteed to overflow the stack.
-               (abs (- (sb-sys:sap-int
-                        (sb-vm::current-thread-offset-sap sb-vm::thread-control-stack-start-slot))
-                       (sb-sys:sap-int
-                        (sb-int:descriptor-sap sb-vm:*control-stack-end*)))))))
-       (declare (dynamic-extent x))
-       (dotimes (i (length x))
-         (setf (aref x i) i))
-       123))
-   ;; This condition will be different depending on whether the
-   ;; explicit stack check signals or the guard page gets hit.
-   (() (condition 'sb-kernel::storage-condition))))
+     (let ((size
+             ;; guaranteed to overflow the stack.
+             (abs (- (sb-sys:sap-int
+                      (sb-vm::current-thread-offset-sap sb-vm::thread-control-stack-start-slot))
+                     (sb-sys:sap-int
+                      (sb-int:descriptor-sap sb-vm:*control-stack-end*))))))
+       (block nil
+         (handler-bind ((sb-kernel::stack-allocated-object-overflows-stack
+                          (lambda (c)
+                            (assert (= (sb-kernel::stack-allocated-object-overflows-stack-size c)
+                                       (sb-vm::primitive-object-size (make-array size))))
+                            (return :good)))
+                        (condition
+                          (lambda (c) (return c))))
+           (let ((x (make-array size)))
+             (declare (dynamic-extent x))
+             (dotimes (i (length x))
+               (setf (aref x i) i))
+             (aref x 0))))))
+   (() :good)))
 
 (with-test (:name :stack-allocated-vector-integer-size-arg)
   (checked-compile-and-assert
@@ -2175,34 +2238,105 @@
    (() nil)))
 
 (with-test (:name :stack-analysis-preserve.setq-loop)
-  (let ((sb-c::*check-consistency* t))
-    (checked-compile-and-assert
-     ()
-     '(lambda ()
-       (let ((digits '()))
-         (declare (dynamic-extent digits))
-         (let ((result (make-array 128 :element-type 'base-char)))
-           (declare (dynamic-extent result))
-           (dotimes (i 2)
-             (setq digits (cons 0 digits)))
-           (dotimes (i 3)
-             (setf (aref result i) #\0)))
-         ;; can't actually deallocate RESULT yet because we have to keep
-         ;; DIGITS on the stack.
-         (let ((another-result (make-array 128 :element-type 'base-char))
-               (another (list 1 2 3 4 5 6 7 8 9 10)))
-           (declare (dynamic-extent another another-result))
-           (dotimes (i 3)
-             (setf (aref another-result i) #\0))
-           (print-nothing (car another)))
-         (car digits)))
-     (() 0))))
+  (checked-compile-and-assert
+   ()
+   '(lambda ()
+     (let ((digits '()))
+       (declare (dynamic-extent digits))
+       (let ((result (make-array 128 :element-type 'base-char)))
+         (declare (dynamic-extent result))
+         (dotimes (i 2)
+           (setq digits (cons 0 digits)))
+         (dotimes (i 3)
+           (setf (aref result i) #\0)))
+       ;; can't actually deallocate RESULT yet because we have to keep
+       ;; DIGITS on the stack.
+       (let ((another-result (make-array 128 :element-type 'base-char))
+             (another (list 1 2 3 4 5 6 7 8 9 10)))
+         (declare (dynamic-extent another another-result))
+         (dotimes (i 3)
+           (setf (aref another-result i) #\0))
+         (print-nothing (car another)))
+       (car digits)))
+   (() 0)))
+
+(with-test (:name :stack-analysis-preserve.setq-nested-loop)
+  (checked-compile-and-assert
+   ()
+   '(lambda ()
+     (let (y)
+       (declare (dynamic-extent y))
+       (loop for i to 10
+             do (let ((j (list 1 2 3)))
+                  (declare (dynamic-extent j))
+                  (print-nothing j)
+                  (assert (sb-ext:stack-allocated-p j))
+                  (push (- i) y)))
+       (assert (sb-ext:stack-allocated-p y))
+       (list-length y)))
+   (() 11)))
+
+(declaim (inline nested.make))
+(defun nested.make (&optional (x nil))
+  (let* ((name (if (stringp x)
+                   nil
+                   (print x)))
+         (set (list 1)))
+    (declare (ignore name))
+    (flet ((add (element)
+             (setq element set)))
+      (map nil #'add x))
+    set))
+
+(with-test (:name :stack-analysis-preserve.nested-inline)
+  (checked-compile
+   '(lambda ()
+     (let* ((v (make-array 3))
+            (set (nested.make)))
+       (declare (dynamic-extent v set))
+       (print (list v set (lambda ())))
+       3))))
+
+(with-test (:name :stack-analysis-preserve.dx-node)
+  (checked-compile
+   '(lambda (b c d)
+     (restart-bind nil
+       (case (catch 'ct7 55)
+         ((2258)
+          (reduce
+           (lambda (x y) y (progv nil b x))
+           (list
+            (block b5
+              (restart-bind nil
+                (return-from b5 (- d c))))))))))))
+
+(with-test (:name :stack-analysis-preserve.dx-node-1)
+  (checked-compile
+   '(lambda ()
+     (let* ((x (vector))
+            (y (vector))
+            (z (prog1 (vector)
+                 (mapcar #'identity nil))))
+       (declare (dynamic-extent x y z))
+       (print-nothing (list x y z))
+       nil))))
+
+(with-test (:name :stack-analysis-preserve.functional-ref)
+  (checked-compile
+   '(lambda (v)
+     (loop repeat 2
+           collect
+           (flet ((l (x)
+                    x
+                    v))
+             (mapcar #'l v)
+             (map nil #'l v))))))
 
 (with-test (:name :encode-error-break-large-immediate)
   (disassemble '(lambda ()
                  (sb-int:dx-let ((v (make-array 65536
                                                 :element-type '(unsigned-byte 8))))
-                  (opaque-identity v)))
+                   (opaque-identity v)))
                :stream (make-broadcast-stream)))
 
 (with-test (:name :make-list-large-immediate)
@@ -2216,3 +2350,230 @@
      (let ((x (make-list 100000 :initial-element 1)))
        (declare (dynamic-extent x))
        (reduce #'+ x)))))
+
+(with-test (:name :dynamic-extent-constantly-function-branch)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (let ((function (if x
+                         (constantly x)
+                         (constantly t))))
+       (declare (dynamic-extent function))
+       (funcall function)))
+   ((1) 1)
+   ((nil) t)))
+
+(with-test (:name :dynamic-extent-function-branch)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (let ((function (if x
+                         (lambda () x)
+                         (lambda () t))))
+       (declare (dynamic-extent function))
+       (when x
+         (assert (sb-ext:stack-allocated-p function)))
+       (funcall function)))
+   ((1) 1)
+   ((nil) t)))
+
+(with-test (:name :dynamic-extent-lp2043242.reduced)
+  (checked-compile-and-assert
+   ()
+   '(lambda (a b)
+     (let ((v (block block258
+                (let ((z (lambda ()
+                           (return-from block258))))
+                  (declare (dynamic-extent z))
+                  (print-nothing z)
+                  (cons a b)))))
+       (declare (dynamic-extent v))
+       (copy-tree v)))
+   ((1 2) '(1 . 2) :test #'equal)))
+
+(with-test (:name :dynamic-extent-lp2043242.reduced.2)
+  (checked-compile-and-assert
+   ()
+   '(lambda (a b)
+     (let ((v (if a
+                  (cons a b)
+                  (let ((z (cons b b)))
+                    (declare (dynamic-extent z))
+                    (print-nothing z)
+                    (cons a b)))))
+       (declare (dynamic-extent v))
+       (copy-tree v)))
+   ((1 2) '(1 . 2) :test #'equal)))
+
+(with-test (:name :dynamic-extent-lp2043242)
+  (checked-compile-and-assert
+   ()
+   '(lambda (a b)
+     (let* ((v (ignore-errors (cons a b))))
+       (declare (dynamic-extent v))
+       (assert (sb-ext:stack-allocated-p v))
+       (case (if t 450336 v)
+         (t (copy-tree v)))))
+   ((1 2) '(1 . 2) :test #'equal)))
+
+(defun auto-dx-flet-several-ref (off array)
+  (let ((acc 0))
+    (flet ((positivep (num) (plusp (+ num off))))
+      (dotimes (i 10)
+        (incf acc (position-if #'positivep array)))
+      (if (plusp off)
+          (incf acc (if (positivep acc) 10 3))
+          (incf acc (position-if #'positivep array))))
+    acc))
+
+(with-test (:name :auto-dx-flet-several-ref.correct)
+  (assert (= (auto-dx-flet-several-ref 1 #(-1 2 3)) 20))
+  (assert (= (auto-dx-flet-several-ref 0 #(-1 2 3)) 11)))
+
+(with-test (:name :auto-dx-flet-several-ref.stack-allocates)
+  (assert-no-consing (auto-dx-flet-several-ref 1 #(-1 2 3)))
+  (assert-no-consing (auto-dx-flet-several-ref 0 #(-1 2 3))))
+
+(defun auto-dx-xep-and-local-call (set)
+  (let ((elt nil))
+    (labels ((add (e)
+               (setf elt e))
+             (visit (item)
+               (add item)))
+      (map nil #'add set)
+      (map nil #'visit set)
+      elt)))
+
+(with-test (:name :auto-dx-xep-and-local-call.correct)
+  (assert (equal (auto-dx-xep-and-local-call '(1)) 1)))
+
+(with-test (:name :auto-dx-xep-and-local-call.stack-allocates)
+  (assert-no-consing (auto-dx-xep-and-local-call '(1))))
+
+(defun auto-dx-xep-and-local-call-escape (set)
+  (let ((seq nil))
+    (labels ((add (e)
+                (push e seq))
+             (visit (item)
+               (add item)))
+      (declare (dynamic-extent #'visit))
+      (map nil #'add set)
+      (map nil #'visit set)
+      (values seq
+              #'add))))
+
+(with-test (:name :auto-dx-xep-and-local-call-escape.correct)
+  (multiple-value-bind (value fun)
+      (auto-dx-xep-and-local-call-escape '(1))
+    (assert (equal value '(1 1)))
+    (assert (not (sb-ext:stack-allocated-p fun)))))
+
+(defun auto-dx-xep-and-local-call.shared-flet-cleanup (set)
+  (let ((elt nil))
+    (flet ((add (e)
+             (setf elt e))
+           (visit (n)
+             n
+             elt))
+      (map nil #'add set)
+      (map nil #'visit set))
+    elt))
+
+(with-test (:name :auto-dx-xep-and-local-call.shared-flet-cleanup.correct)
+  (assert (equal (auto-dx-xep-and-local-call.shared-flet-cleanup '(1)) 1)))
+
+(with-test (:name :auto-dx-xep-and-local-call.shared-flet-cleanup.stack-allocates)
+  (assert-no-consing (auto-dx-xep-and-local-call.shared-flet-cleanup '(1))))
+
+(defun auto-dx-monster (x seq)
+  (map nil
+       (if x
+           (flet ((f (e)
+                    (setq x e)))
+             (map nil (if x
+                          #'f
+                          (lambda (e)
+                            (setq x e)))
+                  seq)
+             #'f)
+           (flet ((g (e)
+                    (setq x e)))
+             (map nil #'g seq)
+             #'g))
+       seq)
+  x)
+
+(with-test (:name :auto-dx-monster)
+  (assert (equal (auto-dx-monster 3 #(1 2 3)) 3))
+  (assert-no-consing (auto-dx-monster 3 #(1 2 3))))
+
+(defun auto-dx-recursive-ref (seq)
+  (labels ((f (x)
+             (when (member x seq)
+               (return-from f))
+             (map nil #'f (cdr seq))))
+    (f seq)))
+
+(with-test (:name :auto-dx-recursive-ref.correct)
+  (assert (equal (auto-dx-recursive-ref '(1 2 3 4)) nil)))
+
+(with-test (:name :auto-dx-recursive-ref.stack-allocates
+            :fails-on :sbcl)
+  (assert-no-consing (auto-dx-recursive-ref '(1 2 3 4))))
+
+(defun auto-dx-recursive-ref-2 (seq)
+  (labels ((f (x)
+             (when (member x seq)
+               (return-from f))
+             (map nil #'f (cdr seq))))
+    (map nil #'f seq)
+    (f seq)))
+
+(with-test (:name :auto-dx-recursive-ref-2.correct)
+  (assert (equal (auto-dx-recursive-ref-2 '(1 2 3 4)) nil)))
+
+(with-test (:name :auto-dx-recursive-ref-2.stack-allocates
+            :fails-on :sbcl)
+  (assert-no-consing (auto-dx-recursive-ref-2 '(1 2 3 4))))
+
+;;; Even though #'f's direct references do not escape, it is closed
+;;; over by #'g which does escape, counting as an implicit escaping
+;;; reference, so #'f must not be stack allocated.
+(defun auto-dx-recursive-closes-over (seq)
+  (let ((z (car seq)))
+    (labels ((f (x)
+               (when (member x seq)
+                 (return-from f z))
+               (map nil #'f (cdr seq)))
+             (g ()
+               (map nil #'f (cdr seq))))
+      (values (f seq) #'g))))
+
+(with-test (:name :auto-dx-recursive-closes-over)
+  (multiple-value-bind (val g)
+      (auto-dx-recursive-closes-over '(1 2 3 4))
+    (assert (eq val nil))
+    (assert (eq (funcall g) nil))))
+
+(defun auto-dx-anonymous-closure-single-ref (x)
+  (let ((y (lambda (a) (incf x a))))
+    (map nil y '(1 2 3))
+    x))
+
+(with-test (:name :auto-dx-anonymous-closure-single-ref.correct)
+  (assert (= (auto-dx-anonymous-closure-single-ref 5) 11)))
+
+(with-test (:name :auto-dx-anonymous-closure-single-ref.stack-allocates)
+  (assert-no-consing (auto-dx-anonymous-closure-single-ref 5)))
+
+(defun auto-dx-anonymous-closure-multiple-ref (x)
+  (let ((y (lambda (a) (incf x a))))
+    (map nil y '(1 2 3))
+    (map nil y '(2 3 4))
+    x))
+
+(with-test (:name :auto-dx-anonymous-closure-multiple-ref.correct)
+  (assert (= (auto-dx-anonymous-closure-multiple-ref 5) 20)))
+
+(with-test (:name :auto-dx-anonymous-closure-multiple-ref.stack-allocates)
+  (assert-no-consing (auto-dx-anonymous-closure-multiple-ref 5)))

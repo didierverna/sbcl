@@ -24,12 +24,7 @@
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(progn
                   (defconstant ,offset-sym ,offset)
-                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-             `(defglobal ,name
-                  (list ,@(mapcar #'(lambda (name)
-                                      (symbolicate name "-OFFSET")) regs)))))
+                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg nl0 0)
   (defreg nl1 1)
@@ -89,7 +84,7 @@
   (defconstant register-arg-count 4)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2 r3)
-  (defparameter *register-arg-names* '(r0 r1 r2 r3))
+  (defconstant-eqx register-arg-names '(r0 r1 r2 r3) #'equal)
   (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 #-darwin r8 r9 r10)
   (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8)
   (defglobal *float-regs* (loop for i below 32 collect i)))
@@ -222,9 +217,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defglobal ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn null descriptor-reg)
   (defregtn lexenv descriptor-reg)
@@ -283,11 +276,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This function is called by debug output routines that want a pretty name
@@ -317,9 +308,7 @@
   nil)
 
 (defun 32-bit-reg (tn)
-  (make-random-tn :kind :normal
-                  :sc (sc-or-lose '32-bit-reg)
-                  :offset (tn-offset tn)))
+  (make-random-tn (sc-or-lose '32-bit-reg) (tn-offset tn)))
 
 ;;; null-tn will be used for setting it, just check the lowtag
 #+sb-thread

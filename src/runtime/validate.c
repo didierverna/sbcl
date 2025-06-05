@@ -31,7 +31,7 @@ uword_t DYNAMIC_SPACE_START;
 #endif
 uword_t READ_ONLY_SPACE_START, READ_ONLY_SPACE_END;
 #ifdef LISP_FEATURE_RELOCATABLE_STATIC_SPACE
-uword_t STATIC_SPACE_START, STATIC_SPACE_END;
+uword_t STATIC_SPACE_START;
 #endif
 
 uword_t asm_routines_start, asm_routines_end;
@@ -64,8 +64,7 @@ int os_reported_page_size;
 #include <sysinfoapi.h>
 #endif
 
-static void
-ensure_undefined_alien(void) {
+void sb_query_os_page_size() {
 #ifdef LISP_FEATURE_WIN32
     SYSTEM_INFO info;
     GetSystemInfo(&info);
@@ -73,6 +72,10 @@ ensure_undefined_alien(void) {
 #else
     os_reported_page_size = getpagesize();
 #endif
+}
+
+void ensure_undefined_alien(void) {
+    // Address of undefined_alien is unimportant so leave it until last to allocate
     os_vm_address_t start =
         os_alloc_gc_space(0, MOVABLE|IS_GUARD_PAGE, NULL, os_reported_page_size);
     if (start) {
@@ -89,11 +92,16 @@ bool allocate_hardwired_spaces(bool hard_failp)
         unsigned size;
         int id;
     } preinit_spaces[] = {
+#ifndef LISP_FEATURE_X86_64
+      // For x86-64, static space allocation request depends on dynamic space size,
+      // and linkage spaces (alien + lisp) are either placed at the start of
+      // text space if it exists, or below static space otherwise.
         { READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE, READ_ONLY_CORE_SPACE_ID },
-#ifndef LISP_FEATURE_IMMOBILE_SPACE
         { ALIEN_LINKAGE_SPACE_START, ALIEN_LINKAGE_SPACE_SIZE, ALIEN_LINKAGE_TABLE_CORE_SPACE_ID },
 #endif
+#ifndef LISP_FEATURE_RELOCATABLE_STATIC_SPACE
         { STATIC_SPACE_START, STATIC_SPACE_SIZE, STATIC_CORE_SPACE_ID },
+#endif
 #ifdef LISP_FEATURE_DARWIN_JIT
         { STATIC_CODE_SPACE_START, STATIC_CODE_SPACE_SIZE, STATIC_CODE_CORE_SPACE_ID },
 #endif
@@ -115,20 +123,6 @@ bool allocate_hardwired_spaces(bool hard_failp)
         exit(1);
     }
     return 1;
-}
-
-void
-allocate_lisp_dynamic_space(bool did_preinit)
-{
-    // Small spaces can be allocated after large spaces are.
-    // The above code is only utilized when heap relocation is disabled.
-    // And when so, failure to allocate dynamic space is fatal.
-    if (!did_preinit)
-      allocate_hardwired_spaces(1);
-
-#ifdef LISP_FEATURE_OS_PROVIDES_DLOPEN
-    ensure_undefined_alien();
-#endif
 }
 
 static inline void

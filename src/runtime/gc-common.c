@@ -1046,7 +1046,8 @@ static lispobj trans_bignum(lispobj object)
 lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
 #ifdef LISP_FEATURE_LINKAGE_SPACE
     extern lispobj entrypoint_taggedptr(uword_t);
-    return entrypoint_taggedptr(linkage_space[fdefn_linkage_index(fdefn)]);
+    int index = fdefn_linkage_index(fdefn);
+    return index ? entrypoint_taggedptr(linkage_space[index]) : 0;
 #else
     lispobj raw_addr = (lispobj)fdefn->raw_addr;
     if (!raw_addr || points_to_asm_code_p(raw_addr))
@@ -1081,10 +1082,21 @@ static sword_t size_fdefn(lispobj __attribute__((unused)) *where) {
     return FDEFN_SIZE;
 }
 
+/* Unboxed objects other than vector and bignum all have a payload length expressible
+ * in 1 byte. They use the scav/trans/size functions below */
+static inline sword_t size_unboxed(lispobj *where) {
+    unsigned char byte =
+#ifdef LISP_FEATURE_BIG_ENDIAN
+      (*where >> 8) & 0xFF;
+#else
+      1[(unsigned char*)where];
+#endif
+    return ALIGN_UP((byte + 1), 2);
+}
 static sword_t
 scav_unboxed(lispobj __attribute__((unused)) *where, lispobj object)
 {
-    sword_t length = HeaderValue(object) + 1;
+    sword_t length = (HeaderValue(object) & 0xFF) + 1;
     return ALIGN_UP(length, 2);
 }
 
@@ -1092,8 +1104,7 @@ static lispobj
 trans_unboxed(lispobj object)
 {
     gc_dcheck(lowtag_of(object) == OTHER_POINTER_LOWTAG);
-    sword_t length = HeaderValue(*native_pointer(object)) + 1;
-    return copy_unboxed_object(object, ALIGN_UP(length, 2));
+    return copy_unboxed_object(object, size_unboxed(native_pointer(object)));
 }
 
 static lispobj
@@ -1786,13 +1797,14 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table,
         // Lisp might not have gotten around to pruning a chain
         // containing previously culled items.
         if (key == empty_symbol && value == empty_symbol) continue;
-        // If the pair doesn't have both halves empty,
-        // then it mustn't have either half empty.
-        // FIXME: this looks like a potential data race - do we definitely store
-        // the key and value before inserting into a chain? Probably.
-        gc_assert(key != empty_symbol);
-        gc_assert(value != empty_symbol);
+        /* There is one situation to be mildy cautious of: stopped for GC after key was stored but
+         * value was not. Such a pair must certainly be live regardless of the table weakness kind.
+         * This is assured due to WITH-WEAK-HASH-TABLE-ENTRY using WITH-PINNED-OBJECTS on KEY,
+         * and empty_symbol being an immediate object (always "live"). Therefore, we assert that
+         * both K and V were stored only if actually culling a pair from its bucket. */
         if (!alivep_test(key, value)) {
+            gc_assert(key != empty_symbol);
+            gc_assert(value != empty_symbol);
             if (debug_weak_ht)
                 fprintf(stderr, "<%"OBJ_FMTX",%"OBJ_FMTX"> is dead\n", key, value);
             gc_assert(hash_table->_count > 0);
@@ -3445,7 +3457,7 @@ static void verify_hash_table_if_possible(struct hash_table* ht, bool fix_bad)
     maybe_fix_hash_table(ht, fix_bad);
 }
 
-static uword_t verify_tables_in_range(lispobj* start, lispobj* end, uword_t fix_bad)
+static uword_t verify_tables_in_range(lispobj* start, lispobj* end, void* fix_bad)
 {
     lispobj* where = next_object(start, 0, end); /* find first marked object */
     lispobj layout;
@@ -3453,16 +3465,16 @@ static uword_t verify_tables_in_range(lispobj* start, lispobj* end, uword_t fix_
         if (widetag_of(where) == INSTANCE_WIDETAG &&
             (layout = instance_layout(where)) != 0 &&
             layout_depth2_id(LAYOUT(layout)) == HASH_TABLE_LAYOUT_ID)
-            verify_hash_table_if_possible((struct hash_table*)where, fix_bad);
+            verify_hash_table_if_possible((struct hash_table*)where, (uintptr_t)fix_bad);
         sword_t nwords = object_size(where);
         where = next_object(where, nwords, end);
     }
     return 0;
 }
 
-void verify_hash_tables(bool fix_bad)
+void verify_hash_tables(uintptr_t fix_bad)
 {
-    walk_generation(verify_tables_in_range, -1, fix_bad);
+    walk_generation(verify_tables_in_range, -1, (void*)fix_bad);
 }
 #endif
 
@@ -3502,37 +3514,6 @@ void remember_all_permgen()
 
 void illegal_linkage_space_call() {
     lose("jumped via obsolete linkage entry");
-}
-
-void scavenge_elf_linkage_space()
-{
-    // ELF space linkage cells, if present, are roots for GC.
-    lispobj modified_vector = SYMBOL(ELF_LINKAGE_CELL_MODIFIED)->value;
-    if (modified_vector == NIL) return;
-    struct vector* v = VECTOR(modified_vector);
-    uword_t* bits = v->data;
-    unsigned int nbits = vector_len(v);
-    unsigned int nwords = (nbits + N_WORD_BITS-1)/N_WORD_BITS;
-    unsigned int wordindex;
-    int ind_major = 0, ind_minor;
-    for (wordindex = 0; wordindex < nwords; ++wordindex, ind_major += N_WORD_BITS) {
-        uword_t word = bits[wordindex];
-        for ( ind_minor = 0 ; word != 0 ; word >>= 1, ++ind_minor ) {
-            // Unmodified cells can be ignored
-            if (!(word & 1)) continue;
-            int linkage_index = ind_major + ind_minor;
-            lispobj entrypoint = elf_linkage_space[linkage_index];
-            /* Entrypoint can't become illegal_linkage_space_call because only
-             * the cells associated with the non-ELF linkage space get swept
-             * (i.e. smashed in the manner of weak objects). */
-            if (!entrypoint) continue;
-            lispobj taggedptr = fun_taggedptr_from_self(entrypoint);
-            lispobj new = taggedptr;
-            scav1(&new, new);
-            if (new != taggedptr)
-                elf_linkage_space[linkage_index] = new + (entrypoint - taggedptr);
-        }
-    }
 }
 
 void sweep_linkage_space()

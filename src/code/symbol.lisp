@@ -35,10 +35,17 @@
   "Set SYMBOL's value cell to NEW-VALUE."
   (declare (type symbol symbol))
   (about-to-modify-symbol-value symbol 'set new-value)
-  (%set-symbol-value symbol new-value))
+  (%primitive set symbol new-value)
+  new-value)
 
-(defun %set-symbol-value (symbol new-value)
-  (%set-symbol-value symbol new-value))
+;;; The vop named %SET-SYMBOL-GLOBAL-VALUE does not translate the function of that name.
+;;; A bunch of calls in cold-init (and later) need an installed function.
+;;; Also note that the vop doesn't yield a value, but this does, because a 1-valued return
+;;; is shorter than a 0-valued return and seems like the right thing to do anyway.
+(defun %set-symbol-global-value (symbol value)
+  (declare (type (and symbol (not null)) symbol))
+  (%primitive %set-symbol-global-value symbol value)
+  value)
 
 (defun symbol-global-value (symbol)
   "Return the SYMBOL's current global value. Identical to SYMBOL-VALUE,
@@ -49,11 +56,16 @@ distinct from the global value. Can also be SETF."
 
 (defun set-symbol-global-value (symbol new-value)
   (about-to-modify-symbol-value symbol 'set new-value)
-  (%set-symbol-global-value symbol new-value))
+  (%primitive %set-symbol-global-value symbol new-value)
+  new-value)
 
 (declaim (inline %makunbound))
 (defun %makunbound (symbol)
-  (%set-symbol-value symbol (make-unbound-marker)))
+  (let ((marker (make-unbound-marker)))
+    (%primitive set symbol marker)
+    ;; I don't think this can ever be called "for value", but it's cheaper
+    ;; to return a value than not to. It always returned the unbound marker.
+    marker))
 
 (defun makunbound (symbol)
   "Make SYMBOL unbound, removing any value it may currently have."
@@ -315,7 +327,6 @@ distinct from the global value. Can also be SETF."
                    (aref *id->package* id)))))
 
 (defun %set-symbol-package (symbol package)
-  (declare (type symbol symbol))
   (let* ((new-id (cond ((not package) +package-id-none+)
                        ((package-id package))
                        (t +package-id-overflow+)))
@@ -346,8 +357,6 @@ distinct from the global value. Can also be SETF."
 ;;; All symbols go into immobile space if #+immobile-symbols is enabled,
 ;;; but not if disabled. The win with immobile space that is that all symbols
 ;;; can be considered static from an addressing viewpoint, but GC'able.
-;;; (After codegen learns how, provided that defrag becomes smart enough
-;;; to fixup machine code so that defrag remains meaningful)
 ;;;
 ;;; However, with immobile space being limited in size, you might not want
 ;;; symbols in there. In particular, if an application uses symbols as data
@@ -395,17 +404,14 @@ distinct from the global value. Can also be SETF."
                #-x86-64 (sb-vm::%alloc-symbol name)))
     (let ((salt (murmur-hash-word/fixnum
                  (word-mix name-hash (get-lisp-obj-address symbol)))))
-      #+64-bit
-      (let ((hash (logior (ash name-hash 32) (mask-field symbol-hash-prng-byte salt))))
-        ;; %SET-SYMBOL-HASH wants a unsigned fixnum, which HASH is not.
-        (%primitive sb-vm::set-slot symbol (%make-lisp-obj hash)
-                    'make-symbol sb-vm:symbol-hash-slot sb-vm:other-pointer-lowtag))
-      #-64-bit
       (with-pinned-objects (symbol) ; no vop sets the raw slot
-        (setf (sap-ref-32 (int-sap (get-lisp-obj-address symbol))
-                          (- (ash sb-vm:symbol-hash-slot sb-vm:word-shift)
-                             sb-vm:other-pointer-lowtag))
-              (logior (ash name-hash 3) (ldb (byte 3 0) salt)))))
+        (setf (sap-ref-word (int-sap (get-lisp-obj-address symbol))
+                            (- (ash sb-vm:symbol-hash-slot sb-vm:word-shift)
+                               sb-vm:other-pointer-lowtag))
+              #+64-bit (logxor (sb-vm::symhash-xor-constant sb-vm:nil-value)
+                               (logior (ash name-hash 32)
+                                       (mask-field symbol-hash-prng-byte salt)))
+              #-64-bit (logior (ash name-hash 3) (ldb (byte 3 0) salt)))))
     ;; Compact-symbol (which is equivalent to #+64-bit) has the package already NIL
     ;; because the PACKAGE-ID-BITS field defaults to 0.
     #-compact-symbol (%set-symbol-package symbol nil)
@@ -524,9 +530,9 @@ distinct from the global value. Can also be SETF."
   (declare (sb-c::tlab :system)) ; heap-cons the property list if copying it
   (let ((new-symbol (make-symbol (symbol-name symbol))))
     (when copy-props
-      ;; Should this really copy a thread-local value ?
-      ;; I would think it more correct to copy only a global value.
-      (%set-symbol-value new-symbol (%primitive sb-c:fast-symbol-value symbol))
+      ;; Just like for %INTERN, we set the global value. However, should we really _copy_
+      ;; a thread-local value if one existed? I don't know but I don't think so.
+      (%set-symbol-global-value new-symbol (%primitive sb-c:fast-symbol-value symbol))
       (locally (declare (optimize speed)) ; will inline COPY-LIST
         (setf (symbol-plist new-symbol)
               (copy-list (symbol-plist symbol))))

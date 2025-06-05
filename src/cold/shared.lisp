@@ -337,6 +337,8 @@
           (push :round-float sb-xc:*features*))
         (when (target-featurep '(:and :arm64 :darwin))
           (push :arm-v8.1 backend-subfeatures))
+        (when (target-featurep '(:and :ppc64 :little-endian))
+          (push :fsqrt backend-subfeatures))
 
         ;; Putting arch and gc choice first is visually convenient, versus
         ;; having to parse a random place in the line to figure out the value
@@ -383,6 +385,8 @@
           ;; It sorta kinda works to have both, but there should be no need,
           ;; and it's not really supported.
           "At most one interpreter can be selected")
+         ("(and immobile-space permgen)"
+          ":IMMOBILE-SPACE and :PERMGEN are mutually exclusive options")
          ("(and compact-instance-header (not (or permgen immobile-space)))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
          ("(and immobile-code (not immobile-space))"
@@ -393,6 +397,10 @@
           ":SYSTEM-TLABS requires SB-THREAD")
          ("(and sb-futex (not sb-thread))"
           "Can't enable SB-FUTEX on platforms lacking thread support")
+         ("(and relocatable-static-space (not (or arm64 x86-64)))"
+          "Relocatable-static-space not supported for chosen architecture")
+         ("(and relocatable-static-space arm64 (not immobile-space))"
+          "Relocatable-static-space requires immobile-space")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))

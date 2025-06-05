@@ -255,6 +255,7 @@
         (setf (node-lexenv bind) *lexenv*)
 
         (let ((block (ctran-starts-block result-ctran)))
+          (declare (inline make-return))
           (let ((return (make-return result-lvar lambda))
                 (tail-set (make-tail-set (list lambda))))
             (setf (lambda-tail-set lambda) tail-set)
@@ -502,6 +503,12 @@
                      (supplied-p (arg-info-supplied-p info))
                      (supplied-used-p (arg-info-supplied-used-p info))
                      (n-value (gensym "N-VALUE-"))
+                     (n-value-checked (if (eq (leaf-defined-type key) *universal-type*)
+                                          n-value-temp
+                                          (wrap-if (policy *lexenv* (plusp safety))
+                                                   '(locally (declare (optimize (safety 1))))
+                                                   `(the* (,(leaf-defined-type key) :context ,keyword)
+                                                          ,n-value-temp))))
                      (clause (cond (supplied-p
                                     (let ((n-supplied (gensym "N-SUPPLIED-")))
                                       (temps (list n-supplied
@@ -513,11 +520,11 @@
                                         (setq ,n-supplied ,(if supplied-used-p
                                                                t
                                                                1))
-                                        (setq ,n-value ,n-value-temp))))
+                                        (setq ,n-value ,n-value-checked))))
                                    (t
                                     (arg-vals n-value)
                                     `((,keyword)
-                                      (setq ,n-value ,n-value-temp))))))
+                                      (setq ,n-value ,n-value-checked))))))
                 (when (and (not allowp) (eq keyword :allow-other-keys))
                   (setq found-allow-p t)
                   (setq clause
@@ -846,7 +853,8 @@
                                  &key post-binding-lexenv
                                  (source-name '.anonymous.)
                                  debug-name)
-  (declare (list body vars aux-vars aux-vals))
+  (declare (list body vars aux-vars aux-vals)
+           (inline make-optional-dispatch))
   (aver (or debug-name (neq '.anonymous. source-name)))
   (let ((res (make-optional-dispatch vars
                                      allowp
@@ -884,9 +892,42 @@
             do (setf (lambda-var-type var) intersection))))
   vars)
 
+(defun add-ftype (vars ftype explicit-check)
+  (flet ((check-p (var)
+           (and (neq explicit-check t)
+                (not (memq (lambda-var-%source-name var) explicit-check)))))
+    (loop for req in (fun-type-required ftype)
+          for var = (pop vars)
+          do
+          (unless (and var
+                       (not (lambda-var-arg-info var)))
+            (return-from add-ftype))
+          (when (check-p var)
+            (setf (leaf-defined-type var) req)))
+    (loop for opt in (fun-type-optional ftype)
+          for var = (pop vars)
+          do (unless (and var
+                          (let ((arg-info (lambda-var-arg-info var)))
+                            (and arg-info
+                                 (eq (arg-info-kind arg-info) :optional))))
+               (return-from add-ftype ))
+             (when (check-p var)
+               (setf (leaf-defined-type var) opt)))
+    (when (fun-type-keyp ftype)
+      (loop with keys = (fun-type-keywords ftype)
+            for var in vars
+            for info = (lambda-var-arg-info var)
+            when (and info
+                      (eq (arg-info-kind info) :keyword)
+                      (check-p var))
+            do (let ((type (find (arg-info-key info) keys :key #'key-info-name)))
+                 (when type
+                   (setf (leaf-defined-type var) (key-info-type type))))))))
+
 ;;; Convert a LAMBDA form into a LAMBDA leaf or an OPTIONAL-DISPATCH leaf.
 (defun ir1-convert-lambda (form &key (source-name '.anonymous.)
-                                     debug-name maybe-add-debug-catch)
+                                     debug-name maybe-add-debug-catch
+                                     ftype)
   (unless (consp form)
     (compiler-error "A ~S was found when expecting a lambda expression:~%  ~S"
                     (type-of form)
@@ -924,21 +965,27 @@
              (forms (if (eq result-type *wild-type*)
                         forms
                         `((the ,(type-specifier result-type) (progn ,@forms)))))
-             (res (if (or (find-if #'lambda-var-arg-info vars) keyp)
-                      (ir1-convert-hairy-lambda forms vars keyp
-                                                allow-other-keys
-                                                aux-vars aux-vals
-                                                :post-binding-lexenv post-binding-lexenv
-                                                :source-name source-name
-                                                :debug-name debug-name)
-                      (ir1-convert-lambda-body forms
-                                               (add-types-for-fixed-args source-name vars)
-                                               :aux-vars aux-vars
-                                               :aux-vals aux-vals
-                                               :post-binding-lexenv post-binding-lexenv
-                                               :source-name source-name
-                                               :debug-name debug-name
-                                               :local-policy local-policy))))
+             (res (progn
+                    (when (fun-type-p ftype)
+                      (add-ftype vars ftype explicit-check))
+                    (when (typep source-name '(cons (eql sb-impl::specialized-xep)))
+                      (push source-name
+                            (lexenv-user-data *lexenv*)))
+                    (if (or (find-if #'lambda-var-arg-info vars) keyp)
+                        (ir1-convert-hairy-lambda forms vars keyp
+                                                  allow-other-keys
+                                                  aux-vars aux-vals
+                                                  :post-binding-lexenv post-binding-lexenv
+                                                  :source-name source-name
+                                                  :debug-name debug-name)
+                        (ir1-convert-lambda-body forms
+                                                 (add-types-for-fixed-args source-name vars)
+                                                 :aux-vars aux-vars
+                                                 :aux-vals aux-vals
+                                                 :post-binding-lexenv post-binding-lexenv
+                                                 :source-name source-name
+                                                 :debug-name debug-name
+                                                 :local-policy local-policy)))))
     (when explicit-check
       (setf (getf (functional-plist res) 'explicit-check) explicit-check))
     (setf (functional-inline-expansion res) (or source-form form))
@@ -991,7 +1038,8 @@
 (defun ir1-convert-lambdalike (thing
                                &key
                                (source-name '.anonymous.)
-                               debug-name)
+                               debug-name
+                               ftype)
   (when (and (not debug-name) (eq '.anonymous. source-name))
     (setf debug-name (name-lambdalike thing)))
   (ecase (car thing)
@@ -999,7 +1047,8 @@
      (ir1-convert-lambda thing
                          :maybe-add-debug-catch t
                          :source-name source-name
-                         :debug-name debug-name))
+                         :debug-name debug-name
+                         :ftype ftype))
     ((named-lambda)
      (let* ((name (cadr thing))
             (lambda-expression `(lambda ,@(cddr thing)))
@@ -1033,7 +1082,8 @@
            (ir1-convert-lambda lambda-expression
                                :maybe-add-debug-catch t
                                :debug-name
-                               (or name (name-lambdalike thing))))))))
+                               (or name (name-lambdalike thing))
+                               :ftype ftype))))))
 
 (declaim (end-block))
 
@@ -1125,8 +1175,9 @@
 ;;; reflect the state at the definition site.
 (defun ir1-convert-inline-lambda (fun
                                   &key
-                                  (source-name '.anonymous.)
-                                  debug-name)
+                                    (source-name '.anonymous.)
+                                    debug-name
+                                    ftype)
   (when (and (not debug-name) (eq '.anonymous. source-name))
     (setf debug-name (name-lambdalike fun)))
   (destructuring-bind (decls &rest body)
@@ -1164,7 +1215,8 @@
                               notinlines))
                       (ir1-convert-lambda `(lambda ,@body)
                                           :source-name source-name
-                                          :debug-name debug-name))))
+                                          :debug-name debug-name
+                                          :ftype ftype))))
       (setf (functional-inline-expanded clambda) t)
       clambda)))
 
@@ -1212,9 +1264,9 @@
 (defun assert-new-definition (var fun)
   (let* ((type (massage-global-definition-type (leaf-type var) fun))
          (for-real (eq (leaf-where-from var) :declared))
-         (name (leaf-source-name var))
-         (info (info :function :info name))
          (explicit-check (getf (functional-plist fun) 'explicit-check)))
+    (when for-real
+      (setf (leaf-defined-type fun) type))
     (assert-definition-type
      fun type
      ;; KLUDGE: Common Lisp is such a dynamic language that in general
@@ -1225,9 +1277,6 @@
      ;; the mismatched data came from the same compilation unit, so we
      ;; can't do that. -- WHN 2001-02-11
      :lossage-fun #'compiler-style-warn
-     :unwinnage-fun (cond (info #'compiler-style-warn)
-                          (for-real #'compiler-notify)
-                          (t nil))
      :really-assert (if for-real
                         (explicit-check->really-assert explicit-check))
      :where (if for-real
@@ -1260,7 +1309,10 @@
   (let* ((name (leaf-source-name var))
          (fun (ir1-convert-lambda lambda
                                   :maybe-add-debug-catch t
-                                  :source-name name))
+                                  :source-name name
+                                  :ftype (and
+                                          (eq (leaf-where-from var) :declared)
+                                          (leaf-type var))))
          (info (info :function :info name)))
     (setf (functional-inlinep fun) (info :function :inlinep name))
     (unless (and info
@@ -1302,7 +1354,7 @@
 
 ;;; Convert a lambda for global inline expansion.
 ;;;
-;;; Unless a INLINE function, we temporarily clobber the inline
+;;; Unless an INLINE function, we temporarily clobber the inline
 ;;; expansion. This prevents recursive inline expansion of
 ;;; opportunistic pseudo-inlines.
 (defun ir1-convert-inline-expansion (var inlinep)
@@ -1312,26 +1364,13 @@
       (setf (defined-fun-inline-expansion var) nil))
     (let* ((name (leaf-source-name var))
            (fun (ir1-convert-inline-lambda var-expansion
-                                           :source-name name))
-           (info (info :function :info name)))
+                                           :source-name name
+                                           :ftype (and
+                                                   (eq (leaf-where-from var) :declared)
+                                                   (leaf-type var)))))
       (setf (functional-inlinep fun) inlinep)
       (assert-new-definition var fun)
       (setf (defined-fun-inline-expansion var) var-expansion)
-      ;;
-      ;; If definitely not an interpreter stub, then substitute for any
-      ;; old references.
-      (unless (or (eq (defined-fun-inlinep var) 'notinline)
-                  (not (block-compile *compilation*))
-                  (and info
-                       (or (fun-info-transforms info)
-                           (fun-info-templates info)
-                           (fun-info-ir2-convert info))))
-        (substitute-leaf fun var)
-        ;; If in a simple environment, then we can allow backward
-        ;; references to this function from following top-level
-        ;; forms.
-        (when (simple-lexical-environment-p *lexenv*)
-          (setf (defined-fun-functional var) fun)))
       fun)))
 
 
@@ -1356,6 +1395,7 @@
                                         (dxable-args
                                           (unless (keywordp extra-info)
                                             extra-info)))
+  (declare (inline make-dxable-args make-inlining-data))
   (cond (defstruct-snippet
          ;; In this case, NAME is a system-generated function. Warn if blowing away
          ;; a previously existing inline expansion coming from an ordinary DEFUN.

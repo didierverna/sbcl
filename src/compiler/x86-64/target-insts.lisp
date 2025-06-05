@@ -102,7 +102,7 @@
 
 ;;; Print to STREAM the name of the general-purpose register encoded by
 ;;; VALUE and of size WIDTH.
-(defun print-reg-with-width (value width stream dstate)
+(defun print-reg-with-width (value width stream dstate &optional (note t))
   (declare (type (or null stream) stream)
            (type disassem-state dstate))
   (let* ((num (etypecase value
@@ -116,6 +116,9 @@
                                 (<= 4 num 7))
                            (+ 16 -4 num) ; legacy high-byte register
                            num))))
+    (when (and note
+               (= (reg-num reg) sb-vm:card-table-reg))
+      (note "NIL" dstate))
     (if stream
         (princ (reg-name reg) stream)
         (operand reg dstate)))
@@ -146,7 +149,7 @@
   (print-reg-with-width value :byte stream dstate))
 
 (defun print-addr-reg (value stream dstate)
-  (print-reg-with-width value +default-address-size+ stream dstate))
+  (print-reg-with-width value +default-address-size+ stream dstate nil))
 
 ;;; Print a register or a memory reference of the given WIDTH.
 ;;; If SIZED-P is true, add an explicit size indicator for memory
@@ -200,7 +203,7 @@
                    (and (eql (machine-ea-base value)
                              (car (sb-disassem::dstate-known-register-contents dstate)))
                         (eq (cdr (sb-disassem::dstate-known-register-contents dstate))
-                            'sb-vm::linkage-table)
+                            'sb-vm::lisp-linkage-table)
                         (integerp (machine-ea-disp value))
                         (not (machine-ea-index value))))
            (setf (sb-disassem::dstate-known-register-contents dstate) nil)
@@ -220,7 +223,11 @@
              (when (<= a (machine-ea-disp value) (1- (+ a (primitive-object-size v))))
                (let ((target (sap-ref-word (int-sap (machine-ea-disp value)) 0)))
                  (maybe-note-assembler-routine target t dstate))))))
-        (t (write value :stream stream :escape nil))))
+        (t
+         (let ((regs (shiftf (sb-disassem::dstate-known-register-contents dstate) nil)))
+           (when (eq (car regs) 'alien)
+             (note (lambda (s) (format s "~A" (cdr regs))) dstate)))
+         (write value :stream stream :escape nil))))
 
 (defun print-sized-byte-reg/mem (value stream dstate)
   (print-reg/mem-with-width value :byte t stream dstate))
@@ -461,8 +468,8 @@
     ;; Assembler routines were already handled above (not really sure why)
     ;; so now we have to figure out everything else.
     #+sb-safepoint
-    (when (and (eql (machine-ea-base value) sb-vm::card-table-reg)
-               (eql (machine-ea-disp value) -8))
+    (when (and (eql (machine-ea-base value) sb-vm:card-table-reg)
+               (eql (machine-ea-disp value) sb-vm::nil-static-space-end-offs))
       (return-from print-mem-ref (note "safepoint" dstate)))
 
     (when (and (eq (machine-ea-base value) :rip) (neq mode :compute))
@@ -495,18 +502,76 @@
                               (:qword (unboxed-constant-ref dstate addr disp))))
                      dstate))))))
 
+    ;; Recognize [R12-disp] as a linkage table use (lisp or alien)
+    #-immobile-space
+    (when (and (eq (machine-ea-base value) sb-vm:card-table-reg)
+               (not (machine-ea-index value))
+               (minusp (machine-ea-disp value)))
+      (let* ((alien-end (- sb-vm::nil-value-offset))
+             (alien-start (- alien-end sb-vm:alien-linkage-space-size))
+             (lisp-start (- alien-start (ash 1 (+ sb-vm:n-linkage-index-bits 3))))
+             (disp (machine-ea-disp value)))
+        (cond ((<= lisp-start disp (1- alien-start))
+               (let ((name (linkage-addr->name (- disp lisp-start) :rel)))
+                 (note (lambda (s) (format s "~S" name)) dstate))
+               (return-from print-mem-ref))
+              ((<= alien-start disp (1- alien-end))
+               (let ((name (sb-impl::alien-linkage-index-to-name
+                            (floor (- disp alien-start)
+                                   sb-vm:alien-linkage-table-entry-size))))
+                 (note (lambda (s) (format s "&~A" name)) dstate))
+               (return-from print-mem-ref)))))
+
     ;; Recognize "[Rbase+disp]" as an alien linkage table reference if Rbase was
     ;; just loaded with the base address in the prior instruction.
     (when (and (eql (machine-ea-base value)
                     (car (sb-disassem::dstate-known-register-contents dstate)))
                (eq (cdr (sb-disassem::dstate-known-register-contents dstate))
-                   'sb-vm::alien-linkage-table-base)
+                   'sb-vm::alien-linkage-table)
                (not (machine-ea-index value))
                (integerp (machine-ea-disp value)))
       (let ((name (sb-impl::alien-linkage-index-to-name
                    (floor (machine-ea-disp value) sb-vm:alien-linkage-table-entry-size))))
         (note (lambda (s) (format s "&~A" name)) dstate)))
     (setf (sb-disassem::dstate-known-register-contents dstate) nil)
+
+    (when (and (eql base-reg sb-vm:card-table-reg) (typep disp '(signed-byte 8)) (not index-reg))
+      (multiple-value-bind (quo rem) (floor (- disp 41) n-word-bytes)
+        (when (and (eql rem 0) (<= -16 quo -8)) ; KLUDGE - raw words residing between T and NIL
+          (return-from print-mem-ref
+            (let* ((addr (+ sb-vm:nil-value disp))
+                   (data (sap-ref-word (int-sap nil-value) disp)))
+              ;; these constants don't have names
+              (note (lambda (s) (format s "[#x~x] = #x~x" addr data)) dstate))))
+        ;; and raw words residing after NIL up to the end of static space
+        (when (and (eql rem 0) (<= 0 quo (1- (length sb-vm::+static-space-trailer-constants+))))
+          (let ((sym (aref sb-vm::+static-space-trailer-constants+ quo)))
+            (when (and (member sym '(sb-vm::lisp-linkage-table sb-vm::alien-linkage-table))
+                       (eq (sb-disassem::inst-name (sb-disassem::dstate-inst dstate)) 'mov))
+              (setf (sb-disassem::dstate-known-register-contents dstate)
+                    `(,(reg-num (regrm-inst-reg dchunk-zero dstate)) . ,sym)))
+            ;; The only use of an ADD into a reg with the source as the alien-linkage-table
+            ;; is for a following CALL inst. So assume it. Probably should verify, but ... meh.
+            (when (and (eq sym 'sb-vm::alien-linkage-table)
+                       ;; prior inst must be MOV RBX,imm32
+                       (eql (logand (sb-disassem::dstate-previous-chunk dstate) #xFF) #xBB)
+                       (eq (sb-disassem::inst-name (sb-disassem::dstate-inst dstate)) 'add))
+              (aver (= (reg-num (regrm-inst-reg dchunk-zero dstate)) sb-vm::rbx-offset))
+              (let* ((disp (ldb (byte 32 8) (sb-disassem::dstate-previous-chunk dstate)))
+                     (name (sb-impl::alien-linkage-index-to-name
+                            (floor disp sb-vm:alien-linkage-table-entry-size))))
+                (setf (sb-disassem::dstate-known-register-contents dstate) (cons 'alien name))))
+            (return-from print-mem-ref
+              (note (lambda (s) (princ sym s)) dstate))))))
+
+    (when (and disp (eq base-reg sb-vm:card-table-reg) (not index-reg))
+      (let* ((ptr (sap+ (int-sap sb-vm:nil-value) disp))
+             (contents (sap-ref-word ptr 0))
+             (name (sb-disassem::find-assembler-routine contents)))
+        (when name
+          (return-from print-mem-ref
+            (note (lambda (s) (format s "[#~x] = #~x ; ~a" (sap-int ptr) contents name))
+                  dstate)))))
 
     (flet ((guess-symbol (predicate)
              (binding* ((code-header (seg-code (dstate-segment dstate)) :exit-if-null)
@@ -534,6 +599,11 @@
                  ;; symbol header that provides an offset into TLS.
                  (note (lambda (stream) (format stream "tls_index: ~S" symbol))
                        dstate))))
+            ((and (eql base-reg sb-vm:card-table-reg)
+                  (not index-reg))
+             (let ((static (find disp +static-symbols+ :key #'static-symbol-offset)))
+               (when static
+                 (note (lambda (s) (princ static s)) dstate))))
             ;; thread slots
             ((and (eql base-reg sb-vm::thread-reg)
                   #+gs-seg (dstate-getprop dstate +gs-segment+)
@@ -549,12 +619,6 @@
                                   ((< index (length thread-slot-names))
                                    (aref thread-slot-names index)))))
                (when symbol
-                 (when (and (member index `(,sb-vm::thread-alien-linkage-table-base-slot
-                                            ,sb-vm::thread-linkage-table-slot))
-                            (eql (logandc2 (sb-disassem::dstate-inst-properties dstate) +rex-r+)
-                                 (logior +rex+ +rex-w+ +rex-b+)))
-                   (setf (sb-disassem::dstate-known-register-contents dstate)
-                         `(,(reg-num (regrm-inst-reg dchunk-zero dstate)) . ,symbol)))
                  (return-from print-mem-ref
                    (note (lambda (stream) (format stream "thread.~(~A~)" symbol))
                          dstate))))

@@ -477,7 +477,7 @@ static void maybe_show_object_name(lispobj obj, FILE* stream)
 
 static bool root_p(lispobj ptr, int criterion)
 {
-    if (ptr <= STATIC_SPACE_END) return 1; // always a root
+    if (ptr >= STATIC_SPACE_START && ptr < STATIC_SPACE_END) return 1; // always a root
     // 0 to 2 are in order of weakest to strongest condition for stopping,
     // i.e. criterion 0 implies that that largest number of objects
     // are considered roots.
@@ -734,9 +734,9 @@ static bool ignorep(lispobj* base_ptr, lispobj ignored_objects)
     return 0;
 }
 
-static uword_t build_refs(lispobj* where, lispobj* end,
-                          struct scan_state* ss)
+static uword_t build_refs(lispobj* where, lispobj* end, void* arg)
 {
+    struct scan_state* ss = arg;
     lispobj layout;
     sword_t nwords, scan_limit, i;
     uword_t n_objects = 0, n_scanned_words = 0,
@@ -868,7 +868,7 @@ static uword_t build_refs(lispobj* where, lispobj* end,
 static void scan_spaces(struct scan_state* ss)
 {
     struct scan_state old = *ss;
-    build_refs((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, ss);
+    build_refs(NIL_SYMBOL_SLOTS_START, NIL_SYMBOL_SLOTS_END, ss);
     build_refs((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, ss);
     show_tally(old, ss, "static");
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -878,8 +878,7 @@ static void scan_spaces(struct scan_state* ss)
     show_tally(old, ss, "text");
 #endif
     old = *ss;
-    walk_generation((uword_t(*)(lispobj*,lispobj*,uword_t))build_refs,
-                    -1, (uword_t)ss);
+    walk_generation(build_refs, -1, ss);
     show_tally(old, ss, "dynamic");
 }
 

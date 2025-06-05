@@ -290,14 +290,6 @@
 ;;; on the heap.
 (defconstant no-tls-value-marker most-positive-word)
 
-(defmacro unbound-marker-bits ()
-  ;; By having unbound-marker-bits appear to be a valid pointer into static
-  ;; space, it admits some optimizations that might "dereference" the value
-  ;; before checking the widetag.
-  ;; Architectures other than x86-64 do not take that liberty.
-  #+x86-64 (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag)
-  #-x86-64 unbound-marker-widetag)
-
 ;;; Map each widetag symbol to a string to go in 'tagnames.h'.
 ;;; I didn't want to mess with the formatting of the table above.
 (defparameter *widetag-string-alist*
@@ -442,8 +434,8 @@
 
 ;;; There are 2 symbol flag bits. The placement restrictions on these stipulate:
 ;;; - no conflict with the generation number (byte 3, low 4 bits)
-;;; - avoid #+permgen use of byte bit 7 as the "remembered" bit
-;;; - prefer that the uint32_t package ID be naturally aligned if it matters.
+;;; - avoid #+permgen use of byte 3 bit 7 as the "remembered" bit
+;;; - prefer that the uint16_t package ID be naturally aligned if it matters.
 ;;; Given the above:
 ;;; - for x864: byte indices 1 and 2 for the package, byte index 3 for flags so that
 ;;;   the generation byte can stay where it is
@@ -462,13 +454,6 @@
 ;;; that implement lazily computed stable hash codes.
 (defconstant stable-hash-required-flag 8)
 (defconstant hash-slot-present-flag    9)
-
-#+immobile-space
-(progn
-  ;; FUNCTION-LAYOUT is a fixnum whose bits are ORed in "as-is" with the
-  ;; low half of a closure header to form the full header word.
-  #-sb-thread
-  (defglobal function-layout 0))        ; set by genesis
 
 ;;; These regions occupy the initial words of static space.
 #-sb-thread

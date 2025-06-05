@@ -318,9 +318,9 @@ Examples:
                    collect
                    (let ((size (sb-size sb)))
                      `(make-finite-sb
-                       :conflicts (make-array ,size :initial-element #())
-                       :always-live (make-array ,size :initial-element #*)
-                       :live-tns (make-array ,size :initial-element nil)))))))
+                       (make-array ,size :initial-element #())
+                       (make-array ,size :initial-element #*)
+                       (make-array ,size :initial-element nil)))))))
      (let ((*warnings-p* nil)
            (*failure-p* nil))
        (values (progn ,@body) *warnings-p* *failure-p*))))
@@ -436,12 +436,12 @@ necessary, since type inference may take arbitrarily long to converge.")
   (when (component-reanalyze component)
     (maybe-mumble "DFO")
     (loop
-     (find-dfo component)
+      (find-dfo component)
       (unless (component-reanalyze component)
         (maybe-mumble " ")
         (return))
-      (maybe-mumble "."))
-    t))
+      (maybe-mumble ".")))
+  (values))
 
 (defvar *ir1-transforms-after-constraints*)
 (defvar *ir1-transforms-after-ir1-phases*)
@@ -574,10 +574,9 @@ necessary, since type inference may take arbitrarily long to converge.")
   (maybe-mumble "IR2Tran ")
   (entry-analyze component)
 
-    ;; For on-demand recalculation of dominators, the previously
-    ;; computed results may be stale.
-
-  (clear-dominators component)
+  ;; Recompute dominators for GC store barriers. Must be done before
+  ;; IR2-convert renumbers blocks according to forward emit order.
+  (find-dominators component)
 
   (ir2-convert component)
 
@@ -1264,7 +1263,8 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; TODO: We could use a bytecode compiler here to produce smaller
 ;;; code. Same goes for top level code.
 (defun compile-load-time-value (form)
-  (let ((lambda (compile-load-time-stuff form t)))
+  (let* (*compiler-error-context*
+         (lambda (compile-load-time-stuff form t)))
     (values (fasl-dump-load-time-value-lambda lambda *compile-object*)
             (let ((type (leaf-type lambda)))
               (if (fun-type-p type)
@@ -1618,17 +1618,17 @@ necessary, since type inference may take arbitrarily long to converge.")
 
         (*compilation*
          (make-compilation
-          :coverage-metadata (cons (make-hash-table :test 'equal)
-                                   (make-hash-table :test 'equal))
           ;; Whether to emit msan unpoisoning code depends on the runtime
           ;; value of the feature, not "#+msan", because we can use the target
           ;; compiler to compile code for itself which isn't sanitized,
           ;; *or* code for another image which is sanitized.
           ;; And we can also cross-compile assuming msan.
-          :msan-unpoison (member :msan sb-xc:*features*)
-          :block-compile *block-compile-argument*
-          :entry-points *entry-points-argument*
-          :compile-toplevel-object cfasl))
+          (member :msan sb-xc:*features*)
+          (cons (make-hash-table :test 'equal)
+                (make-hash-table :test 'equal))
+          *block-compile-argument*
+          *entry-points-argument*
+          cfasl))
 
         (*handled-conditions* *handled-conditions*)
         (*disabled-package-locks* *disabled-package-locks*)
@@ -2095,12 +2095,14 @@ returning its filename.
                        :type (pick 'pathname-type *fasl-file-type*))))))
 
 ;;; FIXME: find a better place for this.
-(defun always-boundp (name)
-  (case (info :variable :always-bound name)
-    (:always-bound t)
-    ;; Compiling to fasl considers a symbol always-bound if its
-    ;; :always-bound info value is now T or will eventually be T.
-    (:eventually (producing-fasl-file))))
+(defun always-boundp (name node)
+  (if (policy node (= debug 3))
+      nil
+      (case (info :variable :always-bound name)
+        (:always-bound t)
+        ;; Compiling to fasl considers a symbol always-bound if its
+        ;; :always-bound info value is now T or will eventually be T.
+        (:eventually (producing-fasl-file)))))
 
 (defun default-gc-strategy ()
   ;; We can notionally cross-compile for a different GC if *FEATURES* override the runtime

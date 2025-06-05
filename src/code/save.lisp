@@ -66,8 +66,8 @@
 ;;; This variable is accessed by C code when saving. Export it to survive tree-shaker.
 ;;; The symbols in this set are clobbered just in time to avoid saving them to the core
 ;;; but not so early that we kill the running image.
-(export 'sb-kernel::*save-lisp-clobbered-globals* 'sb-kernel)
-(define-load-time-global sb-kernel::*save-lisp-clobbered-globals*
+(export 'sb-kernel::+save-lisp-clobbered-globals+ 'sb-kernel)
+(defconstant-eqx sb-kernel::+save-lisp-clobbered-globals+
     '#(sb-impl::*exit-lock*
        sb-vm::*allocator-mutex*
        sb-thread::*make-thread-lock*
@@ -78,7 +78,8 @@
        sb-thread::*joinable-threads*
        sb-thread::*all-threads*
        sb-thread::*session*
-       sb-kernel::*gc-epoch*))
+       sb-kernel::*gc-epoch*)
+  #'equalp)
 
 (defun start-lisp (toplevel callable-exports)
   (if callable-exports
@@ -129,6 +130,8 @@ The following &KEY arguments are defined:
      the standalone executable, and restored when the executable is
      run. This also inhibits normal runtime option processing, causing
      all command line arguments to be passed to the toplevel.
+     If :ACCEPT-RUNTIME-OPTIONS then --dynamic-space-size and
+     --control-stack-size are still processed by the runtime.
      Meaningless if :EXECUTABLE is NIL.
 
   :CALLABLE-EXPORTS
@@ -255,7 +258,10 @@ sufficiently motivated to do lengthy fixes."
           (gc-and-save name
                        (foreign-bool executable)
                        (foreign-bool purify)
-                       (foreign-bool save-runtime-options)
+                       (case save-runtime-options
+                         (:accept-runtime-options 2)
+                         ((nil) 0)
+                         (t 1))
                        (foreign-bool compression)
                        (or compression 0)
                        #+win32 (ecase application-type (:console 0) (:gui 1))

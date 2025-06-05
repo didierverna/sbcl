@@ -22,13 +22,7 @@
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
                   (defconstant ,offset-sym ,offset)
-                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
-                  (list ,@(mapcar #'(lambda (name)
-                                      (symbolicate name "-OFFSET")) regs))))))
+                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg r0 0)
   (defreg r1 1)
@@ -65,7 +59,7 @@
   (defconstant register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2)
-  (defparameter *register-arg-names* '(r0 r1 r2)))
+  (defconstant-eqx register-arg-names '(r0 r1 r2) #'equal))
 
 
 ;;;; SB and SC definition:
@@ -210,9 +204,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
@@ -263,11 +255,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This function is called by debug output routines that want a pretty name

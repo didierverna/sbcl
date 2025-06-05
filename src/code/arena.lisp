@@ -25,7 +25,7 @@
 (defmacro arena-memblk-freeptr (memblk) `(sap-ref-sap ,memblk 0))
 (defmacro arena-memblk-limit (memblk) `(sap-ref-sap ,memblk ,(ash 1 word-shift)))
 (defmacro arena-memblk-next (memblk) `(sap-ref-sap ,memblk ,(ash 2 word-shift)))
-(defmacro arena-memblk-padword (memblk) `(sap-ref-sap ,memblk ,(ash 3 word-shift)))
+(defmacro arena-memblk-base (memblk) `(sap-ref-sap ,memblk ,(ash 3 word-shift)))
 
 (defmacro do-arena-blocks ((blkvar arena) &body body)
   ;; bind BLK to a SAP pointing to successive 'struct memblk' in arena
@@ -266,34 +266,6 @@ one or more times, not to exceed MAX-EXTENSIONS times"
               (setf (aref result i) (or (find-tls-ref word) (find-binding word))))))))
     (coerce (subseq result 0 n) 'list)))
 
-;;; This global var is just for making 1 arena for testing purposes.
-;;; It does not indicate about anything the current thread's arena usage.
-;;; For that you have to examine THREAD-ARENA-SLOT.
-(sb-ext:define-load-time-global *my-arena* nil)
-
-(defparameter default-arena-size (* 10 1024 1024 1024))
-(defun create-arena ()
-  (cond ((null *my-arena*)
-         (setq *my-arena* (new-arena default-arena-size))
-         (format t "Arena memory @ ~x (struct @ ~x)~%"
-                 (arena-base-address *my-arena*)
-                 (sb-kernel:get-lisp-obj-address *my-arena*)))
-        (t
-         (format t "~&Already created~%"))))
-
-(defglobal *foo* nil)
-(defun arena-smoketest ()
-  (setq *foo* nil)
-  (with-arena (*my-arena*)
-    (let (t1 t2)
-      (setq t1 (sb-thread:make-thread
-                (lambda () (declare (notinline make-list)) (vector (make-list 5 :initial-element #\a)))))
-      (setq t2 (sb-thread:make-thread
-                (lambda () (declare (notinline make-list)) (vector (make-list 6 :initial-element #\b)))))
-      (dotimes (i 10) (sb-ext:atomic-push (cons 3 i) *foo*))
-      (sb-thread:join-thread t1)
-      (sb-thread:join-thread t2))))
-
 (defmethod print-object ((self arena) stream)
   (print-unreadable-object (self stream :type t :identity t)
     (format stream "id=~D used=~D waste=~D"
@@ -315,7 +287,6 @@ one or more times, not to exceed MAX-EXTENSIONS times"
                       (declare (type sb-bignum:bignum-index i))
                       (sb-bignum:%bignum-set new i (sb-bignum:%bignum-ref n i)))))
           (double-float
-           #+x86-64 (%primitive sb-vm::!copy-dfloat n)
            (%make-double-float (double-float-bits n)))
           ;; ratio is dynspace-p only if both parts are. copy everything to be safe
           (ratio (%make-ratio (truly-the integer (copy (%numerator n)))

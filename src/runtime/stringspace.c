@@ -97,7 +97,7 @@ static int readonly_unboxed_obj_p(lispobj* obj)
 #endif
     case BIGNUM_WIDETAG: case DOUBLE_FLOAT_WIDETAG:
     case COMPLEX_SINGLE_FLOAT_WIDETAG: case COMPLEX_DOUBLE_FLOAT_WIDETAG:
-    case SAP_WIDETAG: case SIMPLE_ARRAY_NIL_WIDETAG:
+    case SIMPLE_ARRAY_NIL_WIDETAG:
 #ifdef SIMD_PACK_WIDETAG
     case SIMD_PACK_WIDETAG:
 #endif
@@ -107,6 +107,11 @@ static int readonly_unboxed_obj_p(lispobj* obj)
         return 1;
     case RATIO_WIDETAG: case COMPLEX_RATIONAL_WIDETAG:
         return fixnump(obj[1]) && fixnump(obj[2]);
+    case SAP_WIDETAG:
+#if defined LISP_FEATURE_X86_64
+        if (((uint32_t*)obj)[1]) return 0; // high half of header != 0 ==> adjustable
+#endif
+        return 1;
     }
     if ((widetag > SIMPLE_VECTOR_WIDETAG && widetag < COMPLEX_BASE_STRING_WIDETAG)) {
         if (!vector_len((struct vector*)obj)) return 1; // length 0 vectors can't be stored into
@@ -119,9 +124,12 @@ static int readonly_unboxed_obj_p(lispobj* obj)
         if (!length) return 1; // length 0 vectors can't be stored into
         if (*obj & (VECTOR_SHAREABLE|VECTOR_SHAREABLE_NONSTD)<<ARRAY_FLAGS_POSITION) {
             // If every element is non-pointer, then it can go in readonly space
+            /* TODO: I'd like to allow vectors containing symbols into R/O space,
+             * but they might have to be adjusted upon heap relocation.
+             * The general benefit should outweigh the possible cost. */
             sword_t i;
             for (i=0; i<length; ++i)
-                if (v->data[i] != NIL && is_lisp_pointer(v->data[i])) return 0;
+                if (is_lisp_pointer(v->data[i])) return 0;
             return 1;
         }
     }
@@ -151,9 +159,9 @@ struct pair {
     uword_t data;
 };
 
-static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, uword_t arg)
+static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, void* arg)
 {
-    struct pair* pair = (void*)arg;
+    struct pair* pair = arg;
     walk_range(where, limit, pair->func, pair->data);
     return 0;
 }
@@ -161,7 +169,10 @@ static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, uword_t arg)
 /* Call 'fun' on every object in every space, passing it object and 'arg' */
 static void walk_all_gc_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
 {
-    walk_range((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, fun, arg);
+#ifdef T_SYMBOL_SLOTS_START
+    walk_range(T_SYMBOL_SLOTS_START, T_SYMBOL_SLOTS_END, fun, arg);
+#endif
+    walk_range(NIL_SYMBOL_SLOTS_START, NIL_SYMBOL_SLOTS_END, fun, arg);
     walk_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, fun, arg);
     if (PERMGEN_SPACE_START)
         walk_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer, fun, arg);
@@ -171,7 +182,7 @@ static void walk_all_gc_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
     if (TEXT_SPACE_START)
         walk_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, fun, arg);
     struct pair pair = {fun, arg};
-    walk_generation(walk_range_wrapper, -1, (uword_t)&pair);
+    walk_generation(walk_range_wrapper, -1, &pair);
 }
 
 static lispobj readonlyize(lispobj* obj)

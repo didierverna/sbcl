@@ -27,10 +27,16 @@ lispobj* atomic_bump_static_space_free_ptr(int nbytes)
 {
     gc_assert((nbytes & LOWTAG_MASK) == 0);
     lispobj* claimed_ptr = static_space_free_pointer;
+#ifdef LISP_FEATURE_X86_64
+    // Must not clobber some constant data on the final page of static space
+    lispobj* limit = static_space_trailer_start;
+#else
+    lispobj* limit = (lispobj*)STATIC_SPACE_END;
+#endif
     do {
         lispobj* new = (lispobj*)((char*)claimed_ptr + nbytes);
         // Fail if space exhausted or bogusly wrapped around
-        if (new > (lispobj*)STATIC_SPACE_END || new < claimed_ptr) return 0;
+        if (new > limit || new < claimed_ptr) return 0;
         lispobj* actual_old = __sync_val_compare_and_swap(&static_space_free_pointer,
                                                           claimed_ptr, new);
         if (actual_old == claimed_ptr) return claimed_ptr;
@@ -280,13 +286,12 @@ lispobj alloc_code_object(unsigned total_words, unsigned boxed)
     THREAD_JIT_WP(0);
 
     code->header = ((uword_t)total_words << CODE_HEADER_SIZE_SHIFT) | CODE_HEADER_WIDETAG;
+    // GC mustn't see uninitialized data. And one word past the boxed words (which holds the
+    // count of following words containing absolute jump addresses) must also be pre-zeroed.
+    memset((lispobj*)code + 2, 0, (1 + boxed - 2) * N_WORD_BYTES);
     // 'boxed_size' is an untagged word expressing the number of *bytes* in the boxed section
     // (so CODE-INSTRUCTIONS can simply add rather than shift and add).
     code->boxed_size = boxed * N_WORD_BYTES;
-    // GC mustn't see uninitialized data. And one word past the boxed words (which holds the
-    // count of following words containing absolute jump addresses) must also be pre-zeroed.
-    lispobj* begin = 1 + &code->boxed_size, *end = (lispobj*)code + boxed + 1;
-    memset(begin, 0, (char*)end - (char*)begin);
 
     ((lispobj*)code)[total_words-1] = 0; // zeroize the simple-fun table count
     THREAD_JIT_WP(1);

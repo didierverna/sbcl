@@ -209,10 +209,12 @@
 ;;; shifter-operand structure, similar to the make-ea function in the
 ;;; x86 backend.
 
-(defstruct shifter-operand
-  register
-  function-code
-  operand)
+(defstruct (shifter-operand
+            (:copier nil)
+            (:constructor make-shifter-operand (register function-code operand)))
+  (register nil :read-only t)
+  (function-code nil :type (integer 0 3) :read-only t)
+  (operand nil :read-only t))
 
 
 (defun lsl (register operand)
@@ -220,21 +222,21 @@
   (aver (or (register-p operand)
             (typep operand '(integer 0 63))))
 
-  (make-shifter-operand :register register :function-code 0 :operand operand))
+  (make-shifter-operand register 0 operand))
 
 (defun lsr (register operand)
   (aver (register-p register))
   (aver (or (register-p operand)
             (typep operand '(integer 0 63))))
 
-  (make-shifter-operand :register register :function-code 1 :operand operand))
+  (make-shifter-operand register 1 operand))
 
 (defun asr (register operand)
   (aver (register-p register))
   (aver (or (register-p operand)
             (typep operand '(integer 1 63))))
 
-  (make-shifter-operand :register register :function-code 2 :operand operand))
+  (make-shifter-operand register 2 operand))
 
 (defun ror (register operand)
   ;; ROR is a special case: the encoding for ROR with an immediate
@@ -243,19 +245,20 @@
   (aver (or (register-p operand)
             (typep operand '(integer 1 63))))
 
-  (make-shifter-operand :register register :function-code 3 :operand operand))
+  (make-shifter-operand register 3 operand))
 
 (defun rrx (register)
   ;; RRX is a special case: it is encoded as ROR with an immediate
   ;; shift of 32 (0), and has no operand.
   (aver (register-p register))
-  (make-shifter-operand :register register :function-code 3 :operand 0))
+  (make-shifter-operand register 3 0))
 
 (defstruct (extend
-            (:constructor extend (register kind &optional (operand 0))))
-  (register nil :type tn)
-  kind
-  (operand 0 :type (integer 0 63)))
+            (:constructor extend (register kind &optional (operand 0)))
+            (:copier nil))
+  (register nil :type tn :read-only t)
+  (kind nil :read-only t)
+  (operand 0 :type (integer 0 63) :read-only t))
 
 (define-condition cannot-encode-immediate-operand (error)
   ((value :initarg :value))
@@ -282,10 +285,13 @@
 ;;; by constant, we reuse the shifter-operand structure and its public
 ;;; constructors.
 
-(defstruct memory-operand
-  base
-  offset
-  mode)
+(defstruct (memory-operand
+            (:copier nil)
+            (:predicate nil)
+            (:constructor make-memory-operand (base offset mode)))
+  (base nil :read-only t)
+  (offset nil :read-only t)
+  (mode nil :read-only t))
 
 ;;; The @ function is used to encode a memory addressing mode.  The
 ;;; parameters for the base form are a base register, an optional
@@ -303,8 +309,7 @@
   (when (shifter-operand-p offset)
     (aver (integerp (shifter-operand-operand offset))))
 
-  (make-memory-operand :base base :offset offset
-                       :mode mode))
+  (make-memory-operand base offset mode))
 
 
 ;;;; Data-processing instructions
@@ -685,13 +690,6 @@
          (not (logtest (1+ ones) ;; Turns #b111 into #b1000
                        ones))))) ;; And when ANDed will produce 0
 
-(defun count-trailing-zeros (integer)
-  (declare (type (unsigned-byte 64) integer))
-  (loop for i below 64
-        until (logbitp 0 integer)
-        do (setf integer (ash integer -1))
-        finally (return i)))
-
 (defun find-pattern (integer &optional (width 64))
   (declare (type (unsigned-byte 64) integer)
            (type (member 32 64) width)
@@ -719,7 +717,7 @@
              (values (ldb (byte 1 6) size) ;; 64-bit patterns need to set the N bit to 1
                      (cond ((sequence-of-ones-p pattern)
                             ;; Simple case of consecutive ones, just needs shifting right
-                            (mod (- size (count-trailing-zeros pattern)) size))
+                            (mod (- size (sb-c::count-trailing-zeros pattern)) size))
                            ;; Invert the pattern and find consecutive ones there
                            ((not (sequence-of-ones-p (ldb (byte size 0)
                                                           (lognot pattern))))
@@ -2600,9 +2598,9 @@
                              (encode-fp-immediate rn)
                              0
                              (fpr-offset rd)))
-         ((or (sc-is rd complex-double-reg complex-single-reg)
-              (sc-is rn complex-double-reg complex-single-reg))
-          (break "Implement"))
+         ((or (sc-is rd complex-double-reg)
+              (sc-is rn complex-double-reg))
+          (bug "Implement"))
          ((and (fp-register-p rd)
                (fp-register-p rn))
           (assert (and (eq (tn-sc rd) (tn-sc rn))) (rd rn)

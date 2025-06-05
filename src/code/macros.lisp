@@ -338,21 +338,18 @@ tree structure resulting from the evaluation of EXPRESSION."
   ;; :macro-expansion of something that is getting defined as constant.
   (clear-info :variable :macro-expansion name)
   (clear-info :source-location :symbol-macro name)
+  #+sb-xc-host ;; Define the constant in the cross-compilation host, since the
+               ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
+               ;; which reference the constant.
+  (progn (eval `(unless (boundp ',name) (defconstant ,name ',value)))
+         (setf (info :variable :kind name) :constant))
   #-sb-xc-host
-  (progn
-    (when docp
-      (setf (documentation name 'variable) doc))
-    (%set-symbol-value name value))
-  ;; Define the constant in the cross-compilation host, since the
-  ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
-  ;; which reference the constant.
-  #+sb-xc-host
-  (eval `(unless (boundp ',name) (defconstant ,name ',value)))
-  (setf (info :variable :kind name) :constant)
-  ;; Deoptimize after changing it to :CONSTANT, and not before, though tbh
-  ;; if your code cares about the timing of PROGV relative to DEFCONSTANT,
-  ;; well, I can't even.
-  #-sb-xc-host (unset-symbol-progv-optimize name)
+  (progn (%set-symbol-global-value name value)
+         (setf (info :variable :kind name) :constant)
+         ;; Deoptimize after changing it to :CONSTANT, and not before, though if user code
+         ;; cares about the timing of PROGV relative to DEFCONSTANT, it's buggy anyway.
+         (unset-symbol-progv-optimize name)
+         (when docp (setf (documentation name 'variable) doc)))
   name)
 
 (sb-xc:defmacro defvar (var &optional (val nil valp) (doc nil docp))
@@ -734,25 +731,29 @@ invoked. In that case it will store into PLACE and start over."
   ;; variable to work around Python's blind spot in type derivation.
   ;; For more complex places getting the type derived should not
   ;; matter so much anyhow.
-  (let ((expanded (%macroexpand place env))
-        (type (let ((ctype (sb-c::careful-specifier-type type)))
-                (if ctype
-                    (type-specifier ctype)
-                    type))))
-    (if (symbolp expanded)
-        `(unless (typep ,place ',type)
-           (setf ,place
-                 ,(if type-string
-                      `(check-type-error-trap '(,place . ,type) ,place (the string ,type-string))
-                      `(check-type-error-trap ',place ,place ',type)))
-           nil)
-        (let ((value (gensym)))
-          `(do ((,value ,place ,place))
-               ((typep ,value ',type))
-             (setf ,place
-                   (check-type-error ',place ,value ',type
-                                     ,@(and type-string
-                                            `(,type-string)))))))))
+  (let* ((expanded (%macroexpand place env))
+         (ctype (sb-c::careful-specifier-type type))
+         (type (if ctype
+                   (type-specifier ctype)
+                   type))
+         (value (gensym)))
+    (cond ((stringp type)
+           `(the ,type ,place)) ;; bad type
+          ((symbolp expanded)
+           `(let ((,value ,(wrap-if ctype `(the* (,ctype :use-annotations t)) place)))
+              (unless (typep ,value ',type)
+                (setf ,place
+                      ,(if type-string
+                           `(check-type-error-trap '(,place . ,type) ,value (the string ,type-string))
+                           `(check-type-error-trap ',place ,value ',type)))
+                nil)))
+          (t
+           `(do ((,value ,(wrap-if ctype `(the* (,ctype :use-annotations t)) place) ,place))
+                ((typep ,value ',type))
+              (setf ,place
+                    (check-type-error ',place ,value ',type
+                                      ,@(and type-string
+                                             `(,type-string)))))))))
 
 ;;;; DEFINE-SYMBOL-MACRO
 
@@ -1061,11 +1062,6 @@ invoked. In that case it will store into PLACE and start over."
       (incf minimum 2))
     (>= (length keys) minimum)))
 
-(defun wrap-if (condition with form)
-  (if condition
-      (append with (list form))
-      form))
-
 ;;; CASE-BODY returns code for all the standard "case" macros. NAME is
 ;;; the macro name, and KEYFORM is the thing to case on.
 ;;; When ERRORP, no OTHERWISE-CLAUSEs are recognized,
@@ -1107,7 +1103,8 @@ invoked. In that case it will store into PLACE and start over."
                        ,(if (and (eq test 'eql) (self-evaluating-p k)) k `',k))))
         (unless (list-of-length-at-least-p clause 1)
           (with-current-source-form (cases)
-            (error "~S -- bad clause in ~S" clause name)))
+            (warn "~S -- bad clause in ~S" clause name)
+            (go next)))
         (with-current-source-form (clause)
           ;; https://sourceforge.net/p/sbcl/mailman/message/11863996/ contains discussion
           ;; of whether to warn when seeing OTHERWISE in a normal-clause position, but
@@ -1127,24 +1124,32 @@ invoked. In that case it will store into PLACE and start over."
                    (cond ((null (cdr cases))
                           (push `(t ,@forms) clauses))
                          ((eq name 'case)
-                          (error 'simple-reference-error
-                                 :format-control
-                            "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
+                          (push `(t ,@forms) clauses)
+                          (setf specified-clauses
+                                (ldiff specified-clauses (cdr cases)))
+                          (warn 'simple-reference-warning
+                                :format-control
+                                "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
                            designator only in the final otherwise-clause, not in a ~
                            normal-clause. Use (~S) instead, or move the clause to the ~
                            correct position.~:@>"
-                            :format-arguments (list 'case clause keyoid keyoid)
-                            :references `((:ansi-cl :macro case))))
+                                :format-arguments (list 'case clause keyoid keyoid)
+                                :references `((:ansi-cl :macro case)))
+                          (return))
                          (t
+                          (push `(t ,@forms) clauses)
+                          (setf specified-clauses
+                                (ldiff specified-clauses (cdr cases)))
                           ;; OTHERWISE is a redundant bit of the behavior of TYPECASE
                           ;; since T is the universal type. OTHERWISE could not legally
                           ;; be DEFTYPEed so this _must_ be a misplaced clause.
-                          (error 'simple-reference-error
+                          (warn 'simple-reference-warning
                                      :format-control
                             "~@<~IBad ~S clause:~:@_  ~S~:@_~S is allowed only in the final clause. ~
                            Use T instead, or move the clause to the correct position.~:@>"
                             :format-arguments (list 'typecase clause keyoid)
-                            :references `((:ansi-cl :macro typecase))))))
+                            :references `((:ansi-cl :macro typecase)))
+                          (return))))
                   ((and (listp keyoid) (eq test 'eql))
                    (unless (proper-list-p keyoid) ; REVERSE would err with unclear message
                      (error "~S is not a proper list" keyoid))
@@ -1174,7 +1179,8 @@ invoked. In that case it will store into PLACE and start over."
                               (setq case-clauses nil)))))
                    (push keyoid keys)
                    (check-clause (list keyoid))
-                   (push `(,(testify keyoid) ,@forms) clauses)))))))
+                   (push `(,(testify keyoid) ,@forms) clauses))))))
+      next)
     (when (eq errorp :none)
       (setq errorp nil))
 
@@ -1379,6 +1385,13 @@ invoked. In that case it will store into PLACE and start over."
                 (setq ,abortp nil))
            (when ,stream
              (close ,stream :abort ,abortp)))))))
+
+(sb-xc:defmacro sb-debug::with-debug-io-syntax (() &body body)
+  (let ((thunk (gensym "THUNK")))
+    `(dx-flet ((,thunk ()
+                 ,@body))
+       (sb-debug::funcall-with-debug-io-syntax #',thunk))))
+
 
 ;;;; Iteration macros:
 

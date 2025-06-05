@@ -1397,14 +1397,18 @@ Experimental: interface subject to change."
           (if (and where (or allow-inherited (neq where :inherited)))
               (values symbol where)
               (let* ((symbol-name (make-readonly-string length name elt-type))
+                     (keywordp (eq package *keyword-package*))
                      ;; optimistically create the symbol
                      (symbol ; Symbol kind: 1=keyword, 2=other interned
-                       (%make-symbol (if (eq package *keyword-package*) 1 2) symbol-name))
-                     (table (cond ((eq package *keyword-package*)
-                                   (%set-symbol-value symbol symbol)
-                                   (package-external-symbols package))
-                                  (t
-                                   (package-internal-symbols package)))))
+                       (%make-symbol (if keywordp 1 2) symbol-name))
+                     (table
+                      ;; No difference between set-symbol-GLOBAL-value or not here, but
+                      ;; global is simpler.
+                      (cond (keywordp
+                             (%set-symbol-global-value symbol symbol)
+                             (package-external-symbols package))
+                            (t
+                             (package-internal-symbols package)))))
                 ;; Set the symbol's package before storing it into the package
                 ;; so that (symbol-package (intern x #<pkg>)) = #<pkg>.
                 ;; This matters in the case of concurrent INTERN.
@@ -1994,7 +1998,7 @@ PACKAGE."
   (loop for (this . use) in *!initial-package-graph*
         do (setf (package-tables (find-package this))
                  (map 'vector (lambda (x) (package-external-symbols (find-package x)))
-                              use)))
+                      (the list use)))) ; THE LIST yields a better transform of MAP
 
   (rebuild-package-vector)
   ;; Having made all packages, verify that symbol hashes are good.
@@ -2024,8 +2028,13 @@ PACKAGE."
   ;; internals. The difficulties are symmetrical, but solving the problem that occurs
   ;; hypothetically less often is better, as the solution involves consing.
   (labels
-      ((advance-from-state (bits &aux (cur-pkg
-                                       (truly-the package (car (pkg-iter-pkglist iter)))))
+      ((advance-from-state (bits &aux
+                                 (cur-pkg
+                                  (truly-the package
+                                   (or (car (pkg-iter-pkglist iter))
+                                       (load-time-value
+                                        (let ((st (make-symbol-table 0))) (%make-package st st))
+                                        t)))))
          ;; For most platforms, this CASE should become a jump-table, therefore the order
          ;; in which to test clauses is not as relevant as if may have once been.
          (case (logand bits #b11)

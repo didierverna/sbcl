@@ -62,6 +62,7 @@ otherwise evaluate ELSE and return its values. ELSE defaults to NIL."
                    next result else))))
 
 (def-ir1-translator jump-table ((index &rest targets) start next result)
+  (declare (inline make-jump-table))
   (aver targets)
   (let* ((index-ctran (make-ctran))
          (index-lvar (make-lvar))
@@ -164,6 +165,7 @@ RETURN-FROM can be used to exit the form."
     (let* ((env-entry (list entry next result))
            (*lexenv* (make-lexenv :blocks (list (cons name env-entry))
                                   :cleanup cleanup)))
+      (setf (cleanup-block cleanup) env-entry)
       (ir1-convert-progn-body dummy next result forms))))
 
 ;;; We make NEXT start a block just so that it will have a block
@@ -1044,11 +1046,7 @@ other."
                      type)
                     ((compiler-values-specifier-type type))
                     (t
-                     (ir1-convert start next result
-                                  `(progn
-                                     ,value
-                                     (error "Bad type specifier: ~a"
-                                            ',type)))
+                     (ir1-convert start next result value)
                      (return-from the-in-policy)))))
     (cond ((or (eq type *wild-type*)
                (eq type *universal-type*)
@@ -1112,7 +1110,7 @@ care."
   (the-in-policy value-type form **zero-typecheck-policy** start next result))
 
 ;;; THE with some options for the CAST
-(def-ir1-translator the* (((value-type &key context silent-conflict
+(def-ir1-translator the* (((type &key context silent-conflict
                                        derive-type-only
                                        truly
                                        source-form
@@ -1120,9 +1118,16 @@ care."
                                        restart)
                            form)
                           start next result)
-  (let ((value-type (if (ctype-p value-type)
-                        value-type
-                        (values-specifier-type value-type)))
+  (let ((type (cond ((ctype-p type)
+                     type)
+                    ((compiler-values-specifier-type type))
+                    (t
+                     (ir1-convert start next result
+                                  `(progn
+                                     ,form
+                                     (error "Bad type specifier: ~a"
+                                            ',type)))
+                     (return-from ir1-convert-the*))))
         (*current-path* (if source-form
                             (ensure-source-path source-form)
                             (ensure-source-path form)))
@@ -1147,19 +1152,19 @@ care."
                                           (the (not exit) (car new-uses)))
                                          (t
                                           new-uses))
-                                   value-type)))))
+                                   type)))))
           (use-annotations
            (ir1-convert start next result form)
            (when result
              (add-annotation result
-                             (make-lvar-type-annotation :type value-type
+                             (make-lvar-type-annotation :type type
                                                         :source-path *current-path*
                                                         :context context))))
           (t
            (let* ((policy (lexenv-policy *lexenv*))
-                  (cast (the-in-policy value-type form (if truly
-                                                           **zero-typecheck-policy**
-                                                           policy)
+                  (cast (the-in-policy type form (if truly
+                                                     **zero-typecheck-policy**
+                                                     policy)
                                        start next result)))
              (when cast
                (setf (cast-context cast) context)
@@ -1194,7 +1199,38 @@ care."
       (info :function :macro-function 'the*)
       (lambda (whole env)
         (declare (ignore env))
-        `(the ,(caadr whole) ,@(cddr whole)))
+        (destructuring-bind
+              (the* (type &key restart context use-annotations &allow-other-keys) form)
+            whole
+          (declare (ignore the*))
+          (cond (restart
+                 (let* ((val (gensym "VAL"))
+                        (head (gensym "HEAD"))
+                        (ctype (careful-specifier-type type))
+                        (type (if (and ctype (fun-type-p ctype)) 'function type)))
+                   `(let ((,val ,form))
+                      (if (typep ,val ',type)
+                          ,val
+                          (block nil
+                            (let ((sb-kernel::*type-error-no-check-restart*
+                                    (lambda (value) (return value))))
+                              (tagbody
+                                 ,head
+                                 (restart-case
+                                     (error 'type-error :context ',context
+                                                        :datum ,val :expected-type ',type)
+                                   (use-value (value)
+                                     :report (lambda (stream)
+                                               (format stream "Use specified value."))
+                                     :interactive read-evaluated-form
+                                     (setq ,val value)))
+                                 (when (typep ,val ',type)
+                                   (return ,val))
+                                 (go ,head))))))))
+                (use-annotations
+                 `(progn ,@(cddr whole)))
+                (t
+                 `(the ,(caadr whole) ,@(cddr whole))))))
       (info :function :macro-function 'with-source-form)
       (lambda (whole env)
         (declare (ignore env))
@@ -1254,7 +1290,8 @@ care."
 ;;; This should only need to be called in SETQ.
 (defun setq-var (start next result var value)
   (declare (type ctran start next) (type (or lvar null) result)
-           (type basic-var var))
+           (type basic-var var)
+           (inline make-set))
   (let ((dest-ctran (make-ctran))
         (dest-lvar (make-lvar))
         (type (or (lexenv-find var type-restrictions)
@@ -1492,6 +1529,7 @@ due to normal completion or a non-local exit such as THROW)."
 
 Call FUNCTION, passing all the values of each VALUES-FORM as arguments,
 values from the first VALUES-FORM making up the first argument, etc."
+  (declare (inline make-mv-combination))
   (let* ((ctran (make-ctran))
          (fun-lvar (make-lvar))
          (node (if args

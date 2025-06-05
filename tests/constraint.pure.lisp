@@ -1624,6 +1624,12 @@
          (error "")))
    (and sequence (not null) (or (not array) (vector t))))
   (assert-type
+   (lambda (y)
+     (if (position #\a y :test-not #'char=)
+         y
+         (error "")))
+   (and sequence (not null)))
+  (assert-type
    (lambda (x y)
      (declare (simple-array y))
      (if (find x y :key #'car)
@@ -1864,7 +1870,8 @@
          m))
    (or double-float null)))
 
-(with-test (:name :ignore-delays)
+(with-test (:name :ignore-delays
+            :fails-on :arm)
   (assert-type
    (lambda (x)
      (declare (optimize debug))
@@ -1963,3 +1970,14 @@
          (error "")
          x))
    (and number (not integer))))
+
+(with-test (:name :call-vars-with-setf)
+  (assert-type
+   (lambda (j)
+     (labels ((foo (x)
+                (when (symbolp j)
+                  (setf x j))
+                x))
+       (foo 1)
+       (foo 2)))
+   (or (integer 1 2) symbol)))

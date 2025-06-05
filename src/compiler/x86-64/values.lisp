@@ -48,6 +48,12 @@
           while moved
           do (inst add (tn-ref-tn moved) rdi))))
 
+(defun notany-nil-relative-p (vals)
+  (do ((tn-ref vals (tn-ref-across tn-ref)))
+      ((null tn-ref) t)
+    (when (nil-relative-p (encode-value-if-immediate (tn-ref-tn tn-ref)))
+      (return nil))))
+
 ;;; Push some values onto the stack, returning the start and number of values
 ;;; pushed as results. It is assumed that the Vals are wired to the standard
 ;;; argument locations. Nvals is the number of values to push.
@@ -59,7 +65,7 @@
   (:args (vals :more t :scs (descriptor-reg any-reg immediate constant)))
   (:results (start :from :load) (count))
   (:info nvals)
-  (:temporary (:scs (descriptor-reg)) temp)
+  (:temporary (:scs (descriptor-reg) :unused-if (notany-nil-relative-p vals)) temp)
   (:vop-var vop)
   (:generator 20
     (unless (eq (tn-kind start) :unused)
@@ -67,15 +73,10 @@
     (do ((tn-ref vals (tn-ref-across tn-ref)))
         ((null tn-ref))
       (let ((tn (tn-ref-tn tn-ref)))
-        (inst push (sc-case tn
-                     (constant
-                      (load-constant vop tn temp)
-                      temp)
-                     (t
-                      (let ((value (encode-value-if-immediate tn)))
-                        (if (integerp value)
-                            (constantize value)
-                            value)))))))
+        (inst push (let ((value (encode-value-if-immediate tn)))
+                     (cond ((integerp value) (constantize value))
+                           ((nil-relative-p value) (move-immediate temp value))
+                           (t value))))))
     (unless (eq (tn-kind count) :unused)
       (inst mov count (fixnumize nvals)))))
 
@@ -102,7 +103,7 @@
                (not (csubtypep (tn-ref-type arg-ref) (specifier-type 'list))))
       (inst jmp type-check))
     LOOP
-    (inst cmp list nil-value)
+    (inst cmp list null-tn)
     (inst jmp :e DONE)
     (pushw list cons-car-slot list-pointer-lowtag)
     (loadw list list cons-cdr-slot list-pointer-lowtag)

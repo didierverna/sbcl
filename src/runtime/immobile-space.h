@@ -18,10 +18,6 @@
 #include "globals.h" // for FIXEDOBJ_SPACE_START and TEXT_SPACE_START
 #include "gc-assert.h"
 
-// 1 page is reserved for some constant arrays.
-// Right now it is just the array that maps widetag to layout
-#define FIXEDOBJ_RESERVED_PAGES 1
-
 extern void prepare_immobile_space_for_final_gc(void);
 extern void prepare_immobile_space_for_save(bool verbose);
 extern bool immobile_space_preserve_pointer(void*);
@@ -74,6 +70,10 @@ static inline low_page_index_t find_text_page_index(void *addr)
   return -1;
 }
 
+/* The benefit if this approach to testing for two ranges is questionable,
+ * especially as text space is now _higher_ than dynamic space.
+ * Maybe reconsider just using the obvious two discrete range tests,
+ * or else rearrange the spaces again to where this makes sense */
 static inline bool immobile_space_p(lispobj obj)
 {
 /* To test the two immobile ranges, we first check that a pointer is within

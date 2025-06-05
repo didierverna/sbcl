@@ -249,8 +249,10 @@ Examples:
   ;; I believe that most finalizers will *not* have the :DONT-SAVE flag set.
   ;; As evidence the https://github.com/trivial-garbage/trivial-garbage portability
   ;; library does not offer a way to specify :DONT-SAVE.
+  ;;
+  ;; FIXME: This is quite a lousy reason to reach for MAKE-VALUE-CELL.
   (let ((action
-         (if dont-save (sb-sys:%primitive sb-vm::make-value-cell function nil) function)))
+          (if dont-save (sb-vm::make-value-cell function) function)))
     (with-pinned-objects (object)
       #+weak-vector-readbarrier
       (with-system-mutex (*finalizer-lock*)
@@ -308,7 +310,7 @@ Examples:
       (sb-vm::reconstitute-object (sb-lockless:so-key node))))
 
 ;;; Perform various cleanups around finalizers
-(defglobal *saved-finalizers* nil)
+(define-load-time-global *saved-finalizers* nil)
 (defun finalizers-deinit (&aux save)
   (labels
       ((filter-actions (object actions)

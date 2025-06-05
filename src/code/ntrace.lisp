@@ -14,6 +14,87 @@
 ;;; FIXME: Why, oh why, doesn't the SB-DEBUG package use the SB-DI
 ;;; package? That would let us get rid of a whole lot of stupid
 ;;; prefixes..
+
+(defvar *trace-indentation-step* 2
+  "the increase in trace indentation at each call level")
+
+(defvar *max-trace-indentation* 40
+  "If the trace indentation exceeds this value, then indentation restarts at
+   0.")
+
+(defvar *trace-encapsulate-default* t
+  "the default value for the :ENCAPSULATE option to TRACE")
+
+(defvar *trace-report-default* 'trace
+  "the default value for the :REPORT option to TRACE")
+
+
+;;;; internal state
+
+;;; a hash table that maps each traced function to the TRACE-INFO. The
+;;; entry for a closure is the shared function entry object. The entry
+;;; for a method is a (CL:METHOD name qualifiers* (specializers*))
+;;; list.
+(define-load-time-global *traced-funs*
+    (make-hash-table :test 'equal :synchronized t))
+
+;;; a hash-table that maps the name of outer functions to local
+;;; functions keys in the *TRACED-FUNS* hash-table, e.g.: NAME-X ->
+;;; ((NAME-Y :IN NAME-X) (NAME-Z :IN NAME-X)).
+(define-load-time-global *traced-locals*
+    (make-hash-table :test 'equal :synchronized t))
+
+(deftype trace-report-type ()
+  '(or symbol function))
+
+;;; A TRACE-INFO object represents all the information we need to
+;;; trace a given function.
+(defstruct (trace-info
+             (:print-object (lambda (x stream)
+                              (print-unreadable-object (x stream :type t)
+                                (prin1 (trace-info-what x) stream)))))
+  ;; the original representation of the thing traced
+  (what nil :type (or function cons symbol))
+  ;; Is tracing to be done by encapsulation rather than breakpoints?
+  ;; T implies NAMED.
+  (encapsulated *trace-encapsulate-default*)
+  ;; Has this trace been untraced?
+  (untraced nil)
+  ;; breakpoints we set up to trigger tracing
+  (start-breakpoint nil :type (or sb-di:breakpoint null))
+  (end-breakpoint nil :type (or sb-di:breakpoint null))
+  ;; the list of function names for WHEREIN, or NIL if unspecified
+  (wherein nil :type list)
+  ;; should we trace methods given a generic function to trace?
+  (methods nil)
+
+  ;; The following slots represent the forms that we are supposed to
+  ;; evaluate on each iteration. Each form is represented by a cons
+  ;; (Form . Function), where the Function is the cached result of
+  ;; coercing Form to a function. Forms which use the current
+  ;; environment are converted with PREPROCESS-FOR-EVAL, which gives
+  ;; us a one-arg function. Null environment forms also have one-arg
+  ;; functions, but the argument is ignored. NIL means unspecified
+  ;; (the default.)
+
+  ;; report type
+  (report *trace-report-default* :type trace-report-type)
+  ;; current environment forms
+  (condition nil)
+  (break nil)
+  ;; List of current environment forms
+  (print () :type list)
+  ;; null environment forms
+  (condition-after nil)
+  (break-after nil)
+  ;; list of null environment forms
+  (print-after () :type list))
+(!set-load-form-method trace-info (:target))
+
+;;; This variable is used to discourage infinite recursions when some
+;;; trace action invokes a function that is itself traced. In this
+;;; case, we quietly ignore the inner tracing.
+(defvar *in-trace* nil)
 
 ;;;; utilities
 
@@ -231,7 +312,6 @@
                  (*in-trace* t))
              (case (trace-info-report info)
                (trace
-                (fresh-line)
                 (print-trace-indentation)
                 (if (trace-info-encapsulated info)
                     (prin1 `(,(trace-info-what info)
@@ -249,6 +329,7 @@
                              hook-args
                              (nth-value 1 (frame-call frame))))
                 (apply #'trace-print-unadorned frame (trace-info-print info) hook-args)))
+             (fresh-line *trace-output*)
              (write-sequence (get-output-stream-string *standard-output*)
                              *trace-output*)
              (finish-output *trace-output*))
@@ -358,6 +439,30 @@
                        (if (eq vals non-local-exit) nil vals)
                        nil))
             (values-list vals)))))))
+
+;;; Want to avoid a redef warning, but can't fmakunbound this for
+;;; even a second, or you'll lose big.
+(defun maybe-trace-method (gf method fun fmf-p)
+  (let ((m-name (when (plusp (hash-table-count sb-debug::*traced-funs*))
+                  ;; FIXME: We no longer need this test for bootstrap
+                  ;; reasons, but rather that a bunch of tests fail
+                  ;; without this test. Why?
+                  (sb-pcl::method-trace-name gf method))))
+    (when m-name
+      (retrace-local-funs m-name))
+    (let ((info (when m-name
+                  (or (gethash m-name *traced-funs*)
+                      (let ((gf-info (gethash (or (sb-mop:generic-function-name gf) gf)
+                                              *traced-funs*)))
+                        (when (and gf-info (trace-info-methods gf-info))
+                          (let ((copy (copy-structure gf-info)))
+                            (setf (trace-info-what copy) m-name)
+                            copy)))))))
+      (if info
+          (lambda (&rest args)
+            (apply #'trace-method-call info fun fmf-p args))
+          fun))))
+(setf (symbol-function 'sb-pcl::maybe-trace-method) #'maybe-trace-method)
 
 ;;; Trace one function according to the specified options. We copy the
 ;;; trace info (it was a quoted constant), fill in the functions, and

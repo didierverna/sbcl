@@ -166,27 +166,15 @@
 (define-move-vop move-from-single :move
   (single-reg) (descriptor-reg))
 
-(define-vop (move-from-double)
+(define-allocator (move-from-double)
   (:args (x :scs (double-reg) :to :save))
   (:results (y :scs (descriptor-reg)))
-  (:node-var node)
   (:note "float to pointer coercion")
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
   (:generator 13
-     (alloc-other double-float-widetag double-float-size y node nil thread-tn)
+     (alloc-other double-float-widetag double-float-size y)
      (inst movsd (ea-for-df-desc y) x)))
 (define-move-vop move-from-double :move
   (double-reg) (descriptor-reg))
-(define-vop (!copy-dfloat)
-  (:args (x :scs (descriptor-reg) :to :save))
-  (:results (copy :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) bits)
-  (:node-var node)
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
-  (:generator 3
-     (alloc-other double-float-widetag double-float-size copy node nil thread-tn)
-     (loadw bits x double-float-value-slot other-pointer-lowtag)
-     (storew bits copy double-float-value-slot other-pointer-lowtag)))
 
 ;;; Move from a descriptor to a float register.
 (define-vop (move-to-single-reg)
@@ -231,26 +219,22 @@
 
 ;;; Move from complex float to a descriptor reg. allocating a new
 ;;; complex float object in the process.
-(define-vop (move-from-complex-single)
+(define-allocator (move-from-complex-single)
   (:args (x :scs (complex-single-reg) :to :save))
   (:results (y :scs (descriptor-reg)))
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
-  (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (alloc-other complex-single-float-widetag complex-single-float-size y node nil thread-tn)
+     (alloc-other complex-single-float-widetag complex-single-float-size y)
      (inst movlps (ea-for-csf-data-desc y) x)))
 (define-move-vop move-from-complex-single :move
   (complex-single-reg) (descriptor-reg))
 
-(define-vop (move-from-complex-double)
+(define-allocator (move-from-complex-double)
   (:args (x :scs (complex-double-reg) :to :save))
   (:results (y :scs (descriptor-reg)))
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
-  (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (alloc-other complex-double-float-widetag complex-double-float-size y node nil thread-tn)
+     (alloc-other complex-double-float-widetag complex-double-float-size y)
      (inst movapd (ea-for-cdf-data-desc y) x)))
 (define-move-vop move-from-complex-double :move
   (complex-double-reg) (descriptor-reg))
@@ -1242,24 +1226,6 @@
            (inst movss res
                  (ea (frame-byte-offset (tn-offset bits)) rbp-tn))))))))
 
-(define-vop (make-single-float-c)
-  (:results (res :scs (single-reg single-stack descriptor-reg)))
-  (:arg-types (:constant (signed-byte 32)))
-  (:result-types single-float)
-  (:info bits)
-  (:translate make-single-float)
-  (:policy :fast-safe)
-  (:vop-var vop)
-  (:generator 1
-    (sc-case res
-       (single-stack
-        (inst mov res bits))
-       (single-reg
-        (inst movss res (register-inline-constant :dword bits)))
-       (descriptor-reg
-        (inst mov res (logior (ash bits 32)
-                              single-float-widetag))))))
-
 (define-vop (make-double-float)
   (:args (hi-bits :scs (signed-reg))
          (lo-bits :scs (unsigned-reg)))
@@ -1289,17 +1255,6 @@
     (inst movd res lo-bits)
     (inst pinsrd res hi-bits 1)))
 
-(define-vop (make-double-float-c)
-  (:results (res :scs (double-reg)))
-  (:arg-types (:constant (signed-byte 32)) (:constant (unsigned-byte 32)))
-  (:result-types double-float)
-  (:info hi lo)
-  (:translate make-double-float)
-  (:policy :fast-safe)
-  (:vop-var vop)
-  (:generator 1
-    (inst movsd res (register-inline-constant :qword (logior (ash hi 32) lo)))))
-
 (define-vop (%make-double-float)
   (:args (bits :scs (signed-reg)))
   (:results (res :scs (double-reg)))
@@ -1310,17 +1265,6 @@
   (:vop-var vop)
   (:generator 4
     (inst movq res bits)))
-
-(define-vop (%make-double-float-c)
-  (:results (res :scs (double-reg)))
-  (:arg-types (:constant (signed-byte 64)))
-  (:result-types double-float)
-  (:info bits)
-  (:translate make-double-float)
-  (:policy :fast-safe)
-  (:vop-var vop)
-  (:generator 1
-    (inst movsd res (register-inline-constant :qword bits))))
 
 (define-vop (single-float-bits)
   (:args (float :scs (single-reg descriptor-reg)

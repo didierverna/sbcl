@@ -699,144 +699,67 @@
 ;;; desired number of fraction bits, then do round-to-nearest.
 (macrolet ((def (format)
              `(defun ,(symbolicate format '-ratio) (x)
-                (let* ((signed-num (numerator x))
-                       (plusp (plusp signed-num))
-                       (num (if plusp signed-num (- signed-num)))
-                       (den (denominator x))
-                       (digits ,(package-symbolicate :sb-vm format '-digits))
-                       (scale 0))
-                  (declare (fixnum digits scale))
-                  ;; Strip any trailing zeros from the denominator and move it into the scale
-                  ;; factor (to minimize the size of the operands.)
-                  (let ((den-twos (1- (integer-length (logxor den (1- den))))))
-                    (declare (fixnum den-twos))
-                    (decf scale den-twos)
-                    (setq den (ash den (- den-twos))))
-                  ;; Guess how much we need to scale by from the magnitudes of the numerator
-                  ;; and denominator. We want one extra bit for a guard bit.
-                  (let* ((num-len (integer-length num))
-                         (den-len (integer-length den))
-                         (delta (- den-len num-len))
-                         (shift (1+ (the fixnum (+ delta digits))))
-                         (shifted-num (ash num shift)))
-                    (declare (fixnum delta shift))
-                    (decf scale delta)
-                    (labels ((float-and-scale (bits)
-                               (let* ((bits (ash bits -1))
-                                      (len (integer-length bits)))
-                                 (cond ((> len digits)
-                                        (aver (= len (the fixnum (1+ digits))))
-                                        (scale-float (floatit (ash bits -1)) (1+ scale)))
-                                       (t
-                                        (scale-float (floatit bits) scale)))))
-                             (floatit (bits)
-                               (let ((sign (if plusp 0 1)))
-                                 ,(case format
-                                    (single-float
-                                     `(single-from-bits sign sb-vm:single-float-bias bits))
-                                    (double-float
-                                     `(double-from-bits sign sb-vm:double-float-bias bits))
-                                    #+long-float
-                                    (long-float
-                                     `(long-from-bits sign sb-vm:long-float-bias bits))))))
-                      (declare (inline floatit))
-                      (loop
-                       (multiple-value-bind (fraction-and-guard rem)
-                           (truncate shifted-num den)
-                         (let ((extra (- (integer-length fraction-and-guard) digits)))
-                           (declare (fixnum extra))
-                           (cond ((/= extra 1)
-                                  (aver (> extra 1)))
-                                 ((oddp fraction-and-guard)
-                                  (return
-                                    (if (zerop rem)
-                                        (float-and-scale
-                                         (if (zerop (logand fraction-and-guard 2))
-                                             fraction-and-guard
-                                             (1+ fraction-and-guard)))
-                                        (float-and-scale (1+ fraction-and-guard)))))
-                                 (t
-                                  (return (float-and-scale fraction-and-guard)))))
-                         (setq shifted-num (ash shifted-num -1))
-                         (incf scale)))))))))
+                (dispatch-ratio (x signed-num den)
+                  (let* ((plusp (plusp signed-num))
+                         (num (if plusp signed-num (- signed-num)))
+                         (digits ,(package-symbolicate :sb-vm format '-digits))
+                         (scale 0))
+                    (declare (fixnum digits scale))
+                    ;; Strip any trailing zeros from the denominator and move it into the scale
+                    ;; factor (to minimize the size of the operands.)
+                    (let ((den-twos (1- (integer-length (logxor den (1- den))))))
+                      (declare (fixnum den-twos))
+                      (decf scale den-twos)
+                      (setq den (ash den (- den-twos))))
+                    ;; Guess how much we need to scale by from the magnitudes of the numerator
+                    ;; and denominator. We want one extra bit for a guard bit.
+                    (let* ((num-len (integer-length num))
+                           (den-len (integer-length den))
+                           (delta (- den-len num-len))
+                           (shift (1+ (the fixnum (+ delta digits))))
+                           (shifted-num (ash num shift)))
+                      (declare (fixnum delta shift))
+                      (decf scale delta)
+                      (labels ((float-and-scale (bits)
+                                 (let* ((bits (ash bits -1))
+                                        (len (integer-length bits)))
+                                   (cond ((> len digits)
+                                          (aver (= len (the fixnum (1+ digits))))
+                                          (scale-float (floatit (ash bits -1)) (1+ scale)))
+                                         (t
+                                          (scale-float (floatit bits) scale)))))
+                               (floatit (bits)
+                                 (let ((sign (if plusp 0 1)))
+                                   ,(case format
+                                      (single-float
+                                       `(single-from-bits sign sb-vm:single-float-bias bits))
+                                      (double-float
+                                       `(double-from-bits sign sb-vm:double-float-bias bits))
+                                      #+long-float
+                                      (long-float
+                                       `(long-from-bits sign sb-vm:long-float-bias bits))))))
+                        (declare (inline floatit))
+                        (loop
+                         (multiple-value-bind (fraction-and-guard rem)
+                             (truncate shifted-num den)
+                           (let ((extra (- (integer-length fraction-and-guard) digits)))
+                             (declare (fixnum extra))
+                             (cond ((/= extra 1)
+                                    (aver (> extra 1)))
+                                   ((oddp fraction-and-guard)
+                                    (return
+                                      (if (zerop rem)
+                                          (float-and-scale
+                                           (if (zerop (logand fraction-and-guard 2))
+                                               fraction-and-guard
+                                               (1+ fraction-and-guard)))
+                                          (float-and-scale (1+ fraction-and-guard)))))
+                                   (t
+                                    (return (float-and-scale fraction-and-guard)))))
+                           (setq shifted-num (ash shifted-num -1))
+                           (incf scale))))))))))
   (def double-float)
   (def single-float))
-
-;;; This function is called when we are doing a truncate without any funky
-;;; divisor, i.e. converting a float or ratio to an integer. Note that we do
-;;; *not* return the second value of truncate, so it must be computed by the
-;;; caller if needed.
-;;;
-;;; In the float case, we pick off small arguments so that compiler
-;;; can use special-case operations.
-(defun %unary-truncate (number)
-  (declare (explicit-check number))
-  (macrolet ((fits-fixnum (type)
-               `(sb-xc:<= ,(symbol-value (symbolicate 'most-negative-fixnum- type))
-                          number
-                          ,(symbol-value (symbolicate 'most-positive-fixnum- type))))
-             (shift (type integer count)
-               `(,(case type
-                    #-64-bit
-                    (double-float 'ash)
-                    (t 'bignum-ashift-left-fixnum))
-                 ,integer ,count)))
-    (number-dispatch ((number real))
-      ((integer) number)
-      ((ratio) (values (truncate (numerator number) (denominator number))))
-      (((foreach single-float double-float #+long-float long-float))
-       (if (fits-fixnum (dispatch-type number))
-           (truly-the fixnum (%unary-truncate number))
-           (multiple-value-bind (bits exp sign) (integer-decode-float number)
-             (shift (dispatch-type number)
-                    (if (minusp sign)
-                        (- bits)
-                        bits)
-                    exp)))))))
-
-;;; Produce both values, unlike %unary-truncate
-(defun unary-truncate (number)
-  (declare (explicit-check number))
-  (macrolet ((fits-fixnum (type)
-               `(sb-xc:<= ,(symbol-value (symbolicate 'most-negative-fixnum- type))
-                          number
-                          ,(symbol-value (symbolicate 'most-positive-fixnum- type))))
-             (shift (type)
-               (case type
-                 #-64-bit
-                 (double-float
-                  ;; Shifting negatives right is different
-                  `(let ((truncated (ash bits exp)))
-                     (if (minusp sign)
-                         (- truncated)
-                         truncated)))
-                 (t
-                  `(bignum-ashift-left-fixnum (if (minusp sign)
-                                                  (- bits)
-                                                  bits)
-                                              exp)))))
-    (number-dispatch ((number real))
-      ((integer) (values number 0))
-      ((ratio)
-       (let ((truncated (truncate (numerator number) (denominator number))))
-         (values truncated
-                 (- number truncated))))
-      (((foreach single-float double-float #+long-float long-float))
-       (if (fits-fixnum (dispatch-type number))
-           (let* ((truncated (truly-the fixnum (%unary-truncate number))))
-             (values truncated
-                     (sb-xc:- number
-                              (coerce truncated '(dispatch-type number)))))
-           (multiple-value-bind (bits exp sign) (integer-decode-float number)
-             (let ((truncated (shift (dispatch-type number))))
-               (values
-                truncated
-                #+64-bit
-                (coerce 0 '(dispatch-type number))
-                #-64-bit
-                (if (eq '(dispatch-type number) 'single-float)
-                    (coerce 0 '(dispatch-type number))
-                    (sb-xc:- number (coerce truncated '(dispatch-type number))))))))))))
 
 ;;; Specialized versions for floats.
 (macrolet ((def (type name)
@@ -855,45 +778,6 @@
   (values (ceiling m)))
 (defun %unary-floor (m)
   (values (floor m)))
-
-;;; Similar to %UNARY-TRUNCATE, but rounds to the nearest integer. If we
-;;; can't use the round primitive, then we do our own round-to-nearest on the
-;;; result of i-d-f. [Note that this rounding will really only happen
-;;; with double floats on 32-bit architectures, where there are
-;;; fractional floats past most-x-fixnum]
-(defun %unary-round (number)
-  (declare (explicit-check))
-  (macrolet ((fits-fixnum (type)
-               `(sb-xc:<= ,(symbol-value (symbolicate 'most-negative-fixnum- type))
-                          number
-                          ,(symbol-value (symbolicate 'most-positive-fixnum- type)))))
-    (number-dispatch ((number real))
-      ((integer) number)
-      ((ratio) (values (round (numerator number) (denominator number))))
-      (((foreach single-float double-float #+long-float long-float))
-       (if (fits-fixnum (dispatch-type number))
-           (truly-the fixnum (%unary-round number))
-           #+64-bit
-           (multiple-value-bind (bits exp sign) (integer-decode-float number)
-             (bignum-ashift-left-fixnum
-              (if (minusp sign)
-                  (- bits)
-                  bits)
-              exp))
-           #-64-bit
-           (multiple-value-bind (bits exp) (integer-decode-float number)
-             (let* ((shifted (ash bits exp))
-                    (rounded (if (minusp exp)
-                                 (let ((fractional-bits (logand bits (lognot (ash -1 (- exp)))))
-                                       (0.5bits (ash 1 (- -1 exp))))
-                                   (cond
-                                     ((> fractional-bits 0.5bits) (1+ shifted))
-                                     ((< fractional-bits 0.5bits) shifted)
-                                     (t (if (oddp shifted) (1+ shifted) shifted))))
-                                 shifted)))
-               (if (minusp number)
-                   (- rounded)
-                   rounded))))))))
 
 #-round-float
 (defun %unary-fround (number)

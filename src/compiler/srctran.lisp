@@ -140,9 +140,12 @@
       (specifier-type 'cons)
       (lvar-type arg)))
 
-(unless-vop-existsp (:translate unaligned-dx-cons)
-  (define-source-transform unaligned-dx-cons (arg)
-    `(list ,arg)))
+(define-source-transform unaligned-dx-cons (arg)
+  (cond ((and (vop-existsp :translate unaligned-dx-cons)
+              *stack-allocate-dynamic-extent*)
+         (values nil t))
+        (t
+         `(list ,arg))))
 
 (define-source-transform make-list (length &rest rest &environment env)
   (if (or (null rest)
@@ -777,10 +780,14 @@
          (null type))
      val)
     ((consp val)
-     (let ((xbound (coerce-for-bound (car val) type)))
-       (if (coercion-loses-precision-p (car val) type)
-           xbound
-           (list xbound))))
+     (let ((val (car val)))
+       (if (and (floatp val)
+                (float-infinity-p val))
+           (list (coerce val type))
+           (let ((xbound (coerce-for-bound val type)))
+             (if (coercion-loses-precision-p val type)
+                 xbound
+                 (list xbound))))))
     ((subtypep type 'double-float)
      (if (sb-xc:<= most-negative-double-float val most-positive-double-float)
          (coerce val type)))
@@ -1603,7 +1610,7 @@
 ;;; For the case of member types, if a MEMBER-FUN is given it is
 ;;; called to compute the result otherwise the member type is first
 ;;; converted to a numeric type and the DERIVE-FUN is called.
-(defun one-arg-derive-type (arg derive-fun member-fun &optional (ratio-to-rational t))
+(defun one-arg-derive-type (arg derive-fun member-fun)
   (declare (type function derive-fun)
            (type (or null function) member-fun))
   (let ((arg-list (prepare-arg-for-derive-type (lvar-type arg))))
@@ -1619,12 +1626,8 @@
                           (arithmetic-error () nil))
                         ;; Otherwise convert to a numeric type.
                         (funcall derive-fun (convert-member-type x))))
-                   ((or (numeric-type-p x)
-                        (and (not ratio-to-rational)
-                             (eq x (specifier-type 'ratio))))
-                    (funcall derive-fun x))
-                   ((eq x (specifier-type 'ratio))
-                    (deriver (specifier-type 'rational))))))
+                   ((numeric-type-p x)
+                    (funcall derive-fun x)))))
         ;; Run down the list of args and derive the type of each one,
         ;; saving all of the results in a list.
         (let ((results nil))
@@ -1646,23 +1649,14 @@
 ;;; really represent the same lvar. This is useful for deriving the
 ;;; type of things like (* x x), which should always be positive. If
 ;;; we didn't do this, we wouldn't be able to tell.
-(defun two-arg-derive-type (arg1 arg2 derive-fun member-fun &optional (ratio-to-rational t))
+(defun two-arg-derive-type (arg1 arg2 derive-fun member-fun &optional)
   (%two-arg-derive-type (lvar-type arg1) (lvar-type arg2)
                         derive-fun member-fun
-                        (same-leaf-ref-p arg1 arg2)
-                        ratio-to-rational))
+                        (same-leaf-ref-p arg1 arg2)))
 
-(defun %two-arg-derive-type (arg1-type arg2-type derive-fun member-fun &optional same-leaf (ratio-to-rational t))
+(defun %two-arg-derive-type (arg1-type arg2-type derive-fun member-fun &optional same-leaf)
   (declare (type function derive-fun member-fun))
-  (labels ((numeric-or-ratio-p (x)
-             (or (numeric-type-p x)
-                 (eq x (specifier-type 'ratio))))
-           (deriver (x y same-arg)
-             (when ratio-to-rational
-               (when (eq x (specifier-type 'ratio))
-                 (setf x (specifier-type 'rational)))
-               (when (eq y (specifier-type 'ratio))
-                 (setf y (specifier-type 'rational))))
+  (labels ((deriver (x y same-arg)
              (cond ((and (member-type-p x) (member-type-p y))
                     (let* ((x (first (member-type-members x)))
                            (y (first (member-type-members y)))
@@ -1675,11 +1669,11 @@
                                                 :complexp :real))
                             (t
                              (specifier-type `(eql ,result))))))
-                   ((and (member-type-p x) (numeric-or-ratio-p y))
+                   ((and (member-type-p x) (numeric-type-p y))
                     (funcall derive-fun (convert-member-type x) y same-arg))
-                   ((and (numeric-or-ratio-p x) (member-type-p y))
+                   ((and (numeric-type-p x) (member-type-p y))
                     (funcall derive-fun x (convert-member-type y) same-arg))
-                   ((and (numeric-or-ratio-p x) (numeric-or-ratio-p y))
+                   ((and (numeric-type-p x) (numeric-type-p y))
                     (funcall derive-fun x y same-arg))
                    (t
                     *universal-type*)))
@@ -1710,7 +1704,13 @@
     (derive arg1-type arg2-type same-leaf)))
 
 (defun +-derive-type-aux (x y same-arg)
-  (cond ((and (numeric-type-real-p x)
+  (cond ((and (integer-type-p x)
+              (ratio-type-p y))
+         (specifier-type 'ratio))
+        ((and (integer-type-p y)
+              (ratio-type-p x))
+         (specifier-type 'ratio))
+        ((and (numeric-type-real-p x)
               (numeric-type-real-p y))
          (let* ((x-interval (numeric-type->interval x))
                 (y-interval (if same-arg
@@ -1741,22 +1741,23 @@
                           (interval-ratio-p x-interval)))
                  (type-intersection numeric (specifier-type 'ratio))
                  numeric))))
-        ((and (eq x (specifier-type 'ratio))
-              (numeric-type-p y)
-              (eq (numeric-type-class y) 'integer))
-         (specifier-type 'ratio))
-        ((and (eq y (specifier-type 'ratio))
-              (numeric-type-p x)
-              (eq (numeric-type-class x) 'integer))
-         (specifier-type 'ratio))
         (t
          (numeric-contagion x y))))
 
 (defoptimizer (+ derive-type) ((x y))
-  (two-arg-derive-type x y #'+-derive-type-aux #'sb-xc:+ nil))
+  (two-arg-derive-type x y #'+-derive-type-aux #'sb-xc:+))
 
 (defun --derive-type-aux (x y same-arg)
-  (cond ((and (numeric-type-real-p x)
+  (cond ((and (integer-type-p x)
+              (ratio-type-p y))
+         (specifier-type 'ratio))
+        ((and (integer-type-p y)
+              (ratio-type-p x))
+         (specifier-type 'ratio))
+        ((and same-arg
+              (ratio-type-p x))
+         (specifier-type '(integer 0 0)))
+        ((and (numeric-type-real-p x)
               (numeric-type-real-p y))
          (let* ((x-interval (numeric-type->interval x))
                 (y-interval (if same-arg
@@ -1792,25 +1793,17 @@
                           (interval-ratio-p x-interval)))
                  (type-intersection numeric (specifier-type 'ratio))
                  numeric))))
-        ((and (eq x (specifier-type 'ratio))
-              (numeric-type-p y)
-              (eq (numeric-type-class y) 'integer))
-         (specifier-type 'ratio))
-        ((and (eq y (specifier-type 'ratio))
-              (numeric-type-p x)
-              (eq (numeric-type-class x) 'integer))
-         (specifier-type 'ratio))
-        ((and same-arg
-              (eq x (specifier-type 'ratio)))
-         (specifier-type '(integer 0 0)))
         (t
          (numeric-contagion x y))))
 
 (defoptimizer (- derive-type) ((x y))
-  (two-arg-derive-type x y #'--derive-type-aux #'sb-xc:- nil))
+  (two-arg-derive-type x y #'--derive-type-aux #'sb-xc:-))
 
 (defun *-derive-type-aux (x y same-arg)
-  (cond ((and (numeric-type-real-p x)
+  (cond ((and same-arg
+              (ratio-type-p x))
+         (specifier-type '(and ratio (rational 0))))
+        ((and (numeric-type-real-p x)
               (numeric-type-real-p y))
          (let* ((x-interval (numeric-type->interval x))
                 (y-interval (if same-arg
@@ -1857,11 +1850,6 @@
                        (ratio-result-p y y-interval x-interval))
                    (type-intersection numeric (specifier-type 'ratio))
                    numeric)))))
-        ((and same-arg
-              (eq x (specifier-type 'ratio)))
-         ;; TODO: should be positive, but this result is an
-         ;; intersection type which other optimizers do not see.
-         (specifier-type 'ratio))
         (t
          (numeric-contagion x y))))
 
@@ -1876,14 +1864,14 @@
                  (return
                    (let ((result (%two-arg-derive-type (type-intersection x (specifier-type '(and integer (not (eql 0)))))
                                                        y
-                                                       #'*-derive-type-aux #'sb-xc:* nil)))
+                                                       #'*-derive-type-aux #'sb-xc:*)))
                      (when result
                        (type-union result (specifier-type '(eql 0)))))))))
         ;; If one of the integer arguments is non zero seperate the zero
         ;; result from the rest of the result range.
         (try-zero x-type y-type)
         (try-zero y-type x-type)
-        (two-arg-derive-type x y #'*-derive-type-aux #'sb-xc:* nil)))))
+        (two-arg-derive-type x y #'*-derive-type-aux #'sb-xc:*)))))
 
 (defoptimizer (%signed-multiply-high derive-type) ((x y))
   (two-arg-derive-type x y
@@ -1902,7 +1890,12 @@
   (%signed-multiply-high-derive-type-optimizer node))
 
 (defun /-derive-type-aux (x y same-arg)
-  (cond ((and (numeric-type-real-p x)
+  (cond ((and (ratio-type-p x)
+              (cond (same-arg
+                     (specifier-type '(integer 1 1)))
+                    ((integer-type-p y)
+                     (specifier-type 'ratio)))))
+        ((and (numeric-type-real-p x)
               (numeric-type-real-p y))
          (let* ((x-interval (numeric-type->interval x))
                 (y-interval (if same-arg
@@ -1947,17 +1940,11 @@
                              (interval-ratio-p x-interval))
                         (type-intersection numeric (specifier-type 'ratio))
                         numeric))))))
-        ((and (eq x (specifier-type 'ratio))
-              (cond (same-arg
-                     (specifier-type '(integer 1 1)))
-                    ((and (numeric-type-p y)
-                          (eq (numeric-type-class y) 'integer))
-                     (specifier-type 'ratio)))))
         (t
          (numeric-contagion x y))))
 
 (defoptimizer (/ derive-type) ((x y))
-  (two-arg-derive-type x y #'/-derive-type-aux #'sb-xc:/ nil))
+  (two-arg-derive-type x y #'/-derive-type-aux #'sb-xc:/))
 
 (defun ash-derive-type-aux (n-type shift same-arg)
   (declare (ignore same-arg))
@@ -1972,23 +1959,36 @@
          (ash-inner (n s)
            (if (and (fixnump s)
                     (> s most-negative-fixnum))
-             (ash n (min s 64))
-             (if (minusp n) -1 0))))
+               (ash n (min s 64))
+               (if (minusp n) -1 0))))
     (or (and (csubtypep n-type (specifier-type 'integer))
              (csubtypep shift (specifier-type 'integer))
              (let ((n-low (numeric-type-low n-type))
                    (n-high (numeric-type-high n-type))
                    (s-low (numeric-type-low shift))
                    (s-high (numeric-type-high shift)))
-               (make-numeric-type :class 'integer  :complexp :real
-                                  :low (when n-low
-                                         (if (minusp n-low)
-                                           (ash-outer n-low s-high)
-                                           (ash-inner n-low s-low)))
-                                  :high (when n-high
-                                          (if (minusp n-high)
-                                            (ash-inner n-high s-low)
-                                            (ash-outer n-high s-high))))))
+               (flet ((make (n-low n-high s-low s-high)
+                        (make-numeric-type :class 'integer
+                                           :low (when n-low
+                                                  (if (minusp n-low)
+                                                      (ash-outer n-low s-high)
+                                                      (ash-inner n-low s-low)))
+                                           :high (when n-high
+                                                   (if (minusp n-high)
+                                                       (ash-inner n-high s-low)
+                                                       (ash-outer n-high s-high))))))
+                 (cond ((eql n-low 0)
+                        (type-union (specifier-type '(eql 0))
+                                    (make (1+ n-low) n-high s-low s-high)))
+                       ((and (or (not n-low)
+                                 (minusp n-low))
+                             (or (not n-high)
+                                 (plusp n-high)))
+                        (type-union (make n-low -1 s-low s-high)
+                                    (specifier-type '(eql 0))
+                                    (make 1 n-high s-low s-high)))
+                       (t
+                        (make n-low n-high s-low s-high))))))
         *universal-type*)))
 
 (defoptimizer (ash derive-type) ((n shift))
@@ -2008,25 +2008,26 @@
 (defoptimizer (lognot derive-type) ((int))
   (one-arg-derive-type int #'lognot-derive-type-aux #'lognot))
 
-
 (defun %negate-derive-type-aux (type)
-  (if (eq type (specifier-type 'ratio))
-      type
-      (flet ((negate-bound (b)
-               (and b
-                    (set-bound (sb-xc:- (type-bound-number b))
-                               (consp b)))))
-        (modified-numeric-type
-         type
-         :low (negate-bound (numeric-type-high type))
-         :high (negate-bound (numeric-type-low type))))))
+  (flet ((negate-bound (b)
+           (and b
+                (set-bound (sb-xc:- (type-bound-number b))
+                           (consp b)))))
+    (let ((r
+            (modified-numeric-type
+             type
+             :low (negate-bound (numeric-type-high type))
+             :high (negate-bound (numeric-type-low type)))))
+      (if (ratio-type-p type)
+          (type-intersection r (specifier-type 'ratio))
+          r))))
 
 (defoptimizer (%negate derive-type) ((num))
-  (one-arg-derive-type num #'%negate-derive-type-aux #'sb-xc:- nil))
+  (one-arg-derive-type num #'%negate-derive-type-aux #'sb-xc:-))
 
 (defun abs-derive-type-aux (type)
-  (cond ((eq type (specifier-type 'ratio))
-         type)
+  (cond ((ratio-type-p type)
+         (specifier-type '(and ratio (rational 0))))
         ((eq (numeric-type-complexp type) :complex)
          ;; The absolute value of a complex number is always a
          ;; non-negative float.
@@ -2055,7 +2056,7 @@
                    (interval-high abs-bnd) bound-type))))))
 
 (defoptimizer (abs derive-type) ((num))
-  (one-arg-derive-type num #'abs-derive-type-aux #'abs nil))
+  (one-arg-derive-type num #'abs-derive-type-aux #'abs))
 
 (defun rem-result-type (number-type divisor-type)
   ;; Figure out what the remainder type is. The remainder is an
@@ -2097,8 +2098,6 @@
   (let* ((rem-type (rem-result-type number-type divisor-type))
          (number-interval (numeric-type->interval number-type))
          (divisor-interval (numeric-type->interval divisor-type)))
-    ;;(declare (type (member '(integer rational float)) rem-type))
-    ;; We have real numbers now.
     (cond ((eq rem-type 'integer)
            ;; Since the remainder type is INTEGER, both args are
            ;; INTEGERs.
@@ -2114,7 +2113,7 @@
                         (eql (interval-low divisor-interval) 1))
                    (values number-interval nil)
                    (values (interval-div number-interval
-                                         divisor-interval)))
+                                         divisor-interval) t))
              (let* ((*conservative-quotient-bound* conservative)
                     (quot (truncate-quotient-bound quot)))
                (specifier-type `(integer ,(or (interval-low quot) '*)
@@ -2927,7 +2926,7 @@
                (+ weight 10))))))
 
 (defun signum-derive-type-aux (type)
-  (cond ((eq type (specifier-type 'ratio))
+  (cond ((ratio-type-p type)
          (specifier-type '(or (eql 1) (eql -1))))
         ((eq (numeric-type-complexp type) :complex)
          (let* ((format (case (numeric-type-class type)
@@ -3210,6 +3209,14 @@
         *universal-type*)))
 
 ;;; Rightward ASH
+
+(deftransform ash ((integer amount) (integer (constant-arg (integer (#.(- sb-vm:n-word-bits)) -1))) *
+                   :node node :important nil)
+  (when (or (csubtypep (lvar-type integer) (specifier-type 'word))
+            (csubtypep (lvar-type integer) (specifier-type 'sb-vm:signed-word)))
+    (give-up-ir1-transform))
+  (delay-ir1-transform node :ir1-phases)
+  `(ash-right integer ,(- (lvar-value amount))))
 
 (when-vop-existsp (:translate sb-kernel:%ash/right)
   (defun %ash/right (integer amount)
@@ -3494,16 +3501,18 @@
     `(* integer ,(ash 1 shift))))
 
 (defun cast-or-check-bound-type (node &optional fixnum)
-  (multiple-value-bind (dest lvar) (immediately-used-let-dest (node-lvar node) node t)
-    (cond ((cast-p dest)
-           (and (cast-type-check dest)
-                (single-value-type (cast-type-to-check dest))))
-          ((and (combination-p dest)
-                (equal (combination-fun-debug-name dest) '(transform-for check-bound))
-                (eq (third (combination-args dest)) lvar))
-           (if fixnum
-               (specifier-type 'index)
-               (specifier-type 'sb-vm:signed-word))))))
+  (let ((lvar (node-lvar node)))
+    (when lvar
+      (multiple-value-bind (dest lvar) (immediately-used-let-dest lvar node t)
+        (cond ((cast-p dest)
+               (and (cast-type-check dest)
+                    (single-value-type (cast-type-to-check dest))))
+              ((and (combination-p dest)
+                    (equal (combination-fun-debug-name dest) '(transform-for check-bound))
+                    (eq (third (combination-args dest)) lvar))
+               (if fixnum
+                   (specifier-type 'index)
+                   (specifier-type 'sb-vm:signed-word))))))))
 
 (defun overflow-transform (name x y node &optional (swap t))
   (unless (node-lvar node)
@@ -3758,11 +3767,12 @@
         (give-up-ir1-transform))))
 
 (deftransform ceiling ((number divisor) (integer integer) * :node node)
+  (delay-ir1-transform node :constraint)
   (let ((truncate-type (truncate-derive-type-optimizer node)))
     (if (template-translates 'truncate (combination-args node) (single-value-type truncate-type))
-        (let* ((rem-int (type-approximate-interval (lvar-type divisor)))
-               (rem-type (let* ((low (interval-low rem-int))
-                                (high (interval-high rem-int))
+        (let* ((div-int (type-approximate-interval (lvar-type divisor)))
+               (rem-type (let* ((low (interval-low div-int))
+                                (high (interval-high div-int))
                                 (rem-low (cond ((not high) '*)
                                                ((<= high 1)
                                                 0)
@@ -3778,6 +3788,10 @@
                                  (high (interval-high n-int)))
                             (if (and low high)
                                 (let ((max (max (abs low) (abs high))))
+                                  (unless (or (interval-contains-p 1 div-int)
+                                              (interval-contains-p -1 div-int)
+                                              (= max 1))
+                                    (decf max))
                                   `(integer ,(- max) ,max))
                                 t))))
           `(multiple-value-bind (tru rem) (truncate number divisor)
@@ -3789,6 +3803,12 @@
                  (values tru
                          (truly-the ,rem-type rem)))))
         (give-up-ir1-transform))))
+
+(deftransform ceiling ((number divisor) ((and unsigned-byte fixnum) (and unsigned-byte fixnum)) * :result result)
+  (if (and result
+           (lvar-single-value-p result))
+      `(values (truly-the fixnum (truncate (+ number (1- divisor)) divisor)) 0)
+      (give-up-ir1-transform)))
 
 (define-source-transform rem (number divisor)
   `(nth-value 1 (truncate ,number ,divisor)))
@@ -3806,6 +3826,9 @@
 (deftransform floor ((number divisor) ((real (0) (1)) (integer (0) *)) * :important nil)
   `(values 0 number))
 
+(deftransform floor ((number divisor) ((real 0) (real 0)) * :important nil)
+  `(truncate number divisor))
+
 (deftransform truncate ((number divisor) ((and (real (-1) (1)) (not (eql -0d0)) (not (eql -0f0)))
                                           (and integer (not (eql 0))))
                         * :important nil)
@@ -3814,30 +3837,55 @@
 ;;; If arg is a constant power of two, turn FLOOR into a shift and
 ;;; mask. If CEILING, add in (1- (ABS Y)), do FLOOR and correct a
 ;;; remainder.
-(flet ((frob (y ceil-p)
-         (let* ((y (lvar-value y))
-                (y-abs (abs y))
-                (len (1- (integer-length y-abs))))
-           (unless (and (> y-abs 0) (= y-abs (ash 1 len)))
-             (give-up-ir1-transform))
-           (let ((shift (- len))
-                 (mask (1- y-abs))
-                 (delta (if ceil-p (* (signum y) (1- y-abs)) 0)))
-             `(let ((x (+ x ,delta)))
-                ,(if (minusp y)
-                     `(values (ash (- x) ,shift)
-                              (- (- (logand (- x) ,mask)) ,delta))
-                     `(values (ash x ,shift)
-                              (- (logand x ,mask) ,delta))))))))
-  (deftransform floor ((x y) (integer (constant-arg integer)) *)
-    "convert division by 2^k to shift"
-    (frob y nil))
-  (deftransform ceiling ((x y) (integer (constant-arg integer)) *)
-    "convert division by 2^k to shift"
-    (frob y t)))
+(deftransform floor ((x y) (integer (constant-arg integer)) *)
+  "convert division by 2^k to shift"
+  (let* ((y (lvar-value y))
+         (y-abs (abs y))
+         (len (1- (integer-length y-abs))))
+    (unless (and (> y-abs 0) (= y-abs (ash 1 len)))
+      (give-up-ir1-transform))
+    (let ((shift (- len))
+          (mask (1- y-abs)))
+      (if (minusp y)
+          `(values (ash (- x) ,shift)
+                   (- (logand (- x) ,mask)))
+          `(values (ash x ,shift)
+                   (logand x ,mask))))))
+
+(deftransform ceiling ((x y) (integer (constant-arg integer)) * :result result :node node)
+  "convert division by 2^k to shift"
+  (let* ((y (lvar-value y))
+         (y-abs (abs y))
+         (len (1- (integer-length y-abs))))
+    (unless (and (> y-abs 0) (= y-abs (ash 1 len)))
+      (give-up-ir1-transform))
+    (delay-ir1-optimizer node :constraint)
+    (let ((shift (- len))
+          (mask (1- y-abs))
+          (delta (* (signum y) (1- y-abs))))
+      (if (and (plusp y)
+               result
+               (lvar-single-value-p result)
+               (csubtypep (lvar-type result) (specifier-type 'word))
+               (not (csubtypep (lvar-type x)
+                               (make-numeric-type :class 'integer :low 0 :high (- sb-ext:most-positive-word delta)))))
+          ;; Avoid overflowing word-sized arithmetic
+          `(if (= x 0)
+               (values 0 0)
+               (values (1+ (ash (1- x) ,shift)) 0))
+          `(let ((x (+ x ,delta)))
+             ,(if (minusp y)
+                  `(values (ash (- x) ,shift)
+                           (- (- (logand (- x) ,mask)) ,delta))
+                  `(values (ash x ,shift)
+                           (- (logand x ,mask) ,delta))))))))
 
 ;;; If arg is a constant power of two, turn TRUNCATE into a shift and mask.
-(deftransform truncate ((x y) (integer (constant-arg integer)) *  :result result :node node)
+(deftransform truncate ((x y)
+                        (:or ((sb-vm:signed-word (constant-arg integer)) sb-vm:signed-word)
+                             ((unsigned-byte (constant-arg integer)) *))
+                        *  :result result :node node
+                           :important nil)
   "convert division by 2^k to shift"
   (let* ((y (lvar-value y))
          (y-abs (abs y))
@@ -3893,6 +3941,33 @@
     (let ((var (ok-lvar-lambda-var y gen)))
       (when var
         (list (list 'typep var (specifier-type '(eql 0)) t))))))
+
+;;; Multiplicative inverse using the Euclidean algorithm.
+;;; From Hacker's Delight.
+(defun mulinv (d mod)
+  (let ((x1 mod)
+        (v1 (logand (- d) mod))
+        (x2 1)
+        (v2 d)
+        (x3 0)
+        (v3 0)
+        (q 0))
+    (loop while (> v2 1)
+          do (setq q (floor v1 v2)
+                   x3 (- x1 (* q x2))
+                   v3 (- v1 (* q v2))
+                   x1 x2
+                   v1 v2
+                   x2 x3
+                   v2 v3))
+    (logand mod x2)))
+
+(defun count-trailing-zeros (integer)
+  (declare (type (unsigned-byte 64) integer))
+  (loop for i below 64
+        until (logbitp 0 integer)
+        do (setf integer (ash integer -1))
+        finally (return i)))
 
 ;;; Return an expression to calculate the integer quotient of X and
 ;;; constant Y, using multiplication, shift and add/sub instead of
@@ -4017,6 +4092,7 @@
                          *
                          :policy (and (> speed compilation-speed)
                                       (> speed space))
+                         :result result
                          :node node
                          :important nil)
    "convert integer division to multiplication"
@@ -4043,12 +4119,54 @@
                                                         '(and sb-vm:signed-word
                                                           (not unsigned-byte)))))))
            (give-up-ir1-transform))
-      `(let* ((quot (truly-the
-                     (integer ,(- (truncate max-x abs-y)) ,(truncate max-x abs-y))
-                     ,(gen-signed-truncate-by-constant-expr y precision)))
-              (rem (truly-the (integer ,(- 1 abs-y) ,(1- abs-y))
-                              (- x (truly-the sb-vm:signed-word (* quot ,y))))))
-         (values quot rem))))))
+       (let ((rem (and (mv-bind-unused-p result 0)
+                       (mv-bind-dest result 1 t))))
+         (or
+          (when (and rem
+                     (combination-matches 'eq '(* 0) rem))
+            (cond ((oddp y)
+                   (let* ((max-x most-positive-word)
+                          (inv (mulinv abs-y max-x))
+                          (cmp (truncate max-x abs-y)))
+                     (setf (node-derived-type node)
+                           (values-specifier-type '(values integer boolean &optional)))
+                     (erase-lvar-type result)
+                     (transform-call rem
+                                     `(lambda (x z)
+                                        (declare (ignore z))
+                                        x)
+                                     'truncate)
+                     `(values 0 (not (> (logand most-positive-word
+                                                (+ (logand most-positive-word (* (logand most-positive-word x) ,inv))
+                                                   ,(ash cmp -1)))
+                                        ,cmp)))))
+                  ((when-vop-existsp (:translate rotate-right-word)
+                     (let* ((max-x most-positive-word)
+                            (zeros (count-trailing-zeros abs-y))
+                            (odd (ash abs-y (- zeros)))
+                            (inv (mulinv odd max-x))
+                            (add (dpb 0 (byte zeros 0)
+                                      (truncate (ash max-x -1) odd)))
+                            (cmp (ash add (- 1 zeros))))
+                       (setf (node-derived-type node)
+                             (values-specifier-type '(values integer boolean &optional)))
+                       (erase-lvar-type result)
+                       (transform-call rem
+                                       `(lambda (x z)
+                                          (declare (ignore z))
+                                          x)
+                                       'truncate)
+                       `(values 0 (not (> (rotate-right-word (logand most-positive-word
+                                                                     (+ (logand most-positive-word (* (logand most-positive-word x) ,inv))
+                                                                        ,add))
+                                                             ,zeros)
+                                          ,cmp))))))))
+          `(let* ((quot (truly-the
+                         (integer ,(- (truncate max-x abs-y)) ,(truncate max-x abs-y))
+                         ,(gen-signed-truncate-by-constant-expr y precision)))
+                  (rem (truly-the (integer ,(- 1 abs-y) ,(1- abs-y))
+                                  (- x (truly-the sb-vm:signed-word (* quot ,y))))))
+             (values quot rem))))))))
 
 ;;; The paper also has this,
 ;;; but it seems to overflow when adding to X
@@ -4081,6 +4199,7 @@
                         *
                         :policy (and (> speed compilation-speed)
                                      (> speed space))
+                        :result result
                         :node node
                         :important nil)
   "convert integer division to multiplication"
@@ -4093,11 +4212,58 @@
     ;; Division by zero, one or powers of two is handled elsewhere.
     (when (zerop (logand y (1- y)))
       (give-up-ir1-transform))
-    `(let* ((quot (truly-the (integer 0 ,(truncate max-x y))
-                             ,(gen-unsigned-div-by-constant-expr y max-x)))
-            (rem (truly-the (mod ,y)
-                            (- x (* quot ,y)))))
-       (values quot rem))))
+    (let ((rem (and (mv-bind-unused-p result 0)
+                    (mv-bind-dest result 1 t)))
+          plusp)
+      (or
+       (when (and rem
+                  (or (combination-matches 'eq '(* 0) rem)
+                      (and (combination-matches '> '(* 0) rem)
+                           (setf plusp t))))
+         (cond ((oddp y)
+                (let* ((max-x (1- (ash 1 (integer-length max-x))))
+                       (inv (mulinv y max-x)))
+                  (setf (node-derived-type node)
+                        (values-specifier-type '(values integer boolean &optional)))
+                  (erase-lvar-type result)
+                  (transform-call rem
+                                  `(lambda (x z)
+                                     (declare (ignore z))
+                                     x)
+                                  'truncate)
+                  `(values 0 ,(wrap-if (not plusp) '(not)
+                                       `(> (truly-the word (logand (* x ,inv) ,max-x))
+                                           ,(truncate max-x y))))))
+               ((when-vop-existsp (:translate rotate-right-word)
+                  (let* ((max-x most-positive-word)
+                         (zeros (count-trailing-zeros y))
+                         (inv (mulinv (ash y (- zeros)) max-x)))
+                    (setf (node-derived-type node)
+                          (values-specifier-type '(values integer boolean &optional)))
+                    (erase-lvar-type result)
+                    (transform-call rem
+                                    `(lambda (x z)
+                                       (declare (ignore z))
+                                       x)
+                                    'truncate)
+                    `(values 0 ,(wrap-if (not plusp) '(not)
+                                         `(> (rotate-right-word (truly-the word (logand (* x ,inv) ,max-x))
+                                                                ,zeros)
+                                             ,(truncate max-x y)))))))))
+       `(let* ((quot (truly-the (integer 0 ,(truncate max-x y))
+                                ,(gen-unsigned-div-by-constant-expr y max-x)))
+               (rem (truly-the (mod ,y)
+                               (- x (* quot ,y)))))
+          (values quot rem))))))
+
+(deftransform truncate ((x y) (word (and sb-vm:signed-word (integer * 0))) * :node node :important nil)
+  (when (or (csubtypep (lvar-type x) (specifier-type 'sb-vm:signed-word))
+            (and (constant-lvar-p y)
+                 (<= (logcount (- (lvar-value y))) 1)))
+    (give-up-ir1-transform))
+  (delay-ir1-transform node :ir1-phases)
+  `(multiple-value-bind (q r) (truncate x (- y))
+     (values (- q) r)))
 
 ;;; No-op when Y is greater than X
 (deftransform truncate ((x y) (rational rational) * :important nil)
@@ -4125,6 +4291,17 @@
                (> y-min x-max))
           `(values 0 x)
           (give-up-ir1-transform)))))
+
+(make-defs (($fun truncate ceiling floor))
+  (deftransform $fun ((x y) (sb-vm:signed-word sb-vm:signed-word) * :node node :important nil)
+    (delay-ir1-transform node :ir1-phases)
+    (when (csubtypep (single-value-type (node-asserted-type node))
+                     (specifier-type 'sb-vm:signed-word))
+      (give-up-ir1-transform))
+    `(if (and (= y -1)
+              (= x ,(- #1=(expt 2 (1- sb-vm:n-word-bits)))))
+         (values ,#1# 0)
+         (truly-the sb-vm:signed-word ($fun x y)))))
 
 
 ;;;; arithmetic and logical identity operation elimination
@@ -4204,13 +4381,15 @@
 ;;; More complicated stuff that also depends on commutativity
 ;;; (e.g. (f (f x k1) (f y k2)) => (f (f x y) (f k1 k2))) should
 ;;; probably be handled with a more general tree-rewriting pass.
-(macrolet ((def (operator &key (type 'integer) (folded (list operator)))
-             `(deftransform ,operator ((x z) (,type (constant-arg ,type)))
+(macrolet ((def (operator &key (type 'integer) (folded (list operator))
+                               (combine operator)
+                               flip no-ratios)
+             `(deftransform ,operator ((x z) (,type (constant-arg ,type)) * :important nil :node n)
                 ,(format nil "associate ~A/~A of constants"
                          operator folded)
-                (binding* ((node  (if (lvar-has-single-use-p x)
-                                      (lvar-use x)
-                                      (give-up-ir1-transform)))
+                (binding* ((node (if (lvar-has-single-use-p x)
+                                     (lvar-use x)
+                                     (give-up-ir1-transform)))
                            (folded (or (and (combination-p node)
                                             (car (memq (lvar-fun-name
                                                         (combination-fun node))
@@ -4219,26 +4398,84 @@
                            (y   (second (combination-args node)))
                            (nil (or (constant-lvar-p y)
                                     (give-up-ir1-transform)))
-                           (y   (lvar-value y)))
-                  (unless (typep y ',type)
-                    (give-up-ir1-transform))
+                           (y (funcall folded (lvar-value y)))
+                           (z (funcall ',(if flip
+                                             operator
+                                             'identity)
+                                       (lvar-value z)))
+                           (constant (funcall ',(or flip
+                                                    combine)
+                                              z y)))
+                  ,@(when no-ratios
+                      `((when (and (integerp y)
+                                   (ratiop constant)
+                                   (eq folded ',no-ratios))
+                          (give-up-ir1-transform))))
                   (splice-fun-args x folded 2)
                   `(lambda (x y z)
                      (declare (ignore y z))
                      ;; (operator (folded x y) z)
                      ;; == (operator x (folded z y))
-                     (,',operator x (,folded ,(lvar-value z) ,y)))))))
+                     (,',(if flip flip operator) x ,constant))))))
   (def logand)
   (def logior)
   (def logxor)
-  (def logtest :folded (logand))
+  (def logtest :folded (logand) :combine logand)
   (def + :type rational :folded (+ -))
-  (def * :type rational :folded (* /)))
+  (def - :type rational :folded (+ -) :flip +)
+  (def * :type rational :folded (* /))
+  (def / :type rational :folded (* /) :flip * :no-ratios *))
+
+;;; Transform (logior a (- (mask-field (byte 1 n) a)))
+;;; to (mask-signed-field n a)
+(when-vop-existsp (:translate mask-signed-field)
+  (deftransform logior ((a b) (integer integer) * :node node)
+    ;; Gotta abstract this
+    (flet ((transform (a b a-var)
+             (let ((%negate (lvar-uses b)))
+               (when (combination-is %negate '(%negate))
+                 (let* ((negate-arg (car (combination-args %negate)))
+                        (logand (lvar-uses negate-arg)))
+                   (when (combination-is logand '(logand))
+                     (let ((logand-args (combination-args logand)))
+                       (when (= (length logand-args) 2)
+                         (destructuring-bind (a2 c) logand-args
+                           (when (constant-lvar-p c)
+                             (let* ((constant (lvar-value c))
+                                    (size (integer-length constant)))
+                               (when (and (= (logcount constant) 1)
+                                          (<= size sb-vm:n-word-bits)
+                                          (csubtypep (lvar-type a) (specifier-type `(unsigned-byte ,size)))
+                                          (same-leaf-ref-p a a2))
+                                 `(mask-signed-field ,size ,a-var)))))))))))))
+      (or (transform a b 'a)
+          (transform b a 'b)
+          (progn
+            (delay-ir1-optimizer node :constraint)
+            (give-up-ir1-transform))))))
+
+(deftransform * ((x y) (t (constant-arg ratio)))
+  (let* ((y (lvar-value y))
+         (reciprocal (/ y)))
+    (if (and (integerp reciprocal)
+             (ignore-errors
+              (maybe-exact-reciprocal (float y))))
+        `(/ x ,reciprocal)
+        (give-up-ir1-transform))))
 
 (deftransform * ((x y) (rational (constant-arg ratio)))
   (let ((y (/ (lvar-value y))))
     (if (integerp y)
         `(/ x ,y)
+        (give-up-ir1-transform))))
+
+(deftransform / ((x y) (t (constant-arg ratio)))
+  (let* ((y (lvar-value y))
+         (reciprocal (/ y)))
+    (if (and (integerp reciprocal)
+             (ignore-errors
+              (maybe-exact-reciprocal (float y))))
+        `(* x ,reciprocal)
         (give-up-ir1-transform))))
 
 (deftransform / ((x y) (rational (constant-arg ratio)))
@@ -4249,24 +4486,47 @@
 
 (deftransform mask-signed-field ((width x) ((constant-arg unsigned-byte) t))
   "Fold mask-signed-field/mask-signed-field of constant width"
-  (binding* ((node  (if (lvar-has-single-use-p x)
-                        (lvar-use x)
-                        (give-up-ir1-transform)))
-             (nil (or (combination-p node)
-                      (give-up-ir1-transform)))
-             (nil (or (eq (lvar-fun-name (combination-fun node))
-                          'mask-signed-field)
-                      (give-up-ir1-transform)))
-             (x-width (first (combination-args node)))
-             (nil (or (constant-lvar-p x-width)
-                      (give-up-ir1-transform)))
-             (x-width (lvar-value x-width)))
-    (unless (typep x-width 'unsigned-byte)
-      (give-up-ir1-transform))
-    (splice-fun-args x 'mask-signed-field 2)
-    `(lambda (width x-width x)
-       (declare (ignore width x-width))
-       (mask-signed-field ,(min (lvar-value width) x-width) x))))
+  (or
+   ;; (mask-signed-field n (ldb (byte n 0) a))
+   ;; => (mask-signed-field n a)
+   (let ((logand (lvar-uses x)))
+     (or (when (combination-is logand '(logand logandc2))
+           (let ((logand-args (combination-args logand)))
+             (when (= (length logand-args) 2)
+               (destructuring-bind (a c) logand-args
+                 (when (constant-lvar-p c)
+                   (let* ((constant (lvar-value c))
+                          (constant (if (combination-is logand '(logandc2))
+                                        (lognot constant)
+                                        constant))
+                          (size (integer-length constant)))
+                     (when (and (plusp constant)
+                                (= (logcount constant) size)
+                                (>= size (lvar-value width))
+                                (csubtypep (lvar-type a) (specifier-type 'sb-vm:signed-word))
+                                (splice-fun-args x :any 2 nil))
+                       `(lambda (width x constant)
+                          (declare (ignore constant))
+                          (mask-signed-field width x)))))))))))
+
+   (binding* ((node  (if (lvar-has-single-use-p x)
+                         (lvar-use x)
+                         (give-up-ir1-transform)))
+              (nil (or (combination-p node)
+                       (give-up-ir1-transform)))
+              (nil (or (eq (lvar-fun-name (combination-fun node))
+                           'mask-signed-field)
+                       (give-up-ir1-transform)))
+              (x-width (first (combination-args node)))
+              (nil (or (constant-lvar-p x-width)
+                       (give-up-ir1-transform)))
+              (x-width (lvar-value x-width)))
+     (unless (typep x-width 'unsigned-byte)
+       (give-up-ir1-transform))
+     (splice-fun-args x 'mask-signed-field 2)
+     `(lambda (width x-width x)
+        (declare (ignore width x-width))
+        (mask-signed-field ,(min (lvar-value width) x-width) x)))))
 
 ;;; These are restricted to rationals, because (- 0 0.0) is 0.0, not -0.0, and
 ;;; (* 0 -4.0) is -0.0.
@@ -5707,10 +5967,25 @@
     (t
      0)))
 
-(deftransform / ((numerator denominator) (integer integer))
+(deftransform / ((numerator denominator) (integer integer) integer)
+  `(values (truncate numerator denominator)))
+
+(deftransform / ((numerator denominator)
+                 (:or ((word word) *)
+                      ((sb-vm:signed-word sb-vm:signed-word) *))
+                 * :node node :important nil)
+  (let ((cast (or (cast-or-check-bound-type node)
+                  (give-up-ir1-transform))))
+    (if (csubtypep (type-intersection cast (specifier-type 'rational))
+                   (specifier-type 'integer))
+        `(multiple-value-bind (q rem) (truncate numerator denominator)
+           (unless (eql rem 0)
+             (sb-vm::op-not-type2-error numerator denominator '(,(type-specifier cast) . /)))
+           q)
+        (give-up-ir1-transform))))
+
+(deftransform / ((numerator denominator) (integer (constant-arg integer)))
   "convert x/2^k to shift"
-  (unless (constant-lvar-p denominator)
-    (give-up-ir1-transform))
   (let* ((denominator (lvar-value denominator))
          (bits (1- (integer-length denominator))))
     (unless (and (> denominator 0) (= (ash 1 bits) denominator))
@@ -5803,24 +6078,36 @@
          (var (when (ref-p use) (ref-leaf use)))
          (home (when (lambda-var-p var) (lambda-var-home var)))
          (info (when (lambda-var-p var) (lambda-var-arg-info var)))
-         (restp (when info (eq :rest (arg-info-kind info)))))
-    (flet ((ref-good-for-more-context-p (ref)
-             (when (not (node-lvar ref)) ; ref that goes nowhere is ok
-               (return-from ref-good-for-more-context-p t))
-             (let ((dest (principal-lvar-end (node-lvar ref))))
-               (and (combination-p dest)
-                    ;; If the destination is to anything but these, we're going to
-                    ;; actually need the rest list -- and since other operations
-                    ;; might modify the list destructively, the using the context
-                    ;; isn't good anywhere else either.
-                    (lvar-fun-is (combination-fun dest)
-                                 '(%rest-values %rest-ref %rest-length
-                                   %rest-null %rest-true))
-                    ;; If the home lambda is different and isn't DX, it might
-                    ;; escape -- in which case using the more context isn't safe.
-                    (let ((clambda (node-home-lambda dest)))
-                      (or (eq home clambda)
-                          (leaf-dynamic-extent clambda)))))))
+         (restp (when info (eq :rest (arg-info-kind info))))
+         (seen '()))
+    (labels ((ref-good-for-more-context-p (ref)
+               (when (not (node-lvar ref)) ; ref that goes nowhere is ok
+                 (return-from ref-good-for-more-context-p t))
+               (let ((dest (principal-lvar-end (node-lvar ref))))
+                 (and (combination-p dest)
+                      ;; If the destination is to anything but these, we're going to
+                      ;; actually need the rest list -- and since other operations
+                      ;; might modify the list destructively, the using the context
+                      ;; isn't good anywhere else either.
+                      (lvar-fun-is (combination-fun dest)
+                                   '(%rest-values %rest-ref %rest-length
+                                     %rest-null %rest-true %rest-listify))
+                      ;; If the home lambda is different and isn't DX, it might
+                      ;; escape -- in which case using the more context isn't safe.
+                      (dx-node-p dest))))
+             (dx-node-p (node)
+               (let ((fun (node-home-lambda node)))
+                 (or (eq home fun)
+                     (and (or (leaf-dynamic-extent fun)
+                              (let ((entry (or (lambda-entry-fun fun)
+                                               (lambda-optional-dispatch fun))))
+                                (and entry
+                                     (leaf-dynamic-extent entry))))
+                          (cond ((member fun seen) t)
+                                (t
+                                 (push fun seen)
+                                 (loop for ref in (leaf-refs fun)
+                                       always (dx-node-p ref)))))))))
       (let ((ok (and restp
                      (consp (arg-info-default info))
                      (not (lambda-var-specvar var))
@@ -5897,9 +6184,60 @@
 (define-source-transform list-length (list) (source-transform-length list))
 
 (defoptimizer (length derive-type) ((sequence))
-  (when (csubtypep (lvar-type sequence) (specifier-type 'list))
-    (specifier-type '(mod #.(truncate sb-vm::max-dynamic-space-size
-                             (* sb-vm:cons-size sb-vm:n-word-bytes))))))
+  (when (csubtypep (lvar-type sequence) (specifier-type '(or vector list)))
+    (let ((list-int (type-intersection (lvar-type sequence) (specifier-type 'list))))
+      (unless (eq list-int *empty-type*)
+        (let* ((vector-int (type-intersection (lvar-type sequence) (specifier-type 'vector)))
+               (vector (and (neq vector-int *empty-type*)
+                            (vector-length-type vector-int))))
+          (when (or (eq vector-int *empty-type*)
+                    vector)
+            (let ((list (cond ((eq list-int (specifier-type 'null))
+                               (specifier-type '(integer 0 0)))
+                              ((csubtypep list-int (specifier-type 'cons))
+                               (specifier-type '(integer
+                                                 1
+                                                 (#.(truncate sb-vm::max-dynamic-space-size
+                                                     (* sb-vm:cons-size sb-vm:n-word-bytes))))))
+                              (t
+                               (specifier-type '(integer
+                                                 0
+                                                 (#.(truncate sb-vm::max-dynamic-space-size
+                                                     (* sb-vm:cons-size sb-vm:n-word-bytes)))))))))
+              (if vector
+                  (type-union list vector)
+                  list))))))))
+
+;;; Optimize (zerop (length sequence))
+(defoptimizer (length optimizer) ((sequence) node)
+  (when (and (policy node (< safety 3)) ;; signaling errors for improper lists
+             (csubtypep (lvar-type sequence) (specifier-type '(or vector list)))
+             (not (csubtypep (lvar-type sequence) (specifier-type 'vector))))
+    (let ((dest (node-dest node)))
+      (cond ((and (combination-matches 'eq '(* 0) dest)
+                  (when (splice-fun-args (first (combination-args dest))
+                                         'length 1 nil)
+                    (transform-call dest
+                                    `(lambda (sequence zero)
+                                       (declare (ignore zero))
+                                       (if (listp sequence)
+                                           (eq sequence nil)
+                                           (eq (length (truly-the vector sequence)) 0)))
+                                    'length-optimizer-optimizer)
+                    t)))
+            ((and (combination-matches '> '(* 0) dest)
+                  (when (splice-fun-args (first (combination-args dest))
+                                         'length 1 nil)
+                    (transform-call dest
+                                    `(lambda (sequence zero)
+                                       (declare (ignore zero))
+                                       (if (listp sequence)
+                                           (not (eq sequence nil))
+                                           (> (length (truly-the vector sequence)) 0)))
+                                    'length-optimizer-optimizer)
+                    t)))
+            (t
+             (delay-ir1-optimizer node :constraint))))))
 
 ;;; ENDP, NULL and NOT -> %REST-NULL
 ;;;
@@ -5947,6 +6285,26 @@
   (if (rest-var-more-context-ok list)
       `(not (eql 0 count))
       `list))
+
+;;; Unlike a plain reference to &rest it will only allocate when
+;;; executed and won't stop other %rest functions
+(define-source-transform %rest-list (rest)
+  (multiple-value-bind (context count) (possible-rest-arg-context rest)
+    (if context
+        `(%rest-listify ,rest ,context ,count)
+        rest)))
+
+(deftransform %rest-listify ((list context count))
+  (if (rest-var-more-context-ok list)
+      `(%listify-rest-args context count)
+      `list))
+
+(define-source-transform %rest-context (rest)
+  (multiple-value-bind (context count) (possible-rest-arg-context rest)
+    (if context
+        `(progn ,rest (values ,context ,count))
+        (bug "no &REST context"))))
+
 
 ;;;; transforming FORMAT
 ;;;;
@@ -6674,8 +7032,8 @@
         symbol
         (give-up-ir1-transform))))
 
-(deftransform boundp ((symbol) ((constant-arg symbol)) * :policy (< safety 3))
-  (if (always-boundp (lvar-value symbol))
+(deftransform boundp ((symbol) ((constant-arg symbol)) * :policy (< safety 3) :node node)
+  (if (always-boundp (lvar-value symbol) node)
       t
       (give-up-ir1-transform)))
 
@@ -6924,8 +7282,7 @@
               node))))
        (go :next))))
 
-(defun next-node (node-or-block &key type (cast t) single-predecessor
-                                     strict)
+(defun next-node (node-or-block &key type single-predecessor strict)
   (let ((node node-or-block)
         ctran)
     (tagbody
@@ -6943,10 +7300,6 @@
               (typecase node
                 (ref (unless (eq type :non-ref)
                        (return-from next-node node)))
-                (cast
-                 (when (or strict
-                           (not cast))
-                   (return-from next-node node)))
                 (enclose
                  (when strict
                    (return-from next-node node)))

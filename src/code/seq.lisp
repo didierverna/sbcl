@@ -375,75 +375,143 @@
   "Return a sequence of the given RESULT-TYPE and LENGTH, with
   elements initialized to INITIAL-ELEMENT."
   (declare (index length) (explicit-check))
-  (let* ((expanded-type (typexpand result-type))
-         (adjusted-type
-          (typecase expanded-type
-            (atom (cond
-                    ((eq expanded-type 'string) '(vector character))
-                    ((eq expanded-type 'simple-string)
-                     '(simple-array character (*)))
-                    (t expanded-type)))
-            (cons (cond
-                    ((eq (car expanded-type) 'string)
-                     `(vector character ,@(cdr expanded-type)))
-                    ((eq (car expanded-type) 'simple-string)
-                     `(simple-array character ,(if (cdr expanded-type)
-                                                   (cdr expanded-type)
-                                                   '(*))))
-                    (t expanded-type)))))
-         (type (specifier-type adjusted-type))
-         (list-type (specifier-type 'list)))
-    (cond ((csubtypep type list-type)
+  (flet ((try (type)
            (cond
-             ((type= type list-type)
-              (make-list length :initial-element initial-element))
-             ((eq type *empty-type*)
-              (bad-sequence-type-error nil))
-             ((type= type (specifier-type 'null))
-              (if (= length 0)
-                  'nil
-                  (sequence-type-length-mismatch-error type length)))
-             ((cons-type-p type)
-              (multiple-value-bind (min exactp)
-                  (sb-kernel::cons-type-length-info type)
-                (if exactp
-                    (unless (= length min)
-                      (sequence-type-length-mismatch-error type length))
-                    (unless (>= length min)
-                      (sequence-type-length-mismatch-error type length)))
-                (make-list length :initial-element initial-element)))
-             ;; We'll get here for e.g. (OR NULL (CONS INTEGER *)),
-             ;; which may seem strange and non-ideal, but then I'd say
-             ;; it was stranger to feed that type in to MAKE-SEQUENCE.
-             (t (sequence-type-too-hairy (type-specifier type)))))
-          ((csubtypep type (specifier-type 'vector))
-           (cond
-             (;; is it immediately obvious what the result type is?
-              (typep type 'array-type)
-              (aver (= (length (array-type-dimensions type)) 1))
-              (let* ((etype (type-specifier
-                             (array-type-specialized-element-type type)))
-                     (etype (if (eq etype '*) t etype))
-                     (type-length (car (array-type-dimensions type))))
-                (unless (or (eq type-length '*)
-                            (= type-length length))
-                  (sequence-type-length-mismatch-error type length))
+             ((eq type 'list)
+              (return-from make-sequence (make-list length :initial-element initial-element)))
+             ((or (eq type 'vector)
+                  (eq type 'simple-vector))
+              (return-from make-sequence
                 (if iep
-                    (make-array length :element-type etype
-                                :initial-element initial-element)
-                    (make-array length :element-type etype))))
-             (t (sequence-type-too-hairy (type-specifier type)))))
-          ((when-extended-sequence-type
-               (expanded-type type :expandedp t :prototype prototype)
-             ;; This function has the EXPLICIT-CHECK declaration, so
-             ;; we manually assert that it returns a SEQUENCE.
-             (the extended-sequence
-                  (if iep
-                      (sb-sequence:make-sequence-like
-                       prototype length :initial-element initial-element)
-                      (sb-sequence:make-sequence-like
-                       prototype length)))))
-          (t (bad-sequence-type-error (type-specifier type))))))
+                    (make-array length  :initial-element initial-element)
+                    (make-array length))))
+             ((or (eq type 'string)
+                  (eq type 'simple-string))
+              (return-from make-sequence
+                (if iep
+                    (make-array length :element-type 'character :initial-element initial-element)
+                    (make-array length :element-type 'character))))
+             ((and (consp result-type)
+                   (let ((element-type
+                           (case (car type)
+                             (vector
+                              (let ((et-cdr (cdr type)))
+                                (when (consp et-cdr)
+                                  (let ((et-car (car et-cdr))
+                                        (d-cdr (cdr et-cdr)))
+                                    (when (and (consp d-cdr)
+                                               (or (cdr d-cdr)
+                                                   (not (eql (car d-cdr) length))))
+                                      (return-from try))
+                                    (case et-car
+                                      (* t)
+                                      (t et-car))))))
+                             ((array simple-array)
+                              (let ((et-cdr (cdr type)))
+                                (when (consp et-cdr)
+                                  (let ((et-car (car et-cdr))
+                                        (d-cdr (cdr et-cdr)))
+                                    (when (or (atom d-cdr)
+                                              (cdr d-cdr))
+                                      (return-from try))
+                                    (let ((d-car (car d-cdr)))
+                                      (unless (eql d-car 1)
+                                        (when (or (atom d-car)
+                                                  (cdr d-car))
+                                          (return-from try))
+                                        (let ((d-length (car d-car)))
+                                          (unless (or (eq d-length '*)
+                                                      (eql d-length length))
+                                            (return-from try)))))
+                                    (case et-car
+                                      (* t)
+                                      (t et-car)))))))))
+                     (when element-type
+                       (multiple-value-bind (widetag n-bits-shift)
+                           (sb-vm::%vector-widetag-and-n-bits-shift element-type)
+                         (let ((vector
+                                 (sb-vm::allocate-vector-with-widetag
+                                  #+ubsan nil widetag length n-bits-shift)))
+                           (when iep
+                             (fill vector initial-element))
+                           (return-from make-sequence vector)))))))
+             ((or (eq type 'base-string)
+                  (eq type 'simple-base-string))
+              (return-from make-sequence
+                (if iep
+                    (make-array length :element-type 'base-char :initial-element initial-element)
+                    (make-array length :element-type 'base-char)))))))
+    (try result-type)
+    (multiple-value-bind (expanded-type expanded) (typexpand result-type)
+      (when expanded
+        (try expanded-type))
+      (let* ((adjusted-type
+               (typecase expanded-type
+                 (atom (cond
+                         ((eq expanded-type 'string) '(vector character))
+                         ((eq expanded-type 'simple-string)
+                          '(simple-array character (*)))
+                         (t expanded-type)))
+                 (cons (cond
+                         ((eq (car expanded-type) 'string)
+                          `(vector character ,@(cdr expanded-type)))
+                         ((eq (car expanded-type) 'simple-string)
+                          `(simple-array character ,(if (cdr expanded-type)
+                                                        (cdr expanded-type)
+                                                        '(*))))
+                         (t expanded-type)))))
+             (type (specifier-type adjusted-type))
+             (list-type (specifier-type 'list)))
+        (cond ((csubtypep type list-type)
+               (cond
+                 ((eq type list-type)
+                  (make-list length :initial-element initial-element))
+                 ((eq type *empty-type*)
+                  (bad-sequence-type-error nil))
+                 ((eq type (specifier-type 'null))
+                  (if (= length 0)
+                      'nil
+                      (sequence-type-length-mismatch-error type length)))
+                 ((cons-type-p type)
+                  (multiple-value-bind (min exactp)
+                      (sb-kernel::cons-type-length-info type)
+                    (if exactp
+                        (unless (= length min)
+                          (sequence-type-length-mismatch-error type length))
+                        (unless (>= length min)
+                          (sequence-type-length-mismatch-error type length)))
+                    (make-list length :initial-element initial-element)))
+                 ;; We'll get here for e.g. (OR NULL (CONS INTEGER *)),
+                 ;; which may seem strange and non-ideal, but then I'd say
+                 ;; it was stranger to feed that type in to MAKE-SEQUENCE.
+                 (t (sequence-type-too-hairy (type-specifier type)))))
+              ((csubtypep type (specifier-type 'vector))
+               (cond
+                 (;; is it immediately obvious what the result type is?
+                  (typep type 'array-type)
+                  (let* ((etype (type-specifier
+                                 (array-type-specialized-element-type type)))
+                         (etype (if (eq etype '*) t etype))
+                         (type-length (car (array-type-dimensions type))))
+                    (unless (or (eq type-length '*)
+                                (= type-length length))
+                      (sequence-type-length-mismatch-error type length))
+                    (if iep
+                        (make-array length :element-type etype
+                                           :initial-element initial-element)
+                        (make-array length :element-type etype))))
+                 (t (sequence-type-too-hairy (type-specifier type)))))
+              ((when-extended-sequence-type
+                   (expanded-type type :expandedp t :prototype prototype)
+                 ;; This function has the EXPLICIT-CHECK declaration, so
+                 ;; we manually assert that it returns a SEQUENCE.
+                 (the extended-sequence
+                      (if iep
+                          (sb-sequence:make-sequence-like
+                           prototype length :initial-element initial-element)
+                          (sb-sequence:make-sequence-like
+                           prototype length)))))
+              (t (bad-sequence-type-error (type-specifier type))))))))
 
 ;;;; SUBSEQ
 ;;;;
@@ -1448,32 +1516,29 @@ many elements are copied."
            (type list sequences))
   (declare (dynamic-extent fun))
   (let ((result nil))
-    (flet ((f (&rest args)
-             (declare (dynamic-extent args))
-             (push (apply fun args) result)))
-      (declare (dynamic-extent #'f))
-      (%map-for-effect #'f sequences))
+    (%map-for-effect (lambda (&rest args)
+                       (declare (dynamic-extent args))
+                       (push (apply fun args) result))
+                     sequences)
     (nreverse result)))
 (defun %map-to-vector (output-type-spec fun sequences)
   (declare (type function fun)
            (type list sequences))
   (declare (dynamic-extent fun))
   (let ((min-len 0))
-    (flet ((f (&rest args)
-             (declare (dynamic-extent args))
-             (declare (ignore args))
-             (incf min-len)))
-      (declare (dynamic-extent #'f))
-      (%map-for-effect #'f sequences))
+    (%map-for-effect (lambda (&rest args)
+                       (declare (dynamic-extent args))
+                       (declare (ignore args))
+                       (incf min-len))
+                     sequences)
     (let ((result (make-sequence output-type-spec min-len))
           (i 0))
       (declare (type (simple-array * (*)) result))
-      (flet ((f (&rest args)
-               (declare (dynamic-extent args))
-               (setf (aref result i) (apply fun args))
-               (incf i)))
-        (declare (dynamic-extent #'f))
-        (%map-for-effect #'f sequences))
+      (%map-for-effect (lambda (&rest args)
+                         (declare (dynamic-extent args))
+                         (setf (aref result i) (apply fun args))
+                         (incf i))
+                       sequences)
       result)))
 
 ;;; %MAP is just MAP without the final just-to-be-sure check that
@@ -1999,49 +2064,90 @@ many elements are copied."
 ;;; LIST-REMOVE-MACRO does not include (removes) each element that satisfies
 ;;; the predicate.
 (defmacro list-remove-macro (pred reverse?)
-  `(let* ((sequence ,(if reverse?
-                         '(reverse (the list sequence))
-                         'sequence))
-          (%start ,(if reverse? '(- length end) 'start))
-          (%end ,(if reverse? '(- length start) 'end))
-          (splice (list nil))
-          (tail (and (/= %end length)
-                     (nthcdr %end sequence)))
-          (results ,(if reverse?
-                          ;; It's already copied by REVERSE, so it can
-                          ;; be modified here
-                          `(if (plusp %start)
-                               (let* ((tail (nthcdr (1- %start) sequence))
-                                      (remaining (cdr tail)))
-                                 (setf (cdr tail) nil)
-                                 (prog1 splice
-                                   (rplacd splice sequence)
-                                   (setf splice tail
-                                         sequence remaining)))
-                               splice)
-                          `(do ((index 0 (1+ index))
-                                (before-start splice))
-                               ((= index (the fixnum %start)) before-start)
-                             (declare (fixnum index))
-                             (setf splice
-                                   (cdr (rplacd splice (list (pop sequence)))))))))
-     (declare (dynamic-extent splice))
-     (do ((this-element)
-          (number-zapped 0))
-         ((cond ((eq tail sequence)
-                 (rplacd splice tail)
-                 t)
-                ((= number-zapped count)
-                 (rplacd splice sequence)
-                 t))
-          ,(if reverse?
-               '(nreverse (the list (cdr results)))
-               '(cdr results)))
-       (declare (index number-zapped))
-       (setf this-element (pop sequence))
-       (if ,pred
-           (incf number-zapped)
-           (setf splice (cdr (rplacd splice (list this-element))))))))
+    (if reverse?
+        `(let* ((sequence (reverse (the list sequence)))
+                (end (or end length))
+                (%start (- length end))
+                (%end (- length start))
+                (splice (list nil))
+                (tail (and (/= %end length)
+                           (nthcdr %end sequence)))
+                (results ;; It's already copied by REVERSE, so it can
+                  ;; be modified here
+                  (if (plusp %start)
+                      (let* ((tail (nthcdr (1- %start) sequence))
+                             (remaining (cdr tail)))
+                        (setf (cdr tail) nil)
+                        (prog1 splice
+                          (rplacd splice sequence)
+                          (setf splice tail
+                                sequence remaining)))
+                      splice)))
+           (declare (dynamic-extent splice))
+           (do ((this-element)
+                (number-zapped 0))
+               ((cond ((eq tail sequence)
+                       (rplacd splice tail)
+                       t)
+                      ((= number-zapped count)
+                       (rplacd splice sequence)
+                       t))
+                (nreverse (the list (cdr results))))
+             (declare (index number-zapped))
+             (setf this-element (pop sequence))
+             (if ,pred
+                 (incf number-zapped)
+                 (setf splice (cdr (rplacd splice (list this-element)))))))
+        `(let ((save sequence)
+               (list (nthcdr start sequence)))
+           (collect (((result append-tail)))
+             (if (eq count (1- most-positive-fixnum))
+                 (if end
+                     (loop for i from start below end
+                           do (let ((current list)
+                                    (this-element (pop list)))
+                                (cond (,pred
+                                       (loop for x on save
+                                             until (eq x current)
+                                             do (result (car x)))
+                                       (setf save list)))))
+                     (loop while list
+                           do (let ((current list)
+                                    (this-element (pop list)))
+                                (cond (,pred
+                                       (loop for x on save
+                                             until (eq x current)
+                                             do (result (car x)))
+                                       (setf save list))))))
+                 (let ((number-zapped 0))
+                   (declare (index number-zapped))
+                   (if end
+                       (loop for i from start below end
+                             while (< number-zapped count)
+                             do (let ((current list)
+                                      (this-element (pop list)))
+                                  (cond (,pred
+                                         (incf number-zapped)
+                                         (loop for x on save
+                                               until (eq x current)
+                                               do (result (car x)))
+                                         (setf save list)))))
+                       (loop while (and list
+                                        (< number-zapped count))
+                             do (let ((current list)
+                                      (this-element (pop list)))
+                                  (cond (,pred
+                                         (incf number-zapped)
+                                         (loop for x on save
+                                               until (eq x current)
+                                               do (result (car x)))
+                                         (setf save list))))))))
+             (let ((result (result)))
+               (cond (result
+                      (append-tail save)
+                      result)
+                     (t
+                      save)))))))
 
 (defmacro list-remove (pred)
   `(list-remove-macro ,pred nil))
@@ -2085,18 +2191,17 @@ many elements are copied."
   (declare (type fixnum start)
            (dynamic-extent args))
   (declare (explicit-check sequence :result))
-  (seq-dispatch-checking=>seq sequence
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if from-end
-          (normal-list-remove-from-end)
-          (normal-list-remove)))
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if from-end
-          (normal-mumble-remove-from-end)
-          (normal-mumble-remove)))
-    (apply #'sb-sequence:remove item sequence args)))
+  (seq-dispatch-checking=>seq
+   sequence
+   (if from-end
+       (normal-list-remove-from-end)
+       (normal-list-remove))
+   (let ((end (or end length)))
+     (declare (type index end))
+     (if from-end
+         (normal-mumble-remove-from-end)
+         (normal-mumble-remove)))
+   (apply #'sb-sequence:remove item sequence args)))
 
 (define-sequence-traverser remove-if
     (predicate sequence &rest args &key from-end start end count key)

@@ -128,92 +128,113 @@
               (values drop-through target)
               (values target drop-through))
         (assemble ()
-          (cond (widetag
-                 (unless (and value-tn-ref
-                              (= lowtag other-pointer-lowtag)
-                              (other-pointer-tn-ref-p value-tn-ref nil-in-other-pointers immediate-tested))
-                   (multiple-value-bind (bit set) (tn-ref-lowtag-bit lowtag value-tn-ref
+          (flet ((check-widetag (target not-p)
+                   (unless (and value-tn-ref
+                                (= lowtag other-pointer-lowtag)
+                                (other-pointer-tn-ref-p value-tn-ref nil-in-other-pointers immediate-tested))
+                     (multiple-value-bind (bit set) (tn-ref-lowtag-bit lowtag value-tn-ref
                                                                        nil-in-other-pointers immediate-tested)
-                     (case set
-                       (1
-                        (inst tbz* value bit when-false))
-                       (0
-                        (inst tbnz* value bit when-false))
-                       (t
-                        (%test-lowtag value widetag when-false t lowtag)))))
-                 (load-type widetag value (- lowtag)))
-                (t
-                 (setf widetag value
-                       temp tmp-tn)))
-          (do ((remaining headers (cdr remaining)))
-              ((null remaining))
-            (let ((header (car remaining))
-                  (last (null (cdr remaining))))
-              (cond
-                ((and (eql header simple-array-widetag)
-                      value-tn-ref
-                      (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'string))))
-                ((atom header)
-                 (cond
-                   ((and (not last) (null (cddr remaining))
-                         (atom (cadr remaining))
-                         (= (logcount (logxor header (cadr remaining))) 1))
-                    (inst and temp widetag (%logical-mask
-                                         (ldb (byte 8 0) (logeqv header (cadr remaining)))))
-                    (inst cmp temp (ldb (byte 8 0) (logand header (cadr remaining))))
-                    (inst b (if not-p :ne :eq) target)
-                    (return))
-                   (t
-                    (inst cmp widetag header)
-                    (if last
-                        (inst b (if not-p :ne :eq) target)
-                        (inst b :eq when-true)))))
-                (t
-                 (let ((start (car header))
-                       (end (cdr header)))
-                   (cond
-                     ((and last (not (= start bignum-widetag))
-                           (= (+ start 4) end)
-                           (= (logcount (logxor start end)) 1))
-                      (inst and temp widetag (%logical-mask
-                                           (ldb (byte 8 0) (logeqv start end))))
-                      (inst cmp temp (ldb (byte 8 0) (logand start end)))
-                      (inst b (if not-p :ne :eq) target))
-                     ((and (not last) (null (cddr remaining))
-                           (= (+ start 4) end) (= (logcount (logxor start end)) 1)
-                           (listp (cadr remaining))
-                           (= (+ (caadr remaining) 4) (cdadr remaining))
-                           (= (logcount (logxor (caadr remaining) (cdadr remaining))) 1)
-                           (= (logcount (logxor (caadr remaining) start)) 1))
-                      (inst and temp widetag (ldb (byte 8 0) (logeqv start (cdadr remaining))))
-                      (inst cmp temp (ldb (byte 8 0) (logand start (cdadr remaining))))
-                      (inst b (if not-p :ne :eq) target)
-                      (return))
-                     ((and last
-                           value-tn-ref
-                           (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'array))
-                           (= start simple-array-widetag))
-                      (inst cmp widetag end)
-                      (inst b (if not-p :gt :le) target))
-                     ((and last
-                           (/= start bignum-widetag)
-                           (/= end complex-array-widetag))
-                      (inst sub temp widetag start)
-                      (inst cmp temp (- end start))
-                      (inst b (if not-p :hi :ls) target))
+                       (when (and set (not not-p))
+                         (setf set (logxor set 1)))
+                       (case set
+                         (1
+                          (inst tbz* value bit target))
+                         (0
+                          (inst tbnz* value bit target))
+                         (t
+                          (%test-lowtag value widetag target not-p lowtag))))
+                     t)))
+            (cond
+              ((and value-tn-ref
+                    ;; Is testing only the lowtag enough?
+                    (eq lowtag other-pointer-lowtag)
+                    (let ((widetags (sb-c::type-other-pointer-widetags (tn-ref-type value-tn-ref))))
+                      (when widetags
+                        (loop for widetag in widetags
+                              always
+                              (loop for header in headers
+                                    thereis (if (consp header)
+                                                (<= (car header) widetag (cdr header))
+                                                (eql widetag header)))))))
+               (or (check-widetag target not-p)
+                   (unless not-p
+                     (inst b target))))
+              (t
+               (cond (widetag
+                      (check-widetag when-false t)
+                      (load-type widetag value (- lowtag)))
                      (t
-                      (unless (= start bignum-widetag)
-                        (inst cmp widetag start)
-                        (if (= end complex-array-widetag)
-                            (progn
-                              (aver last)
-                              (inst b (if not-p :lt :ge) target))
-                            (inst b :lt when-false)))
-                      (unless (= end complex-array-widetag)
-                        (inst cmp widetag end)
-                        (if last
-                            (inst b (if not-p :gt :le) target)
-                            (inst b :le when-true))))))))))
+                      (setf widetag value
+                            temp tmp-tn)))
+               (do ((remaining headers (cdr remaining)))
+                   ((null remaining))
+                 (let ((header (car remaining))
+                       (last (null (cdr remaining))))
+                   (cond
+                     ((and (eql header simple-array-widetag)
+                           value-tn-ref
+                           (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'string))))
+                     ((atom header)
+                      (cond
+                        ((and (not last) (null (cddr remaining))
+                              (atom (cadr remaining))
+                              (= (logcount (logxor header (cadr remaining))) 1))
+                         (inst and temp widetag (%logical-mask
+                                                 (ldb (byte 8 0) (logeqv header (cadr remaining)))))
+                         (inst cmp temp (ldb (byte 8 0) (logand header (cadr remaining))))
+                         (inst b (if not-p :ne :eq) target)
+                         (return))
+                        (t
+                         (inst cmp widetag header)
+                         (if last
+                             (inst b (if not-p :ne :eq) target)
+                             (inst b :eq when-true)))))
+                     (t
+                      (let ((start (car header))
+                            (end (cdr header)))
+                        (cond
+                          ((and last (not (= start bignum-widetag))
+                                (= (+ start 4) end)
+                                (= (logcount (logxor start end)) 1))
+                           (inst and temp widetag (%logical-mask
+                                                   (ldb (byte 8 0) (logeqv start end))))
+                           (inst cmp temp (ldb (byte 8 0) (logand start end)))
+                           (inst b (if not-p :ne :eq) target))
+                          ((and (not last) (null (cddr remaining))
+                                (= (+ start 4) end) (= (logcount (logxor start end)) 1)
+                                (listp (cadr remaining))
+                                (= (+ (caadr remaining) 4) (cdadr remaining))
+                                (= (logcount (logxor (caadr remaining) (cdadr remaining))) 1)
+                                (= (logcount (logxor (caadr remaining) start)) 1))
+                           (inst and temp widetag (ldb (byte 8 0) (logeqv start (cdadr remaining))))
+                           (inst cmp temp (ldb (byte 8 0) (logand start (cdadr remaining))))
+                           (inst b (if not-p :ne :eq) target)
+                           (return))
+                          ((and last
+                                value-tn-ref
+                                (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'array))
+                                (= start simple-array-widetag))
+                           (inst cmp widetag end)
+                           (inst b (if not-p :gt :le) target))
+                          ((and last
+                                (/= start bignum-widetag)
+                                (/= end complex-array-widetag))
+                           (inst sub temp widetag start)
+                           (inst cmp temp (- end start))
+                           (inst b (if not-p :hi :ls) target))
+                          (t
+                           (unless (= start bignum-widetag)
+                             (inst cmp widetag start)
+                             (if (= end complex-array-widetag)
+                                 (progn
+                                   (aver last)
+                                   (inst b (if not-p :lt :ge) target))
+                                 (inst b :lt when-false)))
+                           (unless (= end complex-array-widetag)
+                             (inst cmp widetag end)
+                             (if last
+                                 (inst b (if not-p :gt :le) target)
+                                 (inst b :le when-true)))))))))))))
           (emit-label drop-through))))))
 
 ;;;; Other integer ranges.
@@ -691,11 +712,8 @@
 (define-vop (non-null-symbol-p type-predicate)
   (:translate non-null-symbol-p)
   (:generator 7
-    (when (types-equal-or-intersect (tn-ref-type args) (specifier-type 'null))
-      (inst cmp value null-tn)
-      (inst b :eq (if not-p target drop-thru)))
-    (test-type value temp target not-p (symbol-widetag) :value-tn-ref args)
-    drop-thru))
+    (test-type value temp target not-p (symbol-widetag) :value-tn-ref args
+               :nil-in-other-pointers nil)))
 
 (define-vop (consp type-predicate)
   (:translate consp)

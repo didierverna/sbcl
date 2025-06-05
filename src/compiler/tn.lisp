@@ -308,6 +308,7 @@
                        :alias (tn-primitive-type tn) nil)))
     (setf (tn-save-tn res) tn
           (tn-type res) (tn-type tn))
+    (setf (tn-vertex tn) :alias)
     (push-in tn-next res
              (ir2-component-alias-tns component))
     res))
@@ -354,14 +355,14 @@
           (let ((w (tn-writes ,tn)))
             (when w
               (setf (tn-ref-prev w) ,ref))
-            (setf (tn-ref-next ref) w
-                  (tn-writes tn) ,ref)))
+            (setf (tn-ref-next ,ref) w
+                  (tn-writes ,tn) ,ref)))
          (t
           (let ((r (tn-reads ,tn)))
             (when r
               (setf (tn-ref-prev r) ,ref))
             (setf (tn-ref-next ,ref) r
-                  (tn-reads tn) ,ref)))))
+                  (tn-reads ,tn) ,ref)))))
 
 ;;; Make a TN-REF that references TN and return it. WRITE-P should be
 ;;; true if this is a write reference, otherwise false. All we do
