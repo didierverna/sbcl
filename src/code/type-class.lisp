@@ -280,9 +280,10 @@
 ;;; and return NIL. This seems kinda sloppy. Can we get rid of that "feature"?
 (declaim (inline contains-unknown-type-p contains-hairy-type-p opaque-type-p))
 (defun contains-unknown-type-p (ctype)
-  (if ctype (oddp (type-%bits ctype)) nil))
+  (and ctype
+       (logtest (type-%bits ctype) ctype-contains-unknown)))
 (defun contains-hairy-type-p (ctype)
-  (logbitp 1 (type-%bits ctype)))
+  (logtest (type-%bits ctype) ctype-contains-hairy))
 
 ;;; Can't do optimizations for satisfies, unknown types or standard-class.
 (defun opaque-type-p (ctype)
@@ -290,9 +291,10 @@
 
 (defun ok-to-memoize-p (arg)
   (etypecase arg
-    (ctype (evenp (type-%bits arg))) ; i.e. not CTYPE-CONTAINS-UNKNOWN
+    (ctype (not (logtest (type-%bits arg) ctype-contains-unknown)))
     (list  (dolist (elt arg t)
-             (when (oddp (type-%bits elt)) (return nil))))))
+             (when (logtest (type-%bits elt) ctype-contains-unknown)
+               (return nil))))))
 
 (defmacro type-class-id (ctype) `(ldb (byte 5 ,ctype-PRNG-nbits) (type-%bits ,ctype)))
 (defmacro type-id->type-class (id) `(truly-the type-class (aref *type-classes* ,id)))
@@ -870,19 +872,11 @@
   ;;  :single-warning-for-single-undefined-type
   (specifier nil :type t :test equal :hasher sb-c::fallback-hash))
 
-(macrolet ((hash-fp-zeros (x) ; order-insensitive
-             `(let ((h 0))
-                (dolist (x ,x h) (setq h (logxor (sb-xc:sxhash x) h)))))
-           (fp-zeros= (a b)
-             `(let ((a ,a) (b ,b))
-                (and (= (length a) (length b))
-                     (every (lambda (x) (member x b)) a)))))
 ;;; A MEMBER-TYPE represent a use of the MEMBER type specifier. We
 ;;; bother with this at this level because MEMBER types are fairly
 ;;; important and union and intersection are well defined.
-(def-type-model (member-type (:constructor* nil (xset fp-zeroes)))
-  (xset nil :type xset :hasher xset-elts-hash :test xset=)
-  (fp-zeroes nil :type list :hasher hash-fp-zeros :test fp-zeros=)))
+(def-type-model (member-type (:constructor* nil (xset)))
+  (xset nil :type xset :hasher xset-elts-hash :test xset=))
 (define-load-time-global *xset-mutex* (or #-sb-xc-host (sb-thread:make-mutex :name "xset")))
 ;;; This hashset is guarded by *XSET-MUTEX*. It is _not_ declared as synchronized
 ;;; so that HASHSET-INSERT-IF-ABSENT should not acquire a mutex inside a mutex
@@ -1123,8 +1117,6 @@
   (typecase x
     (numeric-union-type
      (<= (length (numeric-union-type-ranges x)) 3))))
-
-
 
 (defun numeric-type-low (x)
   (let ((ranges (numeric-union-type-ranges x)))

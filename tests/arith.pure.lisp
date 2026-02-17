@@ -441,17 +441,17 @@
                       2596148429267413814265248164610048))))
 
 (with-test (:name (expt 0 0))
-  ;; Check that (expt 0.0 0.0) and (expt 0 0.0) signal error, but
-  ;; (expt 0.0 0) returns 1.0
-  (flet ((error-case (expr)
-           (checked-compile-and-assert (:allow-style-warnings t)
-               `(lambda () ,expr)
-             (() (condition 'sb-int:arguments-out-of-domain-error)))))
-    (error-case '(expt 0.0 0.0))
-    (error-case '(expt 0 0.0)))
-  (checked-compile-and-assert (:allow-style-warnings t)
-      `(lambda () (expt 0.0 0))
-    (() 1.0)))
+  (checked-compile-and-assert ()
+      `(lambda (x y) (expt x y))
+    ((0 0) 1)
+    ((0f0 0) 1f0)
+    ((0d0 0) 1d0)
+    ((0 0f0) 1f0)
+    ((0 0d0) 1d0)
+    ((0d0 0f0) 1d0)
+    ((0f0 0d0) 1d0)
+    ((0f0 -0f0) 1f0)
+    ((-0f0 0f0) 1f0)))
 
 (with-test (:name :multiple-constant-folding)
   (let ((*random-state* (make-random-state t)))
@@ -881,6 +881,14 @@
       ()
       `(lambda (x b)
          (logand #xFF (ash (the (unsigned-byte 64) x) (the (integer -1000 1000) b))))
+    (((1- (expt 2 64)) -63) 1)
+    (((1- (expt 2 64)) -64) 0)))
+
+(with-test (:name :ash-cut-unsafe)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x b)
+         (truly-the fixnum (ash (the (unsigned-byte 64) x) (the (integer -1000 1000) b))))
     (((1- (expt 2 64)) -63) 1)
     (((1- (expt 2 64)) -64) 0)))
 

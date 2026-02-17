@@ -93,7 +93,7 @@
   (def make-fdefn)
   (def fdefn-name)
   (def fdefn-fun)
-  (def fdefn-makunbound)
+  #-linkage-space (def fdefn-makunbound)
   (def sb-c::vector-length)
   (def make-array-header (type rank))
   (def code-instructions)
@@ -139,9 +139,10 @@
   #+compare-and-swap-vops
   (def* (%array-atomic-incf/word (array index diff))
         (%raw-instance-atomic-incf/word (instance index diff)))
+  #+(or arm64 x86 x86-64)
+  (def* (sb-vm::%vector-cas-pair (vector index old1 old2 new1 new2)))
   #+(or x86 x86-64)
   (def* (sb-vm::%cpu-identification (eax ecx))
-        (sb-vm::%vector-cas-pair (vector index old1 old2 new1 new2))
         (sb-vm::%instance-cas-pair (instance index old1 old2 new1 new2))
         (sb-vm::%cons-cas-pair (cons old1 old2 new1 new2)))
 
@@ -165,13 +166,16 @@
   (def symbol-package-id)
   (def symbol-hash)
   (def symbol-%info) ; primitive reader always needs a stub
-  #-(or x86 x86-64 arm64 riscv) (def lra-code-header)
+  #-(or x86 x86-64 arm64 riscv loongarch64) (def lra-code-header)
   (def %make-lisp-obj)
-  (def get-lisp-obj-address)
   #+x86-64
   (def single-float-copysign (float float2))
   #+x86-64
-  (def single-float-sign))
+  (def single-float-sign)
+  #+64-bit
+  (def %make-double-float)
+  (def %numerator)
+  (def %denominator))
 
 #+sb-simd-pack
 (macrolet ((def (name)
@@ -213,3 +217,9 @@
   (setq sb-c::*undefined-warnings* nil))
 
 (setf (fdefinition 'unaligned-dx-cons) #'list)
+
+(defun rotate-right-word (n count)
+  (dpb
+   n
+   (byte count (- sb-vm:n-word-bits count))
+   (ash n (- count))))

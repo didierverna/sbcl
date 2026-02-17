@@ -9,10 +9,6 @@
  * files for more information.
  */
 
-#ifndef GENCGC_IS_PRECISE
-#error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
-#endif
-
 /* One bit of page_words_t is the need_zerofill flag.
  * That leaves 15 bits to store page_words_used. This can represent
  * a page size of up to 64KiB on 32-bit and 128KiB on 64-bit.
@@ -260,7 +256,7 @@ struct __attribute__((packed)) corefile_pte {
  *
  */
 extern unsigned char *gc_card_mark;
-extern long gc_card_table_mask;
+extern sword_t gc_card_table_mask;
 #define addr_to_card_index(addr) ((((uword_t)addr)>>GENCGC_CARD_SHIFT) & gc_card_table_mask)
 #define page_to_card_index(n) addr_to_card_index(page_address(n))
 

@@ -859,7 +859,7 @@ typedef uint8_t  ub1;\n");
       mem_stream_printf(f, infix ? "ub4 scramble[] = {\n" : "32)");
       for (i=0; i<=UB1MAXVAL; i+=4)
         mem_stream_printf(f,
-                infix ? "0x%.8x, 0x%.8x, 0x%.8x, 0x%.8x,\n" : " #x%8x #x%8x #x%8x #x%8x\n",
+                infix ? "0x%.8x, 0x%.8x, 0x%.8x, 0x%.8x,\n" : " #x%x #x%x #x%x #x%x\n",
                 scramble[i+0], scramble[i+1], scramble[i+2], scramble[i+3]);
     }
     else
@@ -932,18 +932,18 @@ typedef uint8_t  ub1;\n");
     mem_stream_printf(f, infix ? "};\n\n" : ")))\n");
     ++extra_parens;
   }
-  int indent = 0, newline = 0;
+  int indent = 0, newline = 0, more_indent = (blen>0)*2;
   char *comment = 0;
   for (i=0; i<final->used; ++i) {
     char* line = final->line[i];
     if (!line[0]) continue; // empty line
     if (newline) mem_stream_printf(f,"\n");
     newline = 0;
-    int j; for(j=0;j<indent;++j) mem_stream_printf(f," ");
-    mem_stream_printf(f, "  ");
+    int j; for(j=0;j<indent+more_indent;++j) mem_stream_printf(f," ");
 
     comment = strchr(line, ';');
     if (comment && !form->comments) { // strip the comment
+        if (comment[-1] == ' ') --comment;
         mem_stream_printf(f, "%.*s", comment-line, line);
         comment = 0;
     } else

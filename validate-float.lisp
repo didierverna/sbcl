@@ -25,7 +25,7 @@
                              (cons (and (consp y) (eqal (car x) (car y)) (eqal (cdr x) (cdr y))))
                              (symbol (eql x y))
                              (rational (eql x y))
-                             (float (eql x y))
+                             (float (= x y))
                              (string (string= x y)))))
                   (unless (eqal actual result)
                     (cerror "Continue"

@@ -9,6 +9,7 @@
  * files for more information.
  */
 
+#define _GNU_SOURCE
 #include "genesis/sbcl.h"
 #include "lispobj.h"
 
@@ -276,10 +277,13 @@ void save_gc_crashdump(char *pathname,
 #endif
 
 static cmd call_cmd, dump_cmd, print_cmd, quit_cmd, help_cmd;
-static cmd flush_cmd, regs_cmd, exit_cmd;
+static cmd flush_cmd, regs_cmd, exit_cmd, print_code, set_context_cmd;
 static cmd print_context_cmd, pte_cmd, search_cmd, hashtable_cmd;
 static cmd backtrace_cmd, threadbt_cmd, catchers_cmd;
 static cmd threads_cmd, findpath_cmd, layouts_cmd;
+#ifdef ATOMIC_LOGGING
+static cmd events_cmd;
+#endif
 
 extern void gc_stop_the_world(), gc_start_the_world();
 static void suspend_other_threads() {
@@ -387,7 +391,7 @@ static int findpath_cmd(char **ptr, iochannel_t io) {
     struct weak_pointer* wp =
       (void*)(wp_mem + (((uword_t)wp_mem & LOWTAG_MASK) ? N_WORD_BYTES : 0));
     wp->header = ((WEAK_POINTER_SIZE-1)<<N_WIDETAG_BITS)|WEAK_POINTER_WIDETAG;
-    if (parse_lispobj(ptr, &wp->value)) {
+    if (parse_lispobj(ptr, &wp->value, io->out)) {
         list.car = make_lispobj(wp, OTHER_POINTER_LOWTAG);
         list.cdr = NIL;
         result.header = SIMPLE_VECTOR_WIDETAG;
@@ -429,10 +433,10 @@ static int verify_cmd(char __attribute__((unused)) **ptr,
     unsuspend_other_threads();
     return 0;
 }
-static int gc_cmd(char **ptr, __attribute__((unused)) iochannel_t io) {
+static int gc_cmd(char **ptr, iochannel_t io) {
     int last_gen = 0;
     extern generation_index_t verify_gens;
-    if (more_p(ptr)) parse_number(ptr, &last_gen);
+    if (more_p(ptr)) parse_number(ptr, &last_gen, io->out);
     gencgc_verbose = 2;
     pre_verify_gen_0 = 1;
     verify_gens = 0;
@@ -466,8 +470,12 @@ static struct cmd {
     {"call", "Call FUNCTION with ARG1, ARG2, ...", call_cmd},
     {"catchers", "Print a list of all the active catchers.", catchers_cmd},
     {"context", "Print interrupt context number I.", print_context_cmd},
+    {"set_context", "Set the current context.", set_context_cmd},
     {"dump", "Dump memory starting at ADDRESS for COUNT words.", dump_cmd},
     {"d", "(an alias for dump)", dump_cmd},
+#ifdef ATOMIC_LOGGING
+    {"events", "Dump signal-related event log", events_cmd},
+#endif
     {"exit", "Exit this instance of the monitor.", exit_cmd},
     {"findpath", "Find path to an object.", findpath_cmd},
     {"flush", "Flush all temp variables.", flush_cmd},
@@ -475,6 +483,7 @@ static struct cmd {
     {"layouts", "Dump LAYOUT instances.", layouts_cmd},
     {"print", "Print object at ADDRESS.", print_cmd},
     {"p", "(an alias for print)", print_cmd},
+    {"code", "Print the code object at ADDRESS.", print_code},
     {"pte", "Page table entry for address", pte_cmd},
     {"quit", "Quit.", quit_cmd},
     {"regs", "Display current Lisp registers.", regs_cmd},
@@ -525,7 +534,7 @@ static int NO_SANITIZE_MEMORY dump_cmd(char **ptr, iochannel_t io)
         }
         if (!parse_addr(ptr, !force, &addr, io->out)) return 0;
 
-        if (more_p(ptr) && !parse_number(ptr, &count)) return 0;
+        if (more_p(ptr) && !parse_number(ptr, &count, io->out)) return 0;
     }
 
     if (count == 0) {
@@ -620,7 +629,18 @@ static int NO_SANITIZE_MEMORY dump_cmd(char **ptr, iochannel_t io)
 static int print_cmd(char **ptr, iochannel_t io)
 {
     lispobj obj;
-    if (parse_lispobj(ptr, &obj)) print_to_iochan(obj, io);
+    if (parse_lispobj(ptr, &obj, io->out)) print_to_iochan(obj, io);
+    return 0;
+}
+
+static int print_code(char **ptr, iochannel_t io)
+{
+    lispobj obj;
+    if (parse_lispobj(ptr, &obj, io->out)) {
+        lispobj * code = component_ptr_from_pc((char *)obj);
+        if (code)
+            print_to_iochan((lispobj)code | OTHER_POINTER_LOWTAG, io);
+    }
     return 0;
 }
 
@@ -695,7 +715,7 @@ int verify_lisp_hashtable(__attribute__((unused)) struct hash_table* ht,
 static int hashtable_cmd(char **ptr, iochannel_t io)
 {
     lispobj obj;
-    if (parse_lispobj(ptr, &obj)) {
+    if (parse_lispobj(ptr, &obj, io->out)) {
         int errors = verify_lisp_hashtable((void*)native_pointer(obj),
                                            io->out);
         if (errors) fprintf(io->out, "Errors: %d\n", errors);
@@ -707,7 +727,7 @@ static int pte_cmd(char **ptr, iochannel_t io)
 {
     extern void gc_show_pte(lispobj, FILE*);
     lispobj obj;
-    if (parse_lispobj(ptr, &obj)) gc_show_pte(obj, io->out);
+    if (parse_lispobj(ptr, &obj, io->out)) gc_show_pte(obj, io->out);
     return 0;
 }
 
@@ -740,7 +760,7 @@ static int regs_cmd(char __attribute__((unused)) **ptr, iochannel_t io)
 static int call_cmd(char **ptr, iochannel_t io)
 {
     lispobj thing;
-    parse_lispobj(ptr, &thing);
+    parse_lispobj(ptr, &thing, io->out);
     lispobj function, args[3];
     lispobj result = NIL;
 
@@ -784,7 +804,7 @@ static int call_cmd(char **ptr, iochannel_t io)
             fprintf(io->out, "too many arguments (no more than 3 supported)\n");
             return 0;
         }
-        parse_lispobj(ptr, &args[numargs++]);
+        parse_lispobj(ptr, &args[numargs++], io->out);
     }
 
     switch (numargs) {
@@ -876,7 +896,7 @@ static int print_context_cmd(char **ptr, iochannel_t io)
     if (more_p(ptr)) {
         int index;
 
-        if (!parse_number(ptr, &index)) return 0;
+        if (!parse_number(ptr, &index, f)) return 0;
 
         if ((index >= 0) && (index < free_ici)) {
             fprintf(f, "There are %d interrupt contexts.\n", free_ici);
@@ -897,12 +917,26 @@ static int print_context_cmd(char **ptr, iochannel_t io)
     return 0;
 }
 
+static int set_context_cmd(char **ptr, iochannel_t io)
+{
+    __attribute__((unused)) struct thread *thread = get_sb_vm_thread();
+
+    int index;
+
+    if (!parse_number(ptr, &index, io->out))
+        return 0;
+
+    write_TLS(FREE_INTERRUPT_CONTEXT_INDEX,make_fixnum(index + 1),thread);
+
+    return 0;
+}
+
 static int backtrace_cmd(char **ptr, iochannel_t io)
 {
     int n;
 
     if (more_p(ptr)) {
-        if (!parse_number(ptr, &n)) return 0;
+        if (!parse_number(ptr, &n, io->out)) return 0;
     } else
         n = 100;
 
@@ -1063,7 +1097,7 @@ static int layouts_cmd(char __attribute__((unused)) **ptr, iochannel_t io)
     return 0;
 }
 
-static int monitor_loop(struct iochannel);
+static int monitor_loop(char *(*)(char*, int, FILE*), struct iochannel);
 extern FILE *gc_activitylog_file;
 void
 ldb_monitor(void)
@@ -1083,9 +1117,10 @@ ldb_monitor(void)
 #endif
     }
 
-    if (!monitor_loop(io)) exit(1);
+    if (!monitor_loop(fgets, io)) exit(1);
 }
-static int monitor_loop(struct iochannel io)
+static int monitor_loop(char *(*getline_fun)(char*, int, FILE*),
+                        struct iochannel io)
 {
     struct cmd *cmd, *found;
     char buf[256];
@@ -1095,7 +1130,7 @@ static int monitor_loop(struct iochannel io)
     while (1) {
         fprintf(io.out, "ldb> ");
         fflush(io.out);
-        line = fgets(buf, sizeof(buf), io.in);
+        line = getline_fun(buf, sizeof(buf), io.in);
         if (line == NULL) {
             return 0;
         }
@@ -1129,6 +1164,59 @@ static int monitor_loop(struct iochannel io)
     }
 }
 
+#ifdef ATOMIC_LOGGING
+#include "atomiclog.inc"
+char* thread_name_from_pthread(pthread_t thread) {
+    static char name[64];
+#if defined LISP_FEATURE_LINUX || defined LISP_FEATURE_DARWIN
+    // doesn't seem to actualy work on macos?
+    __attribute__((unused)) int r = pthread_getname_np(thread, name, sizeof name);
+    return name;
+#endif
+}
+
+static void dump_eventlog(int fd)
+{
+    int i = 0;
+    uword_t *e = eventdata;
+    char buf[1024];
+    int nc, nc1; // number of chars in buffer
+    // Define buflen to be smaller than 'buf' so that we can prefix it
+    // with thread pointer and suffix it with a newline
+    // without too much hassle.
+#define buflen (sizeof buf-20)
+    nc = snprintf(buf, buflen, "Event log: used %d elements of %d max\n", n_logevents, EVENTBUFMAX);
+    write(fd, buf, nc);
+    while (i<n_logevents) { // FIXME: crashes if n_logevents exceeds max
+        char *fmt = (char*)e[i+1];
+        uword_t prefix = e[i];
+        int nargs = prefix & 7;
+        void* thread_pointer = (void*)(prefix & ~7);
+        char* name = thread_name_from_pthread((pthread_t)thread_pointer);
+        if (name) nc = sprintf(buf, "%s: ", name); else nc = sprintf(buf, "%p: ", thread_pointer);
+        switch (nargs) {
+        default: printf("busted event log"); return;
+        case 0: nc1 = snprintf(buf+nc, buflen, fmt, 0); break; // the 0 inhibits a warning
+        case 1: nc1 = snprintf(buf+nc, buflen, fmt, e[i+2]); break;
+        case 2: nc1 = snprintf(buf+nc, buflen, fmt, e[i+2], e[i+3]); break;
+        case 3: nc1 = snprintf(buf+nc, buflen, fmt, e[i+2], e[i+3], e[i+4]); break;
+        case 4: nc1 = snprintf(buf+nc, buflen, fmt, e[i+2], e[i+3], e[i+4], e[i+5]); break;
+        case 5: nc1 = snprintf(buf+nc, buflen, fmt, e[i+2], e[i+3], e[i+4], e[i+5], e[i+6]); break;
+        case 6: nc1 = snprintf(buf+nc, buflen, fmt, e[i+2], e[i+3], e[i+4], e[i+5], e[i+6],
+                               e[i+7]); break;
+        }
+#undef buflen
+        buf[nc+nc1] = '\n';
+        write(fd, buf, 1+nc+nc1);
+        i += nargs + 2;
+    }
+}
+static int events_cmd(__attribute__((unused)) char **ptr, iochannel_t io) {
+    dump_eventlog(fileno(io->out));
+    return 0;
+}
+#endif
+
 #ifdef START_LDB_SERVICE_THREAD
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1150,7 +1238,7 @@ static void* ldb_service_main(__attribute__((unused)) void* arg) {
         setlinebuf(stream);
         fprintf(stream, "LDB connected\n");
         struct iochannel io = {stream, stream};
-        monitor_loop(io);
+        monitor_loop(fgets_unlocked, io);
         fclose(stream);
     }
     return 0;
@@ -1168,11 +1256,16 @@ void init_ldb_service()
     pthread_attr_t thr_attr;
     pthread_attr_init(&thr_attr);
     pthread_attr_setdetachstate(&thr_attr, PTHREAD_CREATE_DETACHED);
-    sigset_t mask, oldmask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    pthread_sigmask(SIG_BLOCK, &mask, &oldmask);
+    sigset_t oldmask;
+    sigset_t blockmask = deferrable_sigset;
+    /* This sigaddset is ok whether or not SIGCHLD was in deferrables.
+     * sb-safepoint doesn't have it there because most Lisp threads block a lot of
+     * signals all the time, so that signals go to the dedicated handler thread.
+     * ldb service needs to avoid being the recipient of such signals */
+    sigaddset(&blockmask, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &blockmask, &oldmask);
     pthread_create(&ldb_service_thread, &thr_attr, ldb_service_main, 0);
+    pthread_setname_np(ldb_service_thread, "ldbsvc");
     getsockname(listener, (struct sockaddr*)&sin, &addrlen);
     ldb_service_port = ntohs(sin.sin_port);
     fprintf(stderr, "NOTE: ldb service on port %d\n", ldb_service_port);
@@ -1182,8 +1275,27 @@ void init_ldb_service()
 #endif
 
 #ifdef STANDALONE_LDB
+# ifdef LISP_FEATURE_X86_64
+void callback_wrapper_trampoline() { }
+# endif
+void set_thread_state(struct thread *thread, char state, bool sigblocked) {
+    lose("can't set_thread_state %p %d %d", thread, state, sigblocked);
+}
+int thread_wait_until_not(int undesired_state, struct thread *thread) {
+    lose("can't thread_wait %d %p", undesired_state, thread);
+}
 void gc_stop_the_world() { } // do nothing
 void gc_start_the_world() { } // do nothing
+
+void sig_stop_for_gc_handler(int __attribute__((unused)) signal,
+                             siginfo_t __attribute__((unused)) *info,
+                             os_context_t __attribute__((unused)) *context) {
+}
+int
+handle_foreign_call_trigger (os_context_t __attribute__((unused)) *context,
+                             os_vm_address_t __attribute__((unused)) fault_address) {
+    return 0;
+}
 #include <errno.h>
 #include <setjmp.h>
 #include "core.h"
@@ -1256,7 +1368,7 @@ int load_gc_crashdump(char* pathname)
     if (preamble.card_size != GENCGC_CARD_BYTES)
         lose("Can't load crashdump: memory parameters differ");
     gc_card_table_nbits = preamble.card_table_nbits;
-    gc_card_table_mask = (1<<gc_card_table_nbits)-1;
+    gc_card_table_mask = ((sword_t)1<<gc_card_table_nbits)-1;
 #ifdef LISP_FEATURE_LINKAGE_SPACE
     linkage_space = (lispobj*)os_alloc_gc_space(0, 0, (char*)preamble.linkage_start,
                                                 preamble.linkage_nbytes);

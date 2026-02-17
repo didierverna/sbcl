@@ -1,5 +1,6 @@
 (with-compilation-unit ()
   (let ((*evaluator-mode* :compile))
+    #+coverage (require :sb-cover)
     (load "test-util")
     (load "assertoid")))
 
@@ -18,15 +19,13 @@
 
 (defun run (file test-fun
             break-on-failure break-on-expected-failure break-on-error
-            interpret slow)
+            interpret)
   (setf *break-on-failure* break-on-failure
         *break-on-expected-failure* break-on-expected-failure
         *break-on-error* break-on-error)
   (when interpret
     (setf *test-evaluator-mode* :interpret)
     (push :interpreter *features*))
-  (when slow
-    (push :slow *features*))
   (setf sb-ext:*evaluator-mode* *test-evaluator-mode*)
   (format t "// Running ~a in ~a evaluator mode~%"
           file *evaluator-mode*)
@@ -44,7 +43,11 @@
                     (invoke-restart 'skip-file))))
         (let ((*package* (find-package :cl-user)))
           #+nil (sb-aprof:aprof-run test-fun :arguments (list file))
-          (funcall test-fun file)))
+          #+coverage (sb-cover:reset-coverage)
+          (funcall test-fun file)
+          #+coverage
+          (let ((name (concatenate 'string file ".coverage")))
+            (sb-cover:save-coverage-in-file name))))
     (skip-file ()
       (format t ">>>~a<<<~%"*failures*)))
   (report-test-status)

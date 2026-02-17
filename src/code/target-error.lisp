@@ -1164,10 +1164,6 @@ with that condition (or with no condition) will be returned."
 (define-condition simple-reference-warning (reference-condition simple-warning)
   ())
 
-(define-condition arguments-out-of-domain-error
-    (arithmetic-error reference-condition)
-  ())
-
 ;; per CLHS: "The consequences are unspecified if functions are ...
 ;; multiply defined in the same file." so we are within reason to do any
 ;; unspecified behavior at compile-time and/or time, but the compiler was
@@ -2394,6 +2390,15 @@ PROCEED WITH CAUTION."
                  "A ~S condition without bindings for heap statistics.  (If
 you did not expect to see this message, please report it."
                  'heap-exhausted-error)))))
+
+(define-condition arena-exhausted-error (storage-condition)
+  ((arena :initarg :arena)
+   (request :initarg :request))
+  (:report
+   (lambda (condition stream)
+     (format stream "Arena ~A exhausted: ~D bytes requested."
+             (slot-value condition 'arena)
+             (slot-value condition 'request)))))
 
 (define-condition system-condition (condition)
   ((address :initarg :address :reader system-condition-address :initform nil)

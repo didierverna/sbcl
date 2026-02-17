@@ -345,9 +345,6 @@ code to be loaded.
 (defun loop-make-desetq (var-val-pairs)
   (if var-val-pairs (cons 'loop-desetq var-val-pairs)))
 
-(sb-ext:defglobal *loop-desetq-temporary*
-        (make-symbol "LOOP-DESETQ-TEMP"))
-
 (sb-xc:defmacro loop-desetq (&environment env &rest var-val-pairs)
   (labels ((find-non-null (var)
              ;; See whether there's any non-null thing here. Recurse
@@ -401,7 +398,8 @@ code to be loaded.
                    (when (or car-non-null cdr-non-null)
                      (if cdr-non-null
                          (let* ((temp-p temp)
-                                (temp (or temp *loop-desetq-temporary*))
+                                (temp (or temp (load-time-value
+                                                (make-symbol "DSTEMP") t)))
                                 (body `(,@(loop-desetq-internal car
                                                                 `(car ,temp))
                                           (setq ,temp (cdr ,temp))
@@ -1457,6 +1455,15 @@ code to be loaded.
                        (loop-for-across var `(list-reverse-into-vector-cddr ,(second val)) data-type))
                       ((not stepper)
                        (loop-for-across var `(list-reverse-into-vector ,(second val)) data-type))))))
+        ((and (typep val '(cons (eql sort) (cons (cons (eql copy-list) (cons t null)) cons)))
+              (not (sb-c::fun-lexically-notinline-p 'copy-list
+                                                    (macro-environment *loop*)))
+              (let ((stepper (and (loop-tequal (car (source-code *loop*)) :by)
+                                  (source-code *loop*))))
+                (cond ((not stepper)
+                       (destructuring-bind (sort (copy-list list) &rest args) val
+                         (declare (ignore sort copy-list))
+                         (loop-for-across var `(sort (coerce (the list ,list) 'vector) ,@args) data-type)))))))
         (t
          (multiple-value-bind (list constantp list-value)
              (loop-constant-fold-if-possible val)

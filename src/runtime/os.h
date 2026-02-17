@@ -33,7 +33,7 @@
 #define ENABLE_PAGE_PROTECTION 1
 #endif
 
-#if defined LISP_FEATURE_CHENEYGC || defined LISP_FEATURE_SB_SAFEPOINT
+#if defined LISP_FEATURE_CHENEYGC || defined LISP_FEATURE_SB_SAFEPOINT || defined LISP_FEATURE_NONSTOP_FOREIGN_CALL
 // safepoint traps always require a signal handler
 #define INSTALL_SIG_MEMORY_FAULT_HANDLER 1
 #elif defined LISP_FEATURE_GENERATIONAL
@@ -79,8 +79,9 @@ int os_preinit(char *argv[], char *envp[]);
 #else
 #define os_preinit(dummy1,dummy2) (0)
 #endif
-void os_link_runtime();
+void os_link_runtime(lispobj, lispobj);
 void os_unlink_runtime();
+extern int alien_linkage_table_n_prelinked;
 
 /* Do anything we need to do when starting up the runtime environment
  * in this OS. */

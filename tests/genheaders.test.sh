@@ -13,7 +13,17 @@ run_sbcl <<EOF
  (format t "~&Skipping test due to sb-devel~%")
  (exit))
 (setq *evaluator-mode* :interpret)
+(defun pick-evaluator-mode (stem)
+  (cond ((find-package "SB-INTERPRETER") :interpret)
+        ;; If no fasteval then generally prefer to compile, but some files
+        ;; cause style-warnings, or increase the overall test time
+        ((or (search "utils" stem) (search "node" stem) (search "vop" stem)
+             (search "type" stem) (search "cross-float" stem))
+         :interpret)
+        (t
+         :compile)))
 (defvar *sbcl-local-target-features-file* "../local-target-features.lisp-expr")
+(defvar *sbcl-backend-subfeatures-file* "../customize-backend-subfeatures.lisp")
 (load "../src/cold/shared.lisp")
 (load "../src/cold/set-up-cold-packages.lisp")
 (load "../tools-for-build/corefile.lisp")
@@ -24,9 +34,10 @@ run_sbcl <<EOF
                (*load-verbose* t))
    (do-stems-and-flags (stem flags 1)
      (when (member :c-headers flags)
-       (handler-bind ((style-warning (function muffle-warning)))
-         (load (merge-pathnames (stem-remap-target stem)
-                                (make-pathname :directory '(:relative :up) :type "lisp"))))))
+       (let ((host-sb-ext::*evaluator-mode* (cl-user::pick-evaluator-mode stem)))
+         (handler-bind ((style-warning (function muffle-warning)))
+           (load (merge-pathnames (stem-remap-target stem)
+                                  (make-pathname :directory '(:relative :up) :type "lisp")))))))
    (load "../src/compiler/generic/genesis.lisp")))
 (genesis :c-header-dir-name "$TEST_DIRECTORY/" :verbose t)
 (assert (probe-file "$TEST_DIRECTORY/gc-tables.h"))
@@ -39,6 +50,9 @@ if [ -r $TEST_DIRECTORY/cons.h ]
 then
     for i in $TEST_DIRECTORY/*.h
     do
+          name=`basename $i`
+          echo Diffing $name against genesis and checking that it can stand alone
+          diff $i ../src/runtime/genesis/$name
           echo "#include \"$i\"" > ${src}
           ./run-compiler.sh -I../src/runtime -c -o ${obj} ${src}
     done

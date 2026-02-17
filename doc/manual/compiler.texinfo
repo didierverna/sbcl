@@ -720,51 +720,10 @@ variable in the loop body.
 @comment  node-name,  next,  previous,  up
 @subsection Implementation Limitations
 
-Ideally, the compiler would consider @emph{all} type declarations to
-be assertions, so that adding type declarations to a program, no
-matter how incorrect they might be, would @emph{never} cause undefined
-behavior. However, the compiler is known to fall short of this goal in
-two areas:
-
-@itemize
-
-@item
-@emph{Proclaimed} constraints on argument and result types of a
-function are supposed to be checked by the function. If the function
-type is proclaimed before function definition, type checks are
-inserted by the compiler, but the standard allows the reversed order,
-in which case the compiler will trust the declaration.
-
-@item
-The compiler cannot check types of an unknown number of values; if the
-number of generated values is unknown, but the number of consumed is
-known, only consumed values are checked.
-
-For example,
-
-@lisp
-(defun foo (x)
-  (the integer (bar x)))
-@end lisp
-
-causes the following compiler diagnostic to be emitted:
-
-@example
-; note: type assertion too complex to check:
-;  (VALUES INTEGER &REST T).
-@end example
-
-A partial workaround is instead write:
-
-@lisp
-(defun foo (x)
-  (the (values integer &optional) (bar x)))
-@end lisp
-
-@end itemize
-
-These are important issues, but are not necessarily easy to fix, so
-they may, alas, remain in the system for a while.
+If an FTYPE is placed after the function definition the function won't
+perform any type checks, and the calls to the function will blindly
+trust the declared types.
+@code{(optimize (debug 3))} will not trust any FTYPE declarations.
 
 @node Compiler Policy
 @comment  node-name,  next,  previous,  up

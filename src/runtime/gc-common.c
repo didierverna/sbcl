@@ -1513,7 +1513,7 @@ void finalizer_thread_stop () {
 #endif
 
 #ifdef TRACE_MMAP_SYSCALLS
-FILE* mmgr_debug_logfile;
+extern FILE* mmgr_debug_logfile;
 void set_page_type_impl(struct page* pte, int newval)
 {
     if (newval != pte->type) /* too "noisy" without this pre-test */
@@ -1761,7 +1761,12 @@ scav_vector_t(lispobj *where, lispobj header)
 }
 
 /* Walk through the chain whose first element is *FIRST and remove
- * dead weak entries.
+ * dead weak entries. Such entries are linked into a list which is distinct
+ * from the list of free entries linked through the table's "next" vector.
+ * Because GC can run in the middle of any hash-table modification -
+ * since we no longer use WITHOUT-GCING around every weak table operation -
+ * this has to avoid touching the table structure itself. But it's fairly easy
+ * to create an ordinary list which is amenable to SB-EXT:ATOMIC-POP.
  * Return the new value for 'should rehash'.
  *
  * This operation might have to touch a hash-table that is currently
@@ -2255,7 +2260,7 @@ bool maybe_gc(os_context_t *context)
      * A kludgy alternative is to propagate the sigmask change to the
      * outer context.
      */
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     check_gc_signals_unblocked_or_lose(os_context_sigmask_addr(context));
     unblock_gc_stop_signal();
 #endif
@@ -2293,7 +2298,7 @@ bool maybe_gc(os_context_t *context)
              * post-GC code. Except that we do it while the interrupt context
              * is still on the stack */
             thread_sigmask(SIG_SETMASK, context_sigmask, 0);
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
             check_gc_signals_unblocked_or_lose(0);
 #endif
 #endif
@@ -3485,6 +3490,7 @@ void verify_hash_tables(uintptr_t fix_bad)
 #define REMSET_GLOBAL_MAX 20000
 lispobj permgen_remset[REMSET_GLOBAL_MAX];
 int permgen_remset_count;
+lispobj remset_transfer_list;
 
 static void remset_append1(lispobj x)
 {
@@ -3531,3 +3537,38 @@ void sweep_linkage_space()
                 linkage_space[linkage_index] = (uword_t)illegal_linkage_space_call;
     }
 }
+
+#ifdef MEASURE_STOP_THE_WORLD_PAUSE
+static long timespec_diff(struct timespec* begin, struct timespec* end)
+{
+#ifdef LISP_FEATURE_64_BIT
+    return (end->tv_sec - begin->tv_sec) * 1000000000L + (end->tv_nsec - begin->tv_nsec) ;
+#else
+    return (end->tv_sec - begin->tv_sec) * 1000000L + (end->tv_nsec - begin->tv_nsec) / 1000;
+#endif
+}
+void thread_accrue_stw_time(void* opaque_thread,
+                            struct timespec* begin_real,
+                            struct timespec* begin_cpu)
+{
+    struct thread* th = opaque_thread;
+    /* A non-Lisp thread calling into Lisp via DEFINE-ALIEN-CALLABLE
+     * can receive SIG_STOP_FOR_GC as soon as it has a 'struct thread'
+     * and _before_ a thread instance has been consed */
+    if (th->lisp_thread) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        unsigned long elapsed = timespec_diff(begin_real, &now);
+        struct thread_instance* ti = (void*)INSTANCE(th->lisp_thread);
+        if (elapsed > ti->uw_max_stw_pause) ti->uw_max_stw_pause = elapsed;
+        ti->uw_sum_stw_pause += elapsed;
+        ++ti->uw_ct_stw_pauses;
+        if (begin_cpu) {
+#ifdef CLOCK_THREAD_CPUTIME_ID
+          clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+          ti->uw_gc_virtual_time += timespec_diff(begin_cpu, &now);
+#endif
+        }
+    }
+}
+#endif

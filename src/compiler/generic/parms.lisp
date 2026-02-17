@@ -14,7 +14,6 @@
 
 ;;; When building the cross-compiler (and called by the host), read the
 ;;; dynamic-space-size file.
-;;; When called by the cross-compiler (in the host), use the previously chosen value.
 ;;; The target function is never called, but if omitted via #-sb-xc-host,
 ;;; compilation of !GENCGC-SPACE-SETUP would issue an "undefined" warning.
 (defun !read-dynamic-space-size ()
@@ -35,7 +34,7 @@
                                (t
                                 (error "Invalid --dynamic-space-size=~A" line)))))
               (* number mult))))))
-  #-sb-xc-host (symbol-value 'default-dynamic-space-size))
+  #-sb-xc-host (bug "read-dynamic-space-size"))
 
 ;; By happenstance this is the same as small-space-size.
 (defconstant alien-linkage-space-size #x100000)
@@ -84,10 +83,9 @@
                    ;; #+immobile-space implies a relocatable alien linkage space. And x86-64 always
                    ;; has relocatable linkage tables
                    #-(or x86-64 immobile-space) (alien-linkage ,alien-linkage-space-size)
-                   ;; safepoint on 64-bit uses a relocatable trap page just below the card mark
-                   ;; table, which works nicely assuming a register is wired to the card table
+                   ;; x86-64 uses a relocatable trap page just below the card mark
+                   ;; table (wired to a register). Other platforms allocate a separate page.
                    #+(and sb-safepoint (not x86-64))
-                   ;; Must be just before NIL.
                    (safepoint ,(symbol-value '+backend-page-bytes+))
                    (static ,small-space-size)
                    #+darwin-jit (static-code ,small-space-size)))
@@ -211,7 +209,7 @@
     ;; NLX variables are thread slots on x86-64 and RISC-V.  A static sym is needed
     ;; for arm64, ppc, and x86 because we haven't implemented TLS index fixups,
     ;; so must lookup the TLS index given the symbol.
-    #+(and sb-thread (not x86-64) (not riscv))
+    #+(and sb-thread (not x86-64) (not riscv) (not loongarch64))
     ,@'(*current-catch-block*
         *current-unwind-protect-block*)
 
@@ -237,10 +235,6 @@
 
     #+(and x86-64 sb-thread (not gs-seg))
     sb-aprof::*n-profile-sites*
-
-    ;; runtime linking of lisp->C calls (regardless of whether
-    ;; the C function is in a dynamic shared object or not)
-    +required-foreign-symbols+
 
     ;;; The following symbols aren't strictly required to be static
     ;;; - they are not accessed from C - but we make them static in order
@@ -353,19 +347,9 @@
   #+sb-thread    8  ; reasonable value
   #-sb-thread 1024) ; crazy value
 
-;;; Thread slots accessed at negative indices relative to struct thread.
-;;; FIXME: this is extremely unmaintainable.
-(defconstant thread-header-slots
-  ;; This seems to need to be an even number.
-  ;; I'm not sure what the constraint on that stems from.
-  #+(and x86-64 sb-safepoint) 14 ; the safepoint trap page is at word index -15
-  #+(and x86-64 (not sb-safepoint)) 16
-  #+(and (not x86-64) immobile-space) 14 ; the safepoint trap page is at word index -15
-  #+(and (not x86-64) (not immobile-space)) 0)
 
-(progn
-  (defconstant +highest-normal-generation+ 5)
-  (defconstant +pseudo-static-generation+ 6))
+(defconstant +highest-normal-generation+ 5)
+(defconstant +pseudo-static-generation+ 6)
 
 (defparameter *runtime-asm-routines* nil)
 (defparameter *alien-linkage-table-predefined-entries* nil)

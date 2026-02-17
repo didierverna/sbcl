@@ -34,6 +34,7 @@
                          (info nil)
                          (bitmap (if info (dd-bitmap info) 0))
                          (invalid :uninitialized))
+  #+sb-show (declare (optimize (debug 1))) ; workaround for something, I don't know what
   (let* ((fixed-words (type-dd-length layout))
          (extra-id-words ; count of additional words needed to store ancestors
           (if (logtest flags +structure-layout-flag+)
@@ -270,8 +271,8 @@
 ;;; arguments to the defstruct hook (which renders the structure definition
 ;;; into a CLOS class) without having to figure out some means of stashing
 ;;; functions in the DD or DD for the structure.
-(defvar *struct-accesss-fragments* nil)
-(define-load-time-global *struct-accesss-fragments-delayed* nil)
+(defvar *struct-access-fragments* nil)
+(define-load-time-global *struct-access-fragments-delayed* nil)
 
 (defun !bootstrap-defstruct-hook (classoid)
   ;; I hate this, but do whatever it takes...
@@ -279,8 +280,8 @@
   ;; into the LAYOUT-SLOT-TABLE now.
   ;; (I think that's where the code fragments end up)
   (unless (member (classoid-name classoid) '(pathname condition)) ; KLUDGE
-    (push (cons (classoid-name classoid) *struct-accesss-fragments*)
-          *struct-accesss-fragments-delayed*)))
+    (push (cons (classoid-name classoid) *struct-access-fragments*)
+          *struct-access-fragments-delayed*)))
 
 (defun %target-defstruct (dd equalp &rest accessors)
   (declare (type defstruct-description dd))
@@ -319,7 +320,7 @@
                     (lambda (a b)
                       (sb-impl::instance-equalp* comparators a b)))))))
 
-    (let ((*struct-accesss-fragments* accessors))
+    (let ((*struct-access-fragments* accessors))
       (dolist (fun *defstruct-hooks*)
         (funcall fun classoid))))
 
@@ -327,7 +328,7 @@
 (defun !target-defstruct-altmetaclass (dd &rest accessors)
   (declare (type defstruct-description dd))
   (let ((classoid (find-classoid (dd-name dd)))
-        (*struct-accesss-fragments* accessors))
+        (*struct-access-fragments* accessors))
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
   t)

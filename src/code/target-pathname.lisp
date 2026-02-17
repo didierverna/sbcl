@@ -329,9 +329,10 @@
                    ;; they don't mutate strings returned by pathname accessors.
                    (t (let ((l (length part)))
                         (logically-readonlyize
-                         (replace (typecase part
-                                    (base-string (make-string l :element-type 'base-char))
-                                    (t (make-string l)))
+                         (replace (if (or (typep part 'base-string)
+                                          #+sb-unicode (every #'base-char-p part))
+                                      (make-string l :element-type 'base-char)
+                                      (make-string l))
                                   part)))))))
       (let* ((dir+hash
               (if directory ; find the interned dir-key
@@ -1934,14 +1935,19 @@ unspecified elements into a completed to-pathname based on the to-wildname."
                     :directory enough-directory
                     :name (pathname-name pathname)
                     :type (pathname-type pathname)
-                    :version (pathname-version pathname)))))
+                    :version (pathname-version pathname))
+     (eql (pathname-host pathname) (pathname-host defaults)))))
 
-(defun unparse-logical-namestring (pathname)
+(defun unparse-logical-namestring (pathname &optional elide-host)
   (declare (type logical-pathname pathname))
-  (concatenate 'simple-string
-               (logical-host-name (%pathname-host pathname)) ":"
-               (unparse-logical-directory pathname)
-               (unparse-logical-file pathname)))
+  (let ((directory (unparse-logical-directory pathname))
+        (file (unparse-logical-file pathname)))
+    (cond
+      (elide-host (concatenate 'simple-string directory file))
+      (t (concatenate 'simple-string
+                      (logical-host-name (%pathname-host pathname)) ":"
+                      directory
+                      file)))))
 
 ;;;; logical pathname translations
 

@@ -51,11 +51,11 @@
                                 :widetag ratio-widetag
                                 :alloc-trans %make-ratio)
   (numerator :type (and integer (not (eql 0)))
-             :ref-known (flushable movable)
+             :ref-known (foldable flushable movable)
              :ref-trans %numerator
              :init :arg)
   (denominator :type (integer 2)
-               :ref-known (flushable movable)
+               :ref-known (foldable flushable movable)
                :ref-trans %denominator
                :init :arg))
 
@@ -254,7 +254,7 @@ during backtrace.
 (defconstant simple-fun-source-slot  2) ; form and/or docstring
 (defconstant simple-fun-info-slot    3) ; type and possibly xref
 
-#-(or x86 x86-64 arm64 riscv)
+#-(or x86 x86-64 arm64 riscv loongarch64)
 (define-primitive-object (return-pc :lowtag other-pointer-lowtag :widetag t)
   (return-point :c-type "unsigned char" :rest-p t))
 
@@ -465,18 +465,6 @@ during backtrace.
                             +thread-header-slot-names+)))))
   (assign-header-slot-indices))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; allocator histogram capacity
-  (defconstant n-histogram-bins-small 32)
-  (defconstant n-histogram-bins-large 32))
-;;; the #+allocation-size-histogram has an exact count of objects allocated
-;;; for all sizes up to (* cons-size n-word-bytes n-histogram-bins-small).
-;;; Larger allocations are grouped by the binary log of the size.
-;;; It seems that 99.5% of all allocations are less than the small bucket limit,
-;;; making the histogram exact except for the tail.
-(defconstant first-large-histogram-bin-log2size
-  (integer-length (* n-histogram-bins-small cons-size n-word-bytes)))
-
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
@@ -500,7 +488,7 @@ during backtrace.
   (binding-stack-pointer :c-type "lispobj *" :pointer t
                          :special *binding-stack-pointer*)
   ;; next two not used in C, but this wires the TLS offsets to small values
-  #+(or x86-64 (and (or riscv arm64) sb-thread))
+  #+(or x86-64 (and (or riscv arm64 loongarch64) sb-thread))
   #((current-catch-block :special *current-catch-block*)
     (current-unwind-protect-block :special *current-unwind-protect-block*))
   ;; BUG: fundamentally a pseudo-atomic code sequence does not use these bits
@@ -535,7 +523,6 @@ during backtrace.
   ;; for any system that we care about.
   (os-thread :c-type #+(or win32 (not sb-thread)) "lispobj" ; actually is HANDLE
                      #-(or win32 (not sb-thread)) "pthread_t")
-  (os-kernel-tid) ; the kernel's thread identifier, 32 bits on linux
 
   ;; These aren't accessed (much) from Lisp, so don't really care
   ;; if it takes a 4-byte displacement.
@@ -552,9 +539,11 @@ during backtrace.
   (next :c-type "struct thread *" :pointer t)
   ;; a struct containing {starting, running, suspended, dead}
   ;; and some other state fields.
-  (state-word :c-type "struct thread_state_word")
+  (state-word :c-type "struct thread_state_word"
+              :length #.(/ 64 sb-vm:n-word-bits))
   ;; Statistical CPU profiler data recording buffer
   (sprof-data)
+  (sprof-enable :special sb-thread::*sprof-enable*) ; = 0 to block SIGPROF
   ;;
   (arena)
   ;; Miscellaneous arch-specific thread-local state for breakpoints.
@@ -579,7 +568,6 @@ during backtrace.
   ;; print an approximation of the CSP as needed.
   #+(or sb-thread x86-64)
   (control-stack-pointer :c-type "lispobj *")
-  (card-table)
 
   ;; A few extra thread-local allocation buffers for special purposes
   ;; #-sb-thread probably won't use these, to be determined...
@@ -588,18 +576,9 @@ during backtrace.
   (sys-cons-tlab :c-type "struct alloc_region" :length 3)
   (remset)
   ;; allocation instrumenting
-  (tot-bytes-alloc-boxed)
-  (tot-bytes-alloc-unboxed)
   (slow-path-allocs)
-  (et-allocator-mutex-acq) ; elapsed times
   (et-find-freeish-page)
   (et-bzeroing)
-  (allocator-histogram :c-type "size_histogram"
-                       ;; small bins store just a count
-                       ;; large bins store a count and size
-                       :length #.(+ (* 2 n-histogram-bins-large)
-                                    n-histogram-bins-small))
-
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
   (lisp-thread :pointer t :special sb-thread:*current-thread*))

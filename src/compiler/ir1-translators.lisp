@@ -238,35 +238,43 @@ TAGS, and NIL is returned. If a statement contains a GO to a defined TAG
 within the lexical scope of the form, then control is transferred to the next
 statement following that tag. A TAG must be an integer or a symbol. A
 STATEMENT must be a list. Other objects are illegal within the body."
-  (ctran-starts-block next)
-  (let* ((dummy (make-ctran))
-         (entry (make-entry))
-         (segments (parse-tagbody statements))
-         (cleanup (make-cleanup :tagbody entry)))
-    (push entry (lambda-entries (lexenv-lambda *lexenv*)))
-    (setf (entry-cleanup entry) cleanup)
-    (link-node-to-previous-ctran entry start)
-    (use-ctran entry dummy)
+  (let ((segments (and statements
+                       (parse-tagbody statements))))
+    (cond
+      ((not (cdr segments))
+       ;; no tags, just a progn that ends in a NIL
+       (ir1-convert-progn-body start next
+                               result
+                               (append statements '(nil))))
+      (t
+       (ctran-starts-block next)
+       (let* ((dummy (make-ctran))
+              (entry (make-entry))
+              (cleanup (make-cleanup :tagbody entry)))
+         (push entry (lambda-entries (lexenv-lambda *lexenv*)))
+         (setf (entry-cleanup entry) cleanup)
+         (link-node-to-previous-ctran entry start)
+         (use-ctran entry dummy)
 
-    (collect ((tags)
-              (starts)
-              (ctrans))
-      (starts dummy)
-      (dolist (segment (rest segments))
-        (let* ((tag-ctran (make-ctran))
-               (tag (list (car segment) entry tag-ctran)))
-          (ctrans tag-ctran)
-          (starts tag-ctran)
-          (ctran-starts-block tag-ctran)
-          (tags tag)))
-      (ctrans next)
+         (collect ((tags)
+                   (starts)
+                   (ctrans))
+           (starts dummy)
+           (dolist (segment (rest segments))
+             (let* ((tag-ctran (make-ctran))
+                    (tag (list (car segment) entry tag-ctran)))
+               (ctrans tag-ctran)
+               (starts tag-ctran)
+               (ctran-starts-block tag-ctran)
+               (tags tag)))
+           (ctrans next)
 
-      (let ((*lexenv* (make-lexenv :cleanup cleanup :tags (tags))))
-        (mapc (lambda (segment start end)
-                (ir1-convert-progn-body start end
-                                        (when (eq end next) result)
-                                        (rest segment)))
-              segments (starts) (ctrans))))))
+           (let ((*lexenv* (make-lexenv :cleanup cleanup :tags (tags))))
+             (mapc (lambda (segment start end)
+                     (ir1-convert-progn-body start end
+                                             (when (eq end next) result)
+                                             (rest segment)))
+                   segments (starts) (ctrans)))))))))
 
 ;;; Emit an EXIT node without any value.
 (def-ir1-translator go ((tag) start next result)
@@ -505,14 +513,13 @@ body, references to a NAME will effectively be replaced with the EXPANSION."
                nargs
                min)))
 
-    (when (template-conditional-p template)
-      (bug "%PRIMITIVE was used with a conditional template."))
-
     (when (template-more-results-type template)
       (bug "%PRIMITIVE was used with an unknown values template."))
 
     (ir1-convert start next result
-                 `(%%primitive ',template ,@args))))
+                 (if (template-conditional-p template)
+                     `(if (%%primitive ',template ,@args) t nil)
+                     `(%%primitive ',template ,@args)))))
 
 (defmacro inline-%primitive (template &rest args)
   (let* ((required (length (template-arg-types template)))
@@ -944,10 +951,10 @@ also processed as top level forms."
 ;;; then the body is converted as usual.
 ;;;
 ;;; When one of these FUNS is declared dynamic extent, we make a
-;;; cleanup with the ENCLOSE as the MESS-UP node and introduce it into
-;;; the lexical environment to convert the body in. We force NEXT to
-;;; start a block outside of this cleanup, causing cleanup code to be
-;;; emitted when the scope is exited.
+;;; cleanup with a dynamic extent node as the mess-up and introduce it
+;;; into the lexical environment to convert the body in. We force NEXT
+;;; to start a block outside of this cleanup, causing cleanup code to
+;;; be emitted when the scope is exited.
 (defun ir1-convert-fbindings (start next result funs body)
   (let ((enclose-ctran (make-ctran)))
     (enclose start enclose-ctran funs)
@@ -1058,8 +1065,12 @@ other."
                     (constantp value)
                     (or (not (values-type-p type))
                         (values-type-may-be-single-value-p type))
-                    (ctypep (constant-form-value value)
-                            (single-value-type type))))
+                    (multiple-value-call
+                        (lambda (&optional value &rest rest)
+                          (unless rest
+                            (ctypep value
+                                    (values-type-nth 0 type nil))))
+                      (constant-form-value value))))
            (ir1-convert start next result value)
            nil) ;; NIL is important, older SBCLs miscompiled (values &optional x) casts
           (t
@@ -1296,8 +1307,9 @@ care."
         (dest-lvar (make-lvar))
         (type (or (lexenv-find var type-restrictions)
                   (leaf-type var))))
-    (ir1-convert start dest-ctran dest-lvar `(the ,(type-specifier type)
-                                                  ,value))
+    (ir1-convert start dest-ctran dest-lvar (wrap-if (neq type *universal-type*)
+                                                     `(the ,(type-specifier type))
+                                                     value))
     (let ((res (make-set var dest-lvar)))
       (setf (lvar-dest dest-lvar) res)
       (cond (result ; SETQ with a result counts as a REF also

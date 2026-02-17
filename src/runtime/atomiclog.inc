@@ -10,7 +10,7 @@
 #define event6(fmt,a,b,c,d,e,f)
 #else
 
-#define EVENTBUFMAX 40000
+#define EVENTBUFMAX 400000
 extern uword_t *eventdata;
 extern int n_logevents;
 
@@ -37,7 +37,7 @@ extern int n_logevents;
         eventdata[i_+2] = (uword_t)arg1; } }
 
 #define event2(fmt, arg1, arg2) \
-    { int i_ = __sync_fetch_and_add(&n_logevents, 4); if (i_+3 < EVENTBUFMAX) { \
+    { int i_ = __sync_fetch_and_add(&n_logevents, 4); if (i_ < EVENTBUFMAX) { \
         eventdata[i_  ] = 2|(uword_t)pthread_self(); \
         eventdata[i_+1] = (uword_t)fmt; \
         eventdata[i_+2] = (uword_t)arg1; \

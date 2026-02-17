@@ -774,27 +774,28 @@ error if any of PACKAGES is not a valid package designator."
 ;;; this.
 (defun assert-symbol-home-package-unlocked (name &optional format-control
                                             &rest format-arguments)
-  (let* ((symbol (etypecase name
-                   (symbol name)
-                   ;; Istm that the right way to declare that you want to allow
-                   ;; overriding the lock on (SETF X) is to list (SETF X) in
-                   ;; the declaration, not expect that X means itself and SETF.
-                   ;; Worse still, the syntax ({ENABLE|DISABLE}-..-locks (SETF X))
-                   ;; is broken, and yet we make no indication of it.
-                   ((cons (eql setf) cons) (second name))
-                   ;; Skip lists of length 1, single conses and
-                   ;; (class-predicate foo), etc.  FIXME: MOP and
-                   ;; package-lock interaction needs to be thought
-                   ;; about.
-                   (list
-                    (return-from assert-symbol-home-package-unlocked
-                      name))))
-         (package (sb-xc:symbol-package symbol)))
-    (when (package-lock-violation-p package symbol)
-      (package-lock-violation package
-                              :symbol symbol
-                              :format-control format-control
-                              :format-arguments (cons name format-arguments))))
+  (unless (> sb-c::*inlining* 0)
+    (let* ((symbol (etypecase name
+                     (symbol name)
+                     ;; Istm that the right way to declare that you want to allow
+                     ;; overriding the lock on (SETF X) is to list (SETF X) in
+                     ;; the declaration, not expect that X means itself and SETF.
+                     ;; Worse still, the syntax ({ENABLE|DISABLE}-..-locks (SETF X))
+                     ;; is broken, and yet we make no indication of it.
+                     ((cons (eql setf) cons) (second name))
+                     ;; Skip lists of length 1, single conses and
+                     ;; (class-predicate foo), etc.  FIXME: MOP and
+                     ;; package-lock interaction needs to be thought
+                     ;; about.
+                     (list
+                      (return-from assert-symbol-home-package-unlocked
+                        name))))
+           (package (sb-xc:symbol-package symbol)))
+      (when (package-lock-violation-p package symbol)
+        (package-lock-violation package
+                                :symbol symbol
+                                :format-control format-control
+                                :format-arguments (cons name format-arguments)))))
   name)
 
 
@@ -891,7 +892,8 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
 
 (defun package-%used-by-list (package &aux (wp (package-%used-by package)))
   (acond
-     ((and wp (weak-pointer-value wp)) (if (eq it :none) nil it))
+     ((eq wp :none) nil)
+     ((and wp (weak-pointer-value wp)) it)
      (t
       ;; Ensure that the "uses" relation is fixed by acquiring the graph lock.
       ;; Additionally, DO-PACKAGES will acquire the name table lock.
@@ -901,7 +903,7 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
           (do-packages (user)
             (when (find me (package-tables user))
               (push user list)))
-         (setf (package-%used-by package) (make-weak-pointer (or list :none)))
+         (setf (package-%used-by package) (if list (make-weak-pointer list) :none))
          list)))))
 
 (macrolet ((def (ext real)
@@ -1945,9 +1947,9 @@ PACKAGE."
 ;;;; representation of the hosts's *COLD-PACKAGE-SYMBOLS*.
 ;;;; The shape of this list is
 ;;;;    (uninterned-symbols . ((package . (externals . internals)) ...)
-(defvar *!initial-symbols*)
+(define-load-time-global *!initial-symbols* nil)
 ;;; list of (string . list-of-string) to initialize the USE/USED-BY lists
-(defvar *!initial-package-graph*)
+(declaim (global *!initial-package-graph*))
 
 (defun rebuild-package-vector ()
   (let ((max-id 0))

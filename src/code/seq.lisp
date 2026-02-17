@@ -26,8 +26,9 @@
         (or end length)
         (sequence-bounding-indices-bad-error seq start end))))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *sequence-keyword-info*
+(eval-when (:compile-toplevel :execute
+            #+sb-devel :load-toplevel) ; not needed, just convenient maybe
+(defparameter *sequence-keyword-info*
     ;; (name default supplied-p adjustment new-type)
     `((count nil
              nil
@@ -83,9 +84,9 @@
                      (if test-p
                          (error "can't specify both :TEST and :TEST-NOT")
                          (%coerce-callable-to-fun test-not)))
-                (or null function)))))
+                (or null function))))
 
-(defmacro define-sequence-traverser (name args &body body)
+(sb-xc:defmacro define-sequence-traverser (name args &body body)
   (multiple-value-bind (body declarations docstring) (parse-body body t)
     (collect ((new-args)
               (new-declarations)
@@ -143,6 +144,7 @@
            (let* (,@(rebindings/eager))
              (declare ,@(new-declarations))
              ,@body))))))
+) ; end EVAL-WHEN
 
 ;;; SEQ-DISPATCH does an efficient type-dispatch on the given SEQUENCE.
 ;;;
@@ -533,7 +535,7 @@
 ;;;; so we worry about dealing with END being supplied or defaulting
 ;;;; to NIL at this level.
 
-(defun vector-subseq* (sequence start end)
+(defun vector-subseq (sequence start end)
   (declare (type vector sequence))
   (declare (type index start)
            (type (or null index) end)
@@ -551,7 +553,7 @@
                     :force-inline t)
     (vector-subseq-dispatch data start end)))
 
-(defun list-subseq* (sequence start end)
+(defun list-subseq (sequence start end)
   (declare (type list sequence)
            (type unsigned-byte start)
            (type (or null unsigned-byte) end))
@@ -605,8 +607,8 @@
    START and continuing to the end of SEQUENCE or the optional END."
   (declare (explicit-check sequence :result))
   (seq-dispatch-checking=>seq sequence
-    (list-subseq* sequence start end)
-    (vector-subseq* sequence start end)
+    (list-subseq sequence start end)
+    (vector-subseq sequence start end)
     (sb-sequence:subseq sequence start end)))
 
 ;;;; COPY-SEQ
@@ -615,18 +617,18 @@
   "Return a copy of SEQUENCE which is EQUAL to SEQUENCE but not EQ."
   (declare (explicit-check sequence :result))
   (seq-dispatch-checking sequence
-    (list-copy-seq* sequence)
-    (vector-subseq* sequence 0 nil)
+    (list-copy-seq sequence)
+    (vector-subseq sequence 0 nil)
     ;; Copying an extended sequence has to return an extended-sequence
     ;; and not just any SEQUENCE.
     (the extended-sequence (values (sb-sequence:copy-seq sequence)))))
 
-(defun list-copy-seq* (sequence)
+(defun list-copy-seq (sequence)
   (copy-list-macro sequence :check-proper-list t))
 
 ;;;; FILL
 
-(defun list-fill* (sequence item start end)
+(defun list-fill (sequence item start end)
   (declare (type list sequence)
            (type index start)
            (type (or null index) end))
@@ -681,14 +683,14 @@
                                             ,value-transform)
                                          '#'identity))))
                         else do
-                          ;; vector-fill* depends on this assertion
+                          ;; vector-fill depends on this assertion
                           (assert (member et '(t (complex double-float)
                                                #-64-bit (complex single-float)
                                                #-64-bit double-float)
                                           :test #'equal))))))
   (init-fill-bashers))
 
-(defun vector-fill* (vector item start end)
+(defun vector-fill (vector item start end)
   (declare (type index start) (type (or index null) end)
            (optimize speed))
   (with-array-data ((vector vector)
@@ -737,7 +739,7 @@
                    (fill-float (complex double-float))))))))
   vector)
 
-(defun string-fill* (sequence item start end)
+(defun string-fill (sequence item start end)
   (declare (string sequence))
   (with-array-data ((data sequence)
                     (start start)
@@ -761,8 +763,8 @@
   "Replace the specified elements of SEQUENCE with ITEM."
   (declare (explicit-check sequence :result))
   (seq-dispatch-checking=>seq sequence
-   (list-fill* sequence item start end)
-   (vector-fill* sequence item start end)
+   (list-fill sequence item start end)
+   (vector-fill sequence item start end)
    (sb-sequence:fill sequence item
                      :start start
                      :end (%check-generic-sequence-bounds sequence start end))))
@@ -808,8 +810,8 @@
                      (return-from replace))))
                ;; General case is just like the code emitted by TRANSFORM-REPLACE
                ;; but using the getter and setter.
-               (let ((getter (the function (svref %%data-vector-reffers%% tag2)))
-                     (setter (the function (svref %%data-vector-setters%% tag1))))
+               (let ((getter (truly-the function (svref %%data-vector-reffers%% tag2)))
+                     (setter (truly-the function (svref %%data-vector-setters%% tag1))))
                  (cond ((and (eq data1 data2) (> start1 start2))
                         (do ((i (the (or (eql -1) index) (+ start1 nelts -1)) (1- i))
                              (j (the (or (eql -1) index) (+ start2 nelts -1)) (1- j)))
@@ -852,28 +854,32 @@
          (rplaca target-sequence-ref (car source-sequence-ref)))))
 
 (defmacro list-replace-from-vector ()
-  `(do ((target-index target-start (1+ target-index))
-        (source-index source-start (1+ source-index))
-        (target-sequence-ref (nthcdr target-start target-sequence)
-                             (cdr target-sequence-ref)))
-       ((or (= target-index (the fixnum target-end))
-            (= source-index (the fixnum source-end))
-            (null target-sequence-ref))
-        target-sequence)
-     (declare (fixnum source-index target-index))
-     (rplaca target-sequence-ref (aref source-sequence source-index))))
+  `(with-array-data ((source-sequence source-sequence) (source-start source-start) (source-end source-end))
+     (cond-dispatch (simple-vector-p source-sequence)
+       (do ((target-index target-start (1+ target-index))
+            (source-index source-start (1+ source-index))
+            (target-sequence-ref (nthcdr target-start target-sequence)
+                                 (cdr target-sequence-ref)))
+           ((or (= target-index (the fixnum target-end))
+                (= source-index (the fixnum source-end))
+                (null target-sequence-ref))
+            target-sequence)
+         (declare (fixnum source-index target-index))
+         (rplaca target-sequence-ref (aref source-sequence source-index))))))
 
 (defmacro vector-replace-from-list ()
-  `(do ((target-index target-start (1+ target-index))
-        (source-index source-start (1+ source-index))
-        (source-sequence (nthcdr source-start source-sequence)
-                         (cdr source-sequence)))
-       ((or (= target-index (the fixnum target-end))
-            (= source-index (the fixnum source-end))
-            (null source-sequence))
-        target-sequence)
-     (declare (fixnum target-index source-index))
-     (setf (aref target-sequence target-index) (car source-sequence))))
+  `(with-array-data ((target-sequence target-sequence) (target-start target-start) (target-end target-end))
+     (cond-dispatch (simple-vector-p target-sequence)
+       (do ((target-index target-start (1+ target-index))
+            (source-index source-start (1+ source-index))
+            (source-sequence (nthcdr source-start source-sequence)
+                             (cdr source-sequence)))
+           ((or (= target-index (the fixnum target-end))
+                (= source-index (the fixnum source-end))
+                (null source-sequence))
+            target-sequence)
+         (declare (fixnum target-index source-index))
+         (setf (aref target-sequence target-index) (car source-sequence))))))
 
 (define-sequence-traverser replace
     (target-sequence1 source-sequence2 &rest args &key start1 end1 start2 end2)
@@ -964,7 +970,7 @@ many elements are copied."
 
 (defun reverse-word-specialized-vector (from to end)
   (declare (vector from))
-  (do ((length (length to))
+  (do ((length (length (truly-the (simple-unboxed-array 1) to)))
        (left-index 0 (1+ left-index))
        (right-index end))
       ((= left-index length))
@@ -973,6 +979,20 @@ many elements are copied."
     (setf (%vector-raw-bits to left-index)
           (%vector-raw-bits from right-index)))
   to)
+
+;;; Could use another version of this for byte-aligned-.
+;;; If neither is applicable then just use the general case.
+(sb-c::when-vop-existsp (:translate sb-vm::reverse-bits-64)
+  (defun reverse-word-aligned-simple-bit-vector (from to end)
+    (do ((length (floor (length (truly-the simple-bit-vector to)) 64))
+         (left-index 0 (1+ left-index))
+         (right-index end))
+        ((= left-index length))
+      (declare (type index left-index right-index))
+      (decf right-index)
+      (setf (%vector-raw-bits to left-index)
+            (sb-vm::reverse-bits-64 (%vector-raw-bits from right-index))))
+    to))
 
 (defun vector-reverse (vector)
   (declare (vector vector))
@@ -994,6 +1014,11 @@ many elements are copied."
                        (svref vector right-index))))
               ((word-specialized-vector-tag-p tag)
                (reverse-word-specialized-vector vector new-vector end))
+              #+(or arm64 x86-64)
+              ((and (simple-bit-vector-p vector)
+                    (= (mod length 64) 0) (= (mod end 64) 0))
+               (reverse-word-aligned-simple-bit-vector
+                vector new-vector (floor end 64))) ; pass END in words
               #+(or arm64 x86-64)
               ((typep vector '(or (simple-array base-char (*))
                                (simple-array (signed-byte 8) (*))
@@ -1039,6 +1064,22 @@ many elements are copied."
             (%vector-raw-bits vector right-index) left)))
   vector)
 
+(sb-c::when-vop-existsp (:translate sb-vm::reverse-bits-64)
+  (declaim (inline nreverse-word-aligned-simple-bit-vector))
+  (defun nreverse-word-aligned-simple-bit-vector (vector start end)
+    (do ((left-index start (1+ left-index))
+         (right-index (1- end) (1- right-index)))
+        ((<= right-index left-index)
+         (when (= right-index left-index) ; the odd  element was missed
+           (setf (%vector-raw-bits vector left-index)
+                 (sb-vm::reverse-bits-64 (%vector-raw-bits vector left-index)))))
+      (declare (type index left-index right-index))
+      (let ((left (sb-vm::reverse-bits-64 (%vector-raw-bits vector left-index)))
+            (right (sb-vm::reverse-bits-64 (%vector-raw-bits vector right-index))))
+        (setf (%vector-raw-bits vector left-index) right
+              (%vector-raw-bits vector right-index) left)))
+    vector))
+
 (defun vector-nreverse (original-vector)
   (declare (vector original-vector))
   (when (> (length original-vector) 1)
@@ -1057,6 +1098,10 @@ many elements are copied."
                          (svref vector right-index) left))))
               ((word-specialized-vector-tag-p tag)
                (nreverse-word-specialized-vector vector start end))
+              #+(or arm64 x86-64)
+              ((and (simple-bit-vector-p vector) (= (mod start 64) 0) (= (mod end 64) 0))
+               (nreverse-word-aligned-simple-bit-vector
+                vector (floor start 64) (floor end 64))) ; pass START,END in words
               #+(or arm64 x86-64)
               ((typep vector '(or (simple-array base-char (*))
                                (simple-array (signed-byte 8) (*))
@@ -1296,30 +1341,50 @@ many elements are copied."
                                (let ((n (truly-the index (fast-&rest-nth (incf index) sequences))))
                                  (incf index n)
                                  (incf length n)))
+                              ((eq arg '%repeat)
+                               (let* ((n (fast-&rest-nth (incf index) sequences))
+                                      (n (the index
+                                              (if (listp n)
+                                                  (if (cdr n)
+                                                      (error "Bad dimensions for a vector: ~a" n)
+                                                      (car n))
+                                                  n))))
+                                 (incf index)
+                                 (incf length n)))
                               (t
                                (incf length (length arg)))))
                       (let ((result (make-array length :element-type ',element-type))
                             (start* 0))
                         (declare (index start*))
                         (do-rest-arg ((arg index*) sequences)
-                          (if (eq arg '%splice)
-                              (let ((n (truly-the index (fast-&rest-nth (incf index) sequences))))
-                                (loop repeat n
-                                      do (setf (aref result start)
-                                               (fast-&rest-nth (incf index) sequences))
-                                         (incf start)))
-                              (multiple-value-bind (seq start2 end2 length)
-                                  (cond ((eq arg '%subseq)
-                                         (let* ((seq (fast-&rest-nth (incf index) sequences))
-                                                (start (truly-the index (fast-&rest-nth (incf index) sequences)))
-                                                (end (truly-the (or null index) (fast-&rest-nth (incf index) sequences)))
-                                                (end (or end (length seq))))
-                                           (values seq start end (- end start))))
-                                        (t
-                                         (values (truly-the sequence arg) 0 nil (length arg))))
-                                (string-dispatch (,@dispatch t) seq
-                                  (replace result seq :start1 start :start2 start2 :end2 end2)
-                                  (incf start length)))))
+                          (cond ((eq arg '%splice)
+                                 (let ((n (truly-the index (fast-&rest-nth (incf index) sequences))))
+                                   (loop repeat n
+                                         do (setf (aref result start)
+                                                  (fast-&rest-nth (incf index) sequences))
+                                            (incf start))))
+                                ((eq arg '%repeat)
+                                 (let* ((n (fast-&rest-nth (incf index) sequences))
+                                        (n (truly-the index (if (listp n)
+                                                                (car n)
+                                                                n)))
+                                        (element (fast-&rest-nth (incf index) sequences)))
+                                   (loop repeat n
+                                         do (setf (aref result start) element)
+                                            (incf start))))
+                                (t
+                                 (multiple-value-bind (seq start2 end2 length)
+                                     (cond ((eq arg '%subseq)
+                                            (let* ((seq (fast-&rest-nth (incf index) sequences))
+                                                   (start (truly-the index (fast-&rest-nth (incf index) sequences)))
+                                                   (end (truly-the (or null index) (fast-&rest-nth (incf index) sequences)))
+                                                   (end (or end (length seq))))
+                                              (values seq start end (- end start))))
+                                           (t
+                                            (values (truly-the sequence arg) 0 nil (length arg))))
+                                   (string-dispatch (,@dispatch t) seq
+                                     (replace result seq :start1 start :start2 start2 :end2 end2)
+                                     (incf start length))))))
                         result)))))))
   #+sb-unicode
   (def %concatenate-to-string character
@@ -1361,21 +1426,34 @@ many elements are copied."
          (splice result))
     (do-rest-arg ((arg index*) sequences)
       (symbol-macrolet ((index (truly-the index index*)))
-        (if (eq arg '%splice)
-            (let ((n (truly-the index (fast-&rest-nth (incf index) sequences))))
-              (loop repeat n
-                    do
-                    (setf splice (cdr (rplacd splice (list (fast-&rest-nth (incf index) sequences)))))))
-            (multiple-value-bind (seq start2 end2)
-                (cond ((eq arg '%subseq)
-                       (let* ((seq (fast-&rest-nth (incf index) sequences))
-                              (start (the index (fast-&rest-nth (incf index) sequences)))
-                              (end (the (or null index) (fast-&rest-nth (incf index) sequences))))
-                         (values seq start end)))
-                      (t
-                       (values arg 0 nil)))
-              (do-subsequence (e seq start2 end2)
-                (setf splice (cdr (rplacd splice (list e)))))))))
+        (cond ((eq arg '%splice)
+               (let ((n (truly-the index (fast-&rest-nth (incf index) sequences))))
+                 (loop repeat n
+                       do
+                       (setf splice (cdr (rplacd splice (list (fast-&rest-nth (incf index) sequences))))))))
+              ((eq arg '%repeat)
+               (let* ((n (fast-&rest-nth (incf index) sequences))
+                      (n (the index
+                              (if (listp n)
+                                  (if (cdr n)
+                                      (error "Bad dimensions for a vector: ~a" n)
+                                      (car n))
+                                  n)))
+                      (element (fast-&rest-nth (incf index) sequences)))
+                 (loop repeat n
+                       do
+                       (setf splice (cdr (rplacd splice (list element)))))))
+              (t
+               (multiple-value-bind (seq start2 end2)
+                   (cond ((eq arg '%subseq)
+                          (let* ((seq (fast-&rest-nth (incf index) sequences))
+                                 (start (the index (fast-&rest-nth (incf index) sequences)))
+                                 (end (the (or null index) (fast-&rest-nth (incf index) sequences))))
+                            (values seq start end)))
+                         (t
+                          (values arg 0 nil)))
+                 (do-subsequence (e seq start2 end2)
+                   (setf splice (cdr (rplacd splice (list e))))))))))
     (cdr result)))
 
 (defun %concatenate-to-vector-subseq (widetag &rest sequences)
@@ -1395,6 +1473,16 @@ many elements are copied."
                  (if (> start end)
                      (sequence-bounding-indices-bad-error seq start end))
                  (incf length (- end start))))
+               ((eq arg '%repeat)
+                (let* ((n (fast-&rest-nth (incf index) sequences))
+                       (n (the index
+                               (if (listp n)
+                                   (if (cdr n)
+                                       (error "Bad dimensions for a vector: ~a" n)
+                                       (car n))
+                                   n))))
+                  (incf index)
+                  (incf length n)))
               ((eq arg '%splice)
                (let ((n (truly-the index (fast-&rest-nth (incf index) sequences))))
                  (incf index n)
@@ -1407,23 +1495,33 @@ many elements are copied."
              (setter (the function (svref %%data-vector-setters%% widetag)))
              (index* 0))
         (do-rest-arg ((arg rest-index*) sequences)
-          (if (eq arg '%splice)
-              (let ((n (truly-the index (fast-&rest-nth (incf rest-index) sequences))))
-                (loop repeat n
-                      do (funcall setter result index (fast-&rest-nth (incf rest-index) sequences))
-                         (incf index)))
-              (multiple-value-bind (seq start2 end2)
-                  (cond ((eq arg '%subseq)
-                         (let* ((seq (truly-the sequence (fast-&rest-nth (incf rest-index) sequences)))
-                                (start (truly-the index (fast-&rest-nth (incf rest-index) sequences)))
-                                (end (truly-the (or null index) (fast-&rest-nth (incf rest-index) sequences)))
-                                (end (or end (length seq))))
-                           (values seq start end (- end start))))
-                        (t
-                         (values arg 0 nil)))
-                (do-subsequence (e seq start2 end2)
-                  (funcall setter result index e)
-                  (incf index)))))
+          (cond ((eq arg '%splice)
+                 (let ((n (truly-the index (fast-&rest-nth (incf rest-index) sequences))))
+                   (loop repeat n
+                         do (funcall setter result index (fast-&rest-nth (incf rest-index) sequences))
+                            (incf index))))
+                ((eq arg '%repeat)
+                 (let* ((n (fast-&rest-nth (incf rest-index) sequences))
+                        (n (truly-the index (if (listp n)
+                                                (car n)
+                                                n)))
+                        (element (fast-&rest-nth (incf rest-index) sequences)))
+                   (loop repeat n
+                         do (funcall setter result index element)
+                            (incf index))))
+                (t
+                 (multiple-value-bind (seq start2 end2)
+                     (cond ((eq arg '%subseq)
+                            (let* ((seq (truly-the sequence (fast-&rest-nth (incf rest-index) sequences)))
+                                   (start (truly-the index (fast-&rest-nth (incf rest-index) sequences)))
+                                   (end (truly-the (or null index) (fast-&rest-nth (incf rest-index) sequences)))
+                                   (end (or end (length seq))))
+                              (values seq start end (- end start))))
+                           (t
+                            (values arg 0 nil)))
+                   (do-subsequence (e seq start2 end2)
+                     (funcall setter result index e)
+                     (incf index))))))
         result))))
 
 ;;;; MAP
@@ -1710,25 +1808,25 @@ many elements are copied."
 ;;;; REDUCE
 
 (defmacro mumble-reduce (function
-                               sequence
-                               key
-                               start
-                               end
-                               initial-value
-                               ref)
-  `(do ((index ,start (1+ index))
+                         sequence
+                         key
+                         start
+                         end
+                         initial-value
+                         ref)
+  `(do ((index ,start (truly-the index (1+ index)))
         (value ,initial-value))
        ((>= index ,end) value)
      (setq value (funcall ,function value
                           (apply-key ,key (,ref ,sequence index))))))
 
 (defmacro mumble-reduce-from-end (function
-                                        sequence
-                                        key
-                                        start
-                                        end
-                                        initial-value
-                                        ref)
+                                  sequence
+                                  key
+                                  start
+                                  end
+                                  initial-value
+                                  ref)
   `(do ((index (1- ,end) (1- index))
         (value ,initial-value)
         (terminus (1- ,start)))
@@ -1737,72 +1835,198 @@ many elements are copied."
                           (apply-key ,key (,ref ,sequence index))
                           value))))
 
-(defmacro list-reduce (function
-                             sequence
-                             key
-                             start
-                             end
-                             initial-value
-                             ivp)
-  `(let ((sequence (nthcdr ,start ,sequence)))
-     (do ((count (if ,ivp ,start (1+ ,start))
-                 (1+ count))
-          (sequence (if ,ivp sequence (cdr sequence))
-                    (cdr sequence))
-          (value (if ,ivp ,initial-value (apply-key ,key (car sequence)))
-                 (funcall ,function value (apply-key ,key (car sequence)))))
-         ((>= count ,end) value))))
-
-(defmacro list-reduce-from-end (function
-                                      sequence
-                                      key
-                                      start
-                                      end
-                                      initial-value
-                                      ivp)
-  `(let ((sequence (nthcdr (- (length ,sequence) ,end)
-                           (reverse ,sequence))))
-     (do ((count (if ,ivp ,start (1+ ,start))
-                 (1+ count))
-          (sequence (if ,ivp sequence (cdr sequence))
-                    (cdr sequence))
-          (value (if ,ivp ,initial-value (apply-key ,key (car sequence)))
-                 (funcall ,function (apply-key ,key (car sequence)) value)))
-         ((>= count ,end) value))))
-
-(define-sequence-traverser reduce (function sequence &rest args &key key
-                                   from-end start end (initial-value nil ivp))
+(defun reduce-append (function sequence &rest args
+                      &key key from-end (start 0) end (initial-value nil ivp))
   (declare (type index start)
            (dynamic-extent args))
   (declare (explicit-check sequence))
-  (seq-dispatch-checking sequence
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if (= end start)
-          (if ivp initial-value (funcall function))
-          (if from-end
-              (list-reduce-from-end function sequence key start end
-                                    initial-value ivp)
-              (list-reduce function sequence key start end
-                           initial-value ivp))))
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if (= end start)
-          (if ivp initial-value (funcall function))
-          (if from-end
-              (progn
-                (when (not ivp)
-                  (setq end (1- (the fixnum end)))
-                  (setq initial-value (apply-key key (aref sequence end))))
-                (mumble-reduce-from-end function sequence key start end
-                                        initial-value aref))
-              (progn
-                (when (not ivp)
-                  (setq initial-value (apply-key key (aref sequence start)))
-                  (setq start (1+ start)))
-                (mumble-reduce function sequence key start end
-                               initial-value aref)))))
-    (apply #'sb-sequence:reduce function sequence args)))
+  (declare (type index start)
+           (type (or null index) end))
+  (let ((key (and key (%coerce-callable-to-fun key))))
+   (seq-dispatch-checking sequence
+       (let ((sequence (nthcdr-check-bounds start sequence
+                                            start end sequence)))
+         (if end
+             (cond ((> start end)
+                    (sequence-bounding-indices-bad-error sequence start end))
+                   ((= end start)
+                    (if ivp
+                        initial-value))
+                   (t
+                    (let ((count (the index (- end start))))
+                      (let* ((l sequence)
+                             (head (list nil))
+                             (tail head))
+                        (declare (dynamic-extent head))
+                        (loop with i fixnum = count
+                              do
+                              (when (endp l)
+                                (sequence-bounding-indices-bad-error sequence start end))
+                              (let ((e (apply-key key (pop l))))
+                                (when (<= i 1)
+                                  (cond ((not ivp)
+                                         (setf (cdr tail) e))
+                                        (from-end
+                                         (setq tail (copy-list-to e tail))
+                                         (setf (cdr tail) initial-value))
+                                        (t
+                                         (setf (cdr tail) e)
+                                         (return-from reduce-append (append initial-value (cdr head)))))
+                                  (return))
+                                (setq tail (copy-list-to e tail)))
+                              (decf i))
+                        (cdr head)))))
+             (if (endp sequence)
+                 (if ivp
+                     initial-value)
+                 (let* ((l sequence)
+                        (head (list nil))
+                        (tail head))
+                   (declare (dynamic-extent head))
+                   (loop
+                    (let ((e (apply-key key (pop l))))
+                      (when (endp l)
+                        (cond ((not ivp)
+                               (setf (cdr tail) e))
+                              (from-end
+                               (setq tail (copy-list-to e tail))
+                               (setf (cdr tail) initial-value))
+                              (t
+                               (setf (cdr tail) e)
+                               (return-from reduce-append (append initial-value (cdr head)))))
+                        (return))
+                      (setq tail (copy-list-to e tail))))
+                   (cdr head)))))
+       (with-array-data ((vector sequence) (start start) (end end) :check-fill-pointer t
+                                                                   :force-inline t)
+         (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+         (if (= end start)
+             (if ivp
+                 initial-value)
+             (let* ((head (list nil))
+                    (tail head))
+               (declare (dynamic-extent head))
+               (cond-dispatch key
+                 (cond-dispatch (simple-vector-p vector)
+                   (loop with i fixnum = start
+                         do
+                         (let ((e (apply-key key (aref vector i))))
+                           (incf i)
+                           (when (= i end)
+                             (cond ((not ivp)
+                                    (setf (cdr tail) e))
+                                   (from-end
+                                    (setq tail (copy-list-to e tail))
+                                    (setf (cdr tail) initial-value))
+                                   (t
+                                    (setf (cdr tail) e)
+                                    (return-from reduce-append (append initial-value (cdr head)))))
+                             (return))
+                           (setq tail (copy-list-to e tail))))))
+               (truly-the list (cdr head)))))
+       (apply #'sb-sequence:reduce function sequence args))))
+
+(defun reduce (function sequence &rest args
+               &key key from-end (start 0) end (initial-value nil ivp))
+  (declare (type index start)
+           (dynamic-extent args))
+  (declare (explicit-check sequence))
+  (declare (dynamic-extent function key))
+  (let* ((function (%coerce-callable-to-fun function))
+         (key (and key (%coerce-callable-to-fun key))))
+    (declare (type (or null function) key)
+             (type index start)
+             (type (or null index) end))
+    (seq-dispatch-checking sequence
+        (let ((sequence (nthcdr-check-bounds start sequence
+                                             start end sequence)))
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+          (if end
+              (cond ((> start end)
+                     (sequence-bounding-indices-bad-error sequence start end))
+                    ((= end start)
+
+                     (if ivp
+                         initial-value
+                         (funcall function)))
+                    (t
+                     (cond-dispatch key
+                       (let ((count (the index (- end start))))
+                         (if from-end
+                             (let ((vector (reverse-into-vector-to-nthcdr-check-bounds
+                                            count sequence start end sequence))
+                                   (end count)
+                                   (start 0))
+                               (when (not ivp)
+                                 (setq initial-value (apply-key key (aref vector 0)))
+                                 (setq start 1))
+                               (do ((index start (truly-the index (1+ index)))
+                                    (value initial-value))
+                                   ((>= index end) value)
+                                 (setq value (funcall function (apply-key key (aref vector index)) value))))
+                             (do ((count (if ivp
+                                             count
+                                             (1- count))
+                                         (1- count))
+                                  (sequence (if ivp
+                                                sequence
+                                                (cdr sequence))
+                                            (cdr sequence))
+                                  (value (if ivp
+                                             initial-value
+                                             (apply-key key (car sequence)))
+                                         (funcall function value (apply-key key (car sequence)))))
+                                 ((<= count 0) value)
+                               (when (endp sequence)
+                                 (sequence-bounding-indices-bad-error sequence start end))))))))
+              (if (endp sequence)
+                  (if ivp
+                      initial-value
+                      (funcall function))
+                  (cond-dispatch key
+                    (if from-end
+                        (let* ((vector (list-reverse-into-vector sequence))
+                               (end (length vector))
+                               (start 0))
+                          (when (not ivp)
+                            (setq initial-value (apply-key key (aref vector 0)))
+                            (setq start 1))
+                          (do ((index start (truly-the index (1+ index)))
+                               (value initial-value))
+                              ((>= index end) value)
+                            (setq value (funcall function (apply-key key (aref vector index)) value))))
+                        (do ((sequence (if ivp
+                                           sequence
+                                           (cdr sequence))
+                                       (cdr sequence))
+                             (value (if ivp
+                                        initial-value
+                                        (apply-key key (car sequence)))
+                                    (funcall function value (apply-key key (car sequence)))))
+                            ((endp sequence) value)))))))
+        (with-array-data ((vector sequence) (start start) (end end) :check-fill-pointer t
+                          :force-inline t)
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+          (if (= end start)
+              (if ivp
+                  initial-value
+                  (funcall function))
+              (sb-vm::vector-dispatch vector
+                  ((declare (ignore vector))
+                   (sb-c::%type-check-error/c sequence 'nil-array-accessed-error nil))
+                (cond-dispatch key
+                  (if from-end
+                      (progn
+                        (when (not ivp)
+                          (setq end (truly-the index (1- (the fixnum end))))
+                          (setq initial-value (apply-key key (aref vector end))))
+                        (mumble-reduce-from-end function vector key start end initial-value aref))
+                      (progn
+                        (when (not ivp)
+                          (setq initial-value (apply-key key (aref vector start)))
+                          (setq start (1+ start)))
+                        (mumble-reduce function vector key start end initial-value aref)))))))
+        (apply #'sb-sequence:reduce function sequence args))))
 
 ;;;; DELETE
 
@@ -2063,103 +2287,141 @@ many elements are copied."
 
 ;;; LIST-REMOVE-MACRO does not include (removes) each element that satisfies
 ;;; the predicate.
-(defmacro list-remove-macro (pred reverse?)
-    (if reverse?
-        `(let* ((sequence (reverse (the list sequence)))
-                (end (or end length))
-                (%start (- length end))
-                (%end (- length start))
-                (splice (list nil))
-                (tail (and (/= %end length)
-                           (nthcdr %end sequence)))
-                (results ;; It's already copied by REVERSE, so it can
-                  ;; be modified here
-                  (if (plusp %start)
-                      (let* ((tail (nthcdr (1- %start) sequence))
-                             (remaining (cdr tail)))
-                        (setf (cdr tail) nil)
-                        (prog1 splice
-                          (rplacd splice sequence)
-                          (setf splice tail
-                                sequence remaining)))
-                      splice)))
-           (declare (dynamic-extent splice))
-           (do ((this-element)
-                (number-zapped 0))
-               ((cond ((eq tail sequence)
-                       (rplacd splice tail)
-                       t)
-                      ((= number-zapped count)
-                       (rplacd splice sequence)
-                       t))
-                (nreverse (the list (cdr results))))
-             (declare (index number-zapped))
-             (setf this-element (pop sequence))
-             (if ,pred
-                 (incf number-zapped)
-                 (setf splice (cdr (rplacd splice (list this-element)))))))
-        `(let ((save sequence)
-               (list (nthcdr start sequence)))
-           (collect (((result append-tail)))
-             (if (eq count (1- most-positive-fixnum))
-                 (if end
-                     (loop for i from start below end
-                           do (let ((current list)
-                                    (this-element (pop list)))
-                                (cond (,pred
-                                       (loop for x on save
-                                             until (eq x current)
-                                             do (result (car x)))
-                                       (setf save list)))))
-                     (loop while list
-                           do (let ((current list)
-                                    (this-element (pop list)))
-                                (cond (,pred
-                                       (loop for x on save
-                                             until (eq x current)
-                                             do (result (car x)))
-                                       (setf save list))))))
-                 (let ((number-zapped 0))
-                   (declare (index number-zapped))
-                   (if end
-                       (loop for i from start below end
-                             while (< number-zapped count)
-                             do (let ((current list)
-                                      (this-element (pop list)))
-                                  (cond (,pred
-                                         (incf number-zapped)
-                                         (loop for x on save
-                                               until (eq x current)
-                                               do (result (car x)))
-                                         (setf save list)))))
-                       (loop while (and list
-                                        (< number-zapped count))
-                             do (let ((current list)
-                                      (this-element (pop list)))
-                                  (cond (,pred
-                                         (incf number-zapped)
-                                         (loop for x on save
-                                               until (eq x current)
-                                               do (result (car x)))
-                                         (setf save list))))))))
-             (let ((result (result)))
-               (cond (result
-                      (append-tail save)
-                      result)
-                     (t
-                      save)))))))
+(defmacro list-remove-macro (pred reverse? &optional always-copy)
+  (cond (reverse?
+         `(let* ((sequence (reverse (the list sequence)))
+                 (end (or end length))
+                 (%start (- length end))
+                 (%end (- length start))
+                 (splice (list nil))
+                 (tail (and (/= %end length)
+                            (nthcdr %end sequence)))
+                 (results ;; It's already copied by REVERSE, so it can
+                   ;; be modified here
+                   (if (plusp %start)
+                       (let* ((tail (nthcdr (1- %start) sequence))
+                              (remaining (cdr tail)))
+                         (setf (cdr tail) nil)
+                         (prog1 splice
+                           (rplacd splice sequence)
+                           (setf splice tail
+                                 sequence remaining)))
+                       splice)))
+            (declare (dynamic-extent splice))
+            (do ((this-element)
+                 (number-zapped 0))
+                ((cond ((eq tail sequence)
+                        (rplacd splice tail)
+                        t)
+                       ((= number-zapped count)
+                        (rplacd splice sequence)
+                        t))
+                 (nreverse (the list (cdr results))))
+              (declare (index number-zapped))
+              (setf this-element (pop sequence))
+              (if ,pred
+                  (incf number-zapped)
+                  (setf splice (cdr (rplacd splice (list this-element))))))))
+        (always-copy
+         `(let ((list sequence))
+            (collect (((result)))
+              (loop for i below start
+                    do (result (pop list)))
+              (if (eq count (1- most-positive-fixnum))
+                  (if end
+                      (progn
+                        (loop for i from start below end
+                              do (let ((this-element (pop list)))
+                                   (unless ,pred
+                                     (result this-element))))
+                        (loop while list
+                              do (result (pop list))))
+                      (loop while list
+                            do (let ((this-element (pop list)))
+                                 (unless ,pred
+                                   (result this-element)))))
+                  (let ((number-zapped 0))
+                    (declare (index number-zapped))
+                    (if end
+                        (loop for i from start below end
+                              while (< number-zapped count)
+                              do (let ((this-element (pop list)))
+                                   (if ,pred
+                                       (incf number-zapped)
+                                       (result this-element))))
+                        (loop while (and list
+                                         (< number-zapped count))
+                              do (let ((this-element (pop list)))
+                                   (if ,pred
+                                       (incf number-zapped)
+                                       (result this-element)))))
+                    (loop while list
+                          do (result (pop list)))))
+              (result))))
+        (t
+         `(let ((save sequence)
+                (list (nthcdr start sequence)))
+            (collect (((result append-tail)))
+              (if (eq count (1- most-positive-fixnum))
+                  (if end
+                      (loop for i from start below end
+                            do (let ((current list)
+                                     (this-element (pop list)))
+                                 (when ,pred
+                                   (loop for x on save
+                                         until (eq x current)
+                                         do (result (car x)))
+                                   (setf save list))))
+                      (loop while list
+                            do (let ((current list)
+                                     (this-element (pop list)))
+                                 (when ,pred
+                                   (loop for x on save
+                                         until (eq x current)
+                                         do (result (car x)))
+                                   (setf save list)))))
+                  (let ((number-zapped 0))
+                    (declare (index number-zapped))
+                    (if end
+                        (loop for i from start below end
+                              while (< number-zapped count)
+                              do (let ((current list)
+                                       (this-element (pop list)))
+                                   (when ,pred
+                                     (incf number-zapped)
+                                     (loop for x on save
+                                           until (eq x current)
+                                           do (result (car x)))
+                                     (setf save list))))
+                        (loop while (and list
+                                         (< number-zapped count))
+                              do (let ((current list)
+                                       (this-element (pop list)))
+                                   (when ,pred
+                                     (incf number-zapped)
+                                     (loop for x on save
+                                           until (eq x current)
+                                           do (result (car x)))
+                                     (setf save list)))))))
+              (let ((result (result)))
+                (cond (result
+                       (append-tail save)
+                       result)
+                      (t
+                       save))))))))
 
-(defmacro list-remove (pred)
-  `(list-remove-macro ,pred nil))
+(defmacro list-remove (pred &optional always-copy)
+  `(list-remove-macro ,pred nil ,always-copy))
 
 (defmacro list-remove-from-end (pred)
   `(list-remove-macro ,pred t))
 
-(defmacro normal-list-remove ()
+(defmacro normal-list-remove (&optional always-copy)
   `(list-remove
     (if test-not
         (not (funcall test-not item (apply-key key this-element)))
-        (funcall test item (apply-key key this-element)))))
+        (funcall test item (apply-key key this-element)))
+    ,always-copy))
 
 (defmacro normal-list-remove-from-end ()
   `(list-remove-from-end
@@ -2167,79 +2429,95 @@ many elements are copied."
         (not (funcall test-not item (apply-key key this-element)))
         (funcall test item (apply-key key this-element)))))
 
-(defmacro if-list-remove ()
+(defmacro if-list-remove (&optional always-copy)
   `(list-remove
-    (funcall predicate (apply-key key this-element))))
+    (funcall predicate (apply-key key this-element))
+    ,always-copy))
 
 (defmacro if-list-remove-from-end ()
   `(list-remove-from-end
     (funcall predicate (apply-key key this-element))))
 
-(defmacro if-not-list-remove ()
+(defmacro if-not-list-remove (&optional always-copy)
   `(list-remove
-    (not (funcall predicate (apply-key key this-element)))))
+    (not (funcall predicate (apply-key key this-element)))
+    ,always-copy))
 
 (defmacro if-not-list-remove-from-end ()
   `(list-remove-from-end
     (not (funcall predicate (apply-key key this-element)))))
 
-(define-sequence-traverser remove
-    (item sequence &rest args &key from-end test test-not start
-     end count key)
-  "Return a copy of SEQUENCE with elements satisfying the test (default is
-   EQL) with ITEM removed."
-  (declare (type fixnum start)
-           (dynamic-extent args))
-  (declare (explicit-check sequence :result))
-  (seq-dispatch-checking=>seq
-   sequence
-   (if from-end
-       (normal-list-remove-from-end)
-       (normal-list-remove))
-   (let ((end (or end length)))
-     (declare (type index end))
+(make-defs ((($fun $copy)
+             (remove nil)
+             (copy-remove t)))
+  (define-sequence-traverser $fun
+      (item sequence &rest args &key from-end test test-not start
+            end count key)
+    ($unless $copy
+             "Return a copy of SEQUENCE with elements satisfying the test (default is
+   EQL) with ITEM removed.")
+    (declare (type fixnum start)
+             (dynamic-extent args))
+    (declare (explicit-check sequence :result))
+    (seq-dispatch-checking=>seq
+     sequence
      (if from-end
-         (normal-mumble-remove-from-end)
-         (normal-mumble-remove)))
-   (apply #'sb-sequence:remove item sequence args)))
+         (normal-list-remove-from-end)
+         (normal-list-remove $copy))
+     (let ((end (or end length)))
+       (declare (type index end))
+       (if from-end
+           (normal-mumble-remove-from-end)
+           (normal-mumble-remove)))
+     (($if $copy copy-seq values)
+      (apply #'sb-sequence:remove item sequence args)))))
 
-(define-sequence-traverser remove-if
-    (predicate sequence &rest args &key from-end start end count key)
-  "Return a copy of sequence with elements satisfying PREDICATE removed."
-  (declare (type fixnum start)
-           (dynamic-extent args))
-  (declare (explicit-check sequence :result))
-  (seq-dispatch-checking=>seq sequence
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if from-end
-          (if-list-remove-from-end)
-          (if-list-remove)))
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if from-end
-          (if-mumble-remove-from-end)
-          (if-mumble-remove)))
-    (apply #'sb-sequence:remove-if predicate sequence args)))
-
-(define-sequence-traverser remove-if-not
-    (predicate sequence &rest args &key from-end start end count key)
-  "Return a copy of sequence with elements not satisfying PREDICATE removed."
-  (declare (type fixnum start)
-           (dynamic-extent args))
-  (declare (explicit-check sequence :result))
-  (seq-dispatch-checking=>seq sequence
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if from-end
-          (if-not-list-remove-from-end)
-          (if-not-list-remove)))
-    (let ((end (or end length)))
-      (declare (type index end))
-      (if from-end
-          (if-not-mumble-remove-from-end)
-          (if-not-mumble-remove)))
-    (apply #'sb-sequence:remove-if-not predicate sequence args)))
+(make-defs ((($fun $copy)
+             (remove-if nil)
+             (copy-remove-if t)))
+ (define-sequence-traverser $fun
+     (predicate sequence &rest args &key from-end start end count key)
+   ($unless $copy
+            "Return a copy of sequence with elements satisfying PREDICATE removed.")
+   (declare (type fixnum start)
+            (dynamic-extent args))
+   (declare (explicit-check sequence :result))
+   (seq-dispatch-checking=>seq sequence
+                               (let ((end (or end length)))
+                                 (declare (type index end))
+                                 (if from-end
+                                     (if-list-remove-from-end)
+                                     (if-list-remove $copy)))
+                               (let ((end (or end length)))
+                                 (declare (type index end))
+                                 (if from-end
+                                     (if-mumble-remove-from-end)
+                                     (if-mumble-remove)))
+                               (($if $copy copy-seq values)
+                                (apply #'sb-sequence:remove-if predicate sequence args)))))
+(make-defs ((($fun $copy)
+             (remove-if-not nil)
+             (copy-remove-if-not t)))
+ (define-sequence-traverser $fun
+     (predicate sequence &rest args &key from-end start end count key)
+   ($unless $copy
+            "Return a copy of sequence with elements not satisfying PREDICATE removed.")
+   (declare (type fixnum start)
+            (dynamic-extent args))
+   (declare (explicit-check sequence :result))
+   (seq-dispatch-checking=>seq sequence
+                               (let ((end (or end length)))
+                                 (declare (type index end))
+                                 (if from-end
+                                     (if-not-list-remove-from-end)
+                                     (if-not-list-remove $copy)))
+                               (let ((end (or end length)))
+                                 (declare (type index end))
+                                 (if from-end
+                                     (if-not-mumble-remove-from-end)
+                                     (if-not-mumble-remove)))
+                               (($if $copy copy-seq values)
+                                (apply #'sb-sequence:remove-if-not predicate sequence args)))))
 
 ;;;; REMOVE-DUPLICATES
 

@@ -63,6 +63,16 @@
 (defun find-or-create-equality-constraint (operator x y not-p &optional (amount 0))
   (unless amount
     (setf amount 0))
+  (when (and (lambda-var-p x)
+             (lambda-var-p y))
+    ;; Normalize var-var constraints to < and <=
+    (case operator
+      (>
+       (rotatef x y)
+       (setf operator '<))
+      (>=
+       (rotatef x y)
+       (setf operator '<=))))
   (let ((x-var (constraint-var x))
         (cache-key (typecase y
                      (vector-length-constraint y
@@ -106,7 +116,12 @@
          (array-lvar
            (and (combination-p use)
                 (lvar-fun-is (combination-fun use)
-                             '(vector-length length))
+                             '(vector-length length
+                               ;; vector-length-constraint can also be
+                               ;; used for multidimensional arrays in
+                               ;; some cases, like accessing via
+                               ;; ROW-MAJOR-AREF.
+                               %array-available-elements))
                 (car (combination-args use))))
          (array-var (and array-lvar
                          (or (not simple)
@@ -626,12 +641,14 @@
 (defoptimizer (%check-bound equality-constraint) ((array dimension index) node gen)
   (let ((array-var (ok-lvar-lambda-var array gen)))
     (when (and array-var
-               (csubtypep (lvar-type array) (specifier-type '(simple-array * (*))))
+               (csubtypep (lvar-type array) (specifier-type 'simple-array))
                (block nil
                  (map-equality-constraints (make-vector-length-constraint array-var) index gen
                                            (lambda (op not-p)
-                                             (when (and (eq op '>)
-                                                        (not not-p))
+                                             (when (or (and (eq op '>)
+                                                            (not not-p))
+                                                       (and (eq op '<=)
+                                                            not-p))
                                                (return t))))))
       (reoptimize-node node)
       (setf (combination-info node) 'array-in-bounds-p)))
@@ -733,26 +750,30 @@
                                       ((vector-constraint-eq-p (constraint-y con) x)
                                        (and (vector-constraint-eq-p (constraint-x con) y)
                                             (normalize-not (invert-operator (equality-constraint-operator con))
-                                                           (equality-constraint-not-p con))))))
-                              (find-constraint (var1 var2 ref)
-                                (block nil
-                                  (let ((constraints (block-out (node-block ref))))
-                                    (when constraints
-                                      (do-conset-constraints-intersection (con (constraints
-                                                                                (lambda-var-equality-constraints var1)))
-                                        (multiple-value-bind (op not)
-                                            (relations var1 var2 con)
-                                          (when op
-                                            (return (values op not))))))))))
-                       (let ((op1 (find-constraint var1 var2 ref1))
-                             (op2 (find-constraint var2 var1 ref2)))
-                         (case op1
-                           ((< <=) (and (memq op2 '(<= <))
-                                        (push (list '<= var1) r)
-                                        (push (list '<= var2) r)))
-                           ((> >=) (and (memq op2 '(> >=))
-                                        (push (list '>= var1) r)
-                                        (push (list '>= var2) r))))))))
+                                                           (equality-constraint-not-p con)))))))
+                       (let ((constraints1 (block-out (node-block ref1)))
+                             (constraints2 (block-out (node-block ref2))))
+                         (when (and constraints1 constraints2)
+                           (block nil
+                             (do-conset-constraints-intersection (con (constraints1
+                                                                       (lambda-var-equality-constraints var1)))
+                               (let ((op1 (relations var1 var2 con)))
+                                 (when op1
+                                   (do-conset-constraints-intersection (con (constraints2
+                                                                             (lambda-var-equality-constraints var2)))
+                                     (let ((op2 (relations var2 var1 con)))
+                                       (when op2
+                                         (case op1
+                                           ((< <=)
+                                            (when (memq op2 '(<= <))
+                                              (push (list '<= var1) r)
+                                              (push (list '<= var2) r)
+                                              (return)))
+                                           ((> >=)
+                                            (when (memq op2 '(> >=))
+                                              (push (list '>= var1) r)
+                                              (push (list '>= var2) r)
+                                              (return))))))))))))))))
 
                  r)))))))
 
@@ -883,7 +904,8 @@
 (defoptimizer (make-sequence constraint-propagate-result) ((type length &rest args) node)
   (list (list 'vector-length length)))
 
-(defoptimizers constraint-propagate-result (remove delete remove-if delete-if remove-if-not delete-if-not)
+(defoptimizers constraint-propagate-result (remove delete remove-if delete-if remove-if-not delete-if-not
+                                            copy-remove copy-remove-if-not copy-remove-if)
     ((x sequence &rest args &key from-end test test-not start end count key) node gen)
   (let (c)
     (let ((var (ok-lvar-lambda-var sequence gen)))
@@ -894,6 +916,9 @@
        (push (list 'vector-length<= length)
              c)))
     c))
+
+(defoptimizer (random constraint-propagate-result) ((num &optional state) node)
+  (list (list '< num)))
 
 (defun subseq-bounds (sequence start end gen)
   (let* ((null-p (types-equal-or-intersect (lvar-type end) (specifier-type 'null)))
@@ -916,7 +941,7 @@
                   h))
         (values 0 nil))))
 
-(defoptimizer (vector-subseq* constraint-propagate-result) ((sequence start end) node gen)
+(defoptimizer (vector-subseq constraint-propagate-result) ((sequence start end) node gen)
   (let (c
         (null-p (types-equal-or-intersect (lvar-type end) (specifier-type 'null))))
     (when (eql (lvar-type start) (specifier-type '(eql 0)))
@@ -957,6 +982,19 @@
                         (incf max-sum n)
                         (loop repeat n
                               do (pop args))))
+                     ((and subseq
+                           (constant-lvar-p arg)
+                           (eq (lvar-value arg) 'sb-impl::%repeat))
+                      (let* ((length (pop args))
+                             (int (type-approximate-interval (lvar-type length))))
+                        (cond (int
+                               (incf min-sum (or (interval-low int) 0))
+                               (if (interval-high int)
+                                   (incf max-sum (interval-high int))
+                                   (setf max nil)))
+                              (t
+                               (setf max nil))))
+                      (pop args))
                      (t
                       (let ((int (type-approximate-interval (type-intersection (or (vector-length-type (lvar-type arg))
                                                                                    *universal-type*)
@@ -1267,5 +1305,49 @@
 (defoptimizer (%other-pointer-p constraint-propagate-if) ((x))
   (values x (specifier-type 'other-pointer)))
 
-(defoptimizer (%array-rank= constraint-propagate-if) ((x n))
+(defoptimizer (array-rank= constraint-propagate-if) ((x n))
   (values x (specifier-type `(array * ,(lvar-value n)))))
+
+(defoptimizer (array-dimensions-equal constraint-propagate-if) ((array1 array2))
+  (let* ((array1-type (lvar-conservative-type array1))
+         (array2-type (lvar-conservative-type array2))
+         (dims1 (array-type-dimensions-or-give-up array1-type nil))
+         (dims2 (array-type-dimensions-or-give-up array2-type nil)))
+    (flet ((try (dims1 dims2)
+             (when (consp dims1)
+               (let* ((new-dims (if (consp dims2)
+                                    (loop for dim1 in dims1
+                                          for dim2 in dims2
+                                          collect (if (eq dim1 '*)
+                                                      dim2
+                                                      dim1))
+                                    dims1))
+                      (new (make-array-type (if (or (conservative-array-type-complexp array1-type)
+                                                    (conservative-array-type-complexp array2-type))
+                                                (make-list (length new-dims) :initial-element '*)
+                                                new-dims)
+                                            :element-type *wild-type*)))
+                 (list (list 'typep array1 new)
+                       (list 'typep array2 new))))))
+      (values nil nil (or (try dims1 dims2)
+                          (try dims2 dims1))))))
+
+(defoptimizer (array-dimensions-equal-list constraint-propagate-if) ((array1 list))
+  (when (constant-lvar-p list)
+    (let ((dims2 (lvar-value list)))
+      (when (and (proper-list-p dims2)
+                 (every #'integerp dims2))
+        (let* ((array1-type (lvar-conservative-type array1))
+               (new (make-array-type (if (conservative-array-type-complexp array1-type)
+                                         (make-list (length dims2) :initial-element '*)
+                                         dims2)
+                                     :element-type *wild-type*)))
+          (values array1 new nil nil t))))))
+
+(defoptimizer (array-dimension constraint-propagate) ((array axis) node gen)
+  (unless (types-equal-or-intersect (lvar-type axis) (specifier-type '(eql 0)))
+    (let ((var (ok-lvar-lambda-var array gen)))
+      (when var
+        (list (list 'typep var
+                    (specifier-type '(and array (not vector)))
+                    nil))))))

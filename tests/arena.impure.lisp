@@ -78,7 +78,8 @@
     (assert (not (c-find-heap->arena)))
     (destroy-arena a)))
 
-(test-util:with-test (:name :interrupt-thread-on-arena)
+(test-util:with-test (:name :interrupt-thread-on-arena
+                      :broken-on (and :win32 :arm64))
   (let* ((a (new-arena 1048576))
          (sem (sb-thread:make-semaphore))
          (junk))
@@ -577,7 +578,7 @@
         (exit-if-no-arenas))
       (assert (= n-deleted n-arenas)))))
 
-(defvar *another-arena* (new-arena 131072))
+(defvar *another-arena* (new-arena 131072 131072 10 :hidable t))
 (defun g (n) (make-array (the integer n) :initial-element #\z))
 (defun f (a n) (with-arena (a) (g n)))
 

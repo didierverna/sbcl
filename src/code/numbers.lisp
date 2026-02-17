@@ -110,10 +110,9 @@
      (truly-the single-float (imagpart number)))
     ((complex rational)
      (%imagpart number))
-    (float
-     (* 0 number))
-    (number
-     0)))
+    (single-float 0f0)
+    (double-float 0d0)
+    (t 0)))
 
 (defun conjugate (number)
   "Return the complex conjugate of NUMBER. For non-complex numbers, this is
@@ -296,6 +295,39 @@
                       (* (maybe-truncate dx g2)
                          (maybe-truncate dy g1))))))))
 
+(defun *-by-fixnum-to-fixnum (n f)
+  (declare (explicit-check n))
+  (flet ((err ()
+           (the fixnum (two-arg-* n f))
+           (sb-impl::unreachable)))
+    (typecase n
+      (ratio
+       (if (= f 0)
+           0
+           (let ((num (numerator n))
+                 (den (denominator n)))
+             (if (and (typep num 'fixnum)
+                      (typep den 'fixnum))
+                 (multiple-value-bind (q r) (truncate f den)
+                   (if (zerop r)
+                       (the fixnum (* q num))
+                       (err)))
+                 (err)))))
+      (bignum
+       (if (= f 0)
+           0
+           (if (and (typep n 'sb-vm:signed-word)
+                    (= f -1)
+                    (= n (- most-negative-fixnum)))
+               most-negative-fixnum
+               (err))))
+      ((complex rational)
+       (if (= f 0)
+           0
+           (err)))
+      (t
+       (err)))))
+
 (defun %negate (n)
   (declare (explicit-check))
   (number-dispatch ((n number))
@@ -361,8 +393,8 @@
 (declaim (maybe-inline truncate floor ceiling round fround))
 
 (defun truncate (number &optional (divisor 1))
-  "Return number (or number/divisor) as an integer, rounded toward 0.
-  The second returned value is the remainder."
+  "Return number/divisor as an integer, rounded toward 0.
+The second returned value is the remainder."
   (declare (explicit-check)
            (maybe-inline truncate))
   (macrolet ((truncate-float (rtype)
@@ -427,8 +459,8 @@
        (truncate-float (dispatch-type divisor))))))
 
 (defun floor (number &optional (divisor 1))
-  "Return the greatest integer not greater than number, or number/divisor.
-  The second returned value is (mod number divisor)."
+  "Return number/divisor as an integer, rounded toward negative infinity.
+The second returned value is the remainder."
   (declare (explicit-check)
            (maybe-inline floor))
   (macrolet ((truncate-float (rtype)
@@ -508,8 +540,8 @@
        (truncate-float (dispatch-type divisor))))))
 
 (defun ceiling (number &optional (divisor 1))
-  "Return number (or number/divisor) as an integer, rounded toward 0.
-  The second returned value is the remainder."
+  "Return number/divisor as an integer, rounded toward positive infinity.
+The second returned value is the remainder."
   (declare (explicit-check)
            (maybe-inline ceiling))
   (macrolet ((truncate-float (rtype)
@@ -820,7 +852,7 @@
 (macrolet ((def (name)
              `(defun ,name (x mode)
                 (ecase mode
-                  ,@(loop for m in '(#-round-float :round :floor :ceiling :truncate)
+                  ,@(loop for m in '(#+round-float :round :floor :ceiling :truncate)
                           collect `(,m (,name x ,m)))))))
 
 
@@ -1197,8 +1229,7 @@ the first."
      (>= (bignum-compare x y) 0))))
 
 (defun two-arg-= (x y)
-  (declare (inline float-infinity-p)
-           (explicit-check))
+  (declare (explicit-check))
   (number-dispatch ((x number) (y number))
     (basic-compare =
                    ;; An infinite value is never equal to a finite value.
@@ -1453,6 +1484,25 @@ and the number of 0 bits if INTEGER is negative."
     ((bignum)
      (bignum-ashift-right integer count))))
 
+(sb-c::when-vop-existsp (:translate ash-left-add)
+  (defun ash-left-add (integer count add)
+    (etypecase integer
+      (fixnum
+       (ash-left-add (truly-the fixnum integer) count add))
+      (bignum
+       (sb-bignum::bignum-ashift-left-add integer count add))))
+
+  (defun ash-left-word-add (integer add)
+    (etypecase integer
+      (fixnum
+       (ash-left-word-add integer add))
+      (bignum
+       (sb-bignum::bignum-ashift-left-add integer sb-vm:n-word-bits add)))))
+
+(defun ash-right-two-words (word2 word1 count)
+  (logand most-positive-word
+          (ash (dpb word2 (byte sb-vm:n-word-bits sb-vm:n-word-bits) word1) (- count))))
+
 (defun integer-length (integer)
   "Return the number of non-sign bits in the twos-complement representation
   of INTEGER."
@@ -1656,39 +1706,42 @@ and the number of 0 bits if INTEGER is negative."
 (declaim (maybe-inline fixnum-gcd))
 #-arm
 (defun fixnum-gcd (u v)
-  (declare (optimize (safety 0) speed)
-           (fixnum u v))
-  (let ((u (abs u))
-        (v (abs v)))
-    (declare (sb-vm:signed-word u v))
-    (loop (setf (values u v)
-                (values v (rem u (the (not (eql 0)) v))))
-          (if (zerop v)
-              (return u)))))
+  (cond ((eql u 0) (abs v))
+        ((eql v 0) (abs u))
+        (t
+         (let ((u (abs u))
+               (v (abs v)))
+           (declare (sb-vm:signed-word u v))
+           (loop (setf (values u v)
+                       (values v (rem u (the (not (eql 0)) v))))
+                 (if (zerop v)
+                     (return (truly-the (integer 0 #.(1+ most-positive-fixnum)) u))))))))
 
 ;;; But 32-bit arm has no division instruction
 #+arm
 (defun fixnum-gcd (u v)
-  (declare (optimize (safety 0)))
   (locally
       (declare (optimize (speed 3) (safety 0)))
-    (do ((k 0 (1+ k))
-         (u (abs u) (ash u -1))
-         (v (abs v) (ash v -1)))
-        ((oddp (logior u v))
-         (do ((temp (if (oddp u) (- v) (ash u -1))
-                    (ash temp -1)))
-             (nil)
-           (declare (fixnum temp))
-           (when (oddp temp)
-             (if (plusp temp)
-                 (setq u temp)
-                 (setq v (- temp)))
-             (setq temp (- u v))
-             (when (zerop temp)
-               (return (the (integer 0 #.(1+ most-positive-fixnum)) (ash u k)))))))
-      (declare (type (mod #.sb-vm:n-word-bits) k)
-               (type sb-vm:signed-word u v)))))
+    (cond ((eql u 0) (abs v))
+          ((eql v 0) (abs u))
+          (t
+           (do ((k 0 (1+ k))
+                (u (abs u) (ash u -1))
+                (v (abs v) (ash v -1)))
+               ((oddp (logior u v))
+                (do ((temp (if (oddp u) (- v) (ash u -1))
+                           (ash temp -1)))
+                    (nil)
+                  (declare (fixnum temp))
+                  (when (oddp temp)
+                    (if (plusp temp)
+                        (setq u temp)
+                        (setq v (- temp)))
+                    (setq temp (- u v))
+                    (when (zerop temp)
+                      (return (the (integer 0 #.(1+ most-positive-fixnum)) (ash u k)))))))
+             (declare (type (mod #.sb-vm:n-word-bits) k)
+                      (type sb-vm:signed-word u v)))))))
 
 ;;; Do the GCD of two integer arguments.
 ;;; We pick off the special case
@@ -1718,7 +1771,11 @@ and the number of 0 bits if INTEGER is negative."
   (declare (explicit-check)
            (inline fixnum-gcd))
   (if (and (typep x 'fixnum) (typep y 'fixnum))
-      (cond ((= x 0)
+      (cond ((= y 0)
+             (error 'division-by-zero
+                    :operands (list x y)
+                    :operation '/))
+            ((= x 0)
              0)
             (t
              (let ((abs-x (abs x))
@@ -1754,8 +1811,7 @@ and the number of 0 bits if INTEGER is negative."
   (declare (explicit-check))
   (number-dispatch ((x number) (y number))
     (float-contagion / x y (ratio integer))
-
-    ((complex complex)
+    (((foreach integer ratio single-float double-float complex) complex)
      (let* ((rx (realpart x))
             (ix (imagpart x))
             (ry (realpart y))
@@ -1769,18 +1825,6 @@ and the number of 0 bits if INTEGER is negative."
                   (dn (+ iy (* r ry))))
              (complex (/ (+ (* rx r) ix) dn)
                       (/ (- (* ix r) rx) dn))))))
-    (((foreach integer ratio single-float double-float) complex)
-     (let* ((ry (realpart y))
-            (iy (imagpart y)))
-       (if (> (abs ry) (abs iy))
-           (let* ((r (/ iy ry))
-                  (dn (+ ry (* r iy))))
-             (complex (/ x dn)
-                      (/ (- (* x r)) dn)))
-           (let* ((r (/ ry iy))
-                  (dn (+ iy (* r ry))))
-             (complex (/ (* x r) dn)
-                      (/ (- x) dn))))))
     ((complex (or rational float))
      (canonical-complex (/ (realpart x) y)
                         (/ (imagpart x) y)))

@@ -260,8 +260,9 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
 {
     uword_t pc = os_context_pc(context);
     int len = 1;
-    STORE_PC(*trace, 0, pc);
+
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
+    STORE_PC(*trace, 0, pc);
     uword_t* fp = (uword_t*)os_context_frame_pointer(context);
     uword_t* sp = (uword_t*)*os_context_sp_addr(context);
     if (fp >= sp && fp < thread->control_stack_end) { // plausible frame-pointer
@@ -286,17 +287,115 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
     }
 #else
     if (gc_managed_heap_space_p(pc) && component_ptr_from_pc((void*)pc)) {
-        // If the PC was in lisp code, then the frame register is probably correct,
-        // and so it's probably the case that 'frame->saved_lra' is a tagged PC
-        // in the caller. Unfortunately it is not 100% reliable in a signal handler,
-        // so we don't try to walk back more than one frame.
+        // If the PC was in lisp code, then the frame register is
+        // probably correct, and so it's probably the case that
+        // 'frame->saved_lra' is a tagged PC in the
+        // caller. Unfortunately it is not 100% reliable in a signal
+        // handler, so we don't try to walk back more than one frame,
+        // unless we are on ARM64 where precise backtraces are
+        // available.
         struct call_frame* frame = (void*)(*os_context_register_addr(context, reg_CFP));
-        if (in_stack_range((uword_t)frame, thread)
-            && lowtag_of(frame->saved_lra) == OTHER_POINTER_LOWTAG
-            && component_ptr_from_pc((void*)frame->saved_lra)) {
+#ifdef LISP_FEATURE_ARM64
+
+        lispobj lr;
+        unsigned inst = ((unsigned *) pc)[0];
+
+        /* The first frame needs to be found */
+        if (points_to_asm_code_p(pc) ||
+            (inst == 0xD65F03C0 && // RET
+             ((unsigned *) pc)[-1] == 0xA9407B5A)) { // LDP CFP, LR, [CFP]
+            STORE_PC(*trace, 0, pc);
+            lr = (lispobj)*os_context_register_addr(context, reg_LR);
+            STORE_PC(*trace, len, lr);
+            if (++len == limit) return len;
+        }
+        else if (inst == 0xD63F03C0) { // BLR LR
+            /* Use the destination address as the current PC, because
+               the new frame is not yet set up */
+            lr = (lispobj)*os_context_register_addr(context, reg_LR);
+            STORE_PC(*trace, 0, lr);
+            /* And it's called by the current function */
+            STORE_PC(*trace, len, pc+4);
+            if (++len == limit) return len;
+
+            /* Unless an asm routine is called within the same frame. */
+            if ((((unsigned *) pc)[-1] | 0x1F0000) == 0xAA1F03FA) { // MOV CFP, Rx
+                if (!in_stack_range((uword_t)frame, thread))
+                    return len;
+                frame = (void*)frame->old_cont;
+            }
+        }
+        else if (inst == 0xF900075E) {  // STR LR, [CFP, #8]
+            STORE_PC(*trace, 0, pc);
+            lr = (lispobj)*os_context_register_addr(context, reg_LR);
+            STORE_PC(*trace, len, lr);
+            if (++len == limit) return len;
+            if (!in_stack_range((uword_t)frame, thread))
+                return len;
+            frame = (void*)frame->old_cont;
+        } else if ((inst >> 25) == 0x4A && // BL Lx
+                   ((((unsigned *) pc)[-1] | 0x1F0000) == 0xAA1F03FA)) { // MOV CFP, Rx
+            /* A local call */
+            unsigned imm = inst & 0x3FFFFFF;
+            // sign extend
+            int offset = ((int)(imm << 6) >> 6) * 4;
+            STORE_PC(*trace, 0, pc+offset);
+            STORE_PC(*trace, len, pc+4);
+            if (++len == limit) return len;
+            if (!in_stack_range((uword_t)frame, thread))
+                return len;
+            frame = (void*)frame->old_cont;
+        }
+        else {
+            STORE_PC(*trace, 0, pc);
+        }
+
+        for (;;) {
+            if (!in_stack_range((uword_t)frame, thread))
+                break;
+            lr = frame->saved_lra;
+
+            if (!component_ptr_from_pc((char*)lr))
+                break;
+            STORE_PC(*trace, len, lr);
+            if (++len == limit) break;
+            frame = (void*)frame->old_cont;
+        }
+#else
+        STORE_PC(*trace, 0, pc);
+        if (in_stack_range((uword_t)frame, thread) &&
+#ifdef reg_LRA
+            lowtag_of(frame->saved_lra) == OTHER_POINTER_LOWTAG &&
+#endif
+            component_ptr_from_pc((void*)frame->saved_lra)) {
             STORE_PC(*trace, len, frame->saved_lra);
             ++len;
         }
+
+#endif
+    } else {
+        /* Probably foreign code */
+         STORE_PC(*trace, 0, pc);
+
+#ifdef LISP_FEATURE_ARM64
+         if (foreign_function_call_active_p(thread)) {
+             struct call_frame* frame = (void*)access_control_frame_pointer(thread);
+             lispobj lr;
+
+             for (;;) {
+                 if (!in_stack_range((uword_t)frame, thread))
+                     break;
+                 lr = frame->saved_lra;
+
+                 if (!component_ptr_from_pc((char*)lr))
+                     break;
+                 STORE_PC(*trace, len, lr);
+                 if (++len == limit) break;
+                 frame = (void*)frame->old_cont;
+             }
+         }
+#endif
+
     }
 #endif
     return len;
@@ -473,7 +572,7 @@ static void diagnose_failure(struct thread* thread) {
     struct sprof_data* data = (void*)thread->sprof_data;
     if (data && data->capacity == CAPACITY_MAX) {
         // disable the profiler in this thread
-        thread->state_word.sprof_enable = 0;
+        thread->sprof_enable = 0;
 #ifdef LISP_FEATURE_SB_THREAD
         char msg[100];
         int msglen = sprintf(msg,
@@ -486,7 +585,7 @@ static void diagnose_failure(struct thread* thread) {
 
 void record_backtrace_from_context(void *context, struct thread* thread) {
     int success = collect_backtrace(thread, 1, context) == 1;
-    // Release the lock. This synchronizes with acquire_sprof_data_lock()
+    // Release the lock. This synchronizes with acquire_sprof_data()
     // which atomically adds LOCKED_BY_OTHER to the lock field.
     // If that happens first, then the cmpxchg will fail, and we'll do
     // a sem_post here. If this happens first, then the thread wishing to
@@ -515,7 +614,7 @@ void sigprof_handler(int sig, __attribute__((unused)) siginfo_t* info,
     struct thread* thread = get_sb_vm_thread();
     // We can only profile Lisp threads.
     if (thread) {
-        if (thread->state_word.sprof_enable)
+        if (thread->sprof_enable)
             record_backtrace_from_context(context, thread);
         else
             // Block further signals it on return from the handler.
@@ -545,7 +644,7 @@ uword_t acquire_sprof_data(struct thread* thread)
         gc_assert(old == LOCKED_BY_SELF); // could not be LOCKED_BY_OTHER
         // A profiled thread will sem_post() on return from its profiling signal handler
         // if it observes that both lock bits were on.
-        // This should be called with the thread's interruption mutex held so that the thread
+        // This should be called with the thread's TLS lock held so that the thread
         // whose data are being acquired can't exit and delete its sprof_sem.
         os_sem_wait(&thread_extra_data(thread)->sprof_sem);
         gc_assert(SPROF_LOCK(thread) == LOCKED_BY_OTHER);

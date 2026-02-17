@@ -355,7 +355,7 @@
            (type alignment size))
   (zerop (logand (1- size) address)))
 
-#-(or x86 x86-64 arm64 riscv)
+#-(or x86 x86-64 arm64 riscv loongarch64)
 (progn
 (defconstant lra-size (words-to-bytes 1))
 (defun lra-hook (chunk stream dstate)
@@ -1381,7 +1381,7 @@
       (format stream "#X~2,'0x" (sap-ref-8 sap (+ offs start-offs))))))
 
 (defvar *default-dstate-hooks*
-  (list* #-(or x86 x86-64 arm64 riscv) #'lra-hook nil))
+  (list* #-(or x86 x86-64 arm64 riscv loongarch64) #'lra-hook nil))
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
@@ -1403,11 +1403,13 @@
 
 ;;; Logically or MASK into the set of instruction properties in DSTATE.
 (defun dstate-setprop (dstate mask)
+  (declare (fixnum mask))
   (setf (dstate-inst-properties dstate) (logior mask (dstate-inst-properties dstate))))
 
 ;;; Return non-NIL if any bit in MASK
 ;;; is in the set of instruction properties in DSTATE.
 (defun dstate-getprop (dstate mask)
+  (declare (fixnum mask))
   (logtest mask (dstate-inst-properties dstate)))
 
 (defun add-fun-header-hooks (segment)
@@ -2587,10 +2589,13 @@
 (defun get-random-tn-name (sc+offset)
   (let ((sc (sb-c:sc+offset-scn sc+offset))
         (offset (sb-c:sc+offset-offset sc+offset)))
-    (if (= sc sb-vm:immediate-sc-number)
-        (princ-to-string offset)
-        (sb-c:location-print-name
-         (sb-c:make-random-tn (svref sb-c:*backend-sc-numbers* sc) offset)))))
+    (cond ((= sc sb-vm:immediate-sc-number)
+           (princ-to-string offset))
+          ((= sc sb-vm::negative-immediate-sc-number)
+           (princ-to-string (- offset)))
+          (t
+           (sb-c:location-print-name
+            (sb-c:make-random-tn (svref sb-c:*backend-sc-numbers* sc) offset))))))
 
 ;;; When called from an error break instruction's :DISASSEM-CONTROL (or
 ;;; :DISASSEM-PRINTER) function, will correctly deal with printing the

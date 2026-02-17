@@ -16,7 +16,7 @@
 (defknown %sap-alien (system-area-pointer alien-type) alien-value
   (flushable movable))
 (defknown alien-sap (alien-value) system-area-pointer
-  (flushable movable))
+  (flushable movable)) ; (could be always-translatable depending on the backend)
 
 (defknown slot (alien-value symbol) t
   (flushable recursive))
@@ -66,7 +66,17 @@
 (defknown (setf %alien-value) (t system-area-pointer word alien-type) t
   ())
 
+;;; alien-funcall calls a foreign function and returns its result.
+;;; For struct returns, it allocates heap memory and returns an alien wrapper.
 (defknown alien-funcall (alien-value &rest t) *
+  (any recursive))
+
+;;; alien-funcall-into calls a foreign function that returns a struct,
+;;; writing the result to a caller-provided buffer (typically stack-allocated
+;;; via with-alien). Returns (values) - caller accesses result via the buffer.
+;;; The function type is extracted from the alien-function argument.
+(defknown alien-funcall-into (alien-value system-area-pointer &rest t)
+    (values)
   (any recursive))
 
 (defknown sb-alien::string-to-c-string (simple-string t) (or (simple-array (unsigned-byte 8) (*))
@@ -449,6 +459,26 @@
 
 ;;;; ALIEN-SAP, %SAP-ALIEN, %ADDR, etc.
 
+;;; I enabled this as a sanity check to verfify that the compiler only inserts ALIEN-SAP
+;;; calls on things which are instances of ALIEN-VALUE. But this is not needed, and
+;;; it's actually inadequate because apparently both (ALIEN (* (FUNCTION ...))) and
+;;; (ALIEN (FUNCTION ...)) are acceptable to ALIEN-SAP.  So I didn't feel like coming up
+;;; with an exhaustive list of what to expect, for fear of leaving something out.
+#+sb-devel
+(defun pointerish-alientype-p (x) ; (tree-shaken out anyway)
+  (or (and (alien-type-type-p x)
+           (let ((type (alien-type-type-alien-type x)))
+             (or (alien-pointer-type-p type)
+                 (alien-array-type-p type))))
+      (and (union-type-p x)
+           (every #'pointerish-alientype-p (union-type-types x)))
+      (type= x (specifier-type 'alien-value))))
+
+;;; The IR1 transform for ALIEN-SAP tries to un-realize aliens by converting the
+;;; composition of sap-alien followed by alien-sap into an identity operation.
+;;; But sometimes ALIEN-SAP is just ALIEN-VALUE-SAP (i.e. %INSTANCE-REF)
+;;; However I didn't want to further complicate this, so If ALIEN-SAP remains in
+;;; the IR, then it's an ALIEN-VALUE (no need to check) and a vop can do the rest.
 (deftransform alien-sap ((alien))
   (let ((alien-node (lvar-uses alien)))
     (typecase alien-node
@@ -473,7 +503,8 @@
     ;; Optimize multiple alien-saps through a variable
     (cond ((block nil
              (map-refs
-              (lambda (dest)
+              (lambda (dest lvar)
+                (declare (ignore lvar))
                 (cond ((combination-is dest '(alien-sap))
                        (pushnew dest alien-saps :test #'eq))
                       ((combination-is dest '(eq)))
@@ -483,9 +514,7 @@
               :leaf-set (lambda () (return))
               :multiple-uses (lambda () (return)))
              alien-saps)
-           (setf (node-derived-type node)
-                 (values-specifier-type '(values system-area-pointer &optional)))
-           (erase-lvar-type (node-lvar node))
+           (erase-node-type node (values-specifier-type '(values system-area-pointer &optional)))
            (loop for alien-sap in alien-saps
                  do
                  (transform-call alien-sap
@@ -529,6 +558,96 @@
 
 ;;;; ALIEN-FUNCALL support
 
+;;; Generate code to store struct register values to memory
+#-sb-xc-host
+(defun generate-struct-store-code (temps register-slots result-sap)
+  "Generate SETF forms to store register values to struct memory."
+  (let ((offset 0)
+        (stores nil)
+        (temp-idx 0))
+    (dolist (class register-slots)
+      (case class
+        (:integer
+         (push `(setf (sb-sys:sap-ref-64 ,result-sap ,offset) ,(nth temp-idx temps)) stores)
+         (incf offset 8)
+         (incf temp-idx))
+        (:double
+         (push `(setf (sb-sys:sap-ref-double ,result-sap ,offset) ,(nth temp-idx temps)) stores)
+         (incf offset 8)
+         (incf temp-idx))
+        ;; :single is ARM64 HFA only - x86-64 classifies all floats as :double
+        (:single
+         (push `(setf (sb-sys:sap-ref-single ,result-sap ,offset) ,(nth temp-idx temps)) stores)
+         (incf offset 4)
+         (incf temp-idx))))
+    (nreverse stores)))
+
+;;; Build the function expression for %alien-funcall, optimizing to use
+;;; the function name directly when possible (for call-out-named VOP).
+;;; Returns (values func-expr ignore-function-p)
+(defun alien-funcall-func-expr (function alien-type)
+  (declare (ignorable function)) ; unused on platforms without call-out-named
+  (or (when-vop-existsp (:named call-out-named)
+        (when (lvar-matches function :fun-names '(%sap-alien)
+                                     :arg-count 2)
+          (let ((sap (first (combination-args (lvar-use function)))))
+            (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
+                                    :arg-count 1)
+              (let ((sym (first (combination-args (lvar-use sap)))))
+                (when (and (constant-lvar-p sym)
+                           (stringp (lvar-value sym)))
+                  (return-from alien-funcall-func-expr
+                    (values (lvar-value sym) t))))))))
+      (values `(deport function ',alien-type) nil)))
+
+;;; Wrap body with pinning and deport-alloc for alien call parameters.
+;;; The deport-alloc step converts arguments (e.g., Unicode strings to octet
+;;; arrays) and must happen before pinning to ensure we pin the right objects.
+(defun wrap-with-deport (body params arg-types)
+  (let ((wrapped `(maybe-with-pinned-objects ,params ,arg-types ,body)))
+    (loop for param in params
+          for arg-type in arg-types
+          do (setf wrapped
+                   `(let ((,param (deport-alloc ,param ',arg-type)))
+                      ,wrapped)))
+    wrapped))
+
+;;; Wrap body with FP saving if required by policy.
+#+c-stack-is-control-stack
+(defun wrap-with-fp-save (body node)
+  (if (policy node (= 3 alien-funcall-saves-fp-and-pc))
+      `(invoke-with-saved-fp (lambda () ,body))
+      body))
+#-c-stack-is-control-stack
+(defun wrap-with-fp-save (body node)
+  (declare (ignore node))
+  body)
+
+;;; Generate code for a struct-returning foreign call that writes to BUFFER-VAR.
+;;; FUNC-EXPR is the deported function expression.
+;;; DEPORTS is a list of deported argument expressions.
+;;; BUFFER-VAR is the variable/symbol holding the destination SAP.
+;;; For large structs, BUFFER-VAR is passed as hidden first arg to %alien-funcall.
+;;; For small structs, register values are stored to BUFFER-VAR after the call.
+;;; Returns (values) - caller wraps result as alien if needed.
+#-sb-xc-host
+(defun generate-struct-return-code (func-expr alien-type return-type deports buffer-var)
+  (multiple-value-bind (in-registers-p register-slots)
+      (sb-alien::struct-return-info return-type)
+    (cond
+      ;; Large struct: pass buffer as hidden first arg
+      ((not in-registers-p)
+       `(progn
+          (%alien-funcall ,func-expr ',alien-type ,buffer-var ,@deports)
+          (values)))
+      ;; Small struct: receive registers, store to buffer
+      (t
+       (let ((temps (loop repeat (length register-slots) collect (gensym))))
+         `(multiple-value-bind ,temps
+              (%alien-funcall ,func-expr ',alien-type ,@deports)
+            ,@(generate-struct-store-code temps register-slots buffer-var)
+            (values)))))))
+
 (deftransform alien-funcall ((function &rest args)
                              ((alien (* t)) &rest t) *)
   (let ((names (make-gensym-list (length args))))
@@ -544,8 +663,7 @@
     (let ((alien-type (alien-type-type-alien-type type)))
       (unless (alien-fun-type-p alien-type)
         (give-up-ir1-transform))
-      (let ((arg-types (alien-fun-type-arg-types alien-type))
-            (ignore-fun))
+      (let ((arg-types (alien-fun-type-arg-types alien-type)))
         (unless (= (length args) (length arg-types))
           (abort-ir1-transform
            "wrong number of arguments; expected ~W, got ~W"
@@ -556,78 +674,133 @@
             (let ((param (gensym)))
               (params param)
               (deports `(deport ,param ',arg-type))))
-          ;; Build BODY from the inside out.
-          (let ((return-type (alien-fun-type-result-type alien-type))
-                ;; Innermost, we DEPORT the parameters (e.g. by taking SAPs
-                ;; to them) and do the call.
-                (body
-                 ;; If FUNCTION's source looks like
-                 ;;  (%SAP-ALIEN (FOREIGN-SYMBOL-SAP "sym") #<anything>)
-                 ;; then snarf out the string and use it as the funarg
-                 ;; unless the backend lacks the CALL-OUT-NAMED vop.
-                 `(%alien-funcall
-                   ,(or (when-vop-existsp (:named call-out-named)
-                          (when (lvar-matches function :fun-names '(%sap-alien)
-                                                       :arg-count 2)
-                            (let ((sap (first (combination-args (lvar-use function)))))
-                              (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
-                                                      :arg-count 1)
-                                (let ((sym (first (combination-args (lvar-use sap)))))
-                                  (when (and (constant-lvar-p sym)
-                                             (stringp (lvar-value sym)))
-                                    (setq ignore-fun t)
-                                    (lvar-value sym)))))))
-                        `(deport function ',alien-type))
-                   ',alien-type
-                   ,@(deports))))
-            ;; Wrap that in a WITH-PINNED-OBJECTS to ensure the values
-            ;; the SAPs are taken for won't be moved by the GC. (If
-            ;; needed: some alien types won't need it).
-            (setf body `(maybe-with-pinned-objects ,(params) ,arg-types
-                          ,body))
-            ;; Around that handle any memory allocation that's needed.
-            ;; Mostly the DEPORT-ALLOC alien-type-methods are just an
-            ;; identity operation, but for example for deporting a
-            ;; Unicode string we need to convert the string into an
-            ;; octet array. This step needs to be done before the pinning
-            ;; to ensure we pin the right objects, so it can't be combined
-            ;; with the deporting.
-            ;; -- JES 2006-03-16
-            (loop for param in (params)
-                  for arg-type in arg-types
-                  do (setf body
-                           `(let ((,param (deport-alloc ,param ',arg-type)))
-                              ,body)))
-            (if (alien-values-type-p return-type)
-                (collect ((temps) (results))
-                  (dolist (type (alien-values-type-values return-type))
-                    (let ((temp (gensym)))
-                      (temps temp)
-                      (results `(naturalize ,temp ',type))))
-                  (setf body
-                        `(multiple-value-bind ,(temps) ,body
-                           (values ,@(results)))))
-                (setf body `(naturalize ,body ',return-type)))
-            ;; Remember this frame to make sure that we can get back
-            ;; to it later regardless of how the foreign stack looks
-            ;; like.
-            #+c-stack-is-control-stack
-            (when (policy node (= 3 alien-funcall-saves-fp-and-pc))
-              (setf body `(invoke-with-saved-fp (lambda () ,body))))
-            (/noshow "returning from DEFTRANSFORM ALIEN-FUNCALL" (params) body)
-            `(lambda (function ,@(params))
-               ,@(when ignore-fun '((declare (ignore function))))
-               (declare (optimize (let-conversion 3)))
-               ,body)))))))
+          (let ((return-type (alien-fun-type-result-type alien-type)))
+            (multiple-value-bind (func-expr ignore-fun)
+                (alien-funcall-func-expr function alien-type)
+              ;; Check for struct return - handled via unified helper
+              #-sb-xc-host
+              (multiple-value-bind (in-registers-p register-slots size)
+                  (sb-alien::struct-return-info return-type)
+                (declare (ignore in-registers-p register-slots))
+                (when size
+                  (let* ((buf (gensym "BUF"))
+                         (body (generate-struct-return-code
+                                func-expr alien-type return-type (deports) buf)))
+                    (setf body (wrap-with-deport body (params) arg-types))
+                    ;; Wrap with allocation and return alien-wrapped buffer
+                    (setf body `(let ((,buf (sb-alien::%make-alien ,size)))
+                                  ,body
+                                  (sb-alien::%sap-alien ,buf ',return-type)))
+                    (setf body (wrap-with-fp-save body node))
+                    (return-from alien-funcall
+                      `(lambda (function ,@(params))
+                         ,@(when ignore-fun '((declare (ignore function))))
+                         (declare (optimize (let-conversion 3)))
+                         ,body)))))
+              ;; Non-struct return: standard %alien-funcall
+              (let ((body `(%alien-funcall ,func-expr ',alien-type ,@(deports))))
+                (setf body (wrap-with-deport body (params) arg-types))
+                (cond
+                  ((alien-values-type-p return-type)
+                   (collect ((temps) (results))
+                     (dolist (type (alien-values-type-values return-type))
+                       (let ((temp (gensym)))
+                         (temps temp)
+                         (results `(naturalize ,temp ',type))))
+                     (setf body
+                           `(multiple-value-bind ,(temps) ,body
+                              (values ,@(results))))))
+                  (t
+                   (setf body `(naturalize ,body ',return-type))))
+                (setf body (wrap-with-fp-save body node))
+                (/noshow "returning from DEFTRANSFORM ALIEN-FUNCALL" (params) body)
+                `(lambda (function ,@(params))
+                   ,@(when ignore-fun '((declare (ignore function))))
+                   (declare (optimize (let-conversion 3)))
+                   ,body)))))))))
+
+;;; alien-funcall-into: call foreign function, write struct result to buffer.
+;;; Like alien-funcall but writes to caller-provided buffer instead of heap.
+;;; Arguments: (function result-buffer &rest args)
+;;;
+;;; Only available on x86-64 and ARM64 where struct-by-value ABI is implemented.
+#+(and (or x86-64 arm64) (not sb-xc-host))
+(deftransform sb-alien::alien-funcall-into ((function result-buffer &rest args)
+                                            * * :node node)
+  (let ((type (lvar-type function)))
+    (unless (alien-type-type-p type)
+      (give-up-ir1-transform "can't tell function type at compile time"))
+    (let ((alien-type (alien-type-type-alien-type type)))
+      (unless (alien-fun-type-p alien-type)
+        (give-up-ir1-transform))
+      (let* ((arg-types (alien-fun-type-arg-types alien-type))
+             (return-type (alien-fun-type-result-type alien-type)))
+        (unless (= (length args) (length arg-types))
+          (abort-ir1-transform
+           "wrong number of arguments; expected ~W, got ~W"
+           (length arg-types)
+           (length args)))
+        (multiple-value-bind (in-registers-p register-slots size)
+            (sb-alien::struct-return-info return-type)
+          (declare (ignore in-registers-p register-slots))
+          (unless size
+            (abort-ir1-transform
+             "alien-funcall-into requires a struct return type"))
+          (collect ((params) (deports))
+            (dolist (arg-type arg-types)
+              (let ((param (gensym)))
+                (params param)
+                (deports `(deport ,param ',arg-type))))
+            (multiple-value-bind (func-expr ignore-fun)
+                (alien-funcall-func-expr function alien-type)
+              (let ((body (generate-struct-return-code
+                           func-expr alien-type return-type (deports) 'result-buffer)))
+                (setf body (wrap-with-deport body (params) arg-types))
+                (setf body (wrap-with-fp-save body node))
+                `(lambda (function result-buffer ,@(params))
+                   ,@(when ignore-fun '((declare (ignore function))))
+                   (declare (optimize (let-conversion 3)))
+                   ,body)))))))))
 
 (defoptimizer (%alien-funcall derive-type) ((function type &rest args))
   (unless (and (constant-lvar-p type)
                (alien-fun-type-p (lvar-value type)))
     (error "Something is broken."))
-  (let ((spec (compute-alien-rep-type
-               (alien-fun-type-result-type (lvar-value type))
-               :result)))
-    (if (eq spec '*) *wild-type* (values-specifier-type spec))))
+  (let* ((result-type (alien-fun-type-result-type (lvar-value type)))
+         (spec (compute-alien-rep-type result-type :result)))
+    (cond
+      ;; For struct-by-value returns, derive the multiple-values type
+      ;; based on the register slot classification
+      #-sb-xc-host
+      ((multiple-value-bind (in-registers-p register-slots)
+           (sb-alien::struct-return-info result-type)
+         (when in-registers-p
+           ;; Return VALUES type for the register values
+           (make-values-type
+            (mapcar (lambda (class)
+                      (case class
+                        (:integer (specifier-type '(unsigned-byte 64)))
+                        (:double (specifier-type 'double-float))
+                        (:single! (specifier-type 'single-float))
+                        (t *universal-type*)))
+                    register-slots)))))
+      (t
+       (if (eq spec '*) *wild-type* (values-specifier-type spec))))))
+
+;;; arg-tn-loader bundles struct-by-value argument data: TNs for
+;;; register allocator visibility and a function to emit load VOPs.
+(defstruct (arg-tn-loader
+            (:constructor make-arg-tn-loader (tns fn))
+            (:copier nil)
+            (:predicate arg-tn-loader-p))
+  (tns nil :type list :read-only t)
+  (fn nil :type function :read-only t))
+
+(defun extract-arg-tns (entry)
+  "Extract TNs from an arg-tns entry."
+  (if (arg-tn-loader-p entry)
+      (arg-tn-loader-tns entry)
+      (remove-if-not #'tn-p (ensure-list entry))))
 
 (defoptimizer (%alien-funcall ltn-annotate)
               ((function type &rest args) node)
@@ -660,8 +833,18 @@
         (args #-arm args #+arm (reverse args))
         #+c-stack-is-control-stack
         (stack-pointer (make-stack-pointer-tn)))
-    (multiple-value-bind (nsp stack-frame-size arg-tns result-tns)
+    (multiple-value-bind (nsp stack-frame-size arg-tns result-tns
+                          #+(or arm64 x86-64) large-struct-return-p)
         (make-call-out-tns type)
+      ;; For large struct returns, the first arg is the sret pointer
+      ;; Extract it from args so it's not processed as a regular arg
+      ;; Emit the VOP to set x8 (ARM64) or RDI (x86-64) just before
+      ;; the call. Watch out for the kludge above, if anyone comes
+      ;; along and writes sret for arm32.
+      (let ((sret-tn #+(or arm64 x86-64) (when large-struct-return-p
+                                           (lvar-tn call block (pop args)))
+                     #-(or arm64 x86-64) nil))
+        (declare (ignorable sret-tn))
       #+x86
       (vop set-fpu-word-for-c call block)
       ;; Save the stack pointer, it will get aligned and subtracting
@@ -675,13 +858,17 @@
       ;; KLUDGE: This is where the second half of the ARM
       ;; register-pressure change lives (see above).
       (dolist (tn #-arm arg-tns #+arm (reverse arg-tns))
-        (if (functionp tn)
-            (funcall tn (pop args) call block nsp)
-            ;; On PPC, TN might be a list. This is used to indicate
-            ;; something special needs to happen. See below.
-            ;;
-            ;; FIXME: We should implement something better than this.
-            (let* ((first-tn (if (listp tn) (car tn) tn))
+        (cond ((arg-tn-loader-p tn)
+               ;; Struct-by-value: call loader, TNs exposed via arg-tn-loader-tns
+               (funcall (arg-tn-loader-fn tn) (pop args) call block nsp))
+              ((functionp tn)
+               (funcall tn (pop args) call block nsp))
+              (t
+               ;; On PPC, TN might be a list. This is used to indicate
+               ;; something special needs to happen. See below.
+               ;;
+               ;; FIXME: We should implement something better than this.
+               (let* ((first-tn (if (listp tn) (car tn) tn))
                    (arg (pop args))
                    (sc (tn-sc first-tn))
                    (scn (sc-number sc))
@@ -736,13 +923,18 @@
                       (vop sb-vm::move-double-to-int-arg call block
                            float-tn i1-tn i2-tn)
                       (vop sb-vm::move-single-to-int-arg call block
-                           float-tn i1-tn)))))))
+                           float-tn i1-tn))))))))
       (aver (null args))
       (let* ((result-tns (ensure-list result-tns))
              (arg-operands
-              (reference-tn-list (remove-if-not #'tn-p (flatten-list arg-tns)) nil))
+              (reference-tn-list (mapcan #'extract-arg-tns arg-tns) nil))
              (result-operands
               (reference-tn-list (remove-if-not #'tn-p result-tns) t)))
+        ;; For large struct returns, set the sret pointer register
+        ;; (x8 on ARM64, RDI on x86-64) right before making the call
+        (when sret-tn
+          (when-vop-existsp (:named sb-vm::set-struct-return-pointer)
+            (vop sb-vm::set-struct-return-pointer call block sret-tn)))
         (cond #+#.(cl:if (sb-c::vop-existsp :named sb-vm::call-out-named) '(and) '(or))
               ((and (constant-lvar-p function) (stringp (lvar-value function)))
                (vop* call-out-named call block (arg-operands) (result-operands)
@@ -768,7 +960,7 @@
                           (reference-tn (car (last result-tns 2)) t))
            (move-lvar-result call block (list (car (last result-tns 2))) lvar))
           (t
-           (move-lvar-result call block result-tns lvar)))))))
+           (move-lvar-result call block result-tns lvar))))))))
 
 (deftransform sb-alien::c-string-external-format ((type)
                                                   ((constant-arg sb-alien::alien-c-string-type)))
@@ -777,3 +969,27 @@
     (if (eq format :default)
         `(sb-alien::default-c-string-external-format)
         `',format)))
+;;; This transform which recognizes :UTF8 as an easy case if the argument is simple-base-string
+;;; does not have to additionally recognize :ASCII, which is done elsewhere - either deport-alloc-gen
+;;; or deport-alloc (I'm not sure which). An ETYPECASE is inserted over the possible choices of
+;;; Lisp arg type, one of which is SIMPLE-BASE-STRING, which undergoes no conversion
+;;; (assisted by SB-ALIEN::C-STRING-NEEDS-CONVERSION-P given :ASCII as the format).
+;;; However I noticed a premature optimization which either accidentally or intentionally
+;;; fails on non-simple strings. Consider the function F:
+;;; (defun f (s)
+;;;   (alien-funcall (extern-alien "getenv"
+;;;                   (function system-area-pointer (c-string :external-format :ascii)))
+;;;                  (the string s)))
+;;; * (f (make-array 4 :element-type 'base-char :displaced-to (coerce "HOME" 'simple-base-string)))
+;;; which gets:
+;;;    debugger invoked on a CASE-FAILURE @1201809010 in thread
+;;;    #<THREAD tid=663886 "main thread" RUNNING {1201758003}>:
+;;;      "HOME" fell through ETYPECASE expression.
+;;;      Wanted one of (NULL (ALIEN (* CHAR)) SIMPLE-BASE-STRING SIMPLE-STRING).
+;;;
+;;; That seems slightly amiss, but I am unwilling to deoptimize the above example by adding
+;;; more branching to the call-out, given absence of any complaints about it in forever.
+#+sb-unicode
+(deftransform sb-alien::string-to-c-string ((string type)
+                                            (simple-base-string (constant-arg (eql :utf8))))
+  'string)

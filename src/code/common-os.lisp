@@ -55,18 +55,19 @@
   (/show0 "setting *CORE-STRING*")
   (init-var-ignoring-errors
    *core-string*
-   (sb-alien:extern-alien "core_string" sb-alien:c-string)
+   (possibly-base-stringize
+    (sb-alien:extern-alien "core_string" sb-alien:c-string))
    :default "")
   (/show0 "setting *POSIX-ARGV*")
   (init-var-ignoring-errors
    *posix-argv*
    (loop for i from 0
-         for arg = (sb-alien:deref (sb-alien:extern-alien posix_argv
-                                                          (* (sb-alien:c-string
-                                                              #+win32 :external-format #+win32 :ucs-2)))
-                                   i)
+         for arg =
+         (sb-alien:deref (sb-alien:extern-alien posix_argv
+                          (* (sb-alien:c-string #+win32 :external-format #+win32 :ucs-2)))
+                         i)
          while arg
-         collect arg))
+         collect (possibly-base-stringize arg)))
   (/show0 "setting *DEFAULT-PATHNAME-DEFAULTS*")
   ;; Temporary value, so that #'PARSE-NATIVE-NAMESTRING won't blow up
   ;; when we call it below.

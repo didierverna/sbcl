@@ -1449,13 +1449,6 @@ static lispobj conservative_root_p(lispobj addr, page_index_t addr_page_index)
     if (widetag_of(native_pointer(addr)) != FILLER_WIDETAG
         && lowtag_ok_for_page_type(addr, page->type)
         && plausible_tag_p(addr)) return AMBIGUOUS_POINTER;
-
-    // FIXME: I think there is a window of GC vulnerability regarding FINs
-    // and FDEFNs containing executable bytes. In either case if the only pointer
-    // to such an object is the program counter, the object could be considered
-    // garbage because there is no _tagged_ pointer to it.
-    // This is an almost impossible situation to arise, but seems worth some study.
-
     return 0;
 }
 #elif defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64
@@ -3217,6 +3210,13 @@ conservative_stack_scan(struct thread* th,
     }
 #  endif
 # elif defined(LISP_FEATURE_SB_THREAD)
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    lispobj* csp = th->control_stack_pointer;
+    if (csp)
+      esp = (void*) csp;
+#endif
+
     int i;
     /* fprintf(stderr, "Thread %p, ici=%d stack[%p:%p] (%dw)",
             th, fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th)),
@@ -3224,10 +3224,16 @@ conservative_stack_scan(struct thread* th,
             th->control_stack_end - th->control_stack_start); */
     for (i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th))-1; i>=0; i--) {
         os_context_t *c = nth_interrupt_context(i, th);
-        visit_context_registers(context_method, c, (void*)1);
-        lispobj* esp1 = (lispobj*) *os_context_register_addr(c,reg_SP);
-        if (esp1 >= th->control_stack_start && esp1 < th->control_stack_end && (void*)esp1 < esp)
-            esp = esp1;
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        if (c) // can be partially initialized due to a signal into a foreign call
+#endif
+        {
+            visit_context_registers(context_method, c, (void*)1);
+            lispobj* esp1 = (lispobj*) *os_context_register_addr(c,reg_SP);
+            if (esp1 >= th->control_stack_start && esp1 < th->control_stack_end && (void*)esp1 < esp)
+                esp = esp1;
+        }
     }
     if (th == get_sb_vm_thread()) {
         if ((void*)cur_thread_approx_stackptr < esp) esp = cur_thread_approx_stackptr;
@@ -3434,6 +3440,15 @@ garbage_collect_generation(generation_index_t generation, int raise,
         }
     }
 
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    /* Signal handlers might run concurrently with the GC */
+    for (int i = 0; i < NSIG; i++) {
+        lispobj fun = lisp_sig_handlers[i];
+        if(functionp(fun))
+            pin_exact_root(fun);
+    }
+#endif
+
     // Thread creation optionally no longer synchronizes the creating and
     // created thread. When synchronized, the parent thread is responsible
     // for pinning the start function for handoff to the created thread.
@@ -3514,7 +3529,16 @@ garbage_collect_generation(generation_index_t generation, int raise,
         /* Scrub the unscavenged control stack space, so that we can't run
          * into any stale pointers in a later GC (this is done by the
          * stop-for-gc handler in the other threads). */
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        for_each_thread(th) {
+            /* Threads stopped by gc_stop_the_world scrub the stack on
+             * their own in sig_stop_for_gc_handler. */
+            if (csp_around_foreign_call(th) != 0)
+                scrub_thread_control_stack(th);
+        }
+#else
         scrub_control_stack();
+#endif
 # endif
     }
 #endif
@@ -3849,6 +3873,11 @@ collect_garbage(generation_index_t last_gen)
         th->remset = 0;
 #endif
     }
+
+    th = get_sb_vm_thread();
+    if (th && !th->state_word.control_stack_guard_page_protected)
+        protect_control_stack_return_guard_page(0, th);
+
 #ifdef LISP_FEATURE_PERMGEN
     // transfer the remsets from threads that exited
     remset_union(remset_transfer_list);
@@ -3861,9 +3890,12 @@ collect_garbage(generation_index_t last_gen)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
   if (ENABLE_PAGE_PROTECTION) {
       // Unprotect the in-use ranges. Any page could be written during scavenge
+#ifndef LISP_FEATURE_ARM64
+      // ARM64 does not use fixedobj space (FIXEDOBJ_SPACE_START=0).
       os_protect((os_vm_address_t)FIXEDOBJ_SPACE_START,
                  (lispobj)fixedobj_free_pointer - FIXEDOBJ_SPACE_START,
                  OS_VM_PROT_ALL);
+#endif
   }
 #endif
 
@@ -4029,6 +4061,10 @@ collect_garbage(generation_index_t last_gen)
     large_allocation = 0;
  finish:
     write_protect_immobile_space();
+
+    if (th && !th->state_word.control_stack_guard_page_protected)
+        protect_control_stack_return_guard_page(1, th);
+
     gc_active_p = 0;
 
 #ifdef COLLECT_GC_STATS
@@ -4077,7 +4113,7 @@ gc_init(void)
 }
 
 int gc_card_table_nbits;
-long gc_card_table_mask;
+sword_t gc_card_table_mask;
 
 
 /* alloc() and alloc_list() are external interfaces for memory allocation.
@@ -4172,8 +4208,7 @@ lisp_alloc(int flags, struct alloc_region *region, sword_t nbytes,
 #if !(defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 \
       || defined LISP_FEATURE_SPARC || defined LISP_FEATURE_WIN32)
     extern void allocator_record_backtrace(void*, struct thread*);
-    if (page_type != PAGE_TYPE_CODE && gencgc_alloc_profiler
-        && thread->state_word.sprof_enable)
+    if (page_type != PAGE_TYPE_CODE && gencgc_alloc_profiler && thread->sprof_enable)
         allocator_record_backtrace(__builtin_frame_address(0), thread);
 #endif
 

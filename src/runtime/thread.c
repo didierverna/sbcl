@@ -8,7 +8,6 @@
  * provided with absolutely no warranty. See the COPYING and CREDITS
  * files for more information.
  */
-
 #ifdef __linux__
 #define _GNU_SOURCE // for pthread_setname_np()
 #endif
@@ -61,18 +60,10 @@
 #endif
 #endif
 
-int dynamic_values_bytes = 4096 * sizeof(lispobj);  // same for all threads
 // exposed to lisp for pthread_create if not C_STACK_IS_CONTROL_STACK
 os_vm_size_t thread_alien_stack_size = ALIEN_STACK_SIZE;
-struct thread *all_threads;
 
 #ifdef LISP_FEATURE_SB_THREAD
-
-#ifdef LISP_FEATURE_GCC_TLS
-__thread struct thread *current_thread;
-#elif !defined LISP_FEATURE_WIN32
-pthread_key_t current_thread = 0;
-#endif
 
 #ifdef LISP_FEATURE_WIN32
 CRITICAL_SECTION all_threads_lock;
@@ -141,130 +132,18 @@ char* vm_thread_name(struct thread* th)
     return "?";
 }
 
-#define get_thread_state(thread) \
- (int)__sync_val_compare_and_swap(&thread->state_word.state, -1, -1)
+#if HAVE_GC_STW_SIGNAL
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
 
-void
-set_thread_state(struct thread *thread,
-                 char state,
-                 bool signals_already_blocked) // for foreign thread
-{
-    struct extra_thread_data *semaphores = thread_extra_data(thread);
-    int i, waitcount = 0;
-    sigset_t old;
-    // If we've already masked the blockable signals we can avoid two syscalls here.
-    if (!signals_already_blocked)
-        block_blockable_signals(&old);
-    os_sem_wait(&semaphores->state_sem);
-    if (thread->state_word.state != state) {
-        if ((STATE_STOPPED==state) ||
-            (STATE_DEAD==state)) {
-            waitcount = semaphores->state_not_running_waitcount;
-            semaphores->state_not_running_waitcount = 0;
-            for (i=0; i<waitcount; i++)
-                os_sem_post(&semaphores->state_not_running_sem);
-        }
-        if ((STATE_RUNNING==state) ||
-            (STATE_DEAD==state)) {
-            waitcount = semaphores->state_not_stopped_waitcount;
-            semaphores->state_not_stopped_waitcount = 0;
-            for (i=0; i<waitcount; i++)
-                os_sem_post(&semaphores->state_not_stopped_sem);
-        }
-        thread->state_word.state = state;
-    }
-    os_sem_post(&semaphores->state_sem);
-    if (!signals_already_blocked)
-        thread_sigmask(SIG_SETMASK, &old, NULL);
-}
-
-// Wait until "thread's" state is something other than 'undesired_state'
-// and return whatever the new state is.
-int thread_wait_until_not(int undesired_state,
-                          struct thread *thread)
-{
-    struct extra_thread_data *semaphores = thread_extra_data(thread);
-    sigset_t old;
-    os_sem_t *wait_sem;
-    block_blockable_signals(&old);
-  start:
-    os_sem_wait(&semaphores->state_sem);
-    /* "The following functions synchronize memory with respect to other threads:
-     *  ... pthread_mutex_lock() ... "
-     * https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_11
-     * But we still have to ensure no compiler reordering.
-     */
-    int ending_state = get_thread_state(thread);
-    if (ending_state == undesired_state) {
-        switch (undesired_state) {
-        case STATE_RUNNING:
-            wait_sem = &semaphores->state_not_running_sem;
-            semaphores->state_not_running_waitcount++;
-            break;
-        case STATE_STOPPED:
-            wait_sem = &semaphores->state_not_stopped_sem;
-            semaphores->state_not_stopped_waitcount++;
-            break;
-        default:
-            lose("thread_wait_until_not: invalid argument %x", ending_state);
-        }
-    } else {
-        wait_sem = NULL;
-    }
-    os_sem_post(&semaphores->state_sem);
-    if (wait_sem) {
-        os_sem_wait(wait_sem);
-        goto start;
-    }
-    thread_sigmask(SIG_SETMASK, &old, NULL);
-    return ending_state;
-}
 #endif /* sb-safepoint */
 #endif /* sb-thread */
 
-#ifdef LISP_FEATURE_WIN32
-#define sb_GetTID() GetCurrentThreadId()
-#elif defined __linux__
-// gettid() was added in glibc 2.30 but we support older glibc
-int sb_GetTID() { return syscall(SYS_gettid); }
-#elif defined __DragonFly__
-#include <sys/lwp.h>
-lwpid_t sb_GetTID() { return lwp_gettid(); }
-#elif defined __FreeBSD__
-#include <sys/thr.h>
-int sb_GetTID()
-{
-    long id;
-    thr_self(&id);
-    // man thr_self(2) says: the thread identifier is an integer in the range
-    // from PID_MAX + 2 (100001) to INT_MAX. So casting to int is safe.
-    return (int)id;
-}
-#elif defined __OpenBSD__
-int sb_GetTID()
-{
-    return getthrid();
-}
-#elif defined __APPLE__ && defined LISP_FEATURE_SB_THREAD
-int sb_GetTID() {
-    return pthread_mach_thread_np(pthread_self());
-}
-#elif defined __HAIKU__ && defined LISP_FEATURE_SB_THREAD
-int sb_GetTID() {
-    return get_pthread_thread_id(pthread_self());
-}
-#else
-#define sb_GetTID() 0
-#endif
-
 /* Our futex-based lisp mutex needs an OS-assigned unique ID.
- * Why not use pthread_self? I think the reason is that that on linux,
- * the TID is 4 bytes, and the futex lock word is 4 bytes.
- * If the unique ID needed 8 bytes, there could be spurious aliasing
- * that would make the code behave incorrectly. */
-static int get_nonzero_tid()
+ * A futex lock word is 4 bytes on our supported platforms, and so is the thread ID,
+ * so this works out fine. The pthread ID is not an acceptable substitute.
+ * (#+win32 can have WaitOnAddress use an 8-byte value, but we don't)
+ */
+int sb_get_os_thread_id()
 {
     int tid = sb_GetTID();
 #ifdef LISP_FEATURE_SB_FUTEX
@@ -285,7 +164,9 @@ pthread_attr_t new_lisp_thread_attr;
 #endif
 struct thread *alloc_thread_struct(void*);
 
-#ifdef LISP_FEATURE_WIN32
+#ifndef LISP_FEATURE_SB_THREAD
+#define ASSOCIATE_OS_THREAD(thread) { /*do nothing */ }
+#elif defined LISP_FEATURE_WIN32
 #define ASSOCIATE_OS_THREAD(thread) \
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), \
                     GetCurrentProcess(), (LPHANDLE)&thread->os_thread, 0, TRUE, \
@@ -295,9 +176,9 @@ struct thread *alloc_thread_struct(void*);
 #include <sys/prctl.h>
 extern int arch_prctl(int code, unsigned long *addr);
 #define ASSOCIATE_OS_THREAD(thread) arch_prctl(ARCH_SET_GS, (uword_t*)thread), \
-      thread->os_thread = thread_self()
+      thread->os_thread = pthread_self()
 #else
-#define ASSOCIATE_OS_THREAD(thread) thread->os_thread = thread_self()
+#define ASSOCIATE_OS_THREAD(thread) thread->os_thread = pthread_self()
 #endif
 
 #ifdef LISP_FEATURE_WIN32
@@ -311,7 +192,8 @@ void* read_current_thread() {
 extern pthread_key_t ignore_stop_for_gc;
 #endif
 
-#if !defined COLLECT_GC_STATS && !defined STANDALONE_LDB && \
+int show_gc_stats, n_gcs_done; // these may or may not get updated, it doesn't matter
+#if !defined COLLECT_GC_STATS && \
   defined LISP_FEATURE_LINUX && defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_64_BIT
 #define COLLECT_GC_STATS
 #endif
@@ -320,7 +202,6 @@ __attribute__((unused)) static struct timespec gc_start_time;
 __attribute__((unused)) static long stw_elapsed,
     stw_min_duration = LONG_MAX, stw_max_duration, stw_sum_duration,
     gc_min_duration = LONG_MAX, gc_max_duration, gc_sum_duration;
-int show_gc_stats, n_gcs_done;
 static void summarize_gc_stats(void) {
     // TODO: also collect things like number of root pages,bytes scanned
     // and number of pages,bytes copied on average per GC cycle.
@@ -339,25 +220,8 @@ void reset_gc_stats() { // after sb-posix:fork
 }
 #endif
 
-#ifdef ATOMIC_LOGGING
-#define THREAD_NAME_MAP_MAX 20 /* KLUDGE */
-struct {
-  pthread_t thread;
-  char *name; // strdup'ed
-} thread_name_map[THREAD_NAME_MAP_MAX];
-int thread_name_map_count;
-
-char* thread_name_from_pthread(pthread_t pointer){
-    int i;
-    for(i=0; i<thread_name_map_count; ++i)
-        if (thread_name_map[i].thread == pointer) return thread_name_map[i].name;
-    return 0;
-}
-#endif
-
-/* This function is seemingly unused by the C runtime, but DO NOT DELETE.
- * It's needed when the C runtime is compiled with --fsanitize=address, because the sanitizer
- * falsely reports that all the threads running at exit have leaked their zstd_dcontext.
+/* If the C runtime is compiled with --fsanitize=address, the sanitizer can falsely report
+ * that all the threads running at exit have leaked a zstd_dcontext.
  * While it's possible to make the sanitizer shut up about particular allocations,
  * you need to know the size in order to pass it to the unpoisoning routine.
  * The allocator of the ZSTD context object is opaque; we don't know the size.
@@ -380,6 +244,65 @@ void asan_lisp_thread_cleanup() {
     ignore_value(mutex_release(&all_threads_lock));
 }
 
+#ifdef LISP_FEATURE_SB_THREAD
+static void unregister_thread(struct thread *, init_thread_data *);
+#else
+#define unregister_thread(dummy1,dummy2)
+#endif
+
+/* Consing an SB-THREAD:THREAD instance from C for each thread would be ideal because:
+ * 1. Generally the representation of a thread that *MUST* exist is the Lisp object,
+ *    despite the backing memory being freed. Unfortunately, the main thread violated
+ *    this during startup, as it has backing memory without a thread_instance.
+ * 2. In a new yieldpoint implementation (WIP), some logic requires a pthread mutex
+ *    (or Windows equivalent) in each 'struct thread' for mediating access.
+ *    This can cause a lock ordering problem (i.e. deadlock) if, to manipulate a thread
+ *    from Lisp, both the Lisp mutex and C mutex are needed. There should be exactly one
+ *    lock per thread, and it belongs to the thread manifestation that always exists.
+ *    This poses difficulties if the main thread's instance is missing for even a moment.
+ * 3. Possibly we could eliminate the duplicated os_thread slot,
+ *    which is a source of confusion if nothing else.
+ */
+static lispobj cons_lisp_thread(struct thread* thread)
+{
+    struct alloc_region* r = THREAD_ALLOC_REGION(thread, mixed);
+    struct thread_instance* instance
+        = (void*)gc_general_alloc(r, ALIGN_UP(sizeof (struct thread), 2*N_WORD_BYTES),
+                                  PAGE_TYPE_MIXED);
+    int payload_len = (sizeof *instance >> WORD_SHIFT) - 1;
+    instance->header = (payload_len << INSTANCE_LENGTH_SHIFT) | INSTANCE_WIDETAG;
+    instance->_name = NIL;
+    instance->ephemeral_p = NIL;
+    instance->uw_primitive_thread = (lispobj)thread;
+#ifdef LISP_FEATURE_UNIX
+    instance->uw_os_thread = (lispobj)thread->os_thread;
+#endif
+    instance->uw_control_stack_start = (lispobj)thread->control_stack_start;
+    instance->uw_control_stack_end = (lispobj)thread->control_stack_end;
+    instance->_visible = make_fixnum(1);
+    instance->interruptions = NIL;
+    instance->waiting_for = NIL;
+#ifndef LISP_FEATURE_64_BIT
+    instance->sw_observed_internal_real_time_delta_millisec = 0x7FFFFFFF;
+    instance->internal_real_time = NIL;
+#endif
+    instance->alloc_histogram = NIL;
+#ifdef LISP_FEATURE_X86_64
+    struct vector* v = (void*)gc_general_alloc(r, (2+ALLOC_HISTOGRAM_WORDS)*N_WORD_BYTES,
+                                               PAGE_TYPE_MIXED);
+    v->header = SIMPLE_ARRAY_UNSIGNED_BYTE_64_WIDETAG;
+    v->length_ = make_fixnum(ALLOC_HISTOGRAM_WORDS);
+    instance->alloc_histogram = make_lispobj(v, OTHER_POINTER_LOWTAG);
+#endif
+    return make_lispobj(instance, INSTANCE_POINTER_LOWTAG);
+}
+
+#ifdef LISP_FEATURE_64_BIT
+#  define SET_LISPTHREAD_TID(x) x->os_tid = make_fixnum(sb_get_os_thread_id())
+#else // it's a raw slot
+#  define SET_LISPTHREAD_TID(x) x->uw_os_tid = sb_get_os_thread_id()
+#endif
+
 void create_main_lisp_thread(lispobj function) {
 #ifdef LISP_FEATURE_WIN32
     InitializeCriticalSection(&all_threads_lock);
@@ -389,36 +312,35 @@ void create_main_lisp_thread(lispobj function) {
     struct thread *th = alloc_thread_struct(0);
     if (!th || arch_os_thread_init(th)==0 || !init_shared_attr_object())
         lose("can't create initial thread");
-    th->state_word.sprof_enable = 1;
+    th->sprof_enable = make_fixnum(1);
 #if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_GCC_TLS && !defined LISP_FEATURE_WIN32
     pthread_key_create(&current_thread, 0);
 #endif
 #if defined LISP_FEATURE_DARWIN && defined LISP_FEATURE_SB_THREAD
     pthread_key_create(&ignore_stop_for_gc, 0);
 #endif
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-    __attribute__((unused)) lispobj *args = NULL;
-#endif
+
     ASSOCIATE_OS_THREAD(th);
     ASSIGN_CURRENT_THREAD(th);
-#if defined THREADS_USING_GCSIGNAL && \
-    (defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_ARM64 || defined LISP_FEATURE_RISCV)
+#if THREADS_USING_GCSIGNAL && \
+    (defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_ARM64 || defined LISP_FEATURE_RISCV) || defined(LISP_FEATURE_LOONGARCH64)
     /* SIG_STOP_FOR_GC defaults to blocked on PPC? */
     unblock_gc_stop_signal();
 #endif
     link_thread(th);
-    th->os_kernel_tid = get_nonzero_tid();
+    th->lisp_thread = cons_lisp_thread(th);
+    SET_LISPTHREAD_TID(LISPTHREAD(th));
 
 #ifndef LISP_FEATURE_WIN32
-    protect_control_stack_hard_guard_page(1, NULL);
+    protect_control_stack_hard_guard_page(1, th);
 #endif
-    protect_binding_stack_hard_guard_page(1, NULL);
-    protect_alien_stack_hard_guard_page(1, NULL);
+    protect_binding_stack_hard_guard_page(1, th);
+    protect_alien_stack_hard_guard_page(1, th);
 #ifndef LISP_FEATURE_WIN32
-    protect_control_stack_guard_page(1, NULL);
+    protect_control_stack_guard_page(1, th);
 #endif
-    protect_binding_stack_guard_page(1, NULL);
-    protect_alien_stack_guard_page(1, NULL);
+    protect_binding_stack_guard_page(1, th);
+    protect_alien_stack_guard_page(1, th);
 
 #if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_X86_64)
     set_thread_stack(th->control_stack_end);
@@ -432,23 +354,19 @@ void create_main_lisp_thread(lispobj function) {
      * of the current stack */
 #if !(defined(LISP_FEATURE_WIN32) && !defined(OS_THREAD_STACK)) \
     && (defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
-    call_into_lisp_first_time(function,args,0);
+    call_into_lisp_first_time(function, NULL, 0);
 #else
     funcall0(function);
 #endif
-    // If we end up returning, clean up the initial thread.
-#ifdef LISP_FEATURE_SB_THREAD
-    unlink_thread(th);
-#else
-    all_threads = NULL;
-#endif
-    arch_os_thread_cleanup(th);
-    ASSIGN_CURRENT_THREAD(NULL);
+    // If we end up returning (when used as shared library), clean up the initial thread.
+    unregister_thread(th, NULL);
 }
 
 void sb_posix_after_fork() { // for use by sb-posix:fork
     struct thread* th = get_sb_vm_thread();
-    th->os_kernel_tid = get_nonzero_tid();
+    // There's no reason for a GC to occur, so this use of th->lisp_thread
+    // is OK for precise GC.
+    SET_LISPTHREAD_TID(LISPTHREAD(th));
 #ifdef LISP_FEATURE_DARWIN
     extern void darwin_reinit();
     darwin_reinit();
@@ -460,44 +378,36 @@ void sb_posix_after_fork() { // for use by sb-posix:fork
 }
 
 #ifdef LISP_FEATURE_SB_THREAD
-
-void free_thread_struct(struct thread *th)
-{
-    struct extra_thread_data *extra_data = thread_extra_data(th);
-    if (extra_data->arena_savearea) free(extra_data->arena_savearea);
-    os_deallocate((os_vm_address_t) th->os_address, THREAD_STRUCT_SIZE);
-}
-
 /* Note: scribble must be stack-allocated */
 static void
 init_new_thread(struct thread *th,
                 init_thread_data __attribute__((unused)) *scribble,
                 int guardp)
 {
+
     ASSIGN_CURRENT_THREAD(th);
     if(arch_os_thread_init(th)==0) {
         /* FIXME: handle error */
         lose("arch_os_thread_init failed");
     }
-
 #define GUARD_CONTROL_STACK 1
 #define GUARD_BINDING_STACK 2
 #define GUARD_ALIEN_STACK   4
 
 #ifndef LISP_FEATURE_WIN32
     if (guardp & GUARD_CONTROL_STACK)
-        protect_control_stack_guard_page(1, NULL);
+        protect_control_stack_guard_page(1, th);
 #endif
     if (guardp & GUARD_BINDING_STACK)
-        protect_binding_stack_guard_page(1, NULL);
+        protect_binding_stack_guard_page(1, th);
     if (guardp & GUARD_ALIEN_STACK)
-        protect_alien_stack_guard_page(1, NULL);
+        protect_alien_stack_guard_page(1, th);
 
     /* Since GC can only know about this thread from the all_threads
      * list and we're just adding this thread to it, there is no
      * danger of deadlocking even with SIG_STOP_FOR_GC blocked (which
      * it is not). */
-#ifdef LISP_FEATURE_SB_SAFEPOINT
+#if defined(LISP_FEATURE_SB_SAFEPOINT) || defined(LISP_FEATURE_NONSTOP_FOREIGN_CALL)
     csp_around_foreign_call(th) = (lispobj)scribble;
 #endif
     __attribute__((unused)) int lock_ret = mutex_acquire(&all_threads_lock);
@@ -515,8 +425,6 @@ init_new_thread(struct thread *th,
     push_gcing_safety(&scribble->safety);
 #endif
 }
-
-lispobj remset_transfer_list;
 
 static void
 unregister_thread(struct thread *th,
@@ -537,9 +445,17 @@ unregister_thread(struct thread *th,
         th->remset = 0;
     }
 #endif
+    /* Here's a thought: if this structure was for a native thread doing call-in
+     * and so we're about to toss this into the recycle bin, what if we didn't
+     * consume the remainder of all open regions but instead just kept them?
+     * A subsequent call-in which reuses this structure could own the same open
+     * regions if no GC ran in the meantime. If GC does need to run,
+     * it should close TLABs of all thread structures in the recycle bin */
     gc_close_thread_regions(th, LOCK_PAGE_TABLE|CONSUME_REMAINDER);
+
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-    pop_gcing_safety(&scribble->safety);
+    if (scribble)
+      pop_gcing_safety(&scribble->safety);
 #else
     /* This state change serves to "acknowledge" any stop-the-world
      * signal received while the STOP_FOR_GC signal is blocked */
@@ -561,7 +477,7 @@ unregister_thread(struct thread *th,
 #ifdef LISP_FEATURE_UNIX
     os_sem_destroy(&semaphores->sprof_sem);
 #endif
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     os_sem_destroy(&semaphores->state_sem);
     os_sem_destroy(&semaphores->state_not_running_sem);
     os_sem_destroy(&semaphores->state_not_stopped_sem);
@@ -571,12 +487,15 @@ unregister_thread(struct thread *th,
     int i;
     for (i = 0; i<NUM_PRIVATE_EVENTS; ++i)
         CloseHandle(thread_private_events(th,i));
-#else
+#endif
     /* Thread structs are reused and their guard pages are not
      * reestablished. */
     if (!th->state_word.control_stack_guard_page_protected)
         reset_thread_control_stack_guard_page(th);
-#endif
+    if (!th->state_word.alien_stack_guard_page_protected)
+        reset_thread_alien_stack_guard_page(th);
+    if (!th->state_word.binding_stack_guard_page_protected)
+        reset_thread_binding_stack_guard_page(th);
 
     /* Undo the association of the current pthread to its `struct thread',
      * such that we can call get_sb_vm_thread() later in this
@@ -618,7 +537,7 @@ void* new_thread_trampoline(void* arg)
     // 'th->lisp_thread' remains valid despite not being in all_threads
     // due to the pinning via *STARTING-THREADS*.
     struct thread_instance *lispthread = (void*)native_pointer(th->lisp_thread);
-    if (lispthread->_ephemeral_p == LISP_T) th->state_word.user_thread_p = 0;
+    if (lispthread->ephemeral_p == LISP_T) th->state_word.user_thread_p = 0;
 
     struct vector* startup_info = VECTOR(lispthread->startup_info); // 'lispthread' is pinned
     gc_assert(header_widetag(startup_info->header) == SIMPLE_VECTOR_WIDETAG);
@@ -648,8 +567,14 @@ void* new_thread_trampoline(void* arg)
     && !defined LISP_FEATURE_SB_SAFEPOINT
     th->control_stack_end = (lispobj*)&arg + 1;
 #endif
-    th->os_kernel_tid = get_nonzero_tid();
     init_new_thread(th, SCRIBBLE, 0);
+    /* On any platform using MMU-based protection to track dirty GC cards, assigning
+     * a slot of 'lispthread' MUST NOT occur until after init_new_thread so that this
+     * thread is considered to be "in lisp". Otherwise, if GC occurs just prior to
+     * new_thread_trampoline, and write-protects the thread instance, this store will
+     * fault, and the SIGSEGV handler would consider it in foreign code, and croak */
+    SET_LISPTHREAD_TID(LISPTHREAD(th));
+
     // Passing the untagged pointer ensures 2 things:
     // - that the pinning mechanism works as designed, and not just by accident.
     // - that the initial stack does not contain a lisp pointer after it is not needed.
@@ -688,15 +613,8 @@ void sb_set_os_thread_name(char* name)
      * but my testing showed that 12.1 seems to accept any length */
     pthread_set_name_np(pthread_self(), name);
 #endif
-#if defined LISP_FEATURE_DARWIN && !defined LISP_FEATURE_AVOID_PTHREAD_SETNAME_NP
+#if defined LISP_FEATURE_DARWIN && defined LISP_FEATURE_OS_PROVIDES_PTHREAD_SETNAME_NP
     if (vector_len(v) < 64) pthread_setname_np(name);
-#endif
-#ifdef ATOMIC_LOGGING
-      char* string = strdup(name);
-      int index = __sync_fetch_and_add(&thread_name_map_count, 1);
-      gc_assert(index < THREAD_NAME_MAP_MAX);
-      thread_name_map[index].thread = pthread_self();
-      thread_name_map[index].name = string;
 #endif
 }
 
@@ -729,6 +647,7 @@ static void put_recyclebin_item(struct thread* th)
     recyclebin_threads = th;
     ignore_value(mutex_release(&recyclebin_lock));
 }
+extern void free_thread_struct(struct thread *);
 void empty_thread_recyclebin()
 {
     if (!recyclebin_threads) return;
@@ -756,14 +675,13 @@ static void attach_os_thread(init_thread_data *scribble)
     void* recycled_memory = get_recyclebin_item();
     struct thread *th = alloc_thread_struct(recycled_memory);
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     /* new-lisp-thread-trampoline doesn't like when the GC signal is blocked */
     /* FIXME: could be done using a single call to pthread_sigmask
        together with blocking the deferrable signals above. */
     unblock_gc_stop_signal();
 #endif
 
-    th->os_kernel_tid = get_nonzero_tid();
     /* win32: While ASSOCIATE_OS_THREAD performs a relatively expensive DuplicateHandle(),
      * simplicity here is preferable to the complexity entailed by memoizing the handle
      * in a TLS slot and registering a waiter on the foreign thread to close to handle.
@@ -839,7 +757,7 @@ static void detach_os_thread(init_thread_data *scribble)
      *  - but STOP_FOR_GC is pending because it was in the blocked set.
      * Bad things happen unless we clear the pending GC signal.
      */
-#if !defined LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     sigset_t pending;
     sigpending(&pending);
     if (sigismember(&pending, SIG_STOP_FOR_GC)) {
@@ -917,239 +835,6 @@ callback_wrapper_trampoline(lispobj arg0, lispobj arg1, lispobj arg2)
 
 #endif /* LISP_FEATURE_SB_THREAD */
 
-/* this is called from any other thread to create the new one, and
- * initialize all parts of it that can be initialized from another
- * thread
- *
- * The allocated memory will be laid out as depicted below.
- * Left-to-right is in order of lowest to highest address:
- *
- *      ______ spaces as obtained from OS
- *     /   ___ aligned_spaces
- *    /   /
- *  (0) (1)       (2)       (3)       (4)    (5)          (6)
- *   |   | CONTROL | BINDING |  ALIEN  |  CSP | thread     |          |
- *   |   |  STACK  |  STACK  |  STACK  | PAGE | structure  | altstack |
- *   |...|------------------------------------------------------------|
- *          2MiB       1MiB     1MiB               (*)         (**)
- *
- *  |              Lisp TLS             |   (**) altstack         |
- *  |-----------------------------------|----------|--------------|
- *  | thread + struct + dynamically     |   extra  |   sigstack   |
- *  | header   thread   assigned TLS    |   data   |              |
- *  +---------+-------------------------|----------+--------------|
- *  |         | <--- TLS_SIZE words --> |   ~1kb   | 32*SIGSTKSZ  |
- *            ^ thread base
- *
- *   (1) = control stack start. default size shown
- *   (2) = binding stack start. size = BINDING_STACK_SIZE
- *   (3) = alien stack start.   size = ALIEN_STACK_SIZE
- *   (4) = C safepoint page.    size = BACKEND_PAGE_BYTES or 0
- *   (5) = per_thread_data.     size = (THREAD_HEADER_SLOTS+TLS_SIZE) words
- *   (6) = arbitrarily-sized "extra" data and signal stack.
- *
- *   (0) and (1) may coincide; (4) and (5) may coincide
- *
- *   - Lisp TLS overlaps 'struct thread' so that the first N (~30) words
- *     have preassigned TLS indices.
- *
- *   - "extra" data are not in 'struct thread' because placing them there
- *     makes it tough to calculate addresses in 'struct thread' from Lisp.
- *     (Every 'struct thread' slot has a known size)
- *
- * On sb-safepoint builds one page before the thread base is used for the foreign calls safepoint.
- */
-
-struct thread *
-alloc_thread_struct(void* spaces) {
-    /* Allocate the thread structure in one fell swoop as there is no way to recover
-     * from failing to obtain contiguous memory. Note that the OS may have a smaller
-     * alignment granularity than BACKEND_PAGE_BYTES so we may have to adjust the
-     * result to make it conform to our guard page alignment requirement. */
-    bool is_recycled = 0;
-    if (spaces) {
-        // If reusing memory from a previously exited thread, start by removing
-        // some old junk from the stack. This is imperfect since we only clear a little
-        // at the top, but doing so enables diagnosing some garbage-retention issues
-        // using a fine-toothed comb. It would not be possible at all to diagnose
-        // if any newly started thread could refer a dead thread's heap objects.
-        is_recycled = 1;
-    } else {
-        spaces = os_alloc_gc_space(THREAD_STRUCT_CORE_SPACE_ID, MOVABLE,
-                                   NULL, THREAD_STRUCT_SIZE);
-        if (!spaces) return NULL;
-    }
-    /* Aligning up is safe as THREAD_STRUCT_SIZE has
-     * THREAD_ALIGNMENT_BYTES padding. */
-    char *aligned_spaces = PTR_ALIGN_UP(spaces, THREAD_ALIGNMENT_BYTES);
-    char* csp_page = aligned_spaces + thread_control_stack_size +
-                     BINDING_STACK_SIZE + ALIEN_STACK_SIZE;
-
-    // Refer to the ASCII art in the block comment above
-    struct thread *th = (void*)(csp_page + THREAD_CSP_PAGE_SIZE
-                                + THREAD_HEADER_SLOTS*N_WORD_BYTES);
-
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-    // Out of caution I'm supposing that the last thread to use this memory
-    // might have left this page as read-only. Could it? I have no idea.
-    os_protect(csp_page, THREAD_CSP_PAGE_SIZE, OS_VM_PROT_READ|OS_VM_PROT_WRITE);
-#endif
-
-#ifdef LISP_FEATURE_SB_THREAD
-    memset(th, 0, sizeof *th);
-    lispobj* ptr = (lispobj*)(th + 1);
-    lispobj* end = (lispobj*)((char*)th + dynamic_values_bytes);
-    memset(ptr, NO_TLS_VALUE_MARKER & 0xFF, (char*)end-(char*)ptr);
-    th->tls_size = dynamic_values_bytes;
-#endif
-
-    __attribute((unused)) lispobj* tls = (lispobj*)th;
-
-    th->os_address = spaces;
-    th->control_stack_start = (lispobj*)aligned_spaces;
-    th->binding_stack_start=
-        (lispobj*)((char*)th->control_stack_start+thread_control_stack_size);
-    th->control_stack_end = th->binding_stack_start;
-
-    if (is_recycled) {
-#if GENCGC_IS_PRECISE
-    /* Clear the entire control stack. Without this I was able to induce a GC failure
-     * in a test which hammered on thread creation for hours. The control stack is
-     * scavenged before the heap, so a stale word could point to the start (or middle)
-     * of an object using a bad lowtag, for whatever object formerly was there.
-     * Then a wrong transport function would be called and (if it worked at all) would
-     * place a wrongly tagged FP into a word that might not be the base of an object.
-     * Assume for simplicity (as is true) that stacks grow upward if GENCGC_IS_PRECISE.
-     * This could just call scrub_thread_control_stack but the comment there says that
-     * it's a lame algorithm and only mostly right - it stops after (1<<12) words
-     * and checks if the next is nonzero, looping again if it isn't.
-     * There's no reason not to be exactly right here instead of probably right */
-        memset((char*)th->control_stack_start, 0,
-               // take off 2 pages because of the soft and hard guard pages
-               thread_control_stack_size - 2*os_vm_page_size);
-#else
-    /* This is a little wasteful of cycles to pre-zero the pthread overhead (which in glibc
-     * resides at the highest stack addresses) comprising about 5kb, below which is the lisp
-     * stack. We don't need to zeroize above the lisp stack end, but we don't know exactly
-     * where that will be.  Zeroizing more than necessary is conservative, and helps ensure
-     * that garbage retention from reused stacks does not pose a huge problem. */
-        memset((char*)th->control_stack_end - 16384, 0, 16384);
-#endif
-    }
-
-    th->state_word.control_stack_guard_page_protected = 1;
-    th->alien_stack_start=
-        (lispobj*)((char*)th->binding_stack_start+BINDING_STACK_SIZE);
-    set_binding_stack_pointer(th,th->binding_stack_start);
-    th->this = th;
-    th->os_kernel_tid = 0;
-    th->os_thread = 0;
-    // Once allocated, the allocation profiling buffer sticks around.
-    // If present and enabled, assign into the new thread.
-    extern int alloc_profiling;
-    th->profile_data = (uword_t*)(alloc_profiling ? alloc_profile_buffer : 0);
-
-    struct extra_thread_data *extra_data = thread_extra_data(th);
-    memset(extra_data, 0, sizeof *extra_data);
-
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT
-    os_sem_init(&extra_data->state_sem, 1);
-    os_sem_init(&extra_data->state_not_running_sem, 0);
-    os_sem_init(&extra_data->state_not_stopped_sem, 0);
-#endif
-#if defined LISP_FEATURE_UNIX && defined LISP_FEATURE_SB_THREAD
-    os_sem_init(&extra_data->sprof_sem, 0);
-#endif
-    extra_data->sprof_lock = 0;
-    th->sprof_data = 0;
-
-    th->state_word.state = STATE_RUNNING;
-    th->state_word.sprof_enable = 0;
-    th->state_word.user_thread_p = 1;
-
-    lispobj* alien_stack_end = (lispobj*)((char*)th->alien_stack_start + ALIEN_STACK_SIZE);
-#if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
-    // Alien-stack-pointer is predecremented upon use
-    th->alien_stack_pointer = alien_stack_end;
-#else
-    // I do not know the convention for alien-stack-pointer
-    th->alien_stack_pointer = alien_stack_end - 1;
-#endif
-
-#ifdef HAVE_THREAD_PSEUDO_ATOMIC_BITS_SLOT
-    memset(&th->pseudo_atomic_bits, 0, sizeof th->pseudo_atomic_bits);
-#elif defined LISP_FEATURE_GENERATIONAL
-    clear_pseudo_atomic_atomic(th);
-    clear_pseudo_atomic_interrupted(th);
-#endif
-
-    INIT_THREAD_REGIONS(th);
-#ifdef LISP_FEATURE_SB_THREAD
-    /* This parallels the same logic in globals.c for the
-     * single-threaded foreign_function_call_active, KLUDGE and
-     * all. */
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-    th->ffcall_active_p = 0;
-#elif !defined(LISP_FEATURE_ARM64) // uses control_stack_start
-    th->ffcall_active_p = 1;
-#endif
-#endif
-
-#ifndef LISP_FEATURE_SB_THREAD
-    /* the tls-points-into-struct-thread trick is only good for threaded
-     * sbcl, because unithread sbcl doesn't have tls.  So, we copy the
-     * appropriate values from struct thread here, and make sure that
-     * we use the appropriate SymbolValue macros to access any of the
-     * variable quantities from the C runtime.  It's not quite OAOOM,
-     * it just feels like it */
-    SetSymbolValue(BINDING_STACK_START,(lispobj)th->binding_stack_start,th);
-    SetSymbolValue(CONTROL_STACK_START,(lispobj)th->control_stack_start,th);
-    SetSymbolValue(CONTROL_STACK_END,(lispobj)th->control_stack_end,th);
-#if defined(LISP_FEATURE_X86) || defined (LISP_FEATURE_X86_64)
-    SetSymbolValue(ALIEN_STACK_POINTER,(lispobj)th->alien_stack_pointer,th);
-#endif
-#endif
-#ifndef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-    access_control_stack_pointer(th)=th->control_stack_start;
-    access_control_frame_pointer(th)=0;
-#endif
-
-    thread_interrupt_data(th).pending_handler = 0;
-    thread_interrupt_data(th).gc_blocked_deferrables = 0;
-#if HAVE_ALLOCATION_TRAP_CONTEXT
-    thread_interrupt_data(th).allocation_trap_context = 0;
-#endif
-#if defined LISP_FEATURE_PPC64
-    /* Storing a 0 into code coverage mark bytes or GC card mark bytes
-     * can be done from the low byte of the thread base register.
-     * The thread alignment is BACKEND_PAGE_BYTES (from thread.h), but seeing as this is
-     * a similar-but-different requirement, it pays to double-check */
-    if ((lispobj)th & 0xFF) lose("Thread struct not at least 256-byte-aligned");
-#endif
-
-#ifdef LISP_FEATURE_SB_THREAD
-// This macro is the same as "write_TLS(sym,val,th)" but can't be spelled thus.
-// 'sym' would get substituted prior to token pasting, so you end up with a bad
-// token "(*)_tlsindex" because all symbols are #defined to "(*)" so that #ifdef
-// remains meaningful to the preprocessor, while use of 'sym' itself yields
-// a deliberate syntax error if you try to compile an expression involving it.
-#  define INITIALIZE_TLS(sym,val) write_TLS_index(sym##_tlsindex, val, th, _ignored_)
-#else
-#  define INITIALIZE_TLS(sym,val) SYMBOL(sym)->value = val
-#endif
-#include "genesis/thread-init.inc"
-    th->no_tls_value_marker = NO_TLS_VALUE_MARKER;
-
-#if defined(LISP_FEATURE_WIN32)
-    int i;
-    for (i = 0; i<NUM_PRIVATE_EVENTS; ++i)
-        thread_private_events(th,i) = CreateEvent(NULL,FALSE,FALSE,NULL);
-    thread_extra_data(th)->synchronous_io_handle_and_flag = 0;
-#endif
-    th->stepping = 0;
-    th->card_table = (lispobj)gc_card_mark;
-    return th;
-}
 #ifdef LISP_FEATURE_SB_THREAD
 #ifdef LISP_FEATURE_WIN32
 uword_t create_lisp_thread(struct thread* th)
@@ -1165,7 +850,6 @@ uword_t create_lisp_thread(struct thread* th)
                      CREATE_SUSPENDED, &tid);
     bool success = th->os_thread != 0;
     if (success) {
-        th->os_kernel_tid = tid;
         ResumeThread((HANDLE)th->os_thread);
     }
     return success;
@@ -1176,48 +860,22 @@ uword_t create_lisp_thread(struct thread* th)
 #else
 # define START_ROUTINE new_thread_trampoline
 #endif
-int create_lisp_thread(pthread_t *th, pthread_attr_t *attr, void *arg) {
-    return pthread_create(th, attr, START_ROUTINE, arg);
+int create_lisp_thread(lispobj lispthread, struct thread* arg)
+{
+    struct thread_instance* instance = (void*)INSTANCE(lispthread);
+    /* All pthread implementations SBCL runs on have sizeof (pthread_t) = sizeof (uintptr_t)
+     * which is not a POSIX requirement. If pthread_t is larger than a word, we would have to
+     * overlay it on >1 raw slot of 'struct thread_instance'. grovel-headers could output the
+     * number of slots needed to hold the type. But we'd have other problems too: pthread_join
+     * and pthread_kill are called from Lisp, but we can't pass structs by value. Anyway, the
+     * cast to (pthread_t*) proves that monkey business was and is going on */
+    return pthread_create((pthread_t*)&instance->uw_os_thread,
+                          &new_lisp_thread_attr, START_ROUTINE, arg);
 }
 #endif
 
 int try_acquire_gc_lock() { return TryEnterCriticalSection(&in_gc_lock); }
 int release_gc_lock() { return mutex_release(&in_gc_lock); }
-
-static __attribute__((unused)) struct timespec stw_begin_realtime, stw_begin_cputime;
-long timespec_diff(struct timespec* begin, struct timespec* end)
-{
-#ifdef LISP_FEATURE_64_BIT
-    return (end->tv_sec - begin->tv_sec) * 1000000000L + (end->tv_nsec - begin->tv_nsec) ;
-#else
-    return (end->tv_sec - begin->tv_sec) * 1000000L + (end->tv_nsec - begin->tv_nsec) / 1000;
-#endif
-}
-#ifdef MEASURE_STOP_THE_WORLD_PAUSE
-void thread_accrue_stw_time(struct thread* th,
-                            struct timespec* begin_real,
-                            struct timespec* begin_cpu)
-{
-    /* A non-Lisp thread calling into Lisp via DEFINE-ALIEN-CALLABLE
-     * can receive SIG_STOP_FOR_GC as soon as it has a 'struct thread'
-     * and _before_ a thread instance has been consed */
-    if (th->lisp_thread) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        unsigned long elapsed = timespec_diff(begin_real, &now);
-        struct thread_instance* ti = (void*)INSTANCE(th->lisp_thread);
-        if (elapsed > ti->uw_max_stw_pause) ti->uw_max_stw_pause = elapsed;
-        ti->uw_sum_stw_pause += elapsed;
-        ++ti->uw_ct_stw_pauses;
-        if (begin_cpu) {
-#ifdef CLOCK_THREAD_CPUTIME_ID
-          clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
-          ti->uw_gc_virtual_time += timespec_diff(begin_cpu, &now);
-#endif
-        }
-    }
-}
-#endif
 
 #ifndef LISP_FEATURE_WIN32
 /* pthread_kill is not guaranteed to be reentrant, prevent
@@ -1230,140 +888,7 @@ int sb_thread_kill (pthread_t thread, int sig) {
     return ret;
 }
 #endif
-
-/* stopping the world is a two-stage process.  From this thread we signal
- * all the others with SIG_STOP_FOR_GC.  The handler for this signal does
- * the usual pseudo-atomic checks (we don't want to stop a thread while
- * it's in the middle of allocation) then waits for another SIG_STOP_FOR_GC.
- */
-/*
- * (With SB-SAFEPOINT, see the definitions in safepoint.c instead.)
- */
-#if !defined LISP_FEATURE_SB_SAFEPOINT && !defined STANDALONE_LDB
-
-/* To avoid deadlocks when gc stops the world all clients of each
- * mutex must enable or disable SIG_STOP_FOR_GC for the duration of
- * holding the lock, but they must agree on which.
- * [The preceding remark is probably wrong - STOP_FOR_GC is a signal
- * that is directed to a thread, so the "wrong" thread would never
- * respond to someone else's STOP_FOR_GC. I'm leaving the comment
- * just case someone can decipher it and decide to delete it]
- *
- * A note about ESRCH: tchnically ESRCH can happen if an OS thread ceases
- * to exist, while the thread library has a representation of the thread
- * because pthread_join() wasn't invoked on it yet.
- * ESRCH can't oocur for us because:
- * - if a thread was still linked in all_threads at the acquire of all_threads lock,
- *   then that thread can't make progress in its termination code, because it's
- *   waiting on the lock. If it changed its state to DEAD, but we perceived it as
- *   RUNNING, it now must be blocked on the all_threads_lock and it can't disappear.
- * - ESRCH is not guaranteed to be returned anyway, and Linux man page doesn't even
- *   list it as a possible outcome of pthread_kill.
- * Also, there used to be assertion that "thread_state(p)==STATE_DEAD)" on ESRCH
- * error, but that's saying that there is still memory backing 'struct thread'
- * (so that dereferencing was valid), but if dereferencing was valid, then the thread
- * can't have died (i.e. if ESRCH could be returned, then that implies that
- * the memory shouldn't be there) */
-
-void gc_stop_the_world()
-{
-#ifdef MEASURE_STOP_THE_WORLD_PAUSE
-    /* The thread performing stop-the-world does not use sig_stop_for_gc_handler on itself,
-     * so it would not accrue time spent stopped. Force it to, by considering it "paused"
-     * from the moment it wants to stop all other threads. */
-    clock_gettime(CLOCK_MONOTONIC, &stw_begin_realtime);
 #endif
-#ifdef CLOCK_THREAD_CPUTIME_ID
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &stw_begin_cputime);
-#endif
-    struct thread *th, *me = get_sb_vm_thread();
-    int rc;
-
-    /* Keep threads from registering with GC while the world is stopped. */
-    rc = mutex_acquire(&all_threads_lock);
-    gc_assert(rc);
-
-    /* stop all other threads by sending them SIG_STOP_FOR_GC */
-    for_each_thread(th) {
-        if (th != me) {
-            gc_assert(th->os_thread != 0);
-            struct extra_thread_data *semaphores = thread_extra_data(th);
-            os_sem_wait(&semaphores->state_sem);
-            int state = get_thread_state(th);
-            if (state == STATE_RUNNING) {
-                rc = pthread_kill(th->os_thread,SIG_STOP_FOR_GC);
-                /* This used to bogusly check for ESRCH.
-                 * I changed the ESRCH case to just fall into lose() */
-                if (rc) lose("cannot suspend thread %p: %d, %s",
-                     // KLUDGE: assume that os_thread can be cast as pointer.
-                     // See comment in 'interr.h' about that.
-                     (void*)th->os_thread, rc, strerror(rc));
-            }
-            os_sem_post(&semaphores->state_sem);
-        }
-    }
-    for_each_thread(th) {
-        if (th != me) {
-            __attribute__((unused)) int state = thread_wait_until_not(STATE_RUNNING, th);
-            gc_assert(state != STATE_RUNNING);
-        }
-    }
-    event0("/gc_stop_the_world:end");
-}
-
-void gc_start_the_world()
-{
-#ifdef COLLECT_GC_STATS
-    struct timespec gc_end_time;
-    clock_gettime(CLOCK_MONOTONIC, &gc_end_time);
-    long gc_elapsed = (gc_end_time.tv_sec - gc_start_time.tv_sec)*1000000000L
-                      + (gc_end_time.tv_nsec - gc_start_time.tv_nsec);
-    if (stw_elapsed < 0 || gc_elapsed < 0) {
-        char errmsg[] = "GC: Negative times?\n";
-        ignore_value(write(2, errmsg, sizeof errmsg-1));
-    } else {
-        stw_sum_duration += stw_elapsed;
-        if (stw_elapsed < stw_min_duration) stw_min_duration = stw_elapsed;
-        if (stw_elapsed > stw_max_duration) stw_max_duration = stw_elapsed;
-        gc_sum_duration += gc_elapsed;
-        if (gc_elapsed < gc_min_duration) gc_min_duration = gc_elapsed;
-        if (gc_elapsed > gc_max_duration) gc_max_duration = gc_elapsed;
-        ++n_gcs_done;
-    }
-#endif
-    struct thread *th, *me = get_sb_vm_thread();
-    __attribute__((unused)) int lock_ret;
-    /* if a resumed thread creates a new thread before we're done with
-     * this loop, the new thread will be suspended waiting to acquire
-     * the all_threads lock */
-    for_each_thread(th) {
-        gc_assert(th->os_thread);
-        if (th != me) {
-          /* I don't know if a normal load is fine here. I think we can't read
-           * any value other than what was already observed?
-           * No harm in being cautious though with regard to compiler reordering */
-            int state = get_thread_state(th);
-            if (state != STATE_DEAD) {
-                if(state != STATE_STOPPED)
-                    lose("gc_start_the_world: bad thread state %x", state);
-                set_thread_state(th, STATE_RUNNING, 0);
-            }
-        }
-    }
-
-    lock_ret = mutex_release(&all_threads_lock);
-    gc_assert(lock_ret);
-#ifdef MEASURE_STOP_THE_WORLD_PAUSE
-    thread_accrue_stw_time(me, &stw_begin_realtime, &stw_begin_cputime);
-#endif
-}
-
-#endif /* !LISP_FEATURE_SB_SAFEPOINT */
-#elif !defined STANDALONE_LDB
-// no threads
-void gc_stop_the_world() {}
-void gc_start_the_world() {}
-#endif /* !LISP_FEATURE_SB_THREAD */
 
 int
 thread_yield()

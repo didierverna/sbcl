@@ -262,6 +262,26 @@
               (fast-nthcdr (mod n i) r-i))
            (declare (type fixnum i))))))))
 
+(declaim (inline nthcdr-check-bounds))
+(defun nthcdr-check-bounds (n list start end sequence)
+  (declare (index n))
+  (do ((i n (1- i))
+       (result list (cdr result)))
+      ((not (plusp i)) result)
+    (when (endp result)
+      (sequence-bounding-indices-bad-error sequence start end))))
+
+(declaim (inline reverse-into-vector-to-nthcdr-check-bounds))
+(defun reverse-into-vector-to-nthcdr-check-bounds (n list start end sequence)
+  (declare (index n))
+  (do ((result (make-array n))
+       (i (1- n) (1- i))
+       (cdr list (cdr cdr)))
+      ((< i 0) result)
+    (when (endp cdr)
+      (sequence-bounding-indices-bad-error sequence start end))
+    (setf (aref result i) (car cdr))))
+
 ;;; For [n]butlast
 (defun dotted-nthcdr (n list)
   (declare (fixnum n))

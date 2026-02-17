@@ -24,6 +24,8 @@
 
 #include "gc.h"
 
+int sb_GetTID() { return 0; } // this doesn't affect anything
+
 void os_init() {}
 
 os_vm_address_t os_alloc_gc_space(int __attribute__((unused)) space_id,
@@ -59,6 +61,10 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
     void* fault_addr = (void*)info->si_addr;
 
     if (gencgc_handle_wp_violation(context, fault_addr)) return;
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, fault_addr)) return;
+#endif
 
     if (!handle_guard_page_triggered(context, fault_addr))
             lisp_memory_fault_error(context, fault_addr);

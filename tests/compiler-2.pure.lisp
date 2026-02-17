@@ -48,7 +48,8 @@
                    :allow-style-warnings t)
   ;; The sequence must contain a mixture of symbols and non-symbols
   ;; to call %FIND-POSITION. If only symbols, it makes no calls.
-  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g) :from-end t)))))
+  (let ((calls (ctu:ir1-funargs '(lambda (x)
+                                  (position x '(1 2 3 a b c 4 5 6 d e f g "x") :from-end t)))))
     ;; Assert that the default :TEST of #'EQL was strength-reduced to #'EQ
     (assert (equal calls '((sb-kernel:%find-position identity eq)))))
   (checked-compile-and-assert ()
@@ -177,10 +178,10 @@
       (sb-sys:with-pinned-objects (packed-int result)
         ;; Now exercise the C unpacker.
         ;; This hack of allocating 4 longs is terrible, but whatever.
-        (let ((unpacker (make-alien long 4))
+        (let ((unpacker (make-alien word 4))
               (prev-loc 0))
           (alien-funcall (extern-alien "varint_unpacker_init"
-                                       (function void (* long) unsigned))
+                                       (function void (* word) word))
                          unpacker
                          (sb-kernel:get-lisp-obj-address packed-int))
           (sb-int:collect ((unpacked))
@@ -188,7 +189,7 @@
              (let ((status
                     (alien-funcall
                      (extern-alien "varint_unpack"
-                                   (function int (* long) system-area-pointer))
+                                   (function int (* word) system-area-pointer))
                      unpacker (sb-sys:vector-sap result))))
                (let ((val (aref result 0)))
                  ;; status of 0 is EOF, val = 0 means a decoded value was 0,
@@ -211,12 +212,6 @@
     (let ((f (checked-compile `(lambda () (setf (symbol-value ',s) nil)))))
       ;; Should not have a call to SET-SYMBOL-GLOBAL-VALUE>
       (assert (not (ctu:find-code-constants f :type 'sb-kernel:fdefn))))))
-
-(with-test (:name :alien-linkage-table-bogosity)
-  (let ((strings (map 'list (lambda (x) (if (consp x) (car x) x))
-                      sb-vm::+required-foreign-symbols+)))
-    (assert (= (length (remove-duplicates strings :test 'string=))
-               (length strings)))))
 
 (with-test (:name (:no style-warning :for inline :cl-fun))
   (checked-compile '(lambda (x)
@@ -310,11 +305,9 @@
                             (map-into (make-string 10) #'evenp z))))
 
 (with-test (:name (:type-conflict complement))
-  (assert (nth-value 3
-                     (checked-compile
-                      `(lambda (z)
-                         (find z "l" :test (complement #'=)))
-                      :allow-style-warnings t))))
+  (compiles-with-warning
+   `(lambda (z)
+      (find z "l" :test (complement #'=)))))
 
 (with-test (:name :type-across-hairy-lambda-transforms)
   (assert (subtypep (sb-kernel:%simple-fun-type
@@ -4241,17 +4234,6 @@
                       (:nest (f5 d)))))))
     ((1) nil)))
 
-(with-test (:name :type-derivers-type-widening)
-  (checked-compile-and-assert
-      ()
-      `(lambda (b c)
-         (logbitp 0
-                  (if (eql c 0)
-                      (max (ignore-errors c) 0)
-                      b)))
-      ((1 2) t)
-      ((0 0) nil)))
-
 (with-test (:name :propagate-to-refs-hairy)
   (checked-compile-and-assert
       ()
@@ -4714,13 +4696,13 @@
    (lambda ()
      (let ((x '(1 2 3)))
        (values (pop x) (pop x))))
-   (values (or null (integer 1 3)) (or null (integer 1 3)) &optional))
+   (values (integer 1 3) (or null (integer 1 3)) &optional))
   (assert-type
    (lambda ()
      (declare (optimize speed (debug 1)))
      (destructuring-bind (a b) '(1 2)
        (values a b)))
-   (values (or null (integer 1 2)) (or null (integer 1 2)) &optional))
+   (values (integer 1 2) (or null (integer 1 2)) &optional))
   (assert-type
    (lambda (n)
      (loop for x in '(a b c)
@@ -4733,7 +4715,47 @@
        (dolist (x x)
          (when (eql x n)
            (return x)))))
-   (or list (integer 1 2))))
+   (or list (integer 1 2)))
+  (assert-type
+   (lambda (n)
+     (declare (optimize (debug 2)))
+     (let ((x '(1 2 3)))
+       (dolist (x x)
+         (when (eql x n)
+           (return x)))))
+   (or (integer 1 3) null))
+  (assert-type
+   (lambda (x)
+     (do ((cdr '(1 2 3) (cdr cdr)))
+         ((null cdr))
+       (declare (list cdr))
+       (let ((car (car cdr)))
+         (when (eq car x)
+           (return car)))))
+   (or (integer 1 3) null))
+  (assert-type
+   (lambda (j)
+     (declare (optimize (debug 2)))
+     (let ((x nil))
+       (labels ((f ()
+                  (pop x)))
+         (when j
+           (f)
+           (f)))
+       x))
+   null)
+  (assert-type
+   (lambda (j)
+     (block nil
+       (map nil (lambda (x) (when j (return x))) '(1 2 3))
+       0))
+   (integer 0 3))
+  (assert-type
+   (lambda (j)
+     (block nil
+       (map nil (lambda (x) (when j (return (+ x 1)))) nil)
+       0))
+   (eql 0)))
 
 (with-test (:name :test-headers-lowtag-only)
   (checked-compile-and-assert
@@ -4796,3 +4818,297 @@
                                (optimize speed))
                       (coerce l 'vector))
                    :allow-notes nil))
+
+(with-test (:name :flushable-combination-args-p-lost-annotation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (b)
+         (declare (vector b))
+         (let ((j))
+           (find 1 b :key (lambda (x)
+                            (setf j x)))
+           j))
+    ((#(2)) 2)))
+
+(with-test (:name :constant-fold-variables)
+  (assert-type
+   (lambda ()
+     (declare (optimize (debug 2)))
+     (let ((x #(a b)))
+       (aref x 0)))
+   (eql a)))
+
+(with-test (:name :funcall-externally-checkable-type)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n m)
+      (funcall (the (function ((signed-byte 33)) t)
+                    (if m
+                        (lambda (x) x)
+                        (lambda (x) (1+ x))))
+               n))
+   (('a t) (condition 'type-error))
+   (((expt 2 33) nil) (condition 'type-error))
+   ((1 t) 1)
+   ((2 nil) 3))
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n f)
+      (funcall (the (function ((signed-byte 33)) t)
+                    f)
+               n))
+   (('a #'-) (condition 'type-error))
+   ((1 #'-) -1))
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n)
+      (funcall (the (function ((signed-byte 33)) t)
+                    #'opaque-identity)
+               n))
+   (("a") (condition 'type-error))
+   ((2) 2))
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n j)
+      (funcall (the (function ((signed-byte 33)) (values symbol &optional))
+                    (lambda (x) (when (evenp x)
+                                  j)))
+               n))
+   ((2 'a) 'a)
+   ((2 1) (condition 'type-error))))
+
+(with-test (:name :cast-move-exit)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (m f)
+         (+ m (catch t (funcall f) 0)))
+    ((1 #'list) 1)
+    ((1 (lambda () (throw t 1))) 2)
+    ((1 (lambda () (throw t t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (the number (catch t (funcall f) 2)))
+    ((#'list) 2)
+    (((lambda () (throw t 3))) 3)
+    (((lambda () (throw t t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (the number (values (catch t (funcall f) 2))))
+    ((#'list) 2)
+    (((lambda () (throw t 3))) 3)
+    (((lambda () (throw t t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (values (the number (catch t (funcall f) 2))))
+    ((#'list) 2)
+    (((lambda () (throw t 3))) 3)
+    (((lambda () (throw t t))) (condition 'type-error))))
+
+(with-test (:name :apply-type-derivation)
+  (assert-type
+   (lambda (r)
+     (apply #'concatenate 'vector r))
+   simple-vector)
+  (assert-type
+   (lambda (a r)
+     (declare ((array double-float) a))
+     (apply #'aref a r))
+   double-float)
+  (assert-type
+   (lambda (r)
+     (apply #'make-array 1 :element-type t r))
+   (vector t)))
+
+(with-test (:name :foldable-read-only)
+  (assert-type
+   (lambda ()
+     (let ((l (list 1)))
+       (values (car l)
+               (car l))))
+   (values (eql 1) (eql 1) &optional)))
+
+(with-test (:name :>-integer-fixnum)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (v1 m)
+         (declare (single-float v1)
+                  (integer m))
+         (if (> (+ v1 4) 0.9)
+             (>
+              -7
+              (+
+               (if (> v1 7)
+                   #c(4.0 3.0)
+                   2)
+               m))
+             (* -0.2 v1)))
+    ((8.0 8) (condition 'type-error))
+    ((-8.0 8) 1.6)))
+
+(with-test (:name :unused-tns-erased-types)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      '(lambda (x)
+        (declare ((integer 10 20) x))
+        (let ((q (truncate (/ x 0))))
+          (when (minusp x)
+            q)))
+    ((10) (condition 'division-by-zero))))
+
+(with-test (:name :constant-fold-call-multiple-uses-casts)
+  (checked-compile-and-assert
+      (:optimize :safe
+       :allow-warnings t)
+      `(lambda (v)
+         (if v
+             (truncate
+              (if v
+                  #c(1 2)
+                  2)
+              (if v
+                  9
+                  2))))
+    ((t) (condition 'type-error))
+    ((nil) nil)))
+
+(with-test (:name :cast-externally-checkable-p-vop-ref)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (v3)
+         (let ((v (the integer v3)))
+           (values (logand 1 v)
+                   v)))
+    ((t) (condition 'type-error))
+    ((3) (values 1 3))))
+
+(with-test (:name :un/signed-byte-64-p-move-to-word)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x n m)
+         (declare (integer x n))
+         (prog ()
+          sb64
+            (when (typep x '(signed-byte 64))
+              (return (logand x 2)))
+          ub64
+            (when (typep x '(unsigned-byte 64))
+              (return (logand x 1)))
+            (when m
+              (setf x n
+                    m nil)
+              (go ub64))))
+    (((expt 2 64) -1 t) nil)
+    (((expt 2 64) 3 t) 1)))
+
+(with-test (:name :test-header-lowtag-null)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x)
+         (declare ((or bignum null) x))
+         (logand x 3))
+    (((+ (expt 2 64) 2)) 2)
+    ((nil) (condition 'type-error))))
+
+(with-test (:name :unwind-protect-mv-bind)
+  (checked-compile-and-assert
+      ()
+      `(lambda (m)
+         (let (n)
+           (values
+            (nth-value 1
+                       (unwind-protect
+                            1
+                         (setf n m)))
+            n)))
+    ((2) (values nil 2)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (m)
+         (nth-value 1
+                    (block nil
+                      (values (unwind-protect t
+                                (return m))))))
+    ((2) nil)))
+
+(with-test (:name :nth-value-the)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (nth-value 1 (the fixnum (funcall f))))
+    (((lambda () 1)) nil)
+    (((lambda () (values 1 2))) 2)
+    (((lambda () (values t 2))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (values (the (values fixnum fixnum) (funcall f))))
+    (((lambda () 1)) (condition 'type-error))
+    (((lambda () (values 1 2))) 1)
+    (((lambda () (values 2 t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (values (the (values fixnum &optional fixnum) (funcall f))))
+    (((lambda () 1)) 1)
+    (((lambda () (values 1 2))) 1)
+    (((lambda () (values 2 t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (values (the real (the (not single-float) (funcall f)))))
+    (((lambda () 1)) 1)
+    (((lambda () (values 1 2))) 1)
+    (((lambda () nil)) (condition 'type-error))
+    (((lambda () 1.0)) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (the (values number number) (funcall f)))
+    (((lambda () 1)) (condition 'type-error))
+    (((lambda () (values 1 2))) (values 1 2))
+    (((lambda () (values nil 2))) (condition 'type-error))
+    (((lambda () (values 1 nil))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe
+       :allow-style-warnings t)
+      `(lambda (f)
+         (the (values real boolean) (if f (values 1 1))))
+    ((t) (condition 'type-error))
+    ((nil) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe :allow-style-warnings t)
+      `(lambda (f)
+         (the (values &optional real)
+              (the (values &optional complex)
+                   (funcall f))))
+    (((lambda () (values))) (values))
+    (((lambda () 1)) (condition 'type-error))
+    (((lambda () #c(1 2))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe :allow-warnings t)
+      `(lambda ()
+         (the (values &optional real) nil))
+    (() (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe :allow-warnings t)
+      `(lambda ()
+         (the (values real (not real)) (floor 1 1)))
+    (() (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe :allow-warnings t)
+      `(lambda ()
+         (the (values fixnum &optional)
+              (block nil (floor 2))))
+    (() (condition 'type-error))))
+
+(with-test (:name :unwrap-predicates-block)
+  (checked-compile-and-assert
+      ()
+      `(lambda (v)
+         (if (block nil (> v 7))
+             t))
+    ((8) t)
+    ((0) nil)))

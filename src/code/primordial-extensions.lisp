@@ -176,7 +176,7 @@
   ;; Perhaps it's possible for *PACKAGE* to be set to a non-package in some
   ;; host Lisp, but in SBCL it isn't, and the PACKAGEP test below would be
   ;; elided unless forced to be NOTINLINE.
-  (declare (notinline packagep))
+  (declare (notinline packagep type-of))
   (let* ((maybe-package *package*)
          (packagep (packagep maybe-package)))
     ;; And if we don't also always check for deleted packages - as was true
@@ -340,7 +340,12 @@
                       it)
                  (acond ,@rest)))))))
 
-(defvar *!removable-symbols* nil)
+(define-load-time-global *!removable-symbols*
+  '(("SB-INT" uncross hash-cons swapped-args-fun char-case-info packed-info-field
+     type-bound-number
+     prepare-for-fast-read-char fast-read-char done-with-fast-read-char
+     fast-read-var-u-integer fast-read-u-integer fast-read-s-integer
+     clear-flag)))
 
 (defun %defconstant-eqx-value (symbol expr eqx)
   (declare (type function eqx))
@@ -376,10 +381,9 @@
 ;;; ease of guarding against differences in host compilers with
 ;;; respect to coalescing structure in (host) fasl files, which might
 ;;; then be used in compiling the target.
+(declaim (ftype (function (list) list) hash-cons))
 (defun hash-cons (list)
-  (declare (type list list)
-           #-sb-xc-host
-           (notinline gethash3 %puthash))
+  #-sb-xc-host (declare (notinline gethash3 %puthash))
   (let ((table (make-hash-table :test 'equal)))
     (labels ((hc (thing)
                (cond

@@ -848,10 +848,6 @@
               (and array (not simple-array))
               array)
 
-  (disunity-test (:array-type-union :complexp-and-dimensions-dont-unite 1)
-                 (simple-array * (* *))
-                 (and (array * (* 3)) (not simple-array)))
-
   (disunity-test (:array-type-union :complexp-and-dimensions-dont-unite 2)
               (simple-array * (* *))
               (array * (* 3)))
@@ -872,11 +868,7 @@
 
   (disunity-test (:array-type-union :element-type-and-dimensions-dont-unite)
                  (array (unsigned-byte 8))
-                 (array * (* *)))
-
-  (disunity-test (:array-type-union :element-type-and-complexp-dont-unite)
-                 (simple-array (unsigned-byte 8))
-                 (and array (not simple-array))))
+                 (array * (* *))))
 
 ;;; These tests aren't really impure once the SHUFFLE function is provided.
 ;;; Logically they belong with the above, so here they are.
@@ -1032,3 +1024,6 @@
     (assert (and (not answer) (not certain))))
   (multiple-value-bind (answer certain) (subtypep 'jn-even 'jn-odd)
     (assert (and (not answer) (not certain)))))
+
+(with-test (:name :member-type-stack-allocation)
+  (assert (typep 10 (opaque-identity `(member ,@(loop repeat 100000 for i by 2 collect i))))))

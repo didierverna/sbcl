@@ -70,8 +70,10 @@
            function-with-layout-p
            non-null-symbol-p)
     (t) boolean (movable foldable flushable))
+
 (defknown unsigned-byte-x-p
-    (t (integer 1)) boolean (movable foldable flushable))
+    (t (integer #.(1+ sb-vm:n-word-bits)))
+    boolean (movable foldable flushable always-translatable))
 
 (defknown car-eq-if-listp (t t) boolean (movable foldable flushable))
 
@@ -95,6 +97,9 @@
   (float) boolean (movable foldable flushable))
 
 ;;;; miscellaneous "sub-primitives"
+
+(defknown descriptor-hash32 (t) #+64-bit (unsigned-byte 32) #-64-bit (unsigned-byte 29)
+          (flushable always-translatable))
 
 (defknown %sp-string-compare
   (simple-string simple-string index (or null index) index (or null index))
@@ -138,7 +143,7 @@
   (always-translatable flushable)
   :result-arg 0)
 
-(defknown (vector-fill* vector-fill/t) (t t t t) vector
+(defknown (vector-fill vector-fill/t) (t t t t) vector
   (no-verify-arg-count)
   :result-arg 0)
 
@@ -186,10 +191,8 @@
   (flushable))
 (defknown %set-array-dimension (array index index) (values)
   ())
-(defknown %array-rank (array) %array-rank
-  (flushable))
 
-(defknown (%array-rank= widetag=) (t t) boolean
+(defknown (array-rank= widetag=) (t t) boolean
   (flushable))
 
 (defknown vector-data (array index) (values simple-array index)
@@ -197,8 +200,8 @@
 
 (defknown simple-array-header-of-rank-p (t %array-rank) boolean
   (flushable))
-(defknown sb-kernel::check-array-shape (simple-array list)
-  (simple-array)
+(defknown sb-kernel::check-array-shape (array list)
+  (array)
   (flushable no-verify-arg-count)
   :derive-type #'result-type-first-arg
   :result-arg 0)
@@ -233,16 +236,23 @@
   (flushable always-translatable))
 (defknown (%instance-ref-eq) (instance index t) boolean
   (flushable always-translatable))
+;; This predicates sounds as though the argument restriction would be INSTANCE,
+;; but it's lenient because it can perform a lowtag test on one (but not both) args.
+(defknown (%instance-types=) (t t) boolean
+  (flushable always-translatable))
 (defknown %instance-set (instance index t) (values) (always-translatable))
 (defknown update-object-layout (t) layout)
 
-#+(or arm64 ppc ppc64 riscv x86 x86-64)
+#+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
 (defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
   sb-vm:word ())
-#+(or arm64 riscv x86 x86-64)
+#+(or arm64 loongarch64 riscv x86 x86-64)
 (defknown %raw-instance-cas/signed-word (instance index sb-vm:signed-word sb-vm:signed-word)
   sb-vm:signed-word ())
 (defknown %raw-instance-xchg/word (instance index sb-vm:word) sb-vm:word ())
+
+;; vector, index, old1, old2, new1, new2 -> old1, old2
+(defknown sb-vm::%vector-cas-pair (simple-vector index t t t t) (values t t))
 
 (macrolet ((define-raw-slot-defknowns ()
              `(progn
@@ -617,7 +627,7 @@
 (defknown %fixnum-digit-with-correct-sign (bignum-element-type) sb-vm:signed-word
     (foldable flushable movable always-translatable))
 
-;;; %ASHR- take a digit-size quantity and shift it to the left,
+;;; %ASHL- take a digit-size quantity and shift it to the left,
 ;;; returning a digit-size quantity.
 ;;; %ASHR- Do an arithmetic shift right of data even though bignum-element-type is
 ;;; unsigned.
@@ -731,11 +741,11 @@
 ;;; Checks for and adjusts fill-pointer for vector-pop/push and
 ;;; returns the underlying simple data vector.
 (defknown %data-vector-pop
-    (array)
+    (complex-vector)
     (values (simple-array * (*)) index))
 
 (defknown %data-vector-push
-    (array)
+    (complex-vector)
     (values (simple-array * (*)) (or null index)))
 
 (defknown restart-point (t) t ())
@@ -745,6 +755,9 @@
 (defknown %single-float (real) single-float
   (movable foldable unboxed-return))
 (defknown %double-float (real) double-float
+  (movable foldable unboxed-return))
+
+(defknown %single-float-no-double-float ((and real (not double-float))) single-float
   (movable foldable unboxed-return))
 
 (defknown bignum-to-single-float (bignum) single-float
@@ -779,12 +792,20 @@
 (defknown double-float-low-bits (double-float) (unsigned-byte 32)
   (movable foldable flushable))
 
-(defknown (%tan %sinh %asinh %atanh %log %logb %log10 %tan-quick)
+(defknown (%tan %sinh %asinh %atanh %log %logb %log10 %log1p %log2 %tan-quick)
           (double-float) double-float
+  (movable foldable flushable))
+
+(defknown (%tanf %sinhf %asinhf %atanhf %logf %log10f %log1pf %log2f)
+          (single-float) single-float
   (movable foldable flushable))
 
 (defknown (%sin %cos %tanh %sin-quick %cos-quick)
   (double-float) (double-float -1.0d0 1.0d0)
+  (movable foldable flushable))
+
+(defknown (%sinf %cosf %tanhf)
+  (single-float) (single-float -1.0f0 1.0f0)
   (movable foldable flushable))
 
 (defknown (%asin %atan)
@@ -793,17 +814,35 @@
                 #.(coerce (sb-xc:/ pi 2) 'double-float))
   (movable foldable flushable))
 
+(defknown (%asinf %atanf)
+  (single-float)
+  (single-float  #.(coerce (sb-xc:- (sb-xc:/ pi 2)) 'single-float)
+                 #.(coerce (sb-xc:/ pi 2) 'single-float))
+  (movable foldable flushable))
+
 (defknown (%acos)
   (double-float) (double-float 0.0d0 #.(coerce pi 'double-float))
   (movable foldable flushable))
+
+(defknown (%acosf)
+    (single-float) (single-float 0.0f0 #.(coerce pi 'single-float))
+    (movable foldable flushable))
 
 (defknown (%cosh)
   (double-float) (double-float 1.0d0)
   (movable foldable flushable))
 
+(defknown (%coshf)
+  (single-float) (single-float 1.0f0)
+  (movable foldable flushable))
+
 (defknown (%acosh %exp %sqrt)
   (double-float) (double-float 0.0d0)
   (movable foldable flushable))
+
+(defknown (%acoshf %expf %sqrtf)
+    (single-float) (single-float 0.0f0)
+    (movable foldable flushable))
 
 (defknown %expm1
   (double-float) (double-float -1d0)
@@ -813,9 +852,17 @@
   (double-float double-float) (double-float 0d0)
   (movable foldable flushable))
 
+(defknown (%hypotf)
+    (single-float single-float) (single-float 0f0)
+    (movable foldable flushable))
+
 (defknown (%pow)
   (double-float double-float) double-float
   (movable foldable flushable))
+
+(defknown (%powf)
+    (single-float single-float) single-float
+    (movable foldable flushable))
 
 (defknown (%atan2)
   (double-float double-float)
@@ -823,16 +870,18 @@
                 #.(coerce pi 'double-float))
   (movable foldable flushable))
 
+(defknown (%atan2f)
+    (single-float single-float)
+    (single-float #.(coerce (sb-xc:- pi) 'single-float)
+                  #.(coerce pi 'single-float))
+    (movable foldable flushable))
+
 (defknown (%scalb)
   (double-float double-float) double-float
   (movable foldable flushable))
 
 (defknown (%scalbn)
   (double-float (signed-byte 32)) double-float
-  (movable foldable flushable))
-
-(defknown (%log1p %log2)
-  (double-float) double-float
   (movable foldable flushable))
 
 (defknown (%unary-truncate %unary-round) (real) integer
@@ -850,6 +899,8 @@
 (defknown sb-vm::fastrem-64 ((unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
   (unsigned-byte 64)
   (flushable))
+(defknown sb-vm::reverse-bits-64 ((unsigned-byte 64)) (unsigned-byte 64)
+  (flushable always-translatable))
 
 ;;; +-modfx is useful for computing a hash that is commutative in its inputs.
 ;;; These architectures lack a complete set of modular operations; they have operations

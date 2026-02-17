@@ -46,6 +46,29 @@
 
 
 
+#if defined __DragonFly__
+#include <sys/lwp.h>
+lwpid_t sb_GetTID() { return lwp_gettid(); }
+#elif defined __NetBSD__
+#include <lwp.h>
+int sb_GetTID() { return _lwp_self(); }
+#elif defined __FreeBSD__
+#include <sys/thr.h>
+int sb_GetTID()
+{
+    long id;
+    thr_self(&id);
+    // man thr_self(2) says: the thread identifier is an integer in the range
+    // from PID_MAX + 2 (100001) to INT_MAX. So casting to int is safe.
+    return (int)id;
+}
+#elif defined __OpenBSD__
+int sb_GetTID()
+{
+    return getthrid();
+}
+#endif
+
 #ifdef __NetBSD__
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -272,6 +295,10 @@ memory_fault_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
     if (handle_safepoint_violation(context, fault_addr)) return;
+#endif
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, fault_addr)) return;
 #endif
 
 #ifdef LISP_FEATURE_GENCGC

@@ -1233,9 +1233,9 @@
                 (dump-fop 'fop-known-fun fasl-output))
                (:coverage-marks
                 ;; Avoid the coalescence done by DUMP-VECTOR
-                (dump-specialized-vector (make-array (cdr entry)
-                                                     :element-type '(unsigned-byte 8)
-                                                     :initial-element #xFF)
+                (dump-specialized-vector (sb-xc:make-array (cdr entry)
+                                                           :element-type '(unsigned-byte 8)
+                                                           :initial-element #xFF)
                                          fasl-output)))))))
 
       ;; Dump the debug info.
@@ -1479,27 +1479,12 @@
 
 ;;;; code coverage
 
-(defun dump-code-coverage-records (cc file)
-  (declare (type list cc))
+;;; SB-COVER can override this dumping function, outputting more metadata.
+;;; If it does, the resulting functions in FILE can produce descriptions of forms
+;;; hit by line & column without needing to re-read their source files.
+;;; Presentation still needs to read files - only as strings - for display.
+(defun dump-code-coverage-records (cc augmentation file)
+  (declare (type simple-vector cc))
   (dump-object cc file)
+  (dump-object augmentation file)
   (dump-fop 'fop-record-code-coverage file))
-
-;;; NOTE: this is unused at present and may never have been necessary-
-;;; full-calls can be inferred at load-time by tracking :LINKAGE-CELL fixups or FOP-FDEFN.
-(defun dump-emitted-full-calls (hash-table fasl)
-  (let ((list (%hash-table-alist hash-table)))
-    #+sb-xc-host ; enforce host-insensitive reproducible ordering
-    (labels ((symbol< (a b)
-               (cond ((string< a b) t)
-                     ((string= a b)
-                      ;; this does find a few pairs of lookalikes
-                      (string< (cl:package-name (sb-xc:symbol-package a))
-                               (cl:package-name (sb-xc:symbol-package b))))))
-             (fname< (a b)
-               (cond ((and (atom a) (atom b)) (symbol< a b))
-                     ((atom a) t) ; symbol < list
-                     ((atom b) nil) ; opposite
-                     ((symbol< (cadr a) (cadr b))))))
-      (setq list (sort list #'fname< :key #'car)))
-    (dump-object list fasl)
-    (dump-fop 'fop-note-full-calls fasl)))

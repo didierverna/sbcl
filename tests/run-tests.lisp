@@ -1,5 +1,15 @@
 (when (member "--gc-stress" *posix-argv* :test #'equal)
   (push :gc-stress *features*))
+(when (member "--slow" *posix-argv* :test #'equal)
+  (push :slow *features*))
+(when (member "--gc-verify" *posix-argv* :test #'equal)
+  (push :gc-verify *features*))
+(when (member "--coverage" *posix-argv* :test #'equal)
+  (assert (member :sb-cover-for-internals sb-impl::+internal-features+))
+  (push :coverage *features*))
+
+#+coverage
+(require :sb-cover)
 
 (load "test-util.lisp")
 (load "assertoid.lisp")
@@ -48,9 +58,10 @@
             ((string= arg "--report-skipped-tests")
              (setf *report-skipped-tests* t))
             ((string= arg "--no-color"))
-            ((string= arg "--slow")
-             (push :slow *features*))
-            ((string= arg "--gc-stress"))
+            ((or (string= arg "--gc-stress")
+                 (string= arg "--slow")
+                 (string= arg "--gc-verify")
+                 (string= arg "--coverage")))
             ((string= arg "--skip-to")
              (setf skip-to (pop remainder)))
             (t
@@ -415,9 +426,7 @@
     (dolist (package delete)
       (unuse-package (package-use-list package) package))
     ;; Then all deletions
-    (mapc 'delete-package delete)
-    (when delete
-      (format t "::: NOTE: Deleted ~D package~:P~%" (length delete))))
+    (mapc 'delete-package delete))
   ;; Remove PRINT-OBJECT methods specialized on uninterned symbols
   (let ((gf #'print-object))
     (dolist (method (sb-mop:generic-function-methods gf))
@@ -541,7 +550,11 @@
                            (cons :interpreter *features*)
                            *features*)))
                 (let ((start (get-internal-real-time)))
+                  #+coverage (sb-cover:reset-coverage)
                   (funcall test-fun file)
+                  #+coverage
+                  (let ((name (concatenate 'string (namestring file) ".coverage")))
+                    (sb-cover:save-coverage-in-file name))
                   (log-file-elapsed-time file start log))))
             (skip-file ())))
         (sb-impl::disable-stepping)
@@ -575,6 +588,9 @@
            "--noprint"
            "--disable-debugger"
            #+gc-stress "--eval" #+gc-stress "(push :gc-stress *features*)"
+           #+gc-verify "--eval" #+gc-verify "(push :gc-verify *features*)"
+           #+slow "--eval" #+slow "(push :slow *features*)"
+           #+coverage "--eval" #+coverage "(push :coverage *features*)"
            "--load" load
            "--eval" (write-to-string eval
                                      :right-margin 1000))
@@ -591,9 +607,7 @@
      ,*break-on-failure*
      ,*break-on-expected-failure*
      ,*break-on-error*
-     ,(eq *test-evaluator-mode* :interpret)
-     ,(and (member :slow *features*)
-           t))))
+     ,(eq *test-evaluator-mode* :interpret))))
 
 (defun impure-runner (files test-fun log)
   (when files

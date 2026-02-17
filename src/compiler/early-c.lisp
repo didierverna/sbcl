@@ -40,14 +40,12 @@
 
 (defstruct (dxable-args (:constructor make-dxable-args (list))
                         (:predicate nil)
-                        (:copier nil)
-                        #-sb-xc-host :no-constructor-defun)
+                        (:copier nil))
   (list nil :read-only t))
 (defstruct (inlining-data (:include dxable-args)
                           (:constructor make-inlining-data (expansion list))
                           (:predicate nil)
-                          (:copier nil)
-                          #-sb-xc-host :no-constructor-defun)
+                          (:copier nil))
   (expansion nil :read-only t))
 (declaim (freeze-type dxable-args))
 
@@ -218,7 +216,7 @@ possible.")
 
 (defstruct (compilation (:constructor make-compilation
                                       (&optional msan-unpoison
-                                                 coverage-metadata
+                                                 coverage-records
                                                  block-compile entry-points compile-toplevel-object))
                         (:copier nil)
                         (:predicate nil)
@@ -231,7 +229,7 @@ possible.")
   ;; any DECLAIMs for later replay. The logic is explained in EVAL-COMPILE-TLF.
   ;; This slot is set to NIL before use and reset when done.
   (saved-optimize-decls :none)
-  (coverage-metadata nil :type (or (cons hash-table hash-table) null) :read-only t)
+  (coverage-records nil :type (or hash-table null) :read-only t)
   (msan-unpoison nil :read-only t)
   (sset-counter 1 :type fixnum)
   ;; Which GC the code generator should target. The codegen is basically the same for now
@@ -327,21 +325,6 @@ possible.")
          ;; Bit 1 tells whether any warning was emitted yet.
          (= (logand status 3) #b01)
          (ash status -2)))) ; the call count as tracked by IR2
-
-;;; FIXME: the math here is very suspicious-looking. If the flag bits are #b11
-;;; then they can rollover into the counts. And we're ORing counts. Wtf is this doing???
-;;; Well, it doesn't matter really. This is used only in FOP-NOTE-FULL-CALLS which is called
-;;; only if DUMP-EMITTED-FULL-CALLS emits that fop. But that function is never invoked.
-(defun accumulate-full-calls (data)
-  (loop for (name status) in data
-        do
-        (let* ((table (cu-emitted-full-calls *compilation-unit*))
-               (existing (gethash name table 0)))
-          (setf (gethash name table)
-                (logior (+ (logand existing #b11) ; old flag bits
-                           (logand status #b11))  ; new flag bits
-                        (logand existing -4)      ; old count
-                        (logand status -4))))))   ; new count
 
 (declaim (type (simple-array (unsigned-byte 16) 1) *asm-routine-offsets*))
 (define-load-time-global *asm-routine-offsets*

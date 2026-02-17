@@ -2577,3 +2577,62 @@
 
 (with-test (:name :auto-dx-anonymous-closure-multiple-ref.stack-allocates)
   (assert-no-consing (auto-dx-anonymous-closure-multiple-ref 5)))
+
+(with-test (:name :push+dx+mv-call
+            :broken-on :sbcl)
+  (checked-compile-and-assert
+   ()
+   '(lambda (f)
+     (let (j)
+       (declare (dynamic-extent j))
+       (print (multiple-value-call #'list (funcall f)
+                (progn (push 1 j)
+                       (funcall f))))
+       (copy-list j)))
+   (((constantly t)) '(1) :test #'equal)))
+
+(with-test (:name :dynamic-extent-lp2113935)
+  (checked-compile-and-assert
+   (:optimize '(:debug 2))
+   '(lambda (a)
+     (let ((x (cons nil a)))
+       (declare (dynamic-extent x))
+       (print-nothing x)
+       (let* ((g
+                (cons
+                 (let ((v3
+                         (let ((q 0))
+                           (declare (special q))
+                           2)))
+                   (declare (dynamic-extent v3))
+                   v3)
+                 (progn
+                   (let ((g (lambda () x)))
+                     (declare (dynamic-extent g))
+                     (print-nothing g))
+                   0))))
+         (declare (dynamic-extent g))
+         (print-nothing g)
+         0)))
+   ((2) 0)))
+
+(with-test (:name :lambda-ref-substitution)
+  (assert (funcall (checked-compile `(lambda (x)
+                                       (let ((a (lambda () x)))
+                                         (let ((x (list a)))
+                                           (declare (dynamic-extent x))
+                                           (not (sb-ext:stack-allocated-p (car x)))))))
+                   1))
+  (assert (funcall (checked-compile `(lambda (x)
+                                       (let ((a (lambda () x)))
+                                         (let ((x a))
+                                           (declare (dynamic-extent x))
+                                           (sb-ext:stack-allocated-p x)))))
+                   1))
+  (assert (funcall (checked-compile `(lambda (x)
+                                       (flet ((f (&rest args)
+                                                (declare (dynamic-extent args))
+                                                (not (sb-ext:stack-allocated-p (car args)))))
+                                         (declare (notinline f))
+                                         (f (lambda () x)))))
+                   1)))

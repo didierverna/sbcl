@@ -128,10 +128,12 @@
               (values drop-through target)
               (values target drop-through))
         (assemble ()
-          (flet ((check-widetag (target not-p)
+          (flet ((check-widetag (target not-p &optional (nil-in-other-pointers nil-in-other-pointers))
                    (unless (and value-tn-ref
                                 (= lowtag other-pointer-lowtag)
-                                (other-pointer-tn-ref-p value-tn-ref nil-in-other-pointers immediate-tested))
+                                (other-pointer-tn-ref-p value-tn-ref
+                                                        nil-in-other-pointers
+                                                        immediate-tested))
                      (multiple-value-bind (bit set) (tn-ref-lowtag-bit lowtag value-tn-ref
                                                                        nil-in-other-pointers immediate-tested)
                        (when (and set (not not-p))
@@ -142,7 +144,12 @@
                          (0
                           (inst tbnz* value bit target))
                          (t
-                          (%test-lowtag value widetag target not-p lowtag))))
+                          (cond ((other-pointer-tn-ref-p value-tn-ref t immediate-tested)
+                                 ;; It's either NIL or an other-pointer
+                                 (inst cmp value null-tn)
+                                 (inst b (if not-p :eq :ne) target))
+                                (t
+                                 (%test-lowtag value widetag target not-p lowtag))))))
                      t)))
             (cond
               ((and value-tn-ref
@@ -156,7 +163,7 @@
                                     thereis (if (consp header)
                                                 (<= (car header) widetag (cdr header))
                                                 (eql widetag header)))))))
-               (or (check-widetag target not-p)
+               (or (check-widetag target not-p nil)
                    (unless not-p
                      (inst b target))))
               (t
@@ -260,7 +267,7 @@
     not-target))
 
 (define-vop (signed-byte-64-p-move-to-word signed-byte-64-p)
-  (:results (r :scs (signed-reg)))
+  (:results (r :scs (signed-reg unsigned-reg)))
   (:result-types signed-num)
   (:translate)
   (:generator 10
@@ -270,8 +277,8 @@
               (values not-target target)
               (values target not-target))
         (assemble ()
-          (inst asr r value n-fixnum-tag-bits)
           (when fixnum-p
+            (inst asr r value n-fixnum-tag-bits)
             (inst tbz* value 0 yep))
           (unless (fixnum-or-other-pointer-tn-ref-p args t)
             (test-type value temp nope t (other-pointer-lowtag)))
@@ -357,67 +364,74 @@
     NOT-TARGET))
 
 (define-vop (unsigned-byte-x-p type-predicate)
-  (:arg-types * (:constant (integer 1)))
+  (:arg-types * (:constant t))
   (:translate sb-c::unsigned-byte-x-p)
   (:info target not-p x)
   (:temporary (:sc unsigned-reg) last-digit)
   (:generator 10
-    (let* ((type (tn-ref-type args))
-           (fixnum-p (types-equal-or-intersect type (specifier-type 'fixnum)))
-           (integer-p (csubtypep type (specifier-type 'integer)))
-           (other-pointer-p (fixnum-or-other-pointer-tn-ref-p args t))
-           (unsigned-p (not (types-equal-or-intersect type (specifier-type '(integer * -1))))))
-      (multiple-value-bind (yep nope)
-          (if not-p
-              (values not-target target)
-              (values target not-target))
-        (assemble ()
-          (cond ((not other-pointer-p)
-                 ;; Move to a temporary and mask off the lowtag,
-                 ;; but leave the sign bit for testing for positive fixnums.
-                 ;; When using 32-bit registers that bit will not be visible.
-                 (inst and last-digit value (logior (ash 1 (1- n-word-bits)) lowtag-mask)))
-                (fixnum-p
-                 (move last-digit value)))
-          (when fixnum-p
-            (%test-fixnum last-digit nil (if unsigned-p
-                                             yep
-                                             fixnum) nil))
-          (unless other-pointer-p
-            (inst cmp (32-bit-reg last-digit) other-pointer-lowtag)
-            (inst b :ne nope))
-          ;; Get the header.
-          (loadw temp value 0 other-pointer-lowtag)
-          (unless integer-p
-            (inst and tmp-tn temp widetag-mask)
-            (inst cmp tmp-tn bignum-widetag)
-            (inst b :ne nope))
-          #.(assert (= (integer-length bignum-widetag) 5))
-          (inst add last-digit value (lsr temp 5))
-          (inst ldr last-digit (@ last-digit (- other-pointer-lowtag)))
-          (inst lsr temp temp n-widetag-bits)
-          (inst cmp temp (add-sub-immediate (1+ (/ x n-word-bits))))
-          (inst b :gt nope)
-          (inst b :lt (if unsigned-p
-                          yep
-                          fixnum))
-          ;; Is it a sign-extended sign bit
-          (cond ((not unsigned-p)
-                 (inst cbnz last-digit nope))
-                (not-p
-                 (inst cbnz last-digit target))
-                (t
-                 (inst cbz last-digit target)))
-
-          fixnum
-          (unless unsigned-p
+    (multiple-value-bind (digits left) (truncate x n-word-bits)
+      (let* ((type (tn-ref-type args))
+             (fixnum-p (types-equal-or-intersect type (specifier-type 'fixnum)))
+             (integer-p (csubtypep type (specifier-type 'integer)))
+             (other-pointer-p (fixnum-or-other-pointer-tn-ref-p args t))
+             (unsigned-p (not (types-equal-or-intersect type (specifier-type '(integer * -1))))))
+        (multiple-value-bind (yep nope)
             (if not-p
-                (inst tbnz* last-digit (1- n-word-bits) target)
-                (inst tbz* last-digit (1- n-word-bits) target))))))
+                (values not-target target)
+                (values target not-target))
+          (assemble ()
+            (cond ((not other-pointer-p)
+                   ;; Move to a temporary and mask off the lowtag,
+                   ;; but leave the sign bit for testing for positive fixnums.
+                   ;; When using 32-bit registers that bit will not be visible.
+                   (inst and last-digit value (logior (ash 1 (1- n-word-bits)) lowtag-mask)))
+                  (fixnum-p
+                   (move last-digit value)))
+            (when fixnum-p
+              (%test-fixnum last-digit nil (if unsigned-p
+                                               yep
+                                               fixnum) nil))
+            (unless other-pointer-p
+              (inst cmp (32-bit-reg last-digit) other-pointer-lowtag)
+              (inst b :ne nope))
+            ;; Get the header.
+            (loadw temp value 0 other-pointer-lowtag)
+            (unless integer-p
+              (inst and tmp-tn temp widetag-mask)
+              (inst cmp tmp-tn bignum-widetag)
+              (inst b :ne nope))
+            #.(assert (= (integer-length bignum-widetag) 5))
+            (inst add last-digit value (lsr temp 5))
+            (inst ldr last-digit (@ last-digit (- other-pointer-lowtag)))
+            (inst lsr temp temp n-widetag-bits)
+            (inst cmp temp (add-sub-immediate (1+ digits)))
+            (inst b :gt nope)
+            (inst b :lt (if unsigned-p
+                            yep
+                            fixnum))
+            (if (zerop left)
+                ;; Is it a sign-extended sign bit
+                (cond ((not unsigned-p)
+                       (inst cbnz last-digit nope))
+                      (not-p
+                       (inst cbnz last-digit target))
+                      (t
+                       (inst cbz last-digit target)))
+                (progn
+                  ;; Check if the remaining high bits are zero
+                  (inst tst last-digit (dpb 0 (byte left 0) -1))
+                  (inst b :eq yep)
+                  (inst b nope)))
+
+            fixnum
+            (unless unsigned-p
+              (if not-p
+                  (inst tbnz* last-digit (1- n-word-bits) target)
+                  (inst tbz* last-digit (1- n-word-bits) target)))))))
     NOT-TARGET))
 
 (define-vop (unsigned-byte-64-p-move-to-word unsigned-byte-64-p)
-  (:results (r :scs (unsigned-reg)))
+  (:results (r :scs (signed-reg unsigned-reg)))
   (:result-types unsigned-num)
   (:translate)
   (:generator 10
@@ -483,8 +497,8 @@
 (define-vop (un/signed-byte-64-p-move-to-word signed-byte-64-p)
   ;; Ideally, this would use a single register but the rest of the stuff
   ;; depends on their storage class.
-  (:results (rs :scs (signed-reg))
-            (ru :scs (unsigned-reg)))
+  (:results (rs :scs (signed-reg unsigned-reg))
+            (ru :scs (signed-reg unsigned-reg)))
   (:info target not-p target-unsigned not-p-unsigned unsigned-fall-through)
   (:result-types signed-num unsigned-num)
   (:translate)
@@ -524,6 +538,15 @@
                (inst cbz temp target-unsigned)))
         (inst b unsigned-fall-through)))
     not-target))
+
+(define-vop (fixnump)
+  (:translate fixnump)
+  (:arg-refs arg-ref)
+  (:args (value :scs (any-reg descriptor-reg)))
+  (:conditional :eq)
+  (:policy :fast-safe)
+  (:generator 4
+    (inst tst value n-fixnum-tag-bits)))
 
 (define-vop (fixnump/unsigned)
   (:policy :fast-safe)
@@ -767,12 +790,12 @@
 
 (define-vop (test-widetag)
   (:args (value :scs (unsigned-reg)))
-  (:info target not-p type-codes)
+  (:info target not-p type-codes object-tn-ref)
   (:generator 1
     (%test-headers value nil target not-p nil
       (if (every #'integerp type-codes)
           (canonicalize-widetags type-codes)
-          type-codes))))
+          type-codes) :value-tn-ref object-tn-ref)))
 
 (define-vop (load-instance-layout)
   (:args (object :scs (any-reg descriptor-reg)))

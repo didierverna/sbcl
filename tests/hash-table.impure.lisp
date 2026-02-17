@@ -225,7 +225,7 @@
     (with-locked-hash-table (h) (setf (gethash 'foo h) 1))))
 
 (with-test (:name :hash-table-iterator-no-notes
-                  :fails-on (:or :arm :ppc :ppc64))
+                  :fails-on (:or :arm :ppc :ppc64 :loongarch64))
   (let ((f
          (checked-compile
           '(lambda (h)
@@ -269,3 +269,13 @@
           (if (/= 0 (svref (sb-impl::hash-table-pairs table) 1))
               (format t "~S wants rehash~%" table)
               (error "~S should be marked for rehash" table)))))))
+
+(with-test (:name :clrhash-empty-weak-table)
+  (let ((ht (make-hash-table :weakness :key)))
+    (loop repeat 3
+          do
+          (clrhash ht)
+          (dotimes (i 100)
+            (setf (gethash (list i) ht) i))
+          (sb-sys:scrub-control-stack)
+          (sb-ext:gc :full t))))

@@ -72,6 +72,8 @@
 #define THREAD_BASE_REG %r13
 #define reg_NULL %r12
 
+#define THREAD_SAVED_CSP_OFFSET (- N_WORD_BYTES)
+
 #ifdef LISP_FEATURE_WIN32
 #define CARG1 %rcx
 #define CARG2 %rdx
@@ -115,6 +117,17 @@ GNAME(funcall1_switching_stack):
 	.globl  GNAME(call_into_lisp_first_time_)
 	TYPE(GNAME(call_into_lisp_first_time_))
 
+/* macros to save and restore the callee-saved regs which are
+ * potentially clobbered by Lisp, but which are guaranteed to be
+ * preserved across functions calls in accordance with the ABI.
+ * I do not understand why this is adequate for Windows calling
+ * convention, which additionally specifies RDI and RSI as preserved.
+ */
+#define PUSH_C_NONVOLATILE_REGS \
+ push %rbx ; push %r12 ; push %r13 ; push %r14 ; push %r15
+#define POP_C_NONVOLATILE_REGS \
+ pop %r15 ; pop %r14 ; pop %r13 ; pop %r12 ; pop %rbx
+
 /* We don't worry too much about saving registers
  * here, because we never expect to return from the initial call to lisp
  * anyway */
@@ -156,11 +169,7 @@ Lstack:
 	mov	%rax,%r15
 #endif
 	/* FIXME x86 saves FPU state here */
-	push	%rbx  	# these regs are callee-saved according to C
-	push	%r12	# so must be preserved and restored when
-	push	%r13    # the lisp function returns
-	push	%r14    #
-	push	%r15    #
+	PUSH_C_NONVOLATILE_REGS
 	push	%rdi	# args from C
 	push	%rsi	#
 	push	%rdx	#
@@ -184,8 +193,15 @@ Ltwo:	mov	8(%rbx),%rdi	# arg1
 Lone:	mov	0(%rbx),%rdx	# arg0
 Lzero:
 	shl	$(N_FIXNUM_TAG_BITS),%rcx	# (fixnumize num-args)
-	/* Registers rax, rcx, rdx, rdi, and rsi are now live. */
-	xor	%rbx,%rbx	# available
+	
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+	mov     THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG), %r8
+        push    %r8
+        test    %r8, %r8
+        je      1f
+	movq     $0, THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+1:
+#endif
 
 	/* Alloc new frame. */
 	push	%rbp            # Dummy for return address
@@ -202,12 +218,15 @@ Lcall:
 	mov	%rbx, %rsp
 LsingleValue:
 
-/* Restore C regs */
-	pop	%r15
-	pop	%r14
-	pop	%r13
-	pop	%r12
-	pop	%rbx
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        pop    %r8
+        test   %r8, %r8
+        je     1f
+	movq   %r8, THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+1:
+#endif
+
+	POP_C_NONVOLATILE_REGS
 
 /* FIXME Restore the NPX state. */
 
@@ -237,17 +256,18 @@ GNAME(funcall_alien_callback):
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
 
-	push	%rbx  	# these regs are callee-saved according to C
-	push	%r12	# so must be preserved and restored when
-	push	%r13    # the lisp function returns
-	push	%r14    #
-	push	%r15    #
+	PUSH_C_NONVOLATILE_REGS
 #ifdef LISP_FEATURE_SB_THREAD
         mov     %rcx, THREAD_BASE_REG
 #else
         LOAD_PIC_VAR(all_threads, THREAD_BASE_REG)
 #endif
         mov     $(3 << N_FIXNUM_TAG_BITS),%rcx
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        push    THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+	movq    $0, THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+#endif
 
 	/* Alloc new frame. */
         push	%rbp            # Dummy for return address
@@ -258,12 +278,10 @@ GNAME(funcall_alien_callback):
 	LOAD_PIC_VAR(linkage_space, %rax)
 	call	*(8*ENTER_ALIEN_CALLBACK_fname_index)(%rax)
 
-/* Restore C regs */
-	pop	%r15
-	pop	%r14
-	pop	%r13
-	pop	%r12
-	pop	%rbx
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+	pop   THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+#endif
+	POP_C_NONVOLATILE_REGS
 
 	leave
 

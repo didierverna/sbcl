@@ -148,32 +148,6 @@ lose(char *fmt, ...)
 #endif
 }
 
-#if 0
-/// thread printf. This was used to produce the 2-column output
-/// at the bottom of "src/code/final". The main thread'd os_kernel_tid
-/// must be assigned a constant in main_thread_trampoline().
-void tprintf(char *fmt, ...)
-{
-    va_list ap;
-    char buf[200];
-    char *ptr;
-    const char spaces[] = "                                           ";
-    struct thread*th = get_sb_vm_thread();
-    buf[0] = ';'; buf[1] = ' ';
-    ptr = buf+2;
-    if (th->os_kernel_tid == 'A') {
-        strcpy(ptr, spaces);
-        ptr += (sizeof spaces)-1;
-    }
-    va_start(ap, fmt);
-    int n = vsprintf(ptr, fmt, ap);
-    va_end(ap);
-    ptr += n;
-    *ptr++ = '\n';
-    write(2, buf, ptr-buf);
-}
-#endif
-
 int lose_on_corruption_p = 0; // DO NOT CHANGE THIS TO 'bool'. (Naughty users think it's 4 bytes)
 
 void
@@ -353,7 +327,7 @@ describe_internal_error(os_context_t *context)
     uint32_t trap_instruction = *(uint32_t *)ptr;
     unsigned char trap = trap_instruction >> 5 & 0xFF;
     ptr += 4;
-#elif defined(LISP_FEATURE_PPC64) && defined(LISP_FEATURE_LITTLE_ENDIAN)
+#elif defined(LISP_FEATURE_PPC64) && defined(LISP_FEATURE_LITTLE_ENDIAN) || defined(LISP_FEATURE_LOONGARCH64)
     unsigned char trap = *(ptr-4);
 #else
     unsigned char trap = *(ptr-1);

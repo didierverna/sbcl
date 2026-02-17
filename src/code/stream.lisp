@@ -180,24 +180,24 @@
   (declare (type stream stream))
   ;; FIXME: It would be good to comment on the stuff that is done here...
   ;; FIXME: This doesn't look interrupt safe.
-  (let ((res (call-ansi-stream-misc stream :get-file-position))
+  (let ((res (truly-the (or null index) (call-ansi-stream-misc stream :get-file-position)))
         (delta (- +ansi-stream-in-buffer-length+
                   (ansi-stream-in-index stream))))
     (if (eql delta 0)
         res
         (when res
-         (let ((char-size (if (fd-stream-p stream)
-                              (fd-stream-char-size stream)
-                              (external-format-char-size (stream-external-format stream)))))
-           (- res
-              (etypecase char-size
-                (function
-                 (loop with buffer = (ansi-stream-csize-buffer stream)
-                       with start = (ansi-stream-in-index stream)
-                       for i from start below +ansi-stream-in-buffer-length+
-                       sum (aref buffer i)))
-                (fixnum
-                 (* char-size delta)))))))))
+          (let ((char-size (if (fd-stream-p stream)
+                               (fd-stream-char-size stream)
+                               (external-format-char-size (stream-external-format stream)))))
+            (- res
+               (etypecase char-size
+                 (fixnum
+                  (* (truly-the (unsigned-byte 8) char-size) delta))
+                 (function
+                  (loop with buffer = (ansi-stream-csize-buffer stream)
+                        with start = (ansi-stream-in-index stream)
+                        for i from start below +ansi-stream-in-buffer-length+
+                        sum (aref buffer i) of-type fixnum)))))))))
 
 ;;; You're not allowed to specify NIL for the position but we were permitting
 ;;; it, which made it impossible to test for a bad call that tries to assign
@@ -890,9 +890,6 @@
       ;; FD-STREAMS, when running FILE-POSITION, do not update the
       ;; CHARPOS, and consequently there will be much wrongness.
       ;;
-      ;; FIXME: see also TWO-WAY-STREAM treatment of :CHARPOS -- why
-      ;; is it testing the :charpos of an input stream?
-      ;;
       ;; -- CSR, 2004-02-04
       (:charpos
        (dolist (stream streams 0)
@@ -1066,16 +1063,20 @@
          (in-ansi-stream-p (ansi-stream-p in))
          (out-ansi-stream-p (ansi-stream-p out)))
     (stream-misc-case (operation)
+      ;; Input operations forward to IN.
       (:listen
        (if in-ansi-stream-p
            (%ansi-stream-listen in)
+           ;; Why LISTEN rather than STREAM-MISC-DISPATCH?
            (listen in)))
-      ((:finish-output :force-output :clear-output)
+      (:unread (unread-char arg1 in))
+      (:clear-input (clear-input in))
+      ;; Output operations forward to OUT
+      ((:finish-output :force-output :clear-output
+        :charpos :line-length)
        (if out-ansi-stream-p
            (call-ansi-stream-misc out operation arg1)
            (stream-misc-dispatch out operation arg1)))
-      (:clear-input (clear-input in))
-      (:unread (unread-char arg1 in))
       (:element-type
        (let ((in-type (stream-element-type in))
              (out-type (stream-element-type out)))
@@ -2312,12 +2313,13 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
            (type ansi-stream stream)
            (type index start)
            (type (or null index) end))
-  (let* ((end (or end (length seq)))
-         (needed (- end start))
-         (read 0))
-    (prepare-for-fast-read-char stream
-      (declare (ignore %frc-method%))
-      (let ((buffered (- +ansi-stream-in-buffer-length+ %frc-index%)))
+  (prepare-for-fast-read-char stream
+    (declare (ignore %frc-method%))
+    (let* ((end (or end (length seq)))
+           (needed (- end start))
+           (read 0)
+           (buffered (- +ansi-stream-in-buffer-length+ %frc-index%)))
+      (block nil
         (labels ((refill-buffer ()
                    (prog1 (fast-read-char-refill stream nil)
                      (setf %frc-index% (ansi-stream-in-index %frc-stream%))))
@@ -2337,8 +2339,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                      (incf %frc-index% len)
                      (when (or (eql needed read) (not (refill-buffer)))
                        (done-with-fast-read-char)
-                       (return-from ansi-stream-read-string-from-frc-buffer
-                         (+ start read)))))
+                       (return (+ start read)))))
                  (copy ()
                    (when (plusp buffered)
                      (replace seq %frc-buffer%
@@ -2359,23 +2360,27 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                          (cond
                            ((eq (ansi-stream-n-bin stream) #'fd-stream-read-n-characters/utf-8)
                             (copy)
-                            (fd-stream-read-sequence/utf-8-to-base-string stream seq start end))
+                            (return
+                              (fd-stream-read-sequence/utf-8-to-base-string stream seq start end)))
                            ((eq (ansi-stream-n-bin stream) #'fd-stream-read-n-characters/utf-8/crlf)
                             (copy)
-                            (fd-stream-read-sequence/utf-8-crlf-to-base-string stream seq start end))))
+                            (return
+                              (fd-stream-read-sequence/utf-8-crlf-to-base-string stream seq start end)))))
                         ((eq (ansi-stream-n-bin stream) #'fd-stream-read-n-characters/utf-8)
                          (copy)
-                         (fd-stream-read-sequence/utf-8-to-string stream seq start end))
+                         (return
+                           (fd-stream-read-sequence/utf-8-to-string stream seq start end)))
                         ((eq (ansi-stream-n-bin stream) #'fd-stream-read-n-characters/utf-8/crlf)
                          (copy)
-                         (fd-stream-read-sequence/utf-8-crlf-to-character-string stream seq start end)))))
+                         (return
+                           (fd-stream-read-sequence/utf-8-crlf-to-character-string stream seq start end))))))
             (t
              (when (and (= %frc-index% +ansi-stream-in-buffer-length+)
                         (not (refill-buffer)))
                ;; EOF had been reached before we read anything
                ;; at all. But READ-SEQUENCE never signals an EOF error.
                (done-with-fast-read-char)
-               (return-from ansi-stream-read-string-from-frc-buffer start))
+               (return start))
              (loop (add-chunk)))))))))
 
 (declaim (maybe-inline read-sequence/read-function))
@@ -2760,6 +2765,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                                     :input t :output t :buffering :line
                                     :external-format (stdstream-external-format tty)
                                     :serve-events t
+                                    :dual-channel-p t
                                     :auto-close t)
                 (make-two-way-stream *stdin* *stdout*))))
     (princ (get-output-stream-string *error-output*) *stderr*))

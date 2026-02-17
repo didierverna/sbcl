@@ -21,7 +21,6 @@ enum threadstate {STATE_RUNNING=1, STATE_STOPPED, STATE_DEAD};
 
 #ifdef LISP_FEATURE_SB_THREAD
 void set_thread_state(struct thread *thread, char state, bool);
-int thread_wait_until_not(int state, struct thread *thread);
 #endif
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
@@ -47,7 +46,7 @@ struct extra_thread_data
 
     // Data from here down are never looked at from Lisp.
     struct interrupt_data interrupt_data;
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT
+#if THREADS_USING_GCSIGNAL
     // 'state_sem' is a binary semaphore used just like a mutex.
     // I guess we figure that semaphores are OK to use in signal handlers (which is
     // technically false), whereas a mutex would be more certainly wrong?
@@ -64,6 +63,11 @@ struct extra_thread_data
     uint32_t state_not_running_waitcount;
     uint32_t state_not_stopped_waitcount;
 #endif
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    pthread_mutex_t foreign_exit_lock;
+    int gc_inhibited;
+#endif
+
 #if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX
     // According to https://github.com/adrienverge/openfortivpn/issues/105
     //   "using GCD semaphore in signal handlers is documented to be unsafe"
@@ -167,26 +171,11 @@ extern pthread_key_t current_thread;
 #endif
 #endif
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
-# define THREAD_CSP_PAGE_SIZE 0
-#else
+#if defined(LISP_FEATURE_SB_SAFEPOINT) || defined(LISP_FEATURE_NONSTOP_FOREIGN_CALL)
 # define THREAD_CSP_PAGE_SIZE os_reported_page_size
-#endif
-
-#ifdef LISP_FEATURE_WIN32
-#define ALT_STACK_SIZE 0
 #else
-#define ALT_STACK_SIZE 32 * SIGSTKSZ
+# define THREAD_CSP_PAGE_SIZE 0
 #endif
-
-/* As a helpful reminder of how this calculation arises, the summands should
- * correspond, in the correct order, to the picture in thread.c */
-#define THREAD_STRUCT_SIZE \
-  (THREAD_ALIGNMENT_BYTES + \
-   thread_control_stack_size + BINDING_STACK_SIZE + ALIEN_STACK_SIZE + \
-   THREAD_CSP_PAGE_SIZE + \
-   (THREAD_HEADER_SLOTS*N_WORD_BYTES) + dynamic_values_bytes + \
-   sizeof (struct extra_thread_data) + ALT_STACK_SIZE)
 
 /* sigaltstack() - "Signal stacks are automatically adjusted
  * for the direction of stack growth and alignment requirements." */
@@ -196,9 +185,7 @@ static inline void* calc_altstack_base(struct thread* thread) {
     return ((char*) thread) + dynamic_values_bytes
         + ALIGN_UP(sizeof (struct extra_thread_data), N_WORD_BYTES);
 }
-static inline void* calc_altstack_end(struct thread* thread) {
-    return (char*)thread->os_address + THREAD_STRUCT_SIZE;
-}
+extern void* calc_altstack_end(struct thread* thread);
 static inline int calc_altstack_size(struct thread* thread) {
     // 'end' is calculated as exactly the end address we got from the OS.
     // The usually ends up making the stack slightly larger than ALT_STACK_SIZE
@@ -206,11 +193,6 @@ static inline int calc_altstack_size(struct thread* thread) {
     // If the memory was as aligned as we'd like, the padding is ours to keep.
     return (char*)calc_altstack_end(thread) - (char*)calc_altstack_base(thread);
 }
-#if defined(LISP_FEATURE_WIN32)
-static inline struct thread* get_sb_vm_thread()
-    __attribute__((__const__));
-int sb_pthr_kill(struct thread* thread, int signum);
-#endif
 
 /* This is clearly per-arch and possibly even per-OS code, but we can't
  * put it somewhere sensible like x86-linux-os.c because it needs too
@@ -292,13 +274,18 @@ typedef struct init_thread_data {
 #endif
 } init_thread_data;
 
+#if defined(LISP_FEATURE_SB_SAFEPOINT) || defined(LISP_FEATURE_NONSTOP_FOREIGN_CALL)
+#define csp_around_foreign_call(thread) *(((lispobj*)thread)-1)
+#endif
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+int handle_foreign_call_trigger (os_context_t *context, os_vm_address_t fault_address);
+#endif
+
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 void thread_in_safety_transition(os_context_t *ctx);
 void thread_in_lisp_raised(os_context_t *ctx);
 void thread_interrupted(os_context_t *ctx);
 extern void thread_register_gc_trigger();
-
-#define csp_around_foreign_call(thread) *(((lispobj*)thread)-(1+THREAD_HEADER_SLOTS))
 
 static inline
 void push_gcing_safety(struct gcing_safety *into)
@@ -341,6 +328,7 @@ extern CRITICAL_SECTION all_threads_lock;
 extern pthread_mutex_t all_threads_lock;
 #endif
 
+extern int sb_GetTID();
 #ifndef LISP_FEATURE_SB_THREAD
 // Put in an empty conversion to avoid warning at the point of use:
 // "warning: too many arguments for format [-Wformat-extra-args]"
@@ -350,13 +338,13 @@ extern pthread_mutex_t all_threads_lock;
 # define THREAD_ID_LABEL "%ld"
 # define THREAD_ID_VALUE (GetCurrentThreadId())
 #elif defined __linux__
-extern int sb_GetTID();
 # define THREAD_ID_LABEL " tid %d"
 # define THREAD_ID_VALUE (sb_GetTID())
 #else
 # define THREAD_ID_LABEL " pthread %p"
-# define THREAD_ID_VALUE ((void*)thread_self())
+# define THREAD_ID_VALUE ((void*)pthread_self())
 #endif
+#define LISPTHREAD(x) ((struct thread_instance*)INSTANCE(x->lisp_thread))
 
 #ifdef LISP_FEATURE_DARWIN_JIT
 #define THREAD_JIT_WP(x) pthread_jit_write_protect_np((x))

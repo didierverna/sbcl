@@ -108,7 +108,7 @@
   (def-type-predicate-wrapper integerp)
   (def-type-predicate-wrapper listp)
   (def-type-predicate-wrapper long-float-p)
-  #-(or x86 x86-64 arm64 riscv) (def-type-predicate-wrapper lra-p)
+  #-(or x86 x86-64 arm64 riscv loongarch64) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
   (sb-c::when-vop-existsp (:translate pointerp)
@@ -158,6 +158,11 @@
   (def-type-predicate-wrapper stringp)
   (def-type-predicate-wrapper sb-c::string-designator-p)
   (def-type-predicate-wrapper vectorp))
+
+(sb-c::when-vop-existsp (:translate sb-c::unsigned-byte-x-p)
+  (defun sb-c::unsigned-byte-x-p (x width)
+    (and (typep x 'unsigned-byte)
+         (< x (ash 1 width)))))
 
 (sb-c::when-vop-existsp (:translate car-eq-if-listp)
   (defun car-eq-if-listp (value object)

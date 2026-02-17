@@ -68,7 +68,8 @@
 ;;;
 ;;; In each cons, the car is the symbol naming the layout, and the
 ;;; cdr is the layout itself.
-(defvar *!initial-layouts*)
+#+sb-xc-host (defvar *!initial-layouts*)
+#-sb-xc-host (declaim (global *!initial-layouts*))
 
 ;;; a table mapping class names to layouts for classes we have
 ;;; referenced but not yet loaded. This is initialized from an alist
@@ -346,6 +347,17 @@ between the ~A definition and the ~A definition"
       (maphash (lambda (key value) (funcall function key value))
                table))
   nil)
+
+;;; Recursively expand classoid-subclasses. Classoid should probably be a sealed
+;;; classoid for the answer to be meaningful, otherwise the true answer is unbounded.
+(defun classoid-all-subclassoids (classoid &aux result)
+  (labels ((add-descendants (classoid &optional layout)
+             (declare (ignore layout))
+             (unless (member classoid result)
+               (push classoid result)
+               (sb-kernel::call-with-subclassoids #'add-descendants classoid))))
+    (add-descendants classoid)
+    result))
 
 ;;; Record LAYOUT as the layout for its class, adding it as a subtype
 ;;; of all superclasses. This is the operation that "installs" a
@@ -940,7 +952,7 @@ between the ~A definition and the ~A definition"
 (declaim (type cons **non-instance-classoid-types**))
 (defglobal **non-instance-classoid-types**
   '(symbol system-area-pointer weak-pointer code-component
-    #-(or x86 x86-64 arm64 riscv) lra
+    #-(or x86 x86-64 arm64 riscv loongarch64) lra
     fdefn random-class))
 
 (defun classoid-non-instance-p (classoid)
@@ -1041,7 +1053,7 @@ between the ~A definition and the ~A definition"
      (code-component :codes (,sb-vm:code-header-widetag)
                      :predicate code-component-p
                      :prototype-form (fun-code-header #'identity))
-     #-(or x86 x86-64 arm64 riscv)
+     #-(or x86 x86-64 arm64 riscv loongarch64)
      (lra :codes (,sb-vm:return-pc-widetag)
           :predicate lra-p
           ;; Make the PROTOTYPE slot unbound.

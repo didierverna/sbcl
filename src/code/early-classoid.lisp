@@ -214,6 +214,14 @@
   ;; for classes named by a symbol, otherwise a pseudo-random value.
   ;; Must be acceptable as an argument to SB-INT:MIX
   (clos-hash (missing-arg) :type (and fixnum unsigned-byte))
+  ;; Vtable could be used to store the per-layout implementation of the combined methods for
+  ;; any single-dispatch function. The trick is to dynamically figure out when it would make
+  ;; sense to claim a unique index into the vtable. Certainly for a function that has about half
+  ;; as many methods as there are classes e.g. #<STANDARD-GENERIC-FUNCTION CL-PROTOBUFS:CLEAR (2017)>
+  ;; when there are 4000 classes. A PCL cache (key = layout, value = method) would take up double
+  ;; the space at least, plus all the unused cells required to make the probing strategy work.
+  ;; And it wouldn't be as quick as a direct lookup.
+  (vtable)
   ;; the class that this is a layout for
   (classoid (missing-arg) :type classoid)
   ;; The value of this slot can be:
@@ -567,7 +575,7 @@
   (let ((bits (logior (type-%bits x) (logand (ctype-random) +ctype-hash-mask+))))
     (etypecase x
       (member-type
-       (!alloc-member-type bits (member-type-xset x) (member-type-fp-zeroes x))))))
+       (!alloc-member-type bits (member-type-xset x))))))
 #-sb-xc-host
 (macrolet ((safe-member-type-elt-p (obj)
              `(or (not (sb-vm:is-lisp-pointer (get-lisp-obj-address ,obj)))
@@ -598,9 +606,6 @@
              ;; If the XSET is represented as a hash-table, we may have another issue
              ;; which is not dealt with here (hash-table in the arena)
              (cond ((listp data)
-                    ;; the XSET can be empty if a MEMBER type contains only FP zeros.
-                    ;; While we could use (load-time-value) to reference a constant empty xset
-                    ;; there's really no point to doing that.
                     (collect ((elts))
                       (dolist (x data (!new-xset (elts) (xset-extra xset)))
                         (elts (cond ((numberp x) (sb-vm:copy-number-to-heap x))
@@ -639,8 +644,7 @@
            (%set-instance-layout copy (%instance-layout x))
            copy))
         (member-type
-         (!alloc-member-type bits (copy-xset (member-type-xset x))
-          (mapcar 'sb-vm:copy-number-to-heap (member-type-fp-zeroes x))))
+         (!alloc-member-type bits (copy-xset (member-type-xset x))))
         (array-type
          (!alloc-array-type bits (copy (array-type-dimensions x))
                             (array-type-complexp x) (array-type-element-type x)

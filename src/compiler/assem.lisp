@@ -455,6 +455,10 @@
                          (#+sb-xc-host cl:macroexpand-1
                           #-sb-xc-host %macroexpand-1 '..inherited-labels.. env)
                        (if expanded expansion)))
+          ;; REMOVE-IF-NOT can tail-share with its input. For example:
+          ;;  * (defvar form '((inst add x y) ok (progn) done))
+          ;;  * (sort (remove-if-not #'atom form) #'string<) => (DONE OK)
+          ;;  * form => ((INST ADD X Y) OK (PROGN) OK) ; mutated by SORT
           (new-labels (sort (copy-list (remove-if-not #'label-name-p body)) #'string<)))
       ;; Compare for dups using STRING=. Two reasons to use that rather than EQ:
       ;; (1) the assembler input is generally string-like - consider that instruction
@@ -2003,7 +2007,7 @@
 
 (defparameter *show-peephole-transforms-p* nil)
 (defglobal *asm-pattern-matchers* nil)
-(defglobal *asm-pattern-matchers-invoked* (make-array 20 :initial-element 0))
+(defglobal *asm-pattern-matchers-invoked* (make-array 32 :initial-element 0))
 (defun %defpattern (name opcodes1 opcodes2 applicator)
   (let ((entry (find name *asm-pattern-matchers* :test #'string= :key #'fifth)))
     (if entry

@@ -115,17 +115,25 @@
   (setf (aref (the myarraytype array) 0)
         sb-ext:double-float-positive-infinity))
 
-(with-test (:name :bug-407a)
+(with-test (:name :bug-407a
+            :fails-on :no-float-traps)
   (assert-error
    (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
          do (coerce n 'single-float))
    floating-point-overflow))
 
-(with-test (:name :bug-407b)
+(with-test (:name :bug-407b
+            :fails-on :no-float-traps)
   (assert-error
-   (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
-         do (format nil "~E~%" n))
-   floating-point-overflow))
+      (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
+            do (format nil "~E~%" n))
+      floating-point-overflow))
+
+(with-test (:name :bignum-double-float-overflow
+            :fails-on :no-float-traps)
+  (loop for n from 1024 to 1030
+        do (assert-error (coerce (opaque-identity (expt 2 n)) 'double-float) floating-point-overflow)
+           (assert-error (coerce (opaque-identity (- (expt 2 n))) 'double-float) floating-point-overflow)))
 
 ;; 1.0.29.44 introduces a ton of changes for complex floats
 ;; on x86-64. Huge test of doom to help catch weird corner
@@ -230,41 +238,6 @@
                       (3 0) (3 1) (3 2) (3 3))
                     value single double))))))))
 
-;; The x86 port used not to reduce the arguments of transcendentals
-;; correctly.
-;; This test is valid only for x86: The x86 port uses the builtin x87
-;; FPU instructions to implement the trigonometric functions; other
-;; ports rely on the system's math library. These two differ in the
-;; precision of pi used for the range reduction and so yield results
-;; that can differ by arbitrarily large amounts for large inputs.
-;; The test expects the x87 results.
-(with-test (:name (:range-reduction :x87)
-            :skipped-on (not :x86))
-  (flet ((almost= (x y)
-           (< (abs (- x y)) 1d-5)))
-    (macrolet ((foo (op value)
-                 `(let ((actual (,op ,value))
-                        (expected (,op (mod ,value (* 2 pi)))))
-                    (unless (almost= actual expected)
-                      (error "Inaccurate result for ~a: expected ~a, got ~a"
-                             (list ',op ,value) expected actual)))))
-      (let ((big (* pi (expt 2d0 70)))
-            (mid (coerce most-positive-fixnum 'double-float))
-            (odd (* pi most-positive-fixnum)))
-        (foo sin big)
-        (foo sin mid)
-        (foo sin odd)
-        (foo sin (/ odd 2d0))
-
-        (foo cos big)
-        (foo cos mid)
-        (foo cos odd)
-        (foo cos (/ odd 2d0))
-
-        (foo tan big)
-        (foo tan mid)
-        (foo tan odd)))))
-
 ;; To test the range reduction of trigonometric functions we need a much
 ;; more accurate approximation of pi than CL:PI is. Calculating this is
 ;; more fun than copy-pasting a constant and Gauss-Legendre converges
@@ -294,10 +267,7 @@ fractional bits."
 ;; with a sufficiently accurate value of pi that the reduced argument
 ;; is correct to nearly double-float precision even for arguments of
 ;; very large absolute value.
-;; This test is skipped on x86; as to why see the comment at the test
-;; (:range-reduction :x87) above.
-(with-test (:name (:range-reduction :precise-pi)
-            :skipped-on :x86)
+(with-test (:name (:range-reduction :precise-pi))
   (let ((rational-pi-half (/ (pi-gauss-legendre 2200) 2)))
     (labels ((round-pi-half (x)
                "Return two values as if (ROUND X (/ PI 2)) was called
@@ -448,7 +418,7 @@ fractional bits."
   (assert-type (lambda (y)
                  (declare (integer y))
                  (log y 2.0d0))
-               (or (double-float 0d0) (complex double-float)))
+               (or double-float (complex double-float)))
   (assert-type (lambda (y)
                  (declare (double-float y))
                  (log y 2.0d0))
@@ -462,7 +432,84 @@ fractional bits."
                  (declare ((double-float 0d0) d))
                  (when (< d 1.0d0)
                    (log d 2.0d0)))
-               (or null (double-float * 0.0d0))))
+               (or null (double-float * 0.0d0)))
+  (assert-type (lambda (d)
+                 (log -5 d))
+               (or (complex single-float) (complex double-float) (member 0.0 0.0d0)))
+  (assert-type (lambda (d)
+                 (declare (double-float d))
+                 (log -5 d))
+               (or (complex double-float) (member 0.0d0)))
+  (assert-type (lambda (d)
+                 (declare ((double-float 10d0) d))
+                 (log -5 d))
+               (complex double-float))
+  (assert-type (lambda (d)
+                 (declare (complex d))
+                 (log -5 d))
+               (or (member 0.0d0 0.0) (complex double-float) (complex single-float)))
+  (assert-type (lambda (d)
+                 (declare ((complex double-float) d))
+                 (log -5 d))
+               (or (member 0.0d0) (complex double-float)))
+  (assert-type (lambda (d)
+                 (declare ((complex single-float) d))
+                 (log -5 d))
+               (or (member 0.0) (complex single-float)))
+  (assert-type (lambda (x y)
+                 (declare ((integer * -1) y))
+                 (log 96 (if x
+                             y
+                             (expt 3434484076828220102 -16))))
+               (or (complex single-float)
+                   (eql #.(log 96 (expt 3434484076828220102 -16)))))
+  (assert-type (lambda (v)
+                 (log 3532504320689493448
+                      (if v
+                          7384646045169235520
+                          51)))
+               (or (eql #.(log 3532504320689493448 7384646045169235520))
+                   (eql #.(log 3532504320689493448 51))))
+  (assert-type (lambda (v)
+                 (LOG 1.9775647e18
+                      (IF v
+                          12
+                          -881536083005615600)))
+               (or (eql #.(log 1.9775647e18 12))
+                   (complex single-float))))
+
+(with-test (:name :log-base-zero)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare (single-float a b))
+         (log a b))
+    ((-1.0 0.0) 0.0)
+    ((-1.0 -0.0) 0.0))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare (double-float a b))
+         (log a b))
+    ((-1d0 0d0) 0d0)
+    ((-1d0 -0d0) 0d0))
+  (checked-compile-and-assert
+      ()
+      `(lambda (f)
+         (declare (single-float f))
+         (the real (log -3.7739912e17 f)))
+    ((0.0) 0.0))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare (single-float a b))
+         (the real (log a b)))
+    ((-3.0 0.0) 0.0))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (a b)
+         (log a b))
+    ((t 0) (condition 'type-error))))
 
 (with-test (:name (ftruncate :minus-zeros :one-arg))
   (flet ((f (x) (declare (notinline ftruncate)) (ftruncate x)))
@@ -687,3 +734,179 @@ fractional bits."
                   ,@forms))))
   (test-rounders))
 
+(with-test (:name :scale-float-denormals)
+  (assert (= (scale-float (scale-float (opaque-identity (expt 2.0d0 -1021))
+                                       (opaque-identity -5))
+                          (opaque-identity 5))
+             (expt 2.0d0 -1021)))
+  (assert (= (scale-float (opaque-identity least-positive-single-float)
+                          (opaque-identity 0))
+             least-positive-single-float)))
+
+(with-test (:name :truncate-by-zero-error)
+  (assert-error (truncate 1 (opaque-identity 0d0)) division-by-zero)
+  (assert-error (truncate 1f0 (opaque-identity 0f0)) division-by-zero)
+  (sb-int:with-float-traps-masked (:divide-by-zero)
+    (assert-error (truncate 1 (opaque-identity 0d0)) division-by-zero)
+    (assert-error (truncate 1f0 (opaque-identity 0f0)) division-by-zero)))
+
+(with-test (:name :+negative-zero)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (+ a (- b)))
+    ((-0.0 0) 0.0))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (+ (- a) b))
+    ((0 -0.0) 0.0))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (- a (- b)))
+    ((-0.0 0) -0.0)))
+
+(with-test (:name :expt-to-sqrt)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (expt a 1/2))
+    ((-6) (expt (opaque-identity -6) (opaque-identity 1/2))))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (expt a -3))
+    ((-392.42026693446144d0) (expt (opaque-identity -392.42026693446144d0)
+                                   (opaque-identity -3))))
+  (assert (= (expt (opaque-identity -0.0)
+                   (opaque-identity 0.5))
+             0.0)))
+
+(with-test (:name :truncate-bignum-remainder)
+  (assert (equal (multiple-value-list (truncate (opaque-identity 4503599627370495.5d0)
+                                                (opaque-identity 1d0)))
+                 (opaque-identity '(4503599627370495 0.5d0)))))
+
+(with-test (:name :phase--0-derive-type)
+  (assert-type (lambda (p1)
+                 (declare ((single-float 0.0) p1))
+                 (phase p1))
+               (or (member 0.0) (single-float 3.1415927 3.1415927)))
+  (assert (= (phase (opaque-identity -0.0))
+             (opaque-identity 3.1415927)))
+  (assert-type (lambda (p1)
+                 (declare ((double-float 0d0) p1))
+                 (phase p1))
+               (or (member 0d0) (eql 3.141592653589793d0)))
+  (assert (= (phase (opaque-identity -0d0))
+             (opaque-identity pi))))
+
+(with-test (:name :log-minus-zero-rational)
+  (sb-int:with-float-traps-masked (:divide-by-zero)
+    (assert (= (log (opaque-identity -0d0) (opaque-identity 2d0))
+               (opaque-identity double-float-negative-infinity)))
+    (assert (= (log (opaque-identity -0f0) (opaque-identity 2f0))
+               (opaque-identity single-float-negative-infinity)))
+    (assert (= (log (opaque-identity -0d0) (opaque-identity 2))
+               (opaque-identity double-float-negative-infinity)))
+    (assert (= (log (opaque-identity -0f0) (opaque-identity 2))
+               (opaque-identity single-float-negative-infinity)))))
+
+(with-test (:name :ffloor-minus-zero-derive-type)
+  (assert-type (lambda (x)
+                 (declare ((float (-1) (0)) x))
+                 (values (ftruncate x)))
+               (float 0.0 0.0))
+  (assert-type (lambda (x)
+                 (declare ((single-float (0.0) (1.0)) x))
+                 (values (ftruncate x -1.0)))
+               (single-float 0.0 0.0)))
+
+(defun floats-around (float)
+  (multiple-value-bind (sig exp) (integer-decode-float float)
+    (let* ((prev-float (if (= sig (ash 1 (1- (float-digits float))))
+                           (scale-float (float (1- (ash 1 (float-digits float))) float) (1- exp))
+                           (scale-float (float (1- sig) float) exp)))
+           (next-float (scale-float (float (1+ sig) float) exp)))
+      (values prev-float next-float sig))))
+
+(defun check-ratio-to-float (ratio type)
+  (declare (ratio ratio))
+  (let* ((result (float ratio type))
+         (new-ratio (rational result)))
+    (multiple-value-bind (prev-float next-float sig) (floats-around result)
+      (let* ((error (abs (- ratio new-ratio)))
+             (error-prev (abs (- ratio (rational prev-float))))
+             (error-next (abs (- ratio (rational next-float)))))
+        (cond
+          ((< error-next error)
+           (error "(float ~a ~a) = ~a, while ~a is closer" ratio type result next-float))
+          ((< error-prev error)
+           (error "(float ~a ~a) = ~a, while ~a is closer" ratio type result prev-float))
+          ((or (= error error-prev) (= error error-next))
+           (unless (evenp sig)
+             (error "(float ~a ~a) = ~a, not rounded to even" ratio type result))))))))
+
+(with-test (:name :ratio-to-float)
+  (let ((*random-state* (make-random-state t)))
+    (loop repeat 20000
+          do
+          (let* ((n-bits (random 1075))
+                 (d-bits (random 1075))
+                 (num (random (ash 1 n-bits)))
+                 (den (max 1 (random (ash 1 d-bits))))
+                 (ratio (/ num den)))
+            (when (typep ratio 'ratio)
+              (handler-case (progn
+                              (check-ratio-to-float ratio 1f0)
+                              (check-ratio-to-float ratio 1d0))
+                (arithmetic-error ())))))))
+
+(with-test (:name :scale-float-rounding)
+  (assert (= (integer-decode-float (scale-float (opaque-identity 0.7836354097202904d0) -1032))
+             (opaque-identity 3446464979698))))
+
+(with-test (:name :rationalize-denormals)
+  (assert (= (rationalize (opaque-identity 1.4012985e-45))
+             (opaque-identity 1/713623803817686610712884392543280002697789472))))
+
+(with-test (:name :bignum-float-overflow)
+  (assert (= (sb-int:with-float-traps-masked (:overflow)
+               (coerce (opaque-identity (expt 10 1000)) 'double-float))
+             double-float-positive-infinity))
+  (assert (= (sb-int:with-float-traps-masked (:overflow)
+               (coerce (opaque-identity (expt -10 1001)) 'double-float))
+             double-float-negative-infinity))
+  (assert (= (sb-int:with-float-traps-masked (:overflow)
+               (coerce (opaque-identity (expt 10 1000)) 'single-float))
+             single-float-positive-infinity))
+  (assert (= (sb-int:with-float-traps-masked (:overflow)
+               (coerce (opaque-identity (expt -10 1001)) 'single-float))
+             single-float-negative-infinity)))
+
+(with-test (:name :ftruncate-integer)
+  (assert (not (ctu:ir1-named-calls `(lambda (x)
+                                       (declare (fixnum x))
+                                       (ftruncate x)))))
+  (assert (not (ctu:ir1-named-calls `(lambda (x)
+                                       (declare (fixnum x))
+                                       (ftruncate x 1)))))
+  (assert (not (ctu:ir1-named-calls `(lambda (x)
+                                       (declare (fixnum x))
+                                       (ffloor x -1f0)))))
+  (assert (not (ctu:ir1-named-calls `(lambda (x)
+                                       (declare (fixnum x))
+                                       (ffloor x 1d0))))))
+
+(with-test (:name :the-truncate)
+  (checked-compile-and-assert
+      (:optimize :safe-debug)
+      `(lambda (n)
+         (values (the (integer * 0)
+               (truncate
+                (exp (progn (the fixnum n) n))))))
+    ((-1) 0)
+    ((1) (condition 'type-error
+                    (lambda (c)
+                      (= (type-error-datum c) 2))))))

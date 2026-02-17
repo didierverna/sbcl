@@ -11,6 +11,25 @@
 
 (in-package "SB-C")
 
+;;; The vector of source PATHS is not too bad in terms of space consumption
+;;; due to all the sharing that occurs. Each vector element consumes typically at most
+;;; 1 cons cell, because it extends a prior element by 1 path component, e.g.
+;;;   :PATHS #((0) #1=(1) #2=(3 . #1#) #3=(1 . #2#) (1 . #3#) (2 . #3#)
+;;;            (:THEN . #3#) #4=(2 . #2#) (1 . #4#) (2 . #4#) (:ELSE . #3#)
+;;;            #5=(3 . #2#) #6=(2 . #5#) #7=(1 . #6#) #8=(0 . #9=(1 . #7#))
+;;;            (1 . #8#) (2 . #8#) (:THEN . #8#) #10=(1 . #9#) #11=(1 . #10#) ...)
+(defstruct (covered-file
+             (:constructor make-coverage-instrumented-file
+                 (paths locations lines
+                  &aux (executed (make-array (length paths) :element-type 'bit))))
+             (:copier nil) (:predicate nil))
+  (executed #* :type simple-bit-vector :read-only t)
+  (paths #() :type simple-vector :read-only t)
+  ;; The following slots are only for displayless (non-HTML) output.
+  ;; They allow computing coverage "states" without re-reading source files.
+  (locations nil :type (or null vector) :read-only t)
+  (lines nil :type (or null vector) :read-only t))
+
 (defknown %mark-covered (cons) t (always-translatable))
 
 ;;; Check the policy for whether we should generate code coverage
@@ -18,28 +37,31 @@
 ;;; ctran. Otherwise insert code coverage instrumentation after
 ;;; START, and return the new ctran.
 (defun instrument-coverage (start mode form
-                            &aux (metadata (coverage-metadata *compilation*)))
+                            &aux (code-coverage-records (coverage-records *compilation*)))
   ;; We don't actually use FORM for anything, it's just convenient to
   ;; have around when debugging the instrumentation.
   (declare (ignore form))
   (if (and *allow-instrumenting*
-           metadata
+           code-coverage-records
            (policy *lexenv* (> store-coverage-data 0)))
       (let ((path (source-path-original-source *current-path*)))
         (when mode
           (push mode path))
-        ;; If this source path has already been instrumented in this
-        ;; block, don't instrument it again.
-        (if (member (ctran-block start)
-                    (gethash path (code-coverage-blocks metadata)))
-            start
-            (let ((next (make-ctran))
-                  (*allow-instrumenting* nil))
-              (setf (gethash path (code-coverage-records metadata)) t)
-              (push (ctran-block start)
-                    (gethash path (code-coverage-blocks metadata)))
-              (ir1-convert start next nil `(%mark-covered ',path))
-              next)))
+        (let* ((block (ctran-block start))
+               (source-path-marks (block-source-path-marks block)))
+          ;; If this source path has already been instrumented in this
+          ;; block, don't instrument it again.
+          (if (and source-path-marks (gethash path source-path-marks))
+              start
+              (let ((next (make-ctran))
+                    (*allow-instrumenting* nil))
+                (setf (gethash path code-coverage-records) t)
+                (unless source-path-marks
+                  (setf source-path-marks (make-hash-table :test 'equal)
+                        (block-source-path-marks block) source-path-marks))
+                (setf (gethash path source-path-marks) t)
+                (ir1-convert start next nil `(%mark-covered ',path))
+                next))))
       start))
 
 ;;; In contexts where we don't have a source location for FORM
@@ -92,5 +114,15 @@
       (vop mark-covered node block
            (vector-push-extend (ir2-block-covered-paths-ref blocK)
                                (ir2-component-coverage-map 2comp))))
-    (push (lvar-value path) (car (ir2-block-covered-paths-ref block)))
+    ;; Duplicate form paths could sneak in, but repetition is meaningless
+    (pushnew (lvar-value path) (car (ir2-block-covered-paths-ref block)) :test 'equal)
     (values)))
+
+#-sb-xc-host
+(defun code-coverage-map (code &aux (n (code-header-words code)))
+  (declare (type sb-kernel:code-component code))
+  (or (let ((map (code-header-ref code (1- n))))
+        (when (typep map '(cons (eql coverage-map))) (cdr map)))
+      (and (= code-boxed-words-align 2) ; try the next-to-last slot
+           (let ((map (code-header-ref code (- n 2))))
+             (when (typep map '(cons (eql coverage-map))) (cdr map))))))

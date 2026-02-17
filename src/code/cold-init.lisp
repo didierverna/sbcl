@@ -32,10 +32,10 @@
 ;;;; !COLD-INIT
 
 ;;; a list of toplevel things set by GENESIS
-(defvar *!cold-toplevels*)
+(declaim (global *!cold-toplevels*))
 
 ;;; a SIMPLE-VECTOR set by GENESIS
-(defvar *!load-time-values*)
+(declaim (global *!load-time-values*))
 
 ;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
 ;; and use it for most of the cold-init functions. (Just be careful
@@ -129,7 +129,7 @@
   (setq sb-vm::*immobile-codeblob-tree* nil
         sb-vm::*dynspace-codeblob-tree* nil)
   (setq sb-kernel::*defstruct-hooks* '(sb-kernel::!bootstrap-defstruct-hook)
-        sb-kernel::*struct-accesss-fragments-delayed* nil)
+        sb-kernel::*struct-access-fragments-delayed* nil)
   (let ((stream (!make-cold-stderr-stream)))
     (setq *error-output* stream
           *standard-output* stream
@@ -224,6 +224,12 @@
 
   (setq sb-pcl::*!docstrings* nil) ; needed before any documentation is set
   (setq sb-c::*queued-proclaims* nil) ; needed before any proclaims are run
+  (setq *code-coverage-info* ; needed to note / record code coverage
+        (cons (make-hash-table :test 'equal :synchronized t)
+              (loop for v across (the simple-vector sb-fasl::*!xc-covg-instrumented*)
+                    collect (list-to-weak-vector
+                             (loop for c across (the simple-vector v)
+                                   when (sb-c::code-coverage-map c) collect c)))))
 
   (/show0 "calling cold toplevel forms and fixups")
   (let ((*package* *package*)) ; rebind to self, as if by LOAD
@@ -252,6 +258,9 @@
            (sb-fasl::named-constant-set object index name)))
         ((cons (eql :begin-file))
          (unless (!c-runtime-noinform-p) (print (cdr toplevel-thing))))
+        ((cons (eql :record-code-coverage))
+         (setf (gethash (second toplevel-thing) (car *code-coverage-info*))
+               (sb-c::make-coverage-instrumented-file (third toplevel-thing) nil nil)))
         (t
          (!cold-lose "bogus operation in *!COLD-TOPLEVELS*")))))
   (/show0 "done with loop over cold toplevel forms and fixups")
@@ -346,6 +355,32 @@
 see documentation for SB-EXT:EXIT."
   (exit :code unix-status :abort recklessly-p))
 
+(define-load-time-global *address-sanitizer-cleanup* t)
+#+sb-thread
+(defun cleanup-for-asan ()
+  ;; Try to force finalizers to run which helps avoid spurious reports of
+  ;; C++ object leakage where objects are managed by Lisp and have a finalizer
+  ;; which performs a free() and/or other requisite destructor actions.
+  ;; Unfortunately, GC alone can not guarantee that finalizers have run, because the
+  ;; finalizer thread may not act quickly enough. And even polling for the list
+  ;; of pending finalizers to become empty isn't adequate due to an inherent race
+  ;; and the fact that the finalizer thread tries to exit as soon as possible
+  ;; when asked to by %EXIT.  Disabling the thread and manually checking for
+  ;; pending finalizers is usually enough to avoid false positives.
+  (when (eq (cas *address-sanitizer-cleanup* t nil) t) ; at most one time
+    (finalizer-thread-stop)
+    (gc :full t)
+    (run-pending-finalizers)
+    (with-alien ((asan-lisp-thread-cleanup (function void) :extern))
+      ;; The recyclebin of available thread structs was dealt with by POST-GC,
+      ;; leaving two more sets of threads to deal with:
+      ;; - threads still running, let's hope they don't need their ZSTD context!
+      (alien-funcall asan-lisp-thread-cleanup)
+      ;; - threads ready to be pthread_joined, so effectively dead to Lisp
+      ;;   but whose pthread memory resources have not been released
+      (sb-thread:%dispose-thread-structs))
+    t))
+
 (declaim (ftype (sfunction (&key (:code (or null exit-code))
                                  (:timeout (or null real))
                                  (:abort t))
@@ -387,6 +422,12 @@ Consequences are unspecified if serious conditions occur during EXIT
 excepting errors from *EXIT-HOOKS*, which cause warnings and stop
 execution of the hook that signaled, but otherwise allow the exit
 process to continue normally."
+  #+sb-thread
+  (when (and (not abort)
+             (eql code 0)
+             (proper-list-p *features*) ; Don't croak if features got trashed
+             (member :address-sanitizer *features*))
+    (cleanup-for-asan))
   (if (or abort *exit-in-progress*)
       (os-exit (or code 1) :abort t)
       (let ((code (or code 0)))

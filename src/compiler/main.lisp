@@ -62,14 +62,6 @@
 (declaim (type object *compile-object*))
 
 (defvar *emit-cfasl* nil)
-
-(declaim (inline code-coverage-records code-coverage-blocks))
-;; Used during compilation to map code paths to the matching
-;; instrumentation conses.
-(defun code-coverage-records (x) (car x))
-;; Used during compilation to keep track of with source paths have been
-;; instrumented in which blocks.
-(defun code-coverage-blocks (x) (cdr x))
 
 ;;;; WITH-COMPILATION-UNIT and WITH-COMPILATION-VALUES
 
@@ -505,12 +497,14 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; Do all the IR1 phases for a non-top-level component.
 (defun ir1-phases (component)
   (declare (type component component))
-  (aver-live-component component)
   (let ((*constraint-universe* (make-array 64 ; arbitrary, but don't make this 0
                                            :fill-pointer 0 :adjustable t))
         (*delayed-ir1-transforms* nil))
     (declare (special *constraint-universe* *delayed-ir1-transforms*))
     (ir1-optimize-phase-1 component)
+    (when *compiler-trace-output*
+      (when (memq :checkgen *compile-trace-targets*)
+        (describe-component component *compiler-trace-output*)))
     (loop while (progn
                   (maybe-mumble "Type ")
                   (generate-type-checks component))
@@ -536,7 +530,6 @@ necessary, since type inference may take arbitrarily long to converge.")
               (if (fasl-output-p *compile-object*)
                   (and (eq *compile-file-to-memory-space* :immobile)
                        (neq (component-kind component) :toplevel)
-                       (policy *lexenv* (/= sb-c:store-coverage-data 3))
                        :immobile)
                   (if (core-object-ephemeral *compile-object*)
                       :dynamic
@@ -660,7 +653,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                object)))
 
   ;; We're done, so don't bother keeping anything around.
-  (setf (component-info component) :dead)
+  (setf (component-info component) nil)
 
   (values))
 
@@ -683,7 +676,6 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defvar *compile-component-hook* nil)
 
 (defun compile-component (component)
-  (aver-live-component component)
   (let* ((*component-being-compiled* component))
 
     (when *compile-progress*
@@ -813,19 +805,20 @@ necessary, since type inference may take arbitrarily long to converge.")
   (values))
 
 (defun describe-ir2-component (component *standard-output*)
-  (format t "~%~|~%;;;; IR2 component: ~S~2%" (component-name component))
-  (format t "entries:~%")
-  (dolist (entry (ir2-component-entries (component-info component)))
-    (format t "~4TL~D: ~S~:[~; [closure]~]~%"
-            (label-id (entry-info-offset entry))
-            (entry-info-name entry)
-            (entry-info-closure-tn entry)))
-  (terpri)
-  (pre-pack-tn-stats component *standard-output*)
-  (terpri)
-  (print-ir2-blocks component)
-  (terpri)
-  (values))
+  (let ((*print-readably* nil))
+    (format t "~%~|~%;;;; IR2 component: ~S~2%" (component-name component))
+    (format t "entries:~%")
+    (dolist (entry (ir2-component-entries (component-info component)))
+      (format t "~4TL~D: ~S~:[~; [closure]~]~%"
+              (label-id (entry-info-offset entry))
+              (entry-info-name entry)
+              (entry-info-closure-tn entry)))
+    (terpri)
+    (pre-pack-tn-stats component *standard-output*)
+    (terpri)
+    (print-ir2-blocks component)
+    (terpri)
+    (values)))
 
 ;;; Leave this as NIL if you want modern, rational, correct, behavior,
 ;;; or switch it to T for legacy (CLHS-specified) bullshit a la
@@ -946,7 +939,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                 ;; READER-ERRORs already know their position in the file.
                               :condition condition
                               :stream stream))
-            ;; ANSI, in its wisdom, says that READ should return END-OF-FILE
+            ;; ANSI, in its wisdom, says that READ should signal END-OF-FILE
             ;; (and that this is not a READER-ERROR) when it encounters end of
             ;; file in the middle of something it's trying to read,
             ;; making it unfortunately indistinguishable from legal EOF.
@@ -1122,11 +1115,18 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; Print some noise about FORM if *COMPILE-PRINT* is true.
 (defun note-top-level-form (form)
   (when *compile-print*
-    (let ((*print-length* 2)
-          (*print-level* 2)
-          (*print-pretty* nil))
-      (with-compiler-io-syntax
-        (compiler-mumble "~&; processing ~S" form)))))
+    (multiple-value-bind (*print-length* *print-level*)
+        (if (typep form '(cons (eql defmethod)))
+            (values (loop for i from 1
+                          for cdr on form
+                          when (or (atom cdr)
+                                   (listp (car cdr)))
+                          return i)
+                    5)
+            (values 2 2))
+      (let ((*print-pretty* nil))
+        (with-compiler-io-syntax
+          (compiler-mumble "~&; processing ~S" form))))))
 
 ;;; Handle the evaluation the a :COMPILE-TOPLEVEL body during
 ;;; compilation. Normally just evaluate in the appropriate
@@ -1239,14 +1239,6 @@ necessary, since type inference may take arbitrarily long to converge.")
                     (convert-and-maybe-compile form path)))))))))
 
   (values))
-
-(defun copy-hash-table (hash-table)
-  (let ((new (make-hash-table :test (hash-table-test hash-table)
-                              :size (hash-table-size hash-table))))
-    (maphash (lambda (key value)
-               (setf (gethash key new) value))
-             hash-table)
-    new))
 
 ;;;; load time value support
 ;;;;
@@ -1604,6 +1596,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                          (lexenv-handled-conditions *lexenv*))))
       (and ctype (handle-p condition (car ctype))))))
 
+(defglobal *coverage-augmentation-hook* nil)
 ;;; Read all forms from INFO and compile them, with output to
 ;;; *COMPILE-OBJECT*. Return (VALUES ABORT-P WARNINGS-P FAILURE-P).
 (defun sub-compile-file (info cfasl)
@@ -1624,8 +1617,7 @@ necessary, since type inference may take arbitrarily long to converge.")
           ;; *or* code for another image which is sanitized.
           ;; And we can also cross-compile assuming msan.
           (member :msan sb-xc:*features*)
-          (cons (make-hash-table :test 'equal)
-                (make-hash-table :test 'equal))
+          (make-hash-table :test 'equal)
           *block-compile-argument*
           *entry-points-argument*
           cfasl))
@@ -1668,14 +1660,17 @@ necessary, since type inference may take arbitrarily long to converge.")
                         #-sb-xc-host
                         (core-object (fix-core-source-info info object))
                         (null)))))
-                (let ((code-coverage-records
-                        (code-coverage-records (coverage-metadata *compilation*))))
-                  (unless (zerop (hash-table-count code-coverage-records))
+                (let ((hash-table (coverage-records *compilation*)))
+                  (unless (zerop (hash-table-count hash-table))
                     ;; Dump the code coverage records into the fasl.
-                    (dump-code-coverage-records
-                     (loop for k being each hash-key of code-coverage-records
-                           collect k)
-                     *compile-object*)))
+                    (let ((records (make-array (hash-table-count hash-table)))
+                          (i -1))
+                      (dohash ((k v) hash-table)
+                        (declare (ignore v))
+                        (setf (aref records (incf i)) k))
+                      (let ((extra (awhen *coverage-augmentation-hook*
+                                     (funcall it (source-info-stream info) records))))
+                      (dump-code-coverage-records records extra *compile-object*)))))
                 nil))))
       ;; Some errors are sufficiently bewildering that we just fail
       ;; immediately, without trying to recover and compile more of
@@ -1730,8 +1725,10 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defglobal *compile-elapsed-time* 0) ; nanoseconds
 (defglobal *compile-file-elapsed-time* 0) ; nanoseconds
 (defun get-thread-virtual-time ()
-  #+(and linux (not sb-xc-host)) (sb-unix:clock-gettime sb-unix:clock-thread-cputime-id)
-  #-(and linux (not sb-xc-host)) (values 0 0))
+  #+(and linux sb-devel (not sb-xc-host))
+  (return-from get-thread-virtual-time
+    (sb-unix:clock-gettime sb-unix:clock-thread-cputime-id))
+  (values 0 0))
 
 (defun accumulate-compiler-time (symbol start-sec start-nsec)
   (declare (ignorable symbol start-sec start-nsec))

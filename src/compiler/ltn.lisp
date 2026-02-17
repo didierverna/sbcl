@@ -186,11 +186,21 @@
 
 (defun unboxed-specialized-return-p (name)
   (and (typep name '(cons (eql sb-impl::specialized-xep)))
-       (let ((type (fun-type-returns (specifier-type `(function ,@(cddr name))))))
+       (let* ((specifier (cadddr name))
+              (type (and (neq specifier '*)
+                         (values-specifier-type (cadddr name)))))
          (and (values-type-p type)
               (not (or (values-type-optional type)
                        (values-type-rest type)))
               type))))
+
+(defun unboxed-return-p (combination)
+  (let ((fun (basic-combination-fun combination)))
+    (or (let ((info (basic-combination-fun-info combination)))
+          (and info
+               (ir1-attributep (fun-info-attributes info) unboxed-return)
+               (fun-type-returns (lvar-type fun))))
+        (unboxed-specialized-return-p (lvar-fun-name fun)))))
 
 ;;; If TAIL-P is true, then we check to see whether the call can
 ;;; really be a tail call by seeing if this function's return
@@ -202,10 +212,7 @@
   (declare (type basic-combination call))
   (let ((tails (and (node-tail-p call)
                     (lambda-tail-set (node-home-lambda call))))
-        (unboxed-return (or (let ((info (basic-combination-fun-info call)))
-                              (and info
-                                   (ir1-attributep (fun-info-attributes info) unboxed-return)))
-                            (unboxed-specialized-return-p (lvar-fun-name (basic-combination-fun call))))))
+        (unboxed-return (unboxed-return-p call)))
     (cond ((not tails))
           ((eq (return-info-kind (tail-set-info tails))
                (if unboxed-return
@@ -467,6 +474,10 @@
   (setf (node-tail-p node) nil)
   (annotate-ordinary-lvar (set-value node))
   (values))
+
+(defoptimizer (%%primitive ltn-annotate) ((template &rest args) node)
+  (ltn-default-call node)
+  (setf (basic-combination-info node) (lvar-value template)))
 
 ;;; If the only use of the TEST lvar is a combination annotated with a
 ;;; conditional template, then don't annotate the lvar so that IR2
@@ -929,9 +940,13 @@
 ;;; full call.
 (defun ltn-analyze-known-call (call)
   (declare (type combination call))
-  (let ((ltn-policy (node-ltn-policy call))
-        (method (fun-info-ltn-annotate (basic-combination-fun-info call)))
-        (args (basic-combination-args call)))
+  (let* ((ltn-policy (node-ltn-policy call))
+         (info (basic-combination-fun-info call))
+         (method (fun-info-ltn-annotate info))
+         (args (basic-combination-args call))
+         (hook (fun-info-ir2-hook info)))
+    (when hook
+      (funcall hook call))
     (when method
       (funcall method call ltn-policy)
       (return-from ltn-analyze-known-call (values)))

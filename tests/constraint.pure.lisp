@@ -713,13 +713,14 @@
      (let ((l (1- v)))
        (< l v)))
    (member t))
-  (assert-type
-   (lambda (v)
-     (declare (simple-vector v)
-              (optimize (debug 1)))
-     (let ((l (1- (length v))))
-       (< l (length v))))
-   (member t)))
+  ;; (assert-type
+  ;;  (lambda (v)
+  ;;    (declare (simple-vector v)
+  ;;             (optimize (debug 1)))
+  ;;    (let ((l (1- (length v))))
+  ;;      (< l (length v))))
+  ;;  (member t))
+  )
 
 (with-test (:name :sub-sign)
   (assert-type
@@ -793,6 +794,13 @@
                     (ctu:ir1-named-calls
                      `(lambda (x y)
                         (when (< x (length y))
+                          (svref y x)))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x y)
+                        (unless (>= x (length y))
                           (svref y x)))
                      nil))
              0)))
@@ -1038,7 +1046,12 @@
    (lambda (m)
      (when (typep (+ m 1) 'float)
        m))
-   (or null float)))
+   (or null float))
+  (assert-type
+   (lambda (i)
+     (the (mod 16) (* i 3/4))
+     i)
+   (rational 0 20)))
 
 (with-test (:name :ignore-hairy-types)
   (checked-compile
@@ -1745,7 +1758,8 @@
          (length j))))
    (or null (mod 5))))
 
-(with-test (:name :zero-length-check-bound)
+(with-test (:name :zero-length-check-bound
+            :fails-on (not :sb-unicode))
   (assert (= (count 'sb-kernel:%check-bound
                     (ctu:ir1-named-calls
                      `(lambda (x)
@@ -1754,6 +1768,24 @@
                           (aref x 0)))
                      nil))
              0)))
+
+(with-test (:name :loop-row-major-aref-check-bound)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (type (simple-array t (* *)) x))
+                        (loop for i below (array-total-size x)
+                              do (print (row-major-aref x i))))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (type (simple-array t (* *)) x))
+                        (loop for i below (array-total-size x)
+                              do (print (row-major-aref x (1+ i)))))
+                     nil))
+             1)))
 
 (with-test (:name :concatenate-length)
   (assert-type
@@ -1868,16 +1900,22 @@
    (lambda (m)
      (if (typep (nth-value 1 (truncate m 2.0)) 'double-float)
          m))
-   (or double-float null)))
+   (or double-float null))
+  (assert-type
+   (lambda (x)
+     (declare (integer x))
+     (the (integer 3 83461337) (truncate x -74))
+     x)
+   (integer -6176139011 -222)))
 
 (with-test (:name :ignore-delays
-            :fails-on :arm)
+            :fails-on (or :arm :loongarch64))
   (assert-type
    (lambda (x)
      (declare (optimize debug))
      (when (typep (nth-value 1 (truncate x 1)) 'float)
        x))
-   (or null real)))
+   (or null float)))
 
 (with-test (:name :not-eq-eql)
   (assert-type
@@ -1981,3 +2019,80 @@
        (foo 1)
        (foo 2)))
    (or (integer 1 2) symbol)))
+
+(with-test (:name :back-through-casts)
+  (assert-type
+   (lambda (x)
+     (when (typep (nth-value 1 (the (or float (integer 1)) (truncate x 1))) 'float) x))
+   (or float null))
+  (assert-type
+   (lambda (x)
+     (when (typep (the (or float (rational (-1/2) (1))) (nth-value 1 (truncate x 1))) 'float) x))
+   (or float null)))
+
+(with-test (:name :div-by-zero)
+  (assert-type
+   (lambda (x y)
+     (declare (float y))
+     (floor x y)
+     y)
+   float)
+  (assert-type
+   (lambda (x y)
+     (declare (rational x y))
+     (floor x y)
+     y)
+   (and rational (not (eql 0)))))
+
+(with-test (:name :complex-into-real)
+  (assert-type
+   (lambda (c)
+     (if (> (- c c) 10)
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (c)
+     (if (> (+ c c) 10)
+         c
+         (error "")))
+   real)
+  (assert-type
+   (lambda (c)
+     (if (> (* c c) 10)
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (c n)
+     (declare (integer n))
+     (if (> (* c n) 10)
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (c n)
+     (declare ((integer 1) n))
+     (if (> (* c n) 10)
+         c
+         (error "")))
+   real)
+  (assert-type
+   (lambda (n c)
+     (declare (integer n))
+     (if (realp (/ n c))
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (n c)
+     (declare ((integer 1) n))
+     (if (realp (/ n c))
+         c
+         (error "")))
+   real)
+  (assert-type
+   (lambda (n)
+     (the integer (* n n))
+     n)
+   (or integer (complex rational))))

@@ -27,6 +27,8 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+int sb_GetTID() { return pthread_mach_thread_np(pthread_self()); }
+
 char *os_get_runtime_executable_path()
 {
     char path[PATH_MAX + 1];
@@ -42,7 +44,7 @@ void
 darwin_reinit() {
 #ifdef LISP_FEATURE_SB_THREAD
     struct extra_thread_data *extra_data = thread_extra_data(get_sb_vm_thread());
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     os_sem_init(&extra_data->state_sem, 1);
     os_sem_init(&extra_data->state_not_running_sem, 0);
     os_sem_init(&extra_data->state_not_stopped_sem, 0);

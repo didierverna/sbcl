@@ -162,8 +162,9 @@
  ("src/code/debug-var-io")
 
  ("src/code/number-dispatch" :c-headers)
- ("src/code/float" :c-headers)
  ("src/code/cross-float-reader" :c-headers :not-target)
+ ("src/code/float-from-bits" :c-headers)
+ ("src/code/float")
  ("src/code/cross-float" :c-headers :not-target)
 
  ;; 32-bit implementation of GET-INTERNAL-REAL-TIME needs some thread slots
@@ -240,6 +241,7 @@
  ;; This needs DEFINE-ALIEN-ROUTINE from target-alieneval.
  ("src/code/thread" :not-host #-sb-devel :block-compile) ; provides *CURRENT-THREAD* for target-signal
 
+ ("src/code/bignum"          :not-host #-(or bignum-assertions sb-devel) :block-compile)
  ;; RANDOM-LAYOUT-CLOS-HASH (in 'class') uses RANDOM, the transform for which
  ;; uses GENERATE-RANDOM-EXPR-FOR-POWER-OF-2 which becomes BIG-RANDOM-CHUNK,
  ;; which wants to be inlined, and which when inlined becomes RANDOM-CHUNK,
@@ -320,7 +322,6 @@
  ("src/code/foreign"         :not-host)
  ("src/code/unix"            :not-host)
  ("src/code/symbol"          :not-host)
- ("src/code/bignum"          :not-host #-(or bignum-assertions sb-devel) :block-compile)
  ("src/code/numbers"         :not-host)
  ("src/code/float-trap"      :not-host)
  ("src/code/target-float"    :not-host)
@@ -399,11 +400,9 @@
  #+sb-simd-pack ("src/compiler/{arch}/simd-pack")
  #+sb-simd-pack-256 ("src/compiler/{arch}/simd-pack-256")
  ("src/compiler/{arch}/sap")
- ("src/compiler/{arch}/system")
  ("src/compiler/{arch}/char")
+ ("src/compiler/{arch}/system")
  ("src/compiler/{arch}/memory")
- ("src/compiler/{arch}/arith")
- ("src/compiler/{arch}/pred")
  ("src/compiler/{arch}/c-call")
 
  ;; The assembly files need to be compiled twice: once as
@@ -422,7 +421,10 @@
  ("src/compiler/array-tran")
  ("src/compiler/generic/vm-tran")
  ("src/compiler/type-vop-macros")
+ ("src/compiler/{arch}/arith")
+ ("src/compiler/{arch}/pred")
  ("src/compiler/{arch}/type-vops")
+
  ("src/compiler/generic/type-vops")
  ("src/compiler/ir1final")
 
@@ -502,6 +504,7 @@
  #+arm   ("src/code/arm-vm" :not-host)
  #+arm64 ("src/code/arm64-vm" :not-host)
  #+riscv ("src/code/riscv-vm" :not-host)
+ #+loongarch64 ("src/code/loongarch64-vm" :not-host)
 
  #+(or arm64 x86-64)
  ("src/code/simd-fndb")
@@ -666,6 +669,7 @@
  ("src/pcl/fngen"
   "src/pcl/cache"
   "src/pcl/dlisp"
+  "src/pcl/dlisp2"
   "src/pcl/boot"
   "src/pcl/vector"
   "src/pcl/slots-boot"

@@ -96,10 +96,15 @@
   fixed-args
   unboxed-return
   ;; Can be constant-folded if it's not retained or modified
-  foldable-read-only)
+  foldable-read-only
+  ;; The type deriver can be called on multiple value calls
+  mv-deriver)
 
 (defstruct (fun-info (:copier nil)
-                     #-sb-xc-host (:pure t))
+                     #-sb-xc-host (:pure t)
+                     (:constructor make-fun-info
+                         (attributes derive-type optimizer
+                          result-arg call-type-deriver annotation folder read-only-args)))
   ;; boolean attributes of this function.
   (attributes (missing-arg) :type attributes)
   ;; TRANSFORM structures describing transforms for this function
@@ -174,12 +179,18 @@
   annotation
   ;; For functions with unboxed args/returns
   (folder nil :type (or function null))
-  (externally-checkable-type nil :type (or function null))
+  ;; Must have a FOLDABLE attribute to invoke this
+  (fold-p nil :type (or function null))
+  ;; :FULL means it behaves like a full call despite being implemented
+  ;; via VOPs or ir2-convert.
+  (externally-checkable-type nil :type (or function null (eql :full)))
   (constants nil :type (or function null))
   ;; A description of read-only arguments that can be constant folded.
   ;; An integer bitmap for positional arguments.
   ;; Sign-extended into a negative integer for &rest arguments.
-  (read-only-args nil))
+  (read-only-args nil :type (or null sb-xc:fixnum))
+  (rewrite-full-call nil :type (or function null))
+  (flushable nil :type (or function null)))
 
 (defprinter (fun-info)
   (attributes :test (not (zerop attributes))

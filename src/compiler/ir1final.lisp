@@ -124,30 +124,47 @@
             (setq atype (note-fun-use dest atype)))))
       (setf (info :function :assumed-type name) atype))))
 
-;;; Merge CASTs with preceding/following nodes.
-(defun ir1-merge-casts (component)
+(defun ir1-finalize-nodes (component)
   (do-blocks-backwards (block component)
     (do-nodes-backwards (node lvar block :restart-p t)
       (let ((dest (when lvar (lvar-dest lvar))))
-        (cond ((and (cast-p dest)
-                    (not (cast-type-check dest)))
-               (let ((dtype (node-derived-type node))
-                     (atype (node-derived-type dest)))
-                 (when (values-types-equal-or-intersect
-                        dtype atype)
-                   ;; FIXME: We do not perform pathwise CAST->type-error
-                   ;; conversion, and type errors can later cause
-                   ;; backend failures. On the other hand, this version
-                   ;; produces less efficient code.
-                   ;;
-                   ;; This is sorta DERIVE-NODE-TYPE, but does not try
-                   ;; to optimize the node.
-                   (setf (node-derived-type node)
-                         (values-type-intersection dtype atype)))))
-              ((and (cast-p node)
-                    (eq (cast-type-check node) :external))
-               (aver (basic-combination-p dest))
-               (delete-filter node lvar (cast-value node))))))))
+        ;; Merge CASTs with preceding/following nodes.
+        (when (and (cast-p dest)
+                   (not (cast-type-check dest)))
+          (let ((dtype (node-derived-type node))
+                (atype (node-derived-type dest)))
+            (when (values-types-equal-or-intersect
+                   dtype atype)
+              ;; FIXME: We do not perform pathwise CAST->type-error
+              ;; conversion, and type errors can later cause
+              ;; backend failures. On the other hand, this version
+              ;; produces less efficient code.
+              ;;
+              ;; This is sorta DERIVE-NODE-TYPE, but does not try
+              ;; to optimize the node.
+              (setf (node-derived-type node)
+                    (values-type-intersection dtype atype)))))
+        (typecase node
+          (cast
+           (cond
+             ((eq (cast-type-check node) :external)
+              (aver (basic-combination-p dest))
+              (delete-filter node lvar (cast-value node)))
+             ((and (not (delay-p node))
+                   (not (cast-type-check node))
+                   (return-p dest))
+              (let ((value (cast-value node))
+                    (type (node-derived-type node)))
+                (setf (lvar-%derived-type (cast-value node))
+                      type)
+                (do-uses (use value)
+                  (let ((type (values-type-intersection (node-derived-type use) type)))
+                    (unless (eq type *empty-type*)
+                      (setf (node-derived-type use) type))))
+                (delete-filter node lvar (cast-value node))))))
+          (combination
+           (when (eq (combination-kind node) :known)
+             (ir1-optimize-functional-arguments node))))))))
 
 (defglobal *two-arg-functions*
     `((* two-arg-*
@@ -229,74 +246,74 @@
                                (node-lvar alt-ref))
                            (eq next
                                (next-node alt-ref)))
-                  (loop for succ in (block-succ block)
-                        do (unlink-blocks block succ))
-                  (unlink-node if)
+                  (let ((target (node-block next)))
+                    (cond ((eq (ctran-kind (node-prev if)) :block-start)
+                           (loop for pred in (block-pred block)
+                                 do (change-block-successor pred block target)))
+                          (t
+                           (loop for succ in (block-succ block)
+                                 do (unlink-blocks block succ))
+                           (unlink-node if)
+                           (link-blocks block target))))
                   (%delete-lvar-use combination)
                   (use-lvar combination ref-lvar)
                   (push "unwrap-predicates" (node-source-path con-ref))
-                  (push "unwrap-predicates" (node-source-path alt-ref))
-                  (link-blocks block (node-block next)))))))))))
+                  (push "unwrap-predicates" (node-source-path alt-ref)))))))))))
 
 ;;; Convert function designators to functions in calls to known functions
 ;;; Also convert to TWO-ARG- variants
-(defun ir1-optimize-functional-arguments (component)
-  (do-blocks (block component)
-    (do-nodes (node nil block)
-      (when (and (combination-p node)
-                 (eq (combination-kind node) :known)
-                 ;; REDUCE can call with zero arguments.
-                 (neq (lvar-fun-name (combination-fun node) t) 'reduce))
-        (when-vop-existsp (:named  sb-vm::move-conditional-result)
-          (unwrap-predicates node))
-        (map-callable-arguments
-         (lambda (lvar args results &key no-function-conversion &allow-other-keys)
-           (declare (ignore results))
-           ;; Process annotations while the original values are still there.
-           (process-annotations lvar)
-           (unless no-function-conversion
-             (let ((ref (lvar-uses lvar))
-                   (arg-count (length args)))
-               (labels ((translate-two-args (name)
-                          (and (eql arg-count 2)
-                               (not (fun-lexically-notinline-p name (node-lexenv node)))
-                               (cadr (assoc (uncross name) *two-arg-functions*))))
-                        (translate (ref)
-                          (let* ((leaf (ref-leaf ref))
-                                 (fun-name (and (constant-p leaf)
-                                                (constant-value leaf)))
-                                 (replacement
-                                   (cond ((and fun-name (symbolp fun-name))
-                                          (or (translate-two-args fun-name)
-                                              (and (not (memq (info :function :kind fun-name)
-                                                              '(:macro :special-form)))
-                                                   fun-name)))
-                                         ((and (global-var-p leaf)
-                                               (eq (global-var-kind leaf) :global-function))
-                                          (translate-two-args (global-var-%source-name leaf)))))
-                                 (*compiler-error-context* node))
-                            (and replacement
-                                 (prog1
-                                     (find-global-fun replacement t)
-                                   (record-late-xref :calls replacement ref))))))
-                 (cond ((ref-p ref)
+(defun ir1-optimize-functional-arguments (node)
+  (unless (eq (lvar-fun-name (combination-fun node) t) 'reduce) ;; REDUCE can call with zero arguments.
+    (when-vop-existsp (:named  sb-vm::move-conditional-result)
+      (unwrap-predicates node))
+    (map-callable-arguments
+     (lambda (lvar args results &key no-function-conversion &allow-other-keys)
+       (declare (ignore results))
+       ;; Process annotations while the original values are still there.
+       (process-annotations lvar)
+       (unless no-function-conversion
+         (let ((ref (lvar-uses lvar))
+               (arg-count (length args)))
+           (labels ((translate-two-args (name)
+                      (and (eql arg-count 2)
+                           (not (fun-lexically-notinline-p name (node-lexenv node)))
+                           (cadr (assoc (uncross name) *two-arg-functions*))))
+                    (translate (ref)
+                      (let* ((leaf (ref-leaf ref))
+                             (fun-name (and (constant-p leaf)
+                                            (constant-value leaf)))
+                             (replacement
+                               (cond ((and fun-name (symbolp fun-name))
+                                      (or (translate-two-args fun-name)
+                                          (and (not (memq (info :function :kind fun-name)
+                                                          '(:macro :special-form)))
+                                               fun-name)))
+                                     ((and (global-var-p leaf)
+                                           (eq (global-var-kind leaf) :global-function))
+                                      (translate-two-args (global-var-%source-name leaf)))))
+                             (*compiler-error-context* node))
+                        (and replacement
+                             (prog1
+                                 (find-global-fun replacement t)
+                               (record-late-xref :calls replacement ref))))))
+             (cond ((ref-p ref)
+                    (let ((replacement (translate ref)))
+                      (when replacement
+                        (change-ref-leaf ref replacement))))
+                   ((cast-p ref)
+                    (let* ((cast ref)
+                           (ref (lvar-uses (cast-value cast))))
+                      (when (ref-p ref)
                         (let ((replacement (translate ref)))
                           (when replacement
-                            (change-ref-leaf ref replacement))))
-                       ((cast-p ref)
-                        (let* ((cast ref)
-                               (ref (lvar-uses (cast-value cast))))
-                          (when (ref-p ref)
-                            (let ((replacement (translate ref)))
-                              (when replacement
-                                (change-ref-leaf ref replacement :recklessly t)
-                                (setf (node-derived-type cast)
-                                      (lvar-derived-type (cast-value cast)))))))))))))
-         node)
-        (when-vop-existsp (:named sb-vm::load-other-pointer-widetag)
-          (reorder-type-tests node))))))
+                            (change-ref-leaf ref replacement :recklessly t)
+                            (setf (node-derived-type cast)
+                                  (lvar-derived-type (cast-value cast)))))))))))))
+     node)
+    (when-vop-existsp (:named sb-vm::load-other-pointer-widetag)
+      (reorder-type-tests node))))
 
-(defun change-full-call (combination new-fun-name)
+(defun change-full-call (combination new-fun-name &key recklessly)
   (let ((ref (lvar-uses (combination-fun combination))))
     (when (ref-p ref)
       (when (combination-fun-info combination)
@@ -304,55 +321,44 @@
               (fun-info-or-lose new-fun-name)))
       (change-ref-leaf
        ref
-       (find-free-fun new-fun-name ""))
+       (find-free-fun new-fun-name "")
+       :recklessly recklessly)
       t)))
 
-(defun rewrite-full-call (combination)
-  (let ((combination-name (lvar-fun-name (combination-fun combination) t))
-        (args (combination-args combination)))
-    (cond ((eq (combination-kind combination) :known)
-           (let ((two-arg (assoc (uncross combination-name) *two-arg-functions*)))
-             (when (and two-arg
-                        (= (length args) 2))
-               (destructuring-bind (name two-arg &optional types typed-two-arg) two-arg
-                 (declare (ignore name))
-                 (when (and types
-                            (loop for arg in args
-                                  for type in types
-                                  always (csubtypep (lvar-type arg) type)))
-                   (setf two-arg typed-two-arg))
-                 (change-full-call combination two-arg))))
-           (let ((lvar (node-lvar combination)))
-             (when (or (lvar-single-value-p lvar)
-                       (mv-bind-unused-p lvar 1))
-               (let ((single-value-fun (getf '(truncate sb-kernel::truncate1
-                                               floor sb-kernel::floor1
-                                               ceiling sb-kernel::ceiling1
-                                               round sb-kernel::round1
-                                               ftruncate sb-kernel::ftruncate1
-                                               ffloor sb-kernel::ffloor1
-                                               fceiling sb-kernel::fceiling1
-                                               fround sb-kernel::fround1)
-                                             combination-name)))
-                 (when single-value-fun
-                   (unless (cdr args)
-                     (setf (cdr args)
-                           (list (insert-ref-before (find-constant 1) combination))))
-                   (change-full-call combination single-value-fun)
-                   (setf (node-derived-type combination)
-                         (make-single-value-type (single-value-type (node-derived-type combination)))))))))
-          ((and (eq (combination-kind combination) :full)
-                (not (fun-lexically-notinline-p combination-name (node-lexenv combination))))
-           (let ((specialized (or (info :function :specialized-xep combination-name)
-                                  (let ((specialized (assoc 'sb-impl::specialized-xep
-                                                            (lexenv-user-data (node-lexenv combination)))))
-                                    (when (eq (cadr specialized) combination-name)
-                                      (cddr specialized))))))
+(macrolet ((def ()
+             `(progn
+                ,@(loop for (name two-arg types typed) in *two-arg-functions*
+                        collect
+                        (if typed
+                            `(defoptimizer (,name rewrite-full-call) ((a b) node)
+                               (if (and (csubtypep (lvar-type a) (specifier-type  ',(type-specifier (first types))))
+                                        (csubtypep (lvar-type b) (specifier-type  ',(type-specifier (second types)))))
+                                   ',typed
+                                   ',two-arg))
+                            `(defoptimizer (,name rewrite-full-call) ((a b) node)
+                               ',two-arg))))))
+  (def))
 
-             (when (and specialized
-                        (= (length args)
-                           (length (first specialized))))
-               (change-full-call combination `(sb-impl::specialized-xep ,combination-name ,@specialized))))))))
+(defun rewrite-full-call (combination)
+  (case (combination-kind combination)
+    (:known
+     (let ((rewrite (fun-info-rewrite-full-call (combination-fun-info combination))))
+       (when rewrite
+         (let ((new (funcall rewrite combination)))
+           (when new
+             (change-full-call combination new))))))
+    (:full
+     (let* ((combination-name (lvar-fun-name (combination-fun combination) t))
+            (specialized (or (info :function :specialized-xep combination-name)
+                             (let ((specialized (assoc 'sb-impl::specialized-xep
+                                                       (lexenv-user-data (node-lexenv combination)))))
+                               (when (eq (cadr specialized) combination-name)
+                                 (cddr specialized))))))
+       (when (and specialized
+                  (= (length (combination-args combination))
+                     (length (first specialized)))
+                  (not (fun-lexically-notinline-p combination-name (node-lexenv combination))))
+         (change-full-call combination `(sb-impl::specialized-xep ,combination-name ,@specialized)))))))
 
 ;;; The %other-pointer-subtype-p optimizer in ir2opt combines multiple
 ;;; checks for other-pointer into a single widetag load.
@@ -468,6 +474,5 @@
              (note-assumed-types component k v))
            (free-funs *ir1-namespace*))
 
-  (ir1-merge-casts component)
-  (ir1-optimize-functional-arguments component)
+  (ir1-finalize-nodes component)
   (values))

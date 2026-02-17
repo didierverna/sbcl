@@ -1,6 +1,10 @@
 (pop *posix-argv*)
 (require :sb-posix)
-#-sparc (push :test-sprof *features*)
+
+(if (find "--no-sprof" *posix-argv* :test #'equal)
+    (setf *posix-argv* (remove "--no-sprof" *posix-argv* :test #'equal))
+    #-sparc (push :test-sprof *features*))
+
 #+test-sprof (require :sb-sprof)
 
 ;; (push :tlsf-stress *features*)
@@ -24,6 +28,17 @@
   (compile 'tlsf-dump)
   (push #'tlsf-checks sb-ext:*after-gc-hooks*))
 
+(when (find "--slow" *posix-argv* :test #'equal)
+  (push :slow *features*)
+  (setf *posix-argv* (remove "--slow" *posix-argv* :test #'equal)))
+(when (find "--gc-stress" *posix-argv* :test #'equal)
+  (push :gc-stress *features*)
+  (push :gc-stress-delay *features*)
+  (setf *posix-argv* (remove "--gc-stress" *posix-argv* :test #'equal)))
+(when (find "--gc-verify" *posix-argv* :test #'equal)
+  (push :gc-verify *features*)
+  (setf *posix-argv* (remove "--gc-verify" *posix-argv* :test #'equal)))
+
 (let ((*evaluator-mode* :compile))
   (with-compilation-unit () (load"run-tests")))
 #+(and x86-64 linux sb-thread (not sb-safepoint))
@@ -38,7 +53,7 @@
 (in-package run-tests)
 (import '(sb-alien:alien-funcall sb-alien:extern-alien
           sb-alien:int sb-alien:c-string sb-alien:unsigned))
-(setq *summarize-test-times* t)
+(setq *summarize-test-times* (not (sb-ext:posix-getenv "SBCL_TEST_NO_SUMMARIZE")))
 ;;; Ordered approximately in descending order by running time
 (defvar *timings* (with-open-file (s "timing") (read s)))
 
@@ -127,6 +142,9 @@
                          (when (or (search ".pure" filename) (search ".impure" filename))
                            (push filename missing-usage))))
                      (cond ((eq code 104)
+                            (when (and *delete-logs*
+                                       (equal (pathname-type filename) "test"))
+                              (delete-file (format nil "~a/~a~@[-~d~]" *logdir* filename iteration)))
                             (format t "~A: success (~d msec)~%" filename et))
                            (t
                             (format t "~A~@[[~d]~]: status ~D (~d msec)~%"
@@ -151,55 +169,65 @@
           (wait))
         (let ((pid (sb-posix:fork)))
           (when (zerop pid)
-          (let  ((mylog (format nil "~a/~a~@[-~d~]" *logdir* (car file) (cdr file))))
-            ;; FILE is (filename . test-iteration)
-            (with-open-file (stream mylog :direction :output :if-exists :supersede)
-              (alien-funcall (extern-alien "dup2" (function int int int))
-                             (sb-sys:fd-stream-fd stream) 1)
-              (alien-funcall (extern-alien "dup2" (function int int int)) 1 2))
-            (setq file (car file))
-            #+test-aprof
-            (unless (search "allocator.pure" file)
-              (sb-aprof::aprof-start)
-              (proclaim '(optimize sb-c:instrument-consing)))
-            ;; Send this to the log file, not the terminal
-            (setq *debug-io* (make-two-way-stream (make-concatenated-stream)
-                                                  *error-output*))
-            (cond ((string= (pathname-type file) "test")
-                   (let ((shell (or #+sunos (posix-getenv "SHELL") "/bin/sh")))
-                     ;; exec the shell with the test and we'll pick up its exit code
-                     (alien-funcall (extern-alien "execl" (function int c-string c-string
-                                                                    &optional c-string unsigned))
-                                    shell shell
-                                    (concatenate 'string file ".sh") 0))
-                   ;; if exec fails, just exit with a wrong (not 104) status
-                   (alien-funcall (extern-alien "_exit" (function (values) int)) 0))
-                  (t
-                   #+test-sprof (sb-sprof:start-profiling :sample-interval .001)
-                   (setq sb-c::*static-vop-usage-counts* (make-hash-table :synchronized t))
-                   (let ((*features* (cons :parallel-test-runner *features*)))
-                     (pure-runner (list (concatenate 'string file ".lisp"))
-                                  (if (search "-cload" file) 'cload-test 'load-test)
-                                  (make-broadcast-stream)))
-                   (when vop-summary-stats-p
-                     (with-open-file (output (format nil "~a/~a.vop-usage" *logdir* file)
-                                             :direction :output)
-                       ;; There's an impure test that screws with the default pprint dispatch
-                       ;; table such that integers don't print normally (and can't be parsed).
-                       (let ((*print-pretty* nil))
-                         (sb-int:dohash ((name count) sb-c::*static-vop-usage-counts*)
-                           (format output "~7d \"~s\"~%" count name)))))
-                   #+test-sprof (sb-sprof:stop-profiling)
-                   #+test-aprof (progn (sb-aprof::aprof-stop) (sb-aprof:aprof-show))
-                   (when (member :allocator-metrics sb-impl:+internal-features+)
-                     (format t "~2&Allocator histogram:~%")
-                     (funcall (intern "PRINT-ALLOCATOR-HISTOGRAM" "SB-THREAD")))
-                   #+test-sprof (sb-sprof:report :type :flat)
-                   #+tlsf-stress (cl-user::tlsf-dump)
-                   #-arm64 ;; causes crashes
-                   (gc :gen 7)
-                   (when (and (not (unexpected-failures)) *delete-logs*) (delete-file mylog))
-                   (exit :code (if (unexpected-failures) 1 104))))))
+            (let  ((mylog (format nil "~a/~a~@[-~d~]" *logdir* (car file) (cdr file))))
+              ;; FILE is (filename . test-iteration)
+              (with-open-file (stream mylog :direction :output :if-exists :supersede)
+                (alien-funcall (extern-alien "dup2" (function int int int))
+                               (sb-sys:fd-stream-fd stream) 1)
+                (alien-funcall (extern-alien "dup2" (function int int int)) 1 2))
+              (setq file (car file))
+              #+test-aprof
+              (unless (search "allocator.pure" file)
+                (sb-aprof::aprof-start)
+                (proclaim '(optimize sb-c:instrument-consing)))
+              ;; Send this to the log file, not the terminal
+              (setq *debug-io* (make-two-way-stream (make-concatenated-stream)
+                                                    *error-output*))
+
+              (cond ((string= (pathname-type file) "test")
+                     (let ((shell (or #+sunos (posix-getenv "SHELL") "/bin/sh")))
+                       ;; exec the shell with the test and we'll pick up its exit code
+                       (alien-funcall (extern-alien "execl" (function int c-string c-string
+                                                                      &optional c-string unsigned))
+                                      shell shell
+                                      (concatenate 'string file ".sh") 0))
+                     ;; if exec fails, just exit with a wrong (not 104) status
+                     (alien-funcall (extern-alien "_exit" (function (values) int)) 0))
+                    (t
+                     #+gc-stress
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (loop (gc :full t) (sleep 0.001)))
+                      :name "gc stress")
+                     #+test-sprof (sb-sprof:start-profiling :sample-interval .001)
+                     (setq sb-c::*static-vop-usage-counts* (make-hash-table :synchronized t))
+                     (let ((*features* (cons :parallel-test-runner *features*)))
+                       (pure-runner (list (concatenate 'string file ".lisp"))
+                                    (if (search "-cload" file) 'cload-test 'load-test)
+                                    (make-broadcast-stream)))
+                     (when vop-summary-stats-p
+                       (with-open-file (output (format nil "~a/~a.vop-usage" *logdir* file)
+                                               :direction :output)
+                         ;; There's an impure test that screws with the default pprint dispatch
+                         ;; table such that integers don't print normally (and can't be parsed).
+                         (let ((*print-pretty* nil))
+                           (sb-int:dohash ((name count) sb-c::*static-vop-usage-counts*)
+                             (format output "~7d \"~s\"~%" count name)))))
+                     #+test-sprof (sb-sprof:stop-profiling)
+                     #+test-aprof (progn (sb-aprof::aprof-stop) (sb-aprof:aprof-show))
+                     (when (member :allocator-metrics sb-impl:+internal-features+)
+                       (format t "~2&Allocator histogram:~%")
+                       (funcall (intern "PRINT-ALLOCATOR-HISTOGRAM" "SB-THREAD")))
+                     #+test-sprof
+                     (sb-sprof:report :type :flat
+                                      :stream (if (sb-ext:posix-getenv "SBCL_TEST_NO_SUMMARIZE")
+                                                  (make-broadcast-stream)
+                                                  *standard-output*))
+                     #+tlsf-stress (cl-user::tlsf-dump)
+                     #-arm64 ;; causes crashes
+                     (gc :gen 7)
+                     (when (and (not (unexpected-failures)) *delete-logs*) (delete-file mylog))
+                     (exit :code (if (unexpected-failures) 1 104))))))
           (format t "~A: pid ~d~@[ (trial ~d)~]~%" (car file) pid (cdr file))
           (incf subprocess-count)
           (push (list pid file (get-internal-real-time)) subprocess-list)))
@@ -231,6 +259,10 @@
 (when (string= (car *posix-argv*) "--filter")
   (setq *filter* (cadr *posix-argv*))
   (setq *posix-argv* (cddr *posix-argv*)))
+(when (find "--delete-logs" *posix-argv* :test #'equal)
+  (setf *delete-logs* t)
+  (setf *posix-argv* (remove "--delete-logs" *posix-argv* :test #'equal)))
+
 (if (<= (length *posix-argv*) 1)
     ;; short form - test all files. Argument N if specified is the number of
     ;; tasks, defaulting to half the machine's reported cores
@@ -254,8 +286,10 @@
                                 (impure-cload-files)
                                 (sh-files)))))
        jobs
-       t)
-      #+(and linux sb-thread 64-bit) (summarize-gc-times))
+       (not (sb-ext:posix-getenv "SBCL_TEST_NO_SUMMARIZE")))
+      #+(and linux sb-thread 64-bit)
+      (unless (sb-ext:posix-getenv "SBCL_TEST_NO_SUMMARIZE")
+        (summarize-gc-times)))
     ;; long form
     (let ((jobs 4)
           (runs-per-test 1)

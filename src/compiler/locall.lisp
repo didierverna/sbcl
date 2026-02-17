@@ -250,12 +250,7 @@
                                              ;; it will check default values too, but
                                              ;; FTYPEs are for calls and not definitions.
                                              (leaf-defined-type var))
-                                            ((and (not info)
-                                                  (neq (leaf-type var) *universal-type*))
-                                             ;; Check required
-                                             ;; arguments here too, or
-                                             ;; each optional entry
-                                             ;; will be checking them
+                                            ((neq (leaf-type var) *universal-type*)
                                              (leaf-type var))))
                       when type
                       collect
@@ -435,7 +430,6 @@
 ;;; LAMBDAS.
 (defun locall-analyze-component (component)
   (declare (type component component))
-  (aver-live-component component)
   (loop
     (let* ((new (pop (component-new-functionals component)))
            (fun (or new (pop (component-reanalyze-functionals component)))))
@@ -730,7 +724,48 @@
                            (optional-dispatch-entry-point-fun
                             fun (- call-args min-args)))))
           ((optional-dispatch-more-entry fun)
-           (convert-more-call ref call fun))
+           ;; If there are multiple calls to a local function with &rest
+           ;; and they all have the same number of arguments,
+           ;; make a new local function with fixed arguments in which
+           ;; the optional-dispatch entry will be inlined.
+           (cond ((and (cdr (leaf-refs fun))
+                       (or (not (functional-entry-fun fun))
+                           (not (leaf-refs (functional-entry-fun fun))))
+                       (not (functional-inlinep fun))
+                       (loop for var in (optional-dispatch-arglist fun)
+                             for info = (lambda-var-arg-info var)
+                             thereis (and info
+                                          (eq (arg-info-kind info) :rest)))
+                       (let (lengths
+                             unequal)
+                         (block nil
+                           (map-refs (lambda (dest lvar)
+                                       (if (and (combination-p dest)
+                                                (eq (combination-fun dest) lvar))
+                                           (let ((length (length (combination-args dest))))
+                                             (if lengths
+                                                 (if (/= length lengths)
+                                                     (setf unequal t))
+                                                 (setf lengths length)))
+                                           (return)))
+                                     fun)
+                           (unless unequal
+                             (with-ir1-environment-from-node call
+                               (let* ((vars (make-gensym-list lengths))
+                                      (shim (ir1-convert-lambda
+                                             `(lambda ,vars
+                                                (%funcall ,fun ,@vars))
+                                             :debug-name (lvar-fun-debug-name
+                                                          (basic-combination-fun call))))
+                                      (new-ref (car (leaf-refs fun))))
+                                 (substitute-leaf-if (lambda (x)
+                                                       (not (eq x new-ref)))
+                                                     shim fun)
+                                 (locall-analyze-fun-1 fun)
+                                 (locall-analyze-fun-1 shim)
+                                 t)))))))
+                 (t
+                  (convert-more-call ref call fun))))
           (t
            (warn-invalid-local-call call call-args
             'local-argument-mismatch
@@ -1012,7 +1047,6 @@
   (let* ((call-block (node-block call))
          (bind-block (node-block (lambda-bind clambda)))
          (component (block-component call-block)))
-    (aver-live-component component)
     (let ((clambda-component (block-component bind-block)))
       (unless (eq clambda-component component)
         (aver (eq (component-kind component) :initial))
@@ -1163,18 +1197,21 @@
                        (lvar (node-lvar call)))
                    (unlink-blocks block (first (block-succ block)))
                    (link-blocks block next-block)
-                   (if (eq (node-derived-type this-call) *empty-type*)
-                       ;; Delay terminating the block, because there may be more calls
-                       ;; to be processed here and this may prematurely delete NEXT-BLOCK
-                       ;; before we attach more preceding blocks to it.
-                       ;; Although probably if one call to a function
-                       ;; is derived to be NIL all other calls would
-                       ;; be NIL too, but that may not be available at the same time.
-                       ;; (Or something is smart in the future to
-                       ;; derive different results from different
-                       ;; calls.)
-                       (push this-call maybe-terminate)
-                       (add-lvar-use this-call lvar))))
+                   (cond ((eq (node-derived-type this-call) *empty-type*)
+                          ;; Delay terminating the block, because there may be more calls
+                          ;; to be processed here and this may prematurely delete NEXT-BLOCK
+                          ;; before we attach more preceding blocks to it.
+                          ;; Although probably if one call to a function
+                          ;; is derived to be NIL all other calls would
+                          ;; be NIL too, but that may not be available at the same time.
+                          ;; (Or something is smart in the future to
+                          ;; derive different results from different
+                          ;; calls.)
+                          (push this-call maybe-terminate))
+                         (lvar
+                          (add-lvar-use this-call lvar)
+                          (setf (lvar-%derived-type lvar) nil)
+                          (assert-node-type this-call (node-derived-type call) **zero-typecheck-policy**)))))
                 (deleted)
                 ;; The called function might be an assignment in the
                 ;; case where we are currently converting that function.
@@ -1232,7 +1269,10 @@
            (aver (node-tail-p call))
            (setf (lambda-return call-fun) return)
            (setf (return-lambda return) call-fun)
-           (setf (lambda-return fun) nil)))
+           (setf (lambda-return fun) nil)
+           (let ((call-type (node-derived-type call)))
+             (do-uses (use (return-result return))
+               (derive-node-type use call-type)))))
     ;; Delayed because otherwise next-block could become deleted
     (dolist (call maybe-terminate-calls)
       (maybe-terminate-block call nil)))

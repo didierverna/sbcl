@@ -113,6 +113,9 @@
 ;;;
 ;;; The cross-compilation process will force the creation of these directories
 ;;; by executing CL:ENSURE-DIRECTORIES-EXIST (on the xc host Common Lisp).
+;;;
+;;; With suitable settings of these prefixes it is possible to run simultaneous
+;;; builds from one source tree.
 (defvar *host-obj-prefix*)
 (defvar *target-obj-prefix*)
 
@@ -243,13 +246,18 @@
 
 (load (find-bootstrap-file "^shebang"))
 
+(defun custom-or-default (var default)
+  (if (boundp var) (symbol-value var) default))
+
 ;;; Subfeatures could be assigned as late as the beginning of make-host-2,
 ;;; but I don't want to introduce another mechanism for delaying reading
 ;;; of the customizer just because we can.
 ;;; But it's not well-advertised; does it really merit a customization file?
 (export 'backend-subfeatures)
 (defvar backend-subfeatures
-  (let ((customizer-file-name "customize-backend-subfeatures.lisp"))
+  (let* ((customizer-file-name
+          (custom-or-default 'cl-user::*sbcl-backend-subfeatures-file*
+                             "customize-backend-subfeatures.lisp")))
     (when (probe-file customizer-file-name)
       (copy-list (funcall (compile nil (read-from-file customizer-file-name)) nil)))))
 
@@ -267,10 +275,8 @@
 ;;; The compromise is to examine a variable specifying a path
 ;;; (and it can't go in SB-COLD because the package is not made soon enough)
 (setf sb-xc:*features*
-      (let* ((pathname (let ((var 'cl-user::*sbcl-local-target-features-file*))
-                         (if (boundp var)
-                             (symbol-value var)
-                             "local-target-features.lisp-expr")))
+      (let* ((pathname (custom-or-default 'cl-user::*sbcl-local-target-features-file*
+                                          "local-target-features.lisp-expr"))
              (default-features
                (funcall (compile nil (read-from-file pathname))
                         (read-from-file "^base-target-features.lisp-expr")))
@@ -305,6 +311,11 @@
           (pushnew :system-tlabs sb-xc:*features*))
         (when (target-featurep '(:and (:or :permgen :immobile-space) :x86-64))
           (pushnew :compact-instance-header sb-xc:*features*))
+        (when (target-featurep :sb-cover-for-internals)
+          ;; coverage of internals currently works substantially
+          ;; better if we preserve more information, and don't do
+          ;; various link-time optimizations.
+          (pushnew :sb-devel sb-xc:*features*))
         (when (target-featurep :immobile-space)
           (pushnew :immobile-code sb-xc:*features*))
         (when (target-featurep :64-bit)
@@ -363,7 +374,7 @@
 ;;; failure is (not always obvious from when the build fails).
 (let ((feature-compatibility-tests
        '(("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
-         ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
+         ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64 loongarch64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and mark-region-gc (not (or x86-64 arm64)))"
           "mark-region is not supported on selected architecture")
@@ -403,7 +414,9 @@
           "Relocatable-static-space requires immobile-space")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
-          ":SB-THREAD not supported on selected architecture")))
+          ":SB-THREAD not supported on selected architecture")
+         ("(and nonstop-foreign-call (not (and (or arm64 x86-64) sb-thread (not sb-safepoint))))"
+          ":NONSTOP-FOREIGN-CALL not supported with this combination of features")))
       (failed-test-descriptions nil))
   (dolist (test feature-compatibility-tests)
     (let ((*readtable* *xc-readtable*))
@@ -503,12 +516,16 @@
 ;;; Determine the source path for a stem by remapping from the abstract name
 ;;; if it contains "/{arch}/" and appending a ".lisp" suffix.
 ;;; Assume that STEM is source-tree-relative unless it starts with "output/"
-;;; in which case it could be elsewhere, if you prefer to keep the sources
-;;; devoid of compilation artifacts. (The production of out-of-tree artifacts
-;;; is not actually implemented in the generic build, however if your build
-;;; system does that by itself, then hooray for you)
+;;; in which case the file is not under source control, but has a generator script.
 (defun stem-source-path (stem)
-  (concatenate 'string (find-bootstrap-file (stem-remap-target stem)) ".lisp"))
+  ;; Tell FIND-BOOTSTRAP-FILE that the stem is BUILD-DEPENDENT for generated files,
+  ;; because "output/stuff-groveled-from-headers" can be sensitive to the
+  ;; architecture even for a single OS - e.g.
+  ;;  (define-alien-type wst-blksize-t (signed 32)) ; arm64 Linux
+  ;;  (define-alien-type wst-blksize-t (signed 64)) ; x86-64 Linux
+  ;; If running multiarchitecture builds at the same time out of one tree,
+  ;; it is essential that we look in *BUILD-DEPENDENT-GENERATED-SOURCES-ROOT*.
+  (concatenate 'string (find-bootstrap-file (stem-remap-target stem) t) ".lisp"))
 (compile 'stem-source-path)
 
 ;;; Determine the object path for a stem/flags/mode combination.

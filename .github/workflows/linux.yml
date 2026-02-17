@@ -13,9 +13,10 @@ jobs:
         arch: [x86, x86-64]
         subfeatures: ['']
         include:
-          - { arch: x86-64, subfeatures: sse4, options: --with-sb-thread }
-          - { arch: x86-64, subfeatures: fasteval, options: --with-sb-fasteval --without-sb-eval }
-          - { arch: x86-64, options: --with-mark-region-gc }
+          - { arch: x86-64, subfeatures: sse4, options: --with-sb-thread --with-nonstop-foreign-call }
+          - { arch: x86-64, subfeatures: fasteval, options: --with-sb-fasteval --without-sb-eval --with-nonstop-foreign-call }
+          - { arch: x86-64, options: --with-mark-region-gc --with-nonstop-foreign-call }
+          - { arch: x86-64, options: --with-nonstop-foreign-call }
 
       fail-fast: false
 
@@ -75,6 +76,9 @@ jobs:
     - name: crossbuild sparc
       if: matrix.subfeatures == 'sse4'
       run: ./build-all-cores.sh -j 1 sparc
+    - name: crossbuild loongarch64
+      if: matrix.subfeatures == 'sse4'
+      run: ./build-all-cores.sh -j 1 loongarch64
     - name: crossbuild x86
       if: matrix.subfeatures == 'sse4'
       run: ./build-all-cores.sh -j 1 x86

@@ -1,31 +1,16 @@
-(defpackage sb-cover-test (:use :cl))
-
-(in-package sb-cover-test)
-
-(defparameter *source-directory* cl-user::*source-directory*)
-(defparameter *output-directory* cl-user::*coverage-report-directory*)
-
-(defun compile-load (x)
-  (load (compile-file (merge-pathnames (merge-pathnames x ".*lisp") *source-directory*)
-                      :output-file *output-directory*)))
-
-(defun report ()
-  (handler-case
-      (sb-cover:report *output-directory*)
-    (warning (condition)
-      (error "Unexpected warning: ~A" condition))))
-
-(defun report-expect-failure ()
-  (handler-case
-      (progn
-        (sb-cover:report *output-directory*)
-        (error "Should've signaled a warning"))
-    (warning ())))
-
+(in-package "SB-COVER-TEST")
 
 ;;; No instrumentation
+(sb-cover:clear-coverage)
 (compile-load "test-data-1")
 (report-expect-failure)
+
+#+sb-unicode
+(let ((string (sb-cover::read-file (merge-pathnames "test-data-utf8.lisp"
+                                                    *load-pathname*)
+                                   :utf8)))
+  (assert (char/= #\nul (char string (1- (length string)))))
+  (format t "::: UTF8 input looks good~%"))
 
 ;;; Instrument the file, try again -- first with a non-directory pathname
 
@@ -50,7 +35,7 @@
 (assert (= 2 (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
 (assert (plusp (sb-cover::all-of (getf sb-cover::*counts* :expression))))
 
-;;; Call the function again
+;;; Call the function
 (test1)
 (report)
 
@@ -150,3 +135,40 @@
 (assert (zerop (sb-cover::all-of (getf sb-cover::*counts* :branch))))
 (assert (= 7 (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
 (assert (= 11 (sb-cover::all-of (getf sb-cover::*counts* :expression))))
+
+(sb-cover:clear-coverage)
+(compile-load "test-data-sharp-plus-minus")
+(sharp-plus-minus 3)
+(report)
+
+(assert (zerop (sb-cover::ok-of (getf sb-cover::*counts* :branch))))
+(assert (zerop (sb-cover::all-of (getf sb-cover::*counts* :branch))))
+(assert (= 5 (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
+(assert (= 5 (sb-cover::all-of (getf sb-cover::*counts* :expression))))
+
+(sb-cover:clear-coverage)
+(compile-load "test-data-sharp-c")
+(sharp-c 4)
+(report)
+
+(assert (zerop (sb-cover::ok-of (getf sb-cover::*counts* :branch))))
+(assert (zerop (sb-cover::all-of (getf sb-cover::*counts* :branch))))
+(assert (= 7 (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
+(assert (= 7 (sb-cover::all-of (getf sb-cover::*counts* :expression))))
+
+(sb-cover:clear-coverage)
+(defun generate-code (x y)
+  `(if (evenp ,x) (1+ ,y) (1- ,y)))
+(compile-load "test-data-read-eval")
+(report)
+(assert (zerop (sb-cover::ok-of (getf sb-cover::*counts* :branch))))
+(assert (= 2 (sb-cover::all-of (getf sb-cover::*counts* :branch))))
+(assert (= 2 (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
+(assert (= 6 (sb-cover::all-of (getf sb-cover::*counts* :expression))))
+
+(read-eval 3 4)
+(report)
+(assert (= 1 (sb-cover::ok-of (getf sb-cover::*counts* :branch))))
+(assert (= 2 (sb-cover::all-of (getf sb-cover::*counts* :branch))))
+(assert (= 5 (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
+(assert (= 6 (sb-cover::all-of (getf sb-cover::*counts* :expression))))

@@ -853,7 +853,9 @@ process_directory(int count, struct ndir_entry *entry,
                 break;
 #endif
             case IMMOBILE_TEXT_CORE_SPACE_ID:
+#ifndef LISP_FEATURE_ARM64
                 TEXT_SPACE_START = addr;
+#endif
                 break;
             case DYNAMIC_CORE_SPACE_ID:
                 {
@@ -1007,7 +1009,7 @@ static bool compute_card_table_size(int saved_card_mask_nbits)
     // The card table size is a power of 2 at *least* as large
     // as the number of cards. These are the default values.
     int nbits = 13;
-    long num_gc_cards = 1L << nbits;
+    sword_t num_gc_cards = (sword_t)1 << nbits;
 
     // Sure there's a fancier way to round up to a power-of-2
     // but this is executed exactly once, so KISS.
@@ -1015,6 +1017,8 @@ static bool compute_card_table_size(int saved_card_mask_nbits)
 
     // 2 Gigacards should suffice for now. That would span 2TiB of memory
     // using 1Kb card size, or more if larger card size.
+    // (I think 32 bits could be ok too. The AND instruction uses a 4-byte mask, so
+    // #xffffffff would be 0-extended and not sign-extended to the full register width)
     if (nbits > 31)
         lose("dynamic space too large");
 
@@ -1031,7 +1035,7 @@ static bool compute_card_table_size(int saved_card_mask_nbits)
     // Regardless of the mask implied by space size, it has to be gc_card_table_nbits wide
     // even if that is excessive - when the core is restarted using a _smaller_ dynamic space
     // size than saved at - otherwise lisp could overrun the mark table.
-    num_gc_cards = 1L << gc_card_table_nbits;
+    num_gc_cards = (sword_t)1 << gc_card_table_nbits;
 
     gc_card_table_mask =  num_gc_cards - 1;
     return patch_card_index_mask_fixups;
@@ -1094,6 +1098,8 @@ void gc_allocate_ptes()
 #elif defined LISP_FEATURE_PPC64
     unsigned char* mem = checked_malloc(num_gc_cards + LISP_LINKAGE_SPACE_SIZE);
     gc_card_mark = mem + LISP_LINKAGE_SPACE_SIZE;
+    // ppc64-assem loads reg_CARDTABLE from here
+    NIL_SYMBOL_SLOTS_START[-1] = (uword_t)gc_card_mark;
     /* Copy linkage entries from where they were allocated to where they're accessible
      * off the GC card table register using negative indices. */
     memcpy(mem, linkage_space, LISP_LINKAGE_SPACE_SIZE);
@@ -1153,8 +1159,12 @@ static void gengcbarrier_patch_code_range(uword_t start, lispobj* limit)
         if (widetag_of(where) != CODE_HEADER_WIDETAG || !code->fixups) continue;
         varint_unpacker_init(&unpacker, code->fixups);
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
-        // There are two other data streams preceding the one we want
+        // There are two other data streams (linkage table refs, and immobile space refs)
+        // preceding the one we want
         skip_data_stream(&unpacker);
+        skip_data_stream(&unpacker);
+#elif defined LISP_FEATURE_PPC64
+        // There is one other data stream (linkage table refs) preceding the one we want
         skip_data_stream(&unpacker);
 #endif
         char* instructions = code_text_start(code);
@@ -1379,7 +1389,7 @@ init_coreparse_spaces(int n, struct coreparse_space* input)
  * 0: No
  * -1: default, yes for compressed cores, no otherwise.
  */
-lispobj
+struct initfunctions
 load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 {
     void *header;
@@ -1387,7 +1397,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
     os_vm_size_t len, remaining_len, stringlen;
     int fd = open_binary(file, O_RDONLY);
     ssize_t count;
-    lispobj initial_function = NIL;
+    struct initfunctions initfun = {0,0,0};
     struct heap_adjust adj;
     memset(&adj, 0, sizeof adj);
     sword_t linkage_table_data_page = -1;
@@ -1443,7 +1453,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
     // The initializer ensures that indexing into spaces[] is insensitive
     // to the space numbering and the order listed in defined_spaces.
     struct coreparse_space* spaces =
-      init_coreparse_spaces(sizeof defined_spaces/sizeof (struct coreparse_space),
+      init_coreparse_spaces(sizeof(defined_spaces)/sizeof(struct coreparse_space),
                             defined_spaces);
     bool patch_card_marking_instructions = 0;
 
@@ -1524,7 +1534,9 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
                                   spaces, &adj, patch_card_marking_instructions);
             break;
         case INITIAL_FUN_CORE_ENTRY_TYPE_CODE:
-            initial_function = adjust_word(&adj, (lispobj)*ptr);
+            memcpy(&initfun, ptr, sizeof initfun);
+            initfun.c_linkage_vector = adjust_word(&adj, initfun.c_linkage_vector);
+            initfun.lispfun = adjust_word(&adj, initfun.lispfun);
             break;
         case END_CORE_ENTRY_TYPE_CODE:
             free(header);
@@ -1538,15 +1550,15 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
             SYMBOL(FREE_TLS_INDEX)->value = sizeof (struct thread);
 #endif
             // simple-fun implies cold-init, not a warm core (it would be a closure then)
-            if (widetag_of(native_pointer(initial_function)) == SIMPLE_FUN_WIDETAG
+            if (widetag_of(native_pointer(initfun.lispfun)) == SIMPLE_FUN_WIDETAG
                 && !lisp_startup_options.noinform) {
                 fprintf(stderr, "Initial page table:\n");
                 extern void print_generation_stats(void);
                 print_generation_stats();
             }
-            sanity_check_loaded_core(initial_function);
+            sanity_check_loaded_core(initfun.lispfun);
             free(spaces);
-            return initial_function;
+            return initfun;
         case RUNTIME_OPTIONS_MAGIC: break; // already processed
         default:
             lose("unknown core header entry: %"OBJ_FMTX, (lispobj)val);
@@ -1804,9 +1816,9 @@ static void tally(lispobj ptr, struct visitor* v)
  * to it from another object that is definitely in the cold core, via FOP-LOAD-CODE
  * and who know what else. Thus it remains a graph tracing problem in nature,
  * which is best left to GC */
-static uword_t visit_range(lispobj* where, lispobj* limit, uword_t arg)
+static uword_t visit_range(lispobj* where, lispobj* limit, void* arg)
 {
-    struct visitor* v = (struct visitor*)arg;
+    struct visitor* v = arg;
     lispobj* obj = next_object(where, 0, limit);
     while (obj) {
         if (widetag_of(obj) == FILLER_WIDETAG) {
@@ -1843,7 +1855,7 @@ static void sanity_check_loaded_core(lispobj initial_function)
     free(c);
     // Pass 2: Count all heap objects
     v[1].reached = &reached;
-    walk_generation(visit_range, -1, (uword_t)&v[1]);
+    walk_generation(visit_range, -1, &v[1]);
 
     // Pass 3: Compare
     // Start with the conses

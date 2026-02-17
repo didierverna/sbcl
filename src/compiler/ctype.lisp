@@ -78,8 +78,10 @@
                 (dest (lvar-dest lvar)))
        (when (and (cast-p dest)
                   (eq (cast-type-to-check dest) *wild-type*))
-         (values-type-intersection
-          dtype (cast-asserted-type dest))))
+         (let ((int
+                 (values-type-intersection dtype (cast-asserted-type dest))))
+           (unless (eq int *empty-type*)
+             int))))
      dtype)))
 
 ;;;; stuff for checking a call against a function type
@@ -944,14 +946,18 @@ and no value was provided for it." name)))))))))))
              collect arg)
        args)))
 
+(declaim (ftype (sfunction (function basic-combination
+                                     &key (:info t) (:unknown-keys-fun t)
+                                     (:defined-here t) (:asserted-type t) (:type t))
+                           null)
+                map-combination-args-and-types))
 ;;; Call FUN with (arg-lvar arg-type lvars &optional annotation)
 (defun map-combination-args-and-types (fun call &key info
                                                      unknown-keys-fun
                                                      defined-here
                                                      asserted-type
                                                      type)
-  (declare (type function fun)
-           (type basic-combination call))
+  (declare (dynamic-extent fun unknown-keys-fun))
   (binding* ((type (or type
                        (lvar-fun-type (basic-combination-fun call) defined-here asserted-type)))
              (nil (fun-type-p type) :exit-if-null)
@@ -1004,7 +1010,8 @@ and no value was provided for it." name)))))))))))
               (call lvar (key-info-type key) (key-annotation name)))))
         (when (and unknown-keys-fun
                    unknown-keys)
-          (funcall unknown-keys-fun unknown-keys))))))
+          (funcall unknown-keys-fun unknown-keys)))))
+  nil)
 
 (defun assert-array-index-lvar-type (lvar type policy)
   (let ((internal-lvar (make-lvar))
@@ -1046,6 +1053,12 @@ and no value was provided for it." name)))))))))))
                          :kind (car annotation)))))
      (assert-lvar-type arg type policy context))))
 
+(defun inline-expansion-explicit-check-p (fun)
+  (when (and (defined-fun-p fun)
+             (eq (defined-fun-inlinep fun) 'inline))
+    (loop for decls in (nth-value 1 (parse-body (cddr (defined-fun-inline-expansion fun)) t))
+          thereis (find 'explicit-check (cdr decls) :key #'car))))
+
 ;;; Assert that CALL is to a function of the specified TYPE. It is
 ;;; assumed that the call is legal and has only constants in the
 ;;; keyword positions.
@@ -1071,25 +1084,30 @@ and no value was provided for it." name)))))))))))
                               (lvar-has-single-use-p lvar))))
             (when (assert-node-type call returns policy 'ftype-context)
               (reoptimize-lvar lvar)))))
-    (let* ((name (lvar-fun-name (combination-fun call) t))
+    (let* ((fun (combination-fun call))
+           (name (lvar-fun-name fun t))
            (info (and name
                       (info :function :info name))))
-      (if (and info
-               (fun-info-call-type-deriver info))
-          (funcall (fun-info-call-type-deriver info) call trusted)
-          (map-combination-args-and-types
-           (lambda (arg type lvars &optional annotation)
-             (when (and
-                    (apply-type-annotation name arg type
-                                           lvars policy annotation
-                                           (and (not trusted)
-                                                'ftype-context))
-                    (not trusted))
-               (reoptimize-lvar arg)))
-           call
-           :info info
-           :defined-here t
-           :type type))))
+      (cond #+(or sb-devel sb-xc-host)
+            ((and info
+                  (inline-expansion-explicit-check-p (ref-leaf (principal-lvar-use fun)))))
+            ((and info
+                  (fun-info-call-type-deriver info))
+             (funcall (fun-info-call-type-deriver info) call trusted))
+            (t
+             (map-combination-args-and-types
+              (lambda (arg type lvars &optional annotation)
+                (when (and
+                       (apply-type-annotation name arg type
+                                              lvars policy annotation
+                                              (and (not trusted)
+                                                   'ftype-context))
+                       (not trusted))
+                  (reoptimize-lvar arg)))
+              call
+              :info info
+              :defined-here t
+              :type type)))))
   (values))
 
 ;;;; FIXME: Move to some other file.

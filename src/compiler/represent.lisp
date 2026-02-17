@@ -633,16 +633,26 @@
              (tn-ref-type x-tn-ref))
     (multiple-value-bind (constantp value) (type-singleton-p (tn-ref-type x-tn-ref))
       (when constantp
-        (let* ((constant (find-constant value))
-               (sc (constant-sc constant)))
-          (when (or (not load-scs)
-                    ;; This is a more-arg-load-scs
-                    ;; Because more args do not have a generic load
-                    ;; sequence it can't handle aribtrary constants or
-                    ;; immediates.
-                    (svref load-scs (sc-number sc)))
-            (change-tn-ref-tn x-tn-ref (make-constant-tn constant t))
-            t))))))
+        (let ((constant (find-constant value)))
+          (cond #+(or arm64 x86-64)
+                ((eql value 0f0)
+                 (let* ((tn (tn-ref-tn x-tn-ref))
+                        (new-tn (make-tn 0 :constant (tn-primitive-type tn)
+                                         (svref *backend-sc-numbers* sb-vm:immediate-sc-number))))
+                   (setf (tn-type new-tn) (tn-ref-type x-tn-ref)
+                         (tn-leaf new-tn) constant)
+                   (change-tn-ref-tn x-tn-ref new-tn)
+                   t))
+                (t
+                 (let ((sc (constant-sc constant)))
+                   (when (or (not load-scs)
+                             ;; This is a more-arg-load-scs
+                             ;; Because more args do not have a generic load
+                             ;; sequence it can't handle arbitrary constants or
+                             ;; immediates.
+                             (svref load-scs (sc-number sc)))
+                     (change-tn-ref-tn x-tn-ref (make-constant-tn constant t))
+                     t)))))))))
 
 (defun split-ir2-block (vop)
   (cond ((vop-next vop)
@@ -1049,8 +1059,6 @@
               (setf (block-number block) num)
               (incf num))))))
 
-    #+arm64
-    (choose-zero-tn (ir2-component-constant-tns 2comp))
     #-c-stack-is-control-stack
     (macrolet ((frob (slot restricted)
                  `(do ((tn (,slot 2comp) (tn-next tn)))

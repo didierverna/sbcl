@@ -1,3 +1,6 @@
+#ifndef _TINY_LOCK_H_
+#define _TINY_LOCK_H_
+
 #ifdef USE_PTHREAD_LOCK
 /* Probably not something you actually want to do in a signal handler,
  * but it lets you use things like mutrace. */
@@ -36,9 +39,32 @@ static void __attribute__((unused)) acquire_lock(lock_t *l) {
     do {
       if (c == 2 || cmpxchg(l, 1, 2) != 0)
         futex_wait((int*)&l->grabbed, 2, -1, 0);
-    } while ((c = cmpxchg(l, 0, 2) != 0) != 0);
+    } while ((c = cmpxchg(l, 0, 2)) != 0);
   }
 }
+#ifdef LISP_FEATURE_X86_64
+extern int futex_wait_allowing_gc(int*,int);
+/* This acquire method accomplishes something which can not be efficiently done using
+ * a pthread mutex, namely: acquire only if pseudo-atomic, sleep only if not.
+ * (Almost) any attempt to match the logic below using pthread primitives will have a
+ * vulnerability where a mutex is acquired but not in a pseudo-atomic context. A very
+ * inefficient replica is certainly possible, though equivalent to a spinlock:
+ * for (;;) {
+ *   begin pseudo-atomic
+ *   if (!pthread_mutex_trylock(m)) break;
+ *   end-pseudo-atomic / receive-pending-interrupt
+ * }
+ */
+static void __attribute__((unused)) acquire_lock_allowing_gc(lock_t *l) {
+  int c;
+  if ((c = cmpxchg(l, 0, 1)) != 0) {
+    do {
+      if (c == 2 || cmpxchg(l, 1, 2) != 0)
+        futex_wait_allowing_gc((int*)&l->grabbed, 2);
+    } while ((c = cmpxchg(l, 0, 2)) != 0);
+  }
+}
+#endif
 static void __attribute__((unused)) release_lock(lock_t* l) {
   if (atomic_fetch_sub(&l->grabbed, 1) != 1) {
     l->grabbed = 0;
@@ -66,4 +92,6 @@ static int __attribute__((unused)) try_acquire_lock(lock_t *l) {
 }
 
 #define LOCK_INITIALIZER { 0 }
+#endif
+
 #endif

@@ -113,8 +113,8 @@
                  *info-types*
                  :start (length *info-priority-order*))))))))
 
-(defvar *globaldb-defaulting-exprs* nil)
-(defvar *globaldb-validate-exprs* nil)
+(define-load-time-global *globaldb-defaulting-exprs* nil)
+(define-load-time-global *globaldb-validate-exprs* nil)
 (eval-when (:compile-toplevel :execute) ; no load-time definition
 (#+sb-xc-host cl:defmacro
  #-sb-xc-host sb-xc:defmacro
@@ -311,11 +311,7 @@
 ;;; property as either (:known . #<ctype>) or (:assumed . #<ctype>)
 ;;; rather than using two different properties. Do we ever use *both* ?
 (define-info-type (:function :assumed-type)
-  ;; FIXME: The type-spec really should be
-  ;;   (or approximate-fun-type null)).
-  ;; It was changed to T as a hopefully-temporary hack while getting
-  ;; cold init problems untangled.
-  :type-spec t)
+  :type-spec (or sb-c::approximate-fun-type null))
 
 ;;; where this information came from:
 ;;;    :ASSUMED  = from uses of the object

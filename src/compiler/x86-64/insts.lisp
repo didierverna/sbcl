@@ -326,7 +326,7 @@
     (:no . 1)
     (:b . 2) (:nae . 2) (:c . 2)
     (:ae . 3) (:nb . 3) (:nc . 3)
-    (:eq . 4) (:e . 4) (:z . 4)
+    (:e . 4) (:z . 4)
     (:ne . 5) (:nz . 5)
     (:be . 6) (:na . 6)
     (:a . 7) (:nbe . 7)
@@ -2257,10 +2257,9 @@
 ;;; However, if trying to debug code which also gets an "actual" SIGILL, this still poses
 ;;; a problem for gdb. To workaround that we can emit a call to a asm routine which
 ;;; has essentially the same effect as the signal.
-;;; Orthogonal to the preceding choices, INT1 can be used for pseudo-atomic-interrupted
-;;; but that doesn't work on all systems.
 (define-instruction break (segment &optional (code nil codep))
   (:printer byte-imm ((op #xCC)) :default :print-name 'int3 :control #'break-control)
+  #+ud2-breakpoints ; do NOT decode UD2 as BREAK unless using ud2-breakpoints
   (:printer word-imm ((op #x0B0F)) :default :print-name 'ud2 :control #'break-control)
   ;; INTO always signals SIGILL in 64-bit code. Using it avoids conflicting with gdb's
   ;; use of sigtrap and shortens the error break by 1 byte relative to UD2.
@@ -2298,6 +2297,11 @@
    (emit-prefixes segment rm reg :dword)
    (emit-bytes segment #x0F #xB9)
    (emit-ea segment rm reg)))
+
+#-ud2-breakpoints ; UD2 is a perfectly ordinary UD2 instruction in this case
+(define-instruction ud2 (segment)
+  (:printer two-bytes ((op '(#x0F #x0B))))
+  (:emitter (emit-word segment #x0B0F)))
 
 (define-instruction iret (segment)
   (:printer byte ((op #xCF)))
@@ -3189,6 +3193,13 @@
      ;; FIXME: same bug as POPCNT - we can't disassemble if size is :WORD
      (emit-sse-inst segment dst src #xf3 #xBC :operand-size size))))
 
+(define-instruction lzcnt (segment &prefix prefix dst src)
+  (:printer ext-xmm-reg/mem ((prefix #xF3) (op #xBD) (reg nil :type 'reg)))
+  (:emitter
+   (let ((size (pick-operand-size prefix dst src)))
+     (aver (neq size :byte))
+     (emit-sse-inst segment dst src #xf3 #xBD :operand-size size))))
+
 (define-instruction crc32 (segment src-size dst src)
   ;; The low bit of the final opcode byte sets the source size.
   ;; REX.W bit sets the destination size. can't have #x66 prefix and REX.W = 1.
@@ -3558,32 +3569,68 @@
       (delete-stmt stmt)
       next)))
 
-;;; In "{AND,OR,...} reg, src ; TEST reg, reg ; {JMP,SET} {:z,:nz,:s,:ns}"
+;;; In {AND,OR,...} reg, src ; TEST reg, reg ; {JMP,SET,CMOV} {:z,:nz,:s,:ns,...}
 ;;; the TEST is unnecessary since ALU operations set the Z and S flags.
 ;;; Per the processor manual, TEST clears OF and CF, so presumably
 ;;; there is not a branch-if on either of those flags.
 ;;; It shouldn't be a problem that removal of TEST leaves more flags affected.
-(defpattern "ALU + test" ((add adc sub sbb and or xor neg sar shl shr) (test)) (stmt next)
+
+;; TODO:
+;; add adc sub sbb neg sar shl shr
+;; set OF and CF, and while the code below does check for the next
+;; instruction reading this flag, there might be multiple flag-reading
+;; instructions.
+(defpattern "ALU + test" ((and or xor) (test)) (stmt next)
   (binding* (((size1 dst1 src1) (parse-2-operands stmt))
              ((size2 dst2 src2) (parse-2-operands next))
              (next-next (stmt-next next)))
     (declare (ignore src1))
     (when (and (not (stmt-labels next))
                (gpr-tn-p dst2)
-               (location= dst1 dst2) ; they can have different SCs
+               (location= dst1 dst2)    ; they can have different SCs
                (eq dst2 src2)
                next-next
                ;; Zero shifts do not affect the flags
                (not (and (memq (stmt-mnemonic stmt) '(sar shl shr))
                          (memq (car (last (stmt-operands stmt)))
                                '(:cl 0))))
-               (memq (stmt-mnemonic next-next) '(jmp set))
-               ;; TODO: figure out when it would be correct to omit TEST for the carry flag
-               (case (car (stmt-operands next-next))
-                 ((:s :ns)
-                  (eq size2 size1))
-                 ((:ne :e :nz :z)
-                  (or (eq size2 size1) (and (eq size1 :dword) (eq size2 :qword))))))
+               (let ((flag (cond ((memq (stmt-mnemonic next-next) '(jmp set))
+                                  (car (stmt-operands next-next)))
+                                 (t
+                                  (loop for next = next-next then (stmt-next next)
+                                        while next
+                                        do (case (stmt-mnemonic next)
+                                             ((mov lea))
+                                             (cmov
+                                              (return (second (stmt-operands next))))
+                                             (t
+                                              (return))))))))
+                 (or (and (memq (stmt-mnemonic stmt) '(and xor or)) ;; the same flags are set
+                          (or (eq size2 size1)
+                              (and (memq flag '(:ne :e :nz :z))
+                                   (eq size1 :dword)
+                                   (eq size2 :qword))))
+                     (case flag
+                       ;; TODO: figure out when it would be correct to omit TEST for the carry flag
+                       ((:s :ns)
+                        (eq size2 size1))
+                       ((:ne :e :nz :z)
+                        (or (eq size2 size1) (and (eq size1 :dword) (eq size2 :qword))))
+                       ((:ge :g :le :l
+                         :nl :nle :ng :nge)
+                        (and (eq size2 size1)
+                             ;; Assume there's no overflow for signed arithmetic
+                             (memq (vop-name (sb-assem::stmt-vop stmt))
+                                   '(sb-vm::fast--/fixnum=>fixnum
+                                     sb-vm::fast-+/fixnum=>fixnum
+                                     sb-vm::fast--/signed=>signed
+                                     sb-vm::fast-+/signed=>signed
+                                     sb-vm::fast---c/fixnum=>fixnum
+                                     sb-vm::fast-+-c/fixnum=>fixnum
+                                     sb-vm::fast---c/signed=>signed
+                                     sb-vm::fast-+-c/signed=>signed
+                                     sb-vm::fast-negate/fixnum
+                                     sb-vm::fast-negate/signed))))))))
       (delete-stmt next)
       next-next)))
 
@@ -3685,7 +3732,7 @@
            :not-taken)
           ;; I manually examined a sampling of calls to this function
           ;; and did not notice other opportunities to return non-NIL
-          ((conditions :a :eq) :not-taken) ; above to equal
+          ((conditions :a :e) :not-taken) ; above to equal
           ((conditions :a :ne) :taken) ; above to not-equal
           (t nil))))
 

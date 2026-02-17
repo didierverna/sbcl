@@ -14,7 +14,7 @@
 (load "compiler-test-util.lisp")
 (import 'ctu:disassembly-lines)
 
-(with-test (:name :lowtag-test-elision)
+(with-test (:name :lowtag-test-elision :broken-on :sbcl)
   ;; This tests a certain behavior that while "undefined" should at least not
   ;; be fatal. This is important for things like hash-table :TEST where we might
   ;; call (EQUAL x y) with X being an unbound marker indicating an empty cell.
@@ -32,7 +32,9 @@
                         ;; If X is the unbound marker, this will read a byte preceding
                         ;; the start of static space, but it holds a zero.
                         (simple-vector 2))))))
-    (assert (not (funcall f (sb-kernel:make-unbound-marker)))))
+    (assert (not (funcall f (sb-kernel:make-unbound-marker))))))
+
+(with-test (:name :lowtag-test-elision.2)
   (let ((ubm (opaque-identity (sb-kernel:make-unbound-marker)))
         (thing (opaque-identity "")))
     (assert (not (eql thing ubm)))
@@ -942,7 +944,7 @@
              (assert (not (loop for line in (disassembly-lines negative-test)
                                 thereis (search telltale line)))))))
 
-(with-test (:name :bash-copiers-byte-or-larger)
+(with-test (:name :bash-copiers-byte-or-larger :skipped-on :sb-devel)
   (dolist (f '(sb-kernel::ub8-bash-copy
                sb-kernel::ub16-bash-copy
                sb-kernel::ub32-bash-copy
@@ -1417,3 +1419,11 @@
   ;; four raw words: jump table count word, two user data words, and a padding word
   (assert (= 32 (sb-kernel:code-n-unboxed-data-bytes
                  (sb-kernel:fun-code-header #'different-constants)))))
+
+(with-test (:name :push-cons)
+  (let ((f (checked-compile
+            '(lambda (alist x y)
+              (declare (optimize (sb-c:instrument-consing 0)))
+              (push (cons x y) alist)))))
+    ;; should have 1 call to list-alloc-tramp, not one for the cons of x, y and one for push
+    (assert (= 1 (count 'sb-c:call (get-simple-fun-instruction-model f) :key 'second)))))

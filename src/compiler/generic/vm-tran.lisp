@@ -24,7 +24,8 @@
 (define-source-transform char-int (x)
   `(char-code ,x))
 
-(deftransform abs ((x) (rational))
+(deftransform abs ((x) (rational) * :node node)
+  (delay-ir1-transform node :constraint)
   '(if (< x 0) (- x) x))
 
 (deftransform make-symbol ((string) (simple-string))
@@ -291,6 +292,11 @@
                                                     * :node node)
     "avoid runtime dispatch on array element type"
     (hairy-data-vector-set-transform array new-value node '%data-vector-and-index/check-bound)))
+
+(defoptimizer (hairy-data-vector-ref flushable)
+    ((array index) node)
+  ;; Don't flush access to known NIL-arrays, the call will be transformed
+  (not (eq (node-derived-type node) *empty-type*)))
 
 (deftransform hairy-data-vector-ref ((string index) (simple-string t))
   (let ((ctype (lvar-type string)))
@@ -786,7 +792,8 @@
 ;;; VOP can't handle them.
 
 (deftransform sb-vm::get-lisp-obj-address ((obj) ((constant-arg fixnum)))
-  (ash (lvar-value obj) sb-vm:n-fixnum-tag-bits))
+  (logand (ash (lvar-value obj) sb-vm:n-fixnum-tag-bits)
+          sb-ext:most-positive-word))
 
 (deftransform sb-vm::get-lisp-obj-address ((obj) ((constant-arg character)))
   (logior sb-vm:character-widetag

@@ -1149,7 +1149,13 @@
               (setf (auxiliary-alien-type kind name env)
                     (!make-alien-record-type :name name :kind kind))))
          (t
-          (!make-alien-record-type :kind kind)))))
+          (ecase kind
+            (:union
+             (load-time-value
+              (!make-alien-record-type :kind :union)))
+            (:struct
+             (load-time-value
+              (!make-alien-record-type :kind :struct))))))))
   (define-alien-type-translator union (name &rest fields &environment env)
     (parse-alien-record-type :union name fields env))
   (define-alien-type-translator struct (name &rest fields &environment env)
@@ -1267,6 +1273,7 @@
   ;; as indicative of "..." in the C prototype. We can record that too.
   (varargs nil :type (or boolean fixnum (eql :unspecified)) :read-only t)
   (stub nil :type (or null function))
+  (into-stub nil :type (or null function)) ; for alien-funcall-into
   (convention nil :type calling-convention :read-only t))
 ;;; The safe default is to assume that everything is varargs.
 ;;; On x86-64 we have to emit a spurious instruction because of it.

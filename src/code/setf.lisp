@@ -171,25 +171,28 @@
         (return-from setf `(progn ,@(sb-c::explode-setq form 'error))))
       (when (atom (setq place (macroexpand-for-setf place env)))
         (return-from setf `(setq ,place ,value-form)))
+      (wrap-if
+       (sb-c::compiling-p env)
+       `(sb-c::with-source-form ,place)
+       (block nil
+         (let ((fun (car place)))
+           (when (and (symbolp fun)
+                      ;; Local definition of FUN precludes global knowledge.
+                      (not (sb-c::fun-locally-defined-p fun env)))
+             (let ((inverse (info :setf :expander fun)))
+               ;; NIL is not a valid setf inverse name, for two reasons:
+               ;;  1. you can't define a function named NIL,
+               ;;  2. (DEFSETF THING () ...) is the long form DEFSETF syntax.
+               (when (typep inverse '(cons symbol))
+                 (return `(,(car inverse) ,@(cdr place) ,value-form))))
+             (awhen (transformable-struct-setf-p place env)
+               (return
+                 (slot-access-transform :setf (list (cadr place) value-form) it)))))
 
-      (let ((fun (car place)))
-        (when (and (symbolp fun)
-                   ;; Local definition of FUN precludes global knowledge.
-                   (not (sb-c::fun-locally-defined-p fun env)))
-          (let ((inverse (info :setf :expander fun)))
-            ;; NIL is not a valid setf inverse name, for two reasons:
-            ;;  1. you can't define a function named NIL,
-            ;;  2. (DEFSETF THING () ...) is the long form DEFSETF syntax.
-            (when (typep inverse '(cons symbol))
-              (return-from setf `(,(car inverse) ,@(cdr place) ,value-form))))
-          (awhen (transformable-struct-setf-p place env)
-            (return-from setf
-              (slot-access-transform :setf (list (cadr place) value-form) it)))))
-
-      (multiple-value-bind (temps vals newval setter)
-          (get-setf-expansion place env)
-        (car (gen-let* (mapcar #'list temps vals)
-                       (gen-mv-bind newval value-form (forms-list setter)))))))
+         (multiple-value-bind (temps vals newval setter)
+             (get-setf-expansion place env)
+           (car (gen-let* (mapcar #'list temps vals)
+                          (gen-mv-bind newval value-form (forms-list setter)))))))))
 
   ;; various SETF-related macros
 
@@ -300,7 +303,13 @@
   ;; - One errs, says "Multiple store variables not expected"
   ;; - One pushes multiple values produced by OBJ form into multiple places.
   ;; - At least two produce an incorrect expansion that doesn't even work.
-  (expand-rmw-macro 'cons (list obj) place '() nil env '(item)))
+  ;;
+  ;; (PUSH (CONS key val) an-alist) is an extremely common idiom. If (and only if)
+  ;; ACONS has a translator, it is to be preferred in that usage.
+  (if (and (sb-c::vop-existsp :translate acons)
+           (typep obj '(cons (eql cons) (cons t (cons t null)))))
+      (expand-rmw-macro 'acons (cdr obj) place '() nil env '(k v))
+      (expand-rmw-macro 'cons (list obj) place '() nil env '(item))))
 
 (sb-xc:defmacro pushnew (obj place &rest keys &environment env)
   "Takes an object and a location holding a list. If the object is

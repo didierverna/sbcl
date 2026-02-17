@@ -307,11 +307,12 @@
       (let ((ret (alien-funcall afunc (1+ max_path) (cast apath (* char)))))
         (when (zerop ret)
           (win32-error "GetCurrentDirectory"))
-        (if (> ret (1+ max_path))
-            (with-alien ((apath (* char) (make-system-buffer ret)))
-              (alien-funcall afunc ret apath)
-              (cast-and-free apath))
-            (decode-system-string apath))))))
+        (possibly-base-stringize
+         (if (> ret (1+ max_path))
+             (with-alien ((apath (* char) (make-system-buffer ret)))
+               (alien-funcall afunc ret apath)
+               (cast-and-free apath))
+             (decode-system-string apath)))))))
 
 (defun sb-unix:unix-mkdir (name mode)
   (declare (type sb-unix:unix-pathname name)
@@ -329,7 +330,7 @@
            (values result (if result 0 (get-last-error)))
            name1 name2 +movefile-replace-existing+))
 
-(defun sb-unix::posix-getenv (name)
+(defun sb-ext:posix-getenv (name)
   (declare (type simple-string name))
   (with-alien ((aenv (* char) (make-system-buffer default-environment-length)))
     (with-sysfun (afunc ("GetEnvironmentVariable" t)
@@ -340,7 +341,7 @@
           (setf aenv (make-system-buffer ret))
           (alien-funcall afunc name aenv ret))
         (if (> ret 0)
-            (cast-and-free aenv)
+            (possibly-base-stringize (cast-and-free aenv))
             (free-alien aenv))))))
 
 ;; GET-CURRENT-PROCESS
@@ -499,7 +500,7 @@ UNIX epoch: January 1st 1970."
              native-namestring 0 (addr file-attributes))))
 
 (defun native-probe-file-name (native-namestring)
-  "Return truename \(using GetLongPathName\) as primary value,
+  "Return truename \(using GetFullPathName and GetLongPathName\) as primary value,
 File kind as secondary.
 
 Unless kind is false, null truename shouldn't be interpreted as error or file
@@ -512,7 +513,11 @@ absense."
               (syscall (("GetLongPathName" t) dword
                         system-string long-pathname-buffer dword)
                        (and (plusp result) (decode-system-string buffer))
-                       native-namestring buffer 32768)
+                       (syscall (("GetFullPathName" t) dword
+                                 system-string dword long-pathname-buffer (* system-string))
+                                (and (plusp result) (decode-system-string buffer))
+                                native-namestring 32768 buffer nil)
+                       buffer 32768)
               (and result
                    (attribute-file-kind
                     (slot file-attributes 'attributes))))
@@ -576,15 +581,6 @@ absense."
                      name value)
       (void-syscall* (("SetEnvironmentVariable" t) system-string int-ptr)
                      name 0)))
-
-;; Let SETENV be an accessor for POSIX-GETENV.
-;;
-;; DFL: Merged this function because it seems useful to me.  But
-;; shouldn't we then define it on actual POSIX, too?
-(defun (setf sb-unix::posix-getenv) (new-value name)
-  (if (setenv name new-value)
-      new-value
-      (posix-getenv name)))
 
 (defmacro c-sizeof (s)
   "translate alien size (in bits) to c-size (in bytes)"

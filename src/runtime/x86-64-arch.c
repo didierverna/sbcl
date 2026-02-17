@@ -430,12 +430,6 @@ sigtrap_handler(int __attribute__((unused)) signal,
                 siginfo_t __attribute__((unused)) *info,
                 os_context_t *context)
 {
-#ifdef LISP_FEATURE_INT1_BREAKPOINTS
-    // ICEBP instruction = handle-pending-interrupt following pseudo-atomic
-    if (((unsigned char*)OS_CONTEXT_PC(context))[-1] == 0xF1)
-        return interrupt_handle_pending(context);
-#endif
-
     unsigned int trap;
 
     if (single_stepping) {
@@ -463,7 +457,15 @@ sigill_handler(int __attribute__((unused)) signal,
     unsigned char* pc = (void*)OS_CONTEXT_PC(context);
     if (UNALIGNED_LOAD16(pc) == UD2_INST) {
         OS_CONTEXT_PC(context) += 2;
+#ifdef LISP_FEATURE_UD2_BREAKPOINTS
         return sigtrap_handler(signal, siginfo, context);
+#else
+        /* UD2 ends pseudo-atomic sequences and has no trailing bytes that encode the
+         * reason for the trap. So the normal instruction stream is fully decodable by 'gdb'
+         * - which shows 0xCE as "(bad)" - or other tools, being devoid of arbitrary bytes
+         * that encode error metadata after the trapping instruction */
+        return interrupt_handle_pending(context);
+#endif
     }
     // Interrupt if overflow (INTO) raises SIGILL in 64-bit mode
     if (*(unsigned char *)pc == INTO_INST) {
@@ -853,7 +855,7 @@ os_vm_address_t coreparse_alloc_space(int space_id, int attr,
 {
     if (size == 0) return addr;
 
-    int extra_below = 0, extra_above = 0;
+    long extra_below = 0, extra_above = 0;
     extern int lisp_code_in_elf();
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -890,5 +892,31 @@ os_vm_address_t coreparse_alloc_space(int space_id, int attr,
     }
     return addr;
 }
+
+#if defined LISP_FEATURE_SB_FUTEX && !defined LISP_FEATURE_GS_SEG
+// Wait on a futex, but first end the surrounding pseudo-atomic section, handling
+// any deferred interrupt, and reinstate pseudo-atomicity upon return.
+extern int futex_wait(int*,int,long,unsigned long), futex_wake(int*, int);
+int futex_wait_allowing_gc(int *lock_word, int oldval)
+{
+    gc_assert(trap_PendingInterrupt == 9); // this static assertion will (hopefully) be compiled out
+    struct thread* th = get_sb_vm_thread();
+    /* This has a problem with #+gs-seg because RBP-TN is used for the arbitrary nonzero bits
+     * (with the low bit 0) stored in pa_bits - See NONZERO-BITS in EMIT-BEGIN-PSEUDO-ATOMIC
+     * in x86-64/macros.lisp. NULL-TN doesn't work because the low bit is 1.
+     * So good thing #+gs-seg is currently not working for reasons aside from this */
+    gc_assert((th->pseudo_atomic_bits & ~1) == (uword_t)th);
+    uword_t pa_bits = __sync_xor_and_fetch(&th->pseudo_atomic_bits, (uword_t)th);
+    if (pa_bits == 0) {
+        int result = futex_wait(lock_word, oldval, -1, 0);
+        th->pseudo_atomic_bits = (uword_t)th; // become pseudo-atomic again
+        return result;
+    }
+    asm volatile("ud2\n\t.byte 9"); // receive pending int
+    int result = futex_wait(lock_word, oldval, -1, 0);
+    th->pseudo_atomic_bits = (uword_t)th;
+    return result;
+}
+#endif
 
 #include "x86-arch-shared.inc"

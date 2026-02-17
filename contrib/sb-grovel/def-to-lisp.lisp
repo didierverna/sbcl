@@ -26,7 +26,7 @@
 (defun word-cast (arg)
   (format nil "CAST_SIGNED(~A)" arg))
 
-#+(and win32 x86-64)
+#+(and win32 64-bit)
 (defun printf-transform-long-long (x)
   (with-output-to-string (str)
     (loop for previous = #\a then char
@@ -37,7 +37,7 @@
                      (char= char #\l))
             (write-char #\l str)))))
 
-#-(and win32 x86-64)
+#-(and win32 64-bit)
 (defun printf-transform-long-long (x)
   x)
 
@@ -87,9 +87,9 @@ code:
         (as-c "{" cname "t;")
         (printf "  %lu"
                 (format nil "((unsigned long~A)&(t.~A)) - ((unsigned long~A)&(t))"
-                        #+(and win32 x86-64) " long" #-(and win32 x86-64) ""
+                        #+(and win32 64-bit) " long" #-(and win32 64-bit) ""
                         c-el-name
-                        #+(and win32 x86-64) " long" #-(and win32 x86-64) ""))
+                        #+(and win32 64-bit) " long" #-(and win32 64-bit) ""))
         (as-c "}")
         ;; length
         (if distrust-length
@@ -115,7 +115,7 @@ code:
     ;; Cast to signed long when possible.
     ;; Other platforms do not seem to be affected by this,
     ;; but we used to cast everything to INT on x86-64, preserve that behaviour.
-    #+(and win32 x86-64)
+    #+(and win32 64-bit)
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long long) (long) (x): (x))")
     #+(and (not win32) x86-64)
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long) (int) (x): (x))")
@@ -123,19 +123,20 @@ code:
     ;; even though 'long' and 'int' are both 4 bytes.
     #-(or x86 64-bit)
     (as-c "#define CAST_SIGNED(x) ((int) (x))")
-    #+(and (not x86-64) (or x86 64-bit))
+    #+(and (not x86-64) (or x86 (and (not win32) 64-bit)))
     (as-c "#define CAST_SIGNED(x) ((long) (x))")
-    (as-c "int main(int argc, char *argv[]) {")
-    (as-c "    FILE *out;")
-    (as-c "    if (argc != 2) {")
-    (as-c "        printf(\"Invalid argcount!\");")
-    (as-c "        return 1;")
-    (as-c "    } else")
-    (as-c "        out = fopen(argv[1], \"w\");")
-    (as-c "    if (!out) {")
-    (as-c "        printf(\"Error opening output file!\");")
-    (as-c "        return 1;")
-    (as-c "    }")
+    (as-c "
+int main(int argc, char *argv[]) {
+    FILE *out;
+    if (argc != 2) {
+        fprintf(stderr, \"Invalid argcount!\\n\");
+        return 1;
+    } else
+        out = fopen(argv[1], \"w\");
+    if (!out) {
+        fprintf(stderr, \"Error opening output file!\\n\");
+        return 1;
+    }")
     (printf "(cl:in-package #:~A)" package-name)
     (printf "(cl:eval-when (:compile-toplevel :execute)")
     (printf "  (cl:defparameter *integer-sizes* (cl:make-hash-table))")

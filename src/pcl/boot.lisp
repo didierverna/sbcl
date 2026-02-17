@@ -72,7 +72,7 @@ bootstrapping.
                     ensure-generic-function-using-class
                     add-method remove-method))
 
-(defvar *!early-functions*
+(define-load-time-global *!early-functions*
   '((make-a-method !early-make-a-method real-make-a-method)
     (add-named-method !early-add-named-method real-add-named-method)))
 
@@ -101,7 +101,7 @@ bootstrapping.
 ;;;   (LAMBDA-LIST SPECIALIZERS QUALIFIERS METHOD-BODY-FUNCTION-NAME)
 ;;;
 ;;;,where SPECIALIZERS is a list of class names.
-(defvar *!generic-function-fixups*
+(define-load-time-global *!generic-function-fixups*
   '((add-method
      standard
      ((generic-function method)
@@ -1807,13 +1807,7 @@ bootstrapping.
                (t form))))
       (let* ((sb-walker::*walk-form-preserve-source* t)
              (walked-lambda (walk-form method-lambda env #'walk-function)))
-        ;;; FIXME: the walker's rewriting of the source code causes
-        ;;; trouble when doing code coverage. The rewrites should be
-        ;;; removed, and the same operations done using
-        ;;; compiler-macros or tranforms.
-        (values (if (sb-c:policy env (= sb-c:store-coverage-data 0))
-                    walked-lambda
-                    method-lambda)
+        (values walked-lambda
                 call-next-method-p
                 (not (null parameters-setqd))
                 parameters-setqd)))))
@@ -1972,7 +1966,7 @@ bootstrapping.
 
 ;;;; early generic function support
 
-(defvar *!early-generic-functions* ())
+(define-load-time-global *!early-generic-functions* ())
 
 ;; CLHS doesn't specify &allow-other-keys here but I guess the supposition
 ;; is that they'll be checked by ENSURE-GENERIC-FUNCTION-USING-CLASS.

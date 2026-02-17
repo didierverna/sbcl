@@ -15,89 +15,6 @@
 
 (in-package "SB-KERNEL")
 
-;;; Handle float scaling where the X is denormalized or the result is
-;;; denormalized or underflows to 0.
-(macrolet ((def (type)
-             `(defun ,(symbolicate 'scale- type '-maybe-underflow) (x exp)
-                (declare (inline ,(symbolicate 'integer-decode- type)))
-                (cond ((float-infinity-p x)
-                       x)
-                      ((float-nan-p x)
-                       (when (and (float-trapping-nan-p x)
-                                  (sb-vm:current-float-trap :invalid))
-                         (error 'floating-point-invalid-operation :operation 'scale-float
-                                                                  :operands (list x exp)))
-                       x)
-                      (t
-                       (multiple-value-bind (sig old-exp sign) (,(symbolicate 'integer-decode- type) x)
-                         (let* ((digits (float-digits x))
-                                (new-exp (+ exp old-exp digits
-                                            ,(case type
-                                               (single-float 'sb-vm:single-float-bias)
-                                               (double-float 'sb-vm:double-float-bias))))
-                                ;; convert decoded values {-1,+1} into {1,0} respectively
-                                (sign (if (minusp sign) 1 0)))
-                           (cond
-                             ((< new-exp
-                                 ,(case type
-                                    (single-float 'sb-vm:single-float-normal-exponent-min)
-                                    (double-float 'sb-vm:double-float-normal-exponent-min)))
-                              (when (sb-vm:current-float-trap :inexact)
-                                (error 'floating-point-inexact :operation 'scale-float
-                                                               :operands (list x exp)))
-                              (when (sb-vm:current-float-trap :underflow)
-                                (error 'floating-point-underflow :operation 'scale-float
-                                                                 :operands (list x exp)))
-                              (let ((shift (1- new-exp)))
-                                (if (< shift (- (1- digits)))
-                                    (float-sign x ,(case type
-                                                     (single-float 0f0)
-                                                     (double-float 0d0)))
-                                    ,(case type
-                                       (single-float '(single-from-bits sign 0 (ash sig shift)))
-                                       (double-float '(double-from-bits sign 0 (ash sig shift)))))))
-                             (t
-                              ,(case type
-                                 (single-float '(single-from-bits sign new-exp sig))
-                                 (double-float '(double-from-bits sign new-exp sig))))))))))))
-  (def single-float)
-  (def double-float))
-
-;;; Called when scaling a float overflows, or the original float was a
-;;; NaN or infinity. If overflow errors are trapped, then error,
-;;; otherwise return the appropriate infinity. If a NaN, signal or not
-;;; as appropriate.
-(macrolet ((def (type)
-             `(defun ,(symbolicate 'scale- type '-maybe-overflow) (x exp)
-                (declare (inline float-infinity-p float-nan-p))
-                (cond
-                  ((float-infinity-p x)
-                   ;; Infinity is infinity, no matter how small...
-                   x)
-                  ((float-nan-p x)
-                   (when (and (float-trapping-nan-p x)
-                              (sb-vm:current-float-trap :invalid))
-                     (error 'floating-point-invalid-operation :operation 'scale-float
-                                                              :operands (list x exp)))
-                   x)
-                  (t
-                   (when (sb-vm:current-float-trap :overflow)
-                     (error 'floating-point-overflow :operation 'scale-float
-                                                     :operands (list x exp)))
-                   (when (sb-vm:current-float-trap :inexact)
-                     (error 'floating-point-inexact :operation 'scale-float
-                                                    :operands (list x exp)))
-                   (* (float-sign x)
-                      ,(ecase type
-                         (single-float
-                          ;; SINGLE-FLOAT-POSITIVE-INFINITY
-                          `(single-from-bits 0 (1+ sb-vm:single-float-normal-exponent-max) 0))
-                         (double-float
-                          ;; DOUBLE-FLOAT-POSITIVE-INFINITY
-                          `(double-from-bits 0 (1+ sb-vm:double-float-normal-exponent-max) 0)))))))))
-  (def single-float)
-  (def double-float))
-
 ;;; This algorithm for RATIONALIZE, due to Bruno Haible, is included
 ;;; with permission.
 ;;;
@@ -172,37 +89,41 @@
      ;; iterative algorithm above.
      (multiple-value-bind (frac expo sign)
          (integer-decode-float x)
-       (cond ((or (zerop frac) (>= expo 0))
-              (if (minusp sign)
-                  (- (ash frac expo))
-                  (ash frac expo)))
-             (t
-              ;; expo < 0 and (2*m-1) and (2*m+1) are coprime to 2^(1-e),
-              ;; so build the fraction up immediately, without having to do
-              ;; a gcd.
-              (let ((a (build-ratio (- (* 2 frac) 1) (ash 1 (- 1 expo))))
-                    (b (build-ratio (+ (* 2 frac) 1) (ash 1 (- 1 expo))))
-                    (p0 0)
-                    (q0 1)
-                    (p1 1)
-                    (q1 0))
-                (do ((c (ceiling a) (ceiling a)))
-                    ((< c b)
-                     (let ((top (+ (* c p1) p0))
-                           (bot (+ (* c q1) q0)))
-                       (build-ratio (if (minusp sign)
-                                        (- top)
-                                        top)
-                                    bot)))
-                  (let* ((k (- c 1))
-                         (p2 (+ (* k p1) p0))
-                         (q2 (+ (* k q1) q0)))
-                    (psetf a (/ (- b k))
-                           b (/ (- a k)))
-                    (setf p0 p1
-                          q0 q1
-                          p1 p2
-                          q1 q2))))))))
+       ;; Normalize the significand if it's denormal
+       (let* ((shift (- (float-digits x) (integer-length frac)))
+              (frac (truly-the double-float-significand (ash frac shift)))
+              (expo (truly-the double-float-exponent (- expo shift))))
+         (cond ((or (zerop frac) (>= expo 0))
+                (if (minusp sign)
+                    (- (ash frac expo))
+                    (ash frac expo)))
+               (t
+                ;; expo < 0 and (2*m-1) and (2*m+1) are coprime to 2^(1-e),
+                ;; so build the fraction up immediately, without having to do
+                ;; a gcd.
+                (let ((a (build-ratio (- (* 2 frac) 1) (ash 1 (- 1 expo))))
+                      (b (build-ratio (+ (* 2 frac) 1) (ash 1 (- 1 expo))))
+                      (p0 0)
+                      (q0 1)
+                      (p1 1)
+                      (q1 0))
+                  (do ((c (ceiling a) (ceiling a)))
+                      ((< c b)
+                       (let ((top (+ (* c p1) p0))
+                             (bot (+ (* c q1) q0)))
+                         (build-ratio (if (minusp sign)
+                                          (- top)
+                                          top)
+                                      bot)))
+                    (let* ((k (- c 1))
+                           (p2 (+ (* k p1) p0))
+                           (q2 (+ (* k q1) q0)))
+                      (psetf a (/ (- b k))
+                             b (/ (- a k)))
+                      (setf p0 p1
+                            q0 q1
+                            p1 p2
+                            q1 q2)))))))))
     ((rational) x)))
 
 ;;; Unlike most interpreter stubs the definitions of which can be deferred
@@ -210,3 +131,22 @@
 ;;; the floating-point operation cache at the very start of warm build.
 (defun make-single-float (x) (make-single-float x))
 (defun make-double-float (hi lo) (make-double-float hi lo))
+
+;;; When all we want is the sign bit, there is a simpler way to extract it
+;;; than via either integer-decode-float or float-sign. Just shift the msb
+;;; over to the lsb position. FLOAT-SIGN produces some pretty horrific code
+;;; if the specific subtype of float is unnown:
+;;;  (minusp (float-sign x)) becomes (< (float-sign x) (float 0 x))
+;;; which ends up calling not only FLOAT-SIGN, but also FLOAT merely to cast
+;;; the integer 0 into a float of whatever type X is.
+(defun float-sign-bit (x)      ; return 1 or 0, literally the sign bit
+  (declare (explicit-check))
+  (number-dispatch ((x float))
+    ((single-float) (float-sign-bit x))
+    ((double-float) (float-sign-bit x))))
+
+(defun float-sign-bit-set-p (x)
+  (declare (explicit-check))
+  (number-dispatch ((x float))
+    ((single-float) (float-sign-bit-set-p x))
+    ((double-float) (float-sign-bit-set-p x))))

@@ -9,10 +9,6 @@
  * files for more information.
  */
 
-#ifndef GENCGC_IS_PRECISE
-#error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
-#endif
-
 /* Use AVX2 versions of code when we can, since blasting bytes faster
  * is always nice.
  * If used more widely, we should put these in runtime.h */
@@ -292,7 +288,7 @@ struct __attribute__((packed)) corefile_pte {
  *
  */
 extern unsigned char *gc_card_mark;
-extern long gc_card_table_mask;
+extern sword_t gc_card_table_mask;
 #define addr_to_card_index(addr) ((((uword_t)addr)>>GENCGC_CARD_SHIFT) & gc_card_table_mask)
 #define page_to_card_index(n) addr_to_card_index(page_address(n))
 

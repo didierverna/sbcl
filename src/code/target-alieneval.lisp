@@ -94,13 +94,45 @@ variable is undefined."
 (defmacro extern-alien (name type &environment env)
   "Access the alien variable named NAME, assuming it is of type TYPE.
 This is SETFable."
-  (let* ((alien-name (possibly-base-stringize
+  (let* ((name (if (and env (constantp name env)) (constant-form-value name env) name))
+         (alien-name (possibly-base-stringize
                       (etypecase name
                        (symbol (guess-alien-name-from-lisp-name name))
                        (string name))))
          (alien-type (parse-alien-type type env))
          (datap (not (alien-fun-type-p alien-type))))
     `(%alien-value (foreign-symbol-sap ,alien-name ,datap) 0 ',alien-type)))
+
+;;; Allow callback struct returns to signal that inner WITH-ALIEN
+;;; forms should defer *alien-stack-pointer* cleanup. When a callback
+;;; returns a struct by value, the struct is typically constructed
+;;; using WITH-ALIEN. Without this mechanism, the WITH-ALIEN cleanup
+;;; would run before the struct data is copied to the return area,
+;;; causing corruption.
+;;;
+;;; WITH-OUTER-ALIEN-STACK-CLEANUP establishes a lexical marker (via
+;;; symbol-macrolet) that WITH-ALIEN detects during its macroexpansion
+;;; using macroexpand-1.
+(defmacro with-outer-alien-stack-cleanup (&body body)
+  "Establish an outer *alien-stack-pointer* binding and signal to inner WITH-ALIEN
+   forms that they should skip their own cleanup. Used by callback struct returns."
+  `(symbol-macrolet ((%in-outer-alien-stack-cleanup-context% t))
+     (let ((sb-c:*alien-stack-pointer* sb-c:*alien-stack-pointer*))
+       ,@body)))
+
+#+(or x86-64 arm64)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun maybe-extract-alien-funcall-into (form alien-type var env)
+    "Transform (alien-funcall func args...) to (alien-funcall-into func sap args...).
+   Returns transformed form or NIL if not applicable."
+    (declare (ignore env))
+    ;; Form must be (alien-funcall func-expr args...)
+    (when (and (consp form)
+               (eq (car form) 'alien-funcall)
+               (alien-record-type-p alien-type))
+      (let ((func-expr (second form))
+            (args (cddr form)))
+        `(alien-funcall-into ,func-expr ,var ,@args)))))
 
 (defmacro with-alien (bindings &body body &environment env)
   "Establish some local alien variables. Each BINDING is of the form:
@@ -156,16 +188,28 @@ This is SETFable."
                            ,@body)))
                       (:local
                        (let* ((var (gensym "VAR"))
-                              (initval (if initial-value (gensym "INITVAL")))
                               (info (make-local-alien-info :type alien-type))
+                              ;; Try to optimize alien-funcall initializer
+                              (funcall-into-form
+                               #+(or x86-64 arm64)
+                               (and initial-value
+                                    (maybe-extract-alien-funcall-into
+                                     initial-value alien-type var env))
+                               #-(or x86-64 arm64)
+                               nil)
+                              (initval (if (and initial-value (not funcall-into-form))
+                                           (gensym "INITVAL")))
                               (inner-body
                                 `((note-local-alien-type ',info ,var)
                                   (symbol-macrolet ((,symbol (local-alien ',info ,var)))
-                                    ,@(when initial-value
-                                        `((setq ,symbol ,initval)))
-                                    ,@body)))
+                                    ,@(cond
+                                        (funcall-into-form
+                                         `(,funcall-into-form ,@body))
+                                        (initial-value
+                                         `((setq ,symbol ,initval) ,@body))
+                                        (t body)))))
                               (body-forms
-                                (if initial-value
+                                (if initval
                                     `((let ((,initval ,initial-value))
                                         ,@inner-body))
                                     inner-body)))
@@ -177,6 +221,15 @@ This is SETFable."
                            ,(append *new-auxiliary-types*
                                     (auxiliary-type-definitions env))))
          ,@(cond
+             ;; When in callback struct return context, skip the binding.
+             ;; The outer WITH-OUTER-ALIEN-STACK-CLEANUP already established
+             ;; a single *alien-stack-pointer* binding that will clean up all
+             ;; allocations after the struct is copied to the result area.
+             ;; Detect this by checking for the %in-outer-alien-stack-cleanup-context%
+             ;; symbol-macrolet marker in the lexical environment.
+             ((and bind-alien-stack-pointer
+                   (nth-value 1 (macroexpand-1 '%in-outer-alien-stack-cleanup-context% env)))
+              body)
              (bind-alien-stack-pointer
               ;; The LET IR1-translator will actually turn this into
               ;; RESTORING-NSP on #-c-stack-is-control-stack to avoid
@@ -729,6 +782,37 @@ type specifies the argument and result types."
          (apply stub alien args)))
       (t
        (error "~S is not an alien function." alien)))))
+
+#+(or x86-64 arm64)
+(defun alien-funcall-into (alien result-buffer &rest args)
+  "Call the foreign function ALIEN, writing the struct result to RESULT-BUFFER.
+RESULT-BUFFER should be a system-area-pointer to appropriately sized memory.
+Only supported on x86-64 and ARM64."
+  (declare (type alien-value alien)
+           (type system-area-pointer result-buffer))
+  (let ((type (alien-value-type alien)))
+    (unless (alien-fun-type-p type)
+      (error "~S is not an alien function." alien))
+    (unless (= (length (alien-fun-type-arg-types type))
+               (length args))
+      (error "wrong number of arguments for ~S~%expected ~W, got ~W"
+             type
+             (length (alien-fun-type-arg-types type))
+             (length args)))
+    (let ((stub (alien-fun-type-into-stub type)))
+      (unless stub
+        (setf stub
+              (let ((fun (gensym "FUN"))
+                    (buf (gensym "BUF"))
+                    (parms (make-gensym-list (length args))))
+                (compile nil
+                         `(lambda (,fun ,buf ,@parms)
+                            (declare (optimize (sb-c:insert-step-conditions 0)))
+                            (declare (type (alien ,(unparse-alien-type type)) ,fun))
+                            (declare (type system-area-pointer ,buf))
+                            (alien-funcall-into ,fun ,buf ,@parms)))))
+        (setf (alien-fun-type-into-stub type) stub))
+      (apply stub alien result-buffer args))))
 
 (defmacro define-alien-routine (name result-type
                                      &rest args

@@ -31,12 +31,14 @@
 ;; in the relevant files)?
 ;; -- didier
 
+(defun canonical-docstring (s) (if s (possibly-base-stringize s)))
+
 (defun random-documentation (name type)
   (cdr (assoc type (info :random-documentation :stuff name))))
 
 (defun (setf random-documentation) (new-value name type)
   (let ((pair (assoc type (info :random-documentation :stuff name)))
-        (new-value (possibly-base-stringize new-value)))
+        (new-value (canonical-docstring new-value)))
     (if pair
         (setf (cdr pair) new-value)
         (push (cons type new-value)

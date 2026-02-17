@@ -649,13 +649,26 @@ conservative_stack_scan(struct thread* th,
     }
 #  endif
 # elif defined(LISP_FEATURE_SB_THREAD)
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    lispobj* csp = th->control_stack_pointer;
+    if (csp)
+      esp = (void*) csp;
+#endif
+
     int i;
     for (i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th))-1; i>=0; i--) {
         os_context_t *c = nth_interrupt_context(i, th);
-        visit_context_registers(context_method, c, (void*)1);
-        lispobj* esp1 = (lispobj*) *os_context_register_addr(c,reg_SP);
-        if (esp1 >= th->control_stack_start && esp1 < th->control_stack_end && (void*)esp1 < esp)
-            esp = esp1;
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        if (c) // can be partially initialized due to a signal into a foreign call
+#endif
+        {
+            visit_context_registers(context_method, c, (void*)1);
+            lispobj* esp1 = (lispobj*) *os_context_register_addr(c,reg_SP);
+            if (esp1 >= th->control_stack_start && esp1 < th->control_stack_end && (void*)esp1 < esp)
+                esp = esp1;
+        }
     }
     if (th == get_sb_vm_thread()) {
         if ((void*)cur_thread_approx_stackptr < esp) esp = cur_thread_approx_stackptr;
@@ -910,7 +923,14 @@ garbage_collect_generation(generation_index_t generation, int raise,
     }
 #endif
 
-
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    /* Signal handlers might run concurrently with the GC */
+    for (int i = 0; i < NSIG; i++) {
+        lispobj fun = lisp_sig_handlers[i];
+        if(functionp(fun))
+            pin_exact_root(fun);
+    }
+#endif
     /* Scavenge all the rest of the roots. */
 
 #if GENCGC_IS_PRECISE
@@ -937,7 +957,16 @@ garbage_collect_generation(generation_index_t generation, int raise,
         /* Scrub the unscavenged control stack space, so that we can't run
          * into any stale pointers in a later GC (this is done by the
          * stop-for-gc handler in the other threads). */
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        for_each_thread(th) {
+            /* Threads stopped by gc_stop_the_world scrub the stack on
+             * their own in sig_stop_for_gc_handler. */
+            if (csp_around_foreign_call(th) != 0)
+                scrub_thread_control_stack(th);
+        }
+#else
         scrub_control_stack();
+#endif
 # endif
     }
 #endif
@@ -951,6 +980,10 @@ garbage_collect_generation(generation_index_t generation, int raise,
     {
         struct thread *th;
         for_each_thread(th) {
+            /* FIXME: we don't require that binding stack values pin their referents.
+             * Nor are they ambiguous pointers, so I'm not sure why this mentions preservation
+             * and/or ambiguity. Was it an abundance of caution when developing incremental
+             * compaction, was something failing, or it just a mistake ? */
             scav_binding_stack((lispobj*)th->binding_stack_start,
                                (lispobj*)get_binding_stack_pointer(th),
                                mr_preserve_ambiguous);
@@ -958,6 +991,12 @@ garbage_collect_generation(generation_index_t generation, int raise,
             lispobj* from = &th->lisp_thread;
             lispobj* to = (lispobj*)(SymbolValue(FREE_TLS_INDEX,0) + (char*)th);
             sword_t nwords = to - from;
+            /* FIXME: as above, why is this "preserving" pointers in the TLS range
+             * instead of just marking them as live when it's OK to move them?
+             * But note that mr_preserve_range doesn't actually manipulate gc_page_pins,
+             * which is odd because "preserve" as used elsewhere implies livening and pinning
+             * objects which would otherwise not be pinned.
+             * Could this be an incompatible use of the term "preserve"? */
             mr_preserve_range(from, nwords);
         }
     }
@@ -1281,7 +1320,7 @@ gc_init(void)
 }
 
 int gc_card_table_nbits;
-long gc_card_table_mask;
+sword_t gc_card_table_mask;
 
 
 /*
@@ -1369,8 +1408,7 @@ lisp_alloc(__attribute__((unused)) int flags,
 #if !(defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 \
       || defined LISP_FEATURE_SPARC || defined LISP_FEATURE_WIN32)
     extern void allocator_record_backtrace(void*, struct thread*);
-    if (page_type != PAGE_TYPE_CODE && gencgc_alloc_profiler
-        && thread->state_word.sprof_enable)
+    if (page_type != PAGE_TYPE_CODE && gencgc_alloc_profiler && thread->sprof_enable)
         allocator_record_backtrace(__builtin_frame_address(0), thread);
 #endif
 

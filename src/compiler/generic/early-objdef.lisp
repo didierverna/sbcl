@@ -209,8 +209,8 @@
   simple-fun-widetag                              ;  3A   41
   closure-widetag                                 ;  3E   45
 
-  #-(or x86 x86-64 arm64 riscv) return-pc-widetag ;  42   49
-  #+(or x86 x86-64 arm64 riscv) lra-widetag-notused
+  #-(or x86 x86-64 arm64 riscv loongarch64) return-pc-widetag ;  42   49
+  #+(or x86 x86-64 arm64 riscv loongarch64) lra-widetag-notused
 
   value-cell-widetag                              ;  46   4D
   character-widetag                               ;  4A   51
@@ -292,7 +292,7 @@
 
 ;;; Map each widetag symbol to a string to go in 'tagnames.h'.
 ;;; I didn't want to mess with the formatting of the table above.
-(defparameter *widetag-string-alist*
+(define-load-time-global *widetag-string-alist*
   `((bignum-widetag "bignum")
     (ratio-widetag "ratio")
     (single-float-widetag "sfloat")

@@ -240,7 +240,8 @@
 (defun generate-code (component &aux (ir2-component (component-info component)))
   (declare (type ir2-component ir2-component))
   (when *compiler-trace-output*
-    (let ((*print-pretty* nil)) ; force 1 line
+    (let ((*print-pretty* nil)          ; force 1 line
+          (*print-readably*))
       (format *compiler-trace-output* "~|~%assembly code for ~S~2%" component)))
   (let* ((prev-env nil)
          (sb-vm::*adjustable-vectors* nil)
@@ -306,9 +307,11 @@
                    (setf vop (vop-next vop)))
                   (t
                    (funcall gen vop)))))))
-
-    (when *do-instcombine-pass*
-      #+(or arm64 x86-64)
+    #+(or arm64 x86-64)
+    (when (and *do-instcombine-pass*
+               (policy (block-home-lambda
+                        (block-next (component-head component)))
+                   (>= speed compilation-speed)))
       (sb-assem::combine-instructions (asmstream-code-section asmstream)))
 
     (emit (asmstream-data-section asmstream)

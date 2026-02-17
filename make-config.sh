@@ -398,7 +398,7 @@ case $uname_arch in
     amd64) guessed_sbcl_arch=x86-64 ;;
     sparc*) guessed_sbcl_arch=sparc ;;
     sun*) guessed_sbcl_arch=sparc ;;
-    *ppc) guessed_sbcl_arch=ppc ;;
+    *powerpc|*ppc) guessed_sbcl_arch=ppc ;;
     ppc64) guessed_sbcl_arch=ppc ;;
     ppc64le) guessed_sbcl_arch=ppc64 ;; # is ok because there was never 32-bit LE
     Power*Macintosh) guessed_sbcl_arch=ppc ;;
@@ -409,6 +409,7 @@ case $uname_arch in
     aarch64) guessed_sbcl_arch=arm64 ;;
     riscv32) guessed_sbcl_arch=riscv xlen=32;;
     riscv64) guessed_sbcl_arch=riscv xlen=64;;
+    loongarch64) guessed_sbcl_arch=loongarch64;;
     *)
         # If we're not building on a supported target architecture, we
         # we have no guess, but it's not an error yet, since maybe
@@ -431,6 +432,16 @@ fi
 # Under NetBSD, uname -m returns "evbarm" even if CPU is arm64.
 if [ "$sbcl_os" = "netbsd" ] && [ `uname -p` = "aarch64" ]; then
     guessed_sbcl_arch=arm64
+fi
+
+# Under FreeBSD, uname -m returns "powerpc" even if CPU is powerpc64.
+if [ "$sbcl_os" = "freebsd" ] && [ `uname -p` = "powerpc64" ]; then
+    guessed_sbcl_arch=ppc64
+fi
+
+# Under FreeBSD, uname -m returns "powerpc" even if CPU is powerpc64le.
+if [ "$sbcl_os" = "freebsd" ] && [ `uname -p` = "powerpc64le" ]; then
+    guessed_sbcl_arch=ppc64
 fi
 
 echo //setting up CPU-architecture-dependent information
@@ -485,7 +496,7 @@ if $fancy
 then
     # If --fancy, enable threads on platforms where they can be built.
     case $sbcl_arch in
-        x86|x86-64|ppc|arm64|riscv)
+        x86|x86-64|ppc|arm64|riscv|loongarch64)
 	    if [ "$sbcl_os" = "dragonflybsd" ]
 	    then
 		echo "No threads on this platform."
@@ -507,7 +518,7 @@ else
             esac
     esac
     case $sbcl_arch in
-        arm64|riscv)
+        arm64|riscv|loongarch64)
             WITH_FEATURES="$WITH_FEATURES :sb-thread"
     esac
 fi
@@ -561,6 +572,11 @@ rm -f sbcl.mk sbcl.o libsbcl.a
 # of the shell script, though. -- CSR, 2002-02-03
 link_or_copy $sbcl_arch-arch.h target-arch.h
 link_or_copy $sbcl_arch-lispregs.h target-lispregs.h
+case "$sbcl_os" in # all but 2 unconditionally have clock-gettime
+    darwin) ;;
+    win32) ;;
+    *) printf ' :os-provides-clock-gettime' >> $ltf ;;
+esac
 case "$sbcl_os" in
     linux)
         printf ' :unix :linux :elf' >> $ltf
@@ -638,10 +654,12 @@ case "$sbcl_os" in
         darwin_version=`uname -r`
         darwin_version_major=${DARWIN_VERSION_MAJOR:-${darwin_version%%.*}}
         if (( 10 > $darwin_version_major )) || [ $sbcl_arch = "ppc" ]; then
-            printf ' :use-darwin-posix-semaphores :avoid-pthread-setname-np' >> $ltf
+            printf ' :use-darwin-posix-semaphores' >> $ltf
+        else
+            printf ' :os-provides-pthread-setname-np' >> $ltf
         fi
-        if (( 15 > $darwin_version_major )); then
-            printf ' :avoid-clock-gettime' >> $ltf
+        if (( $darwin_version_major >= 15 )); then
+            printf ' :os-provides-clock-gettime' >> $ltf
         fi
         if [ $sbcl_arch = "x86-64" ]; then
             if (( 8 < $darwin_version_major )); then
@@ -676,6 +694,16 @@ case "$sbcl_os" in
         printf ' :os-provides-dlopen' >> $ltf
         printf ' :sb-thread :sb-safepoint' >> $ltf
         #
+        case "$sbcl_arch" in
+            arm64)
+                ;;
+            x86 | x86-64)
+                ;;
+            *)
+                echo "unsupported architecture for win32: $sbcl_arch"
+                exit 1
+                ;;
+        esac
         link_or_copy Config.$sbcl_arch-win32 Config
         link_or_copy $sbcl_arch-win32-os.h target-arch-os.h
         link_or_copy win32-os.h target-os.h
@@ -747,6 +775,8 @@ case "$sbcl_arch" in
         echo 'Architecture word width unspecified. (Either 32-bit or 64-bit.)'
         exit 1
     fi
+    ;;
+  loongarch64)
     ;;
 esac
 

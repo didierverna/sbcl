@@ -106,8 +106,10 @@
 (defmacro int-syscall ((name &rest arg-types) &rest args)
   `(syscall (,(libc-name-for name) ,@arg-types) (values result 0) ,@args))
 
-(defmacro type-syscall ((name return-type &rest arg-types) &rest args)
-  `(syscall-type (,(libc-name-for name) ,return-type ,@arg-types) (values result 0) ,@args))
+(defmacro type-syscall ((name return-type lisp-return-type &rest arg-types) &rest args)
+  `(syscall-type (,(libc-name-for name) ,return-type ,@arg-types)
+                 (values (truly-the ,lisp-return-type result) 0)
+                 ,@args))
 
 (defmacro with-restarted-syscall ((&optional (value (gensym))
                                              (errno (gensym)))
@@ -123,18 +125,18 @@ SYSCALL-FORM. Repeat evaluation of SYSCALL-FORM if it is interrupted."
 
 (defmacro void-syscall ((name &rest arg-types) &rest args)
   `(syscall (,name ,@arg-types) (values t 0) ,@args))
-
-#+win32
-(progn
-  (defconstant espipe 29))
 
 ;;;; hacking the Unix environment
 
 #-win32
-(define-alien-routine ("getenv" posix-getenv) c-string
+(progn
+ (declaim (ftype (function (t) (values (or simple-string null) &optional))
+                 posix-getenv))
+ (defun posix-getenv (name)
   "Return the \"value\" part of the environment string \"name=value\" which
 corresponds to NAME, or NIL if there is none."
-  (name (c-string :not-null t)))
+  (with-alien ((posix-getenv (function c-string (c-string :not-null t)) :extern "getenv"))
+    (acond ((alien-funcall posix-getenv name) (possibly-base-stringize it))))))
 
 ;;; from stdio.h
 
@@ -328,9 +330,11 @@ corresponds to NAME, or NIL if there is none."
 (defun unix-read (fd buf len)
   (declare (type unix-fd fd)
            (type index len))
+  (declare (system-area-pointer buf))
+  (declare (inline get-errno))
   (type-syscall (#-win32 "read" #+win32 "win32_unix_read"
-                 ssize-t
-                 int (* char) size-t)
+                 ssize-t index
+                 int system-area-pointer size-t)
                 fd buf
                 (min len
                      #+(or darwin freebsd)
@@ -340,29 +344,22 @@ corresponds to NAME, or NIL if there is none."
 ;;; length to write. It attempts to write len bytes to the device
 ;;; associated with fd from the buffer starting at offset. It returns
 ;;; the actual number of bytes written.
+;;; If BUF is a string, is does *NOT* undergo external-format encoding.
 (defun unix-write (fd buf offset len)
-  ;; KLUDGE: change 60fa88b187e438cc made this function unusable in cold-init
-  ;; if compiled with #+sb-show (which increases DEBUG to 2) because of
-  ;; full calls to SB-ALIEN-INTERNALS:DEPORT-ALLOC and DEPORT.
-  (declare (optimize (debug 1)))
   (declare (type unix-fd fd)
            (type index offset len))
-  (flet ((%write (sap)
-           (declare (system-area-pointer sap))
-           (type-syscall (#-win32 "write" #+win32 "win32_unix_write"
-                          ssize-t int (* char) size-t)
-                         fd
-                         (with-alien ((ptr (* char) sap))
-                           (addr (deref ptr offset)))
-                         (min len
-                              #+(or darwin freebsd)
-                              (1- (expt 2 31))))))
-    (etypecase buf
-      ((simple-array * (*))
-       (with-pinned-objects (buf)
-         (%write (vector-sap buf))))
-      (system-area-pointer
-       (%write buf)))))
+  (declare (type (or (sb-kernel:simple-unboxed-array (*)) system-area-pointer) buf))
+  (declare (inline get-errno))
+  ;; Pinning unconditionally allows the guts of this function to be relatively
+  ;; straight-line versus an ETYPECASE over two calls to a local function
+  ;; taking a SAP. It's no big deal if BUF is already a SAP.
+  (with-pinned-objects (buf)
+    (type-syscall (#-win32 "write" #+win32 "win32_unix_write"
+                   ssize-t index
+                   int system-area-pointer size-t)
+                  fd
+                  (sap+ (if (system-area-pointer-p buf) buf (vector-sap buf)) offset)
+                  (min len #+(or darwin freebsd) (1- (expt 2 31))))))
 
 ;;; Set up a unix-piping mechanism consisting of an input pipe and an
 ;;; output pipe. Return two values: if no error occurred the first
@@ -394,11 +391,10 @@ corresponds to NAME, or NIL if there is none."
 ;;; corresponding Lisp string (or return NIL if the pointer is a C NULL).
 (defun newcharstar-string (newcharstar)
   (declare (type (alien (* char)) newcharstar))
-  (if (null-alien newcharstar)
-      nil
-      (prog1
-          (cast newcharstar c-string)
-        (free-alien newcharstar))))
+  (unless (null-alien newcharstar)
+    (possibly-base-stringize
+      (prog1 (cast newcharstar c-string)
+        (free-alien newcharstar)))))
 
 ;;; Return the Unix current directory as a SIMPLE-STRING, in the
 ;;; style returned by getcwd() (no trailing slash character).
@@ -442,7 +438,10 @@ corresponds to NAME, or NIL if there is none."
 ;;; Return the Unix current directory as a SIMPLE-STRING terminated
 ;;; by a slash character.
 (defun posix-getcwd/ ()
-  (concatenate 'string (posix-getcwd) "/"))
+  (let ((str (the simple-string (posix-getcwd))))
+    (if (typep str 'base-string)
+        (concatenate 'base-string str "/")
+        (concatenate 'string str "/"))))
 
 ;;; Duplicate an existing file descriptor (given as the argument) and
 ;;; return it. If FD is not a valid file descriptor, NIL and an error
@@ -526,6 +525,10 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 (defun unix-realpath (path)
   (declare (type unix-pathname path))
+  ;; KLUDGE: change 60fa88b187e438cc made this function unusable in cold-init
+  ;; if compiled with #+sb-show (which increases DEBUG to 2) because of
+  ;; full calls to SB-ALIEN-INTERNALS:DEPORT-ALLOC and DEPORT.
+  (declare (optimize (debug 1)))
   (with-alien ((ptr (* char)
                     (alien-funcall (extern-alien
                                     "sb_realpath"
@@ -995,12 +998,9 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 ;;; UNIX specific code, that has been cleanly separated from the
 ;;; Windows build.
-#-win32
+#+os-provides-clock-gettime
 (progn
-
-  #-avoid-clock-gettime
   (declaim (inline clock-gettime))
-  #-avoid-clock-gettime
   (defun clock-gettime (clockid)
     (declare (type (signed-byte 32) clockid))
     (with-alien ((ts (struct timespec)))
@@ -1011,8 +1011,10 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
       ;; can express 1E11 years in seconds.
       (values #+64-bit (truly-the fixnum (slot ts 'tv-sec))
               #-64-bit (slot ts 'tv-sec)
-              (truly-the (integer 0 #.(expt 10 9)) (slot ts 'tv-nsec)))))
+              (truly-the (integer 0 #.(expt 10 9)) (slot ts 'tv-nsec))))))
 
+#+unix
+(progn
   (declaim (inline get-time-of-day))
   (defun get-time-of-day ()
     "Return the number of seconds and microseconds since the beginning of
@@ -1035,10 +1037,10 @@ the UNIX epoch (January 1st 1970.)"
           ;; By scaling down we end up with far less resolution than clock-realtime
           ;; offers, and COARSE is about twice as fast, so use that, but only for linux.
           ;; BSD has something similar.
-          #-avoid-clock-gettime
-        (clock-gettime #+linux clock-monotonic-coarse #-linux clock-monotonic)
-        #+avoid-clock-gettime
-        (multiple-value-bind (c-sec c-usec) (get-time-of-day) (values c-sec (* c-usec 1000)))
+          #+os-provides-clock-gettime
+          (clock-gettime #+linux clock-monotonic-coarse #-linux clock-monotonic)
+          #-os-provides-clock-gettime
+          (multiple-value-bind (c-sec c-usec) (get-time-of-day) (values c-sec (* c-usec 1000)))
 
         #+64-bit ;; I know that my math is valid for 64-bit.
         (declare (optimize (sb-c::type-check 0)))
@@ -1090,13 +1092,13 @@ the UNIX epoch (January 1st 1970.)"
 
   ;; SunOS defines CLOCK_PROCESS_CPUTIME_ID but you get EINVAL if you try to use it,
   ;; also use the same trick when clock_gettime should be avoided.
-  #-(or sunos avoid-clock-gettime)
+  #+(and os-provides-clock-gettime (not sunos))
   (defun system-internal-run-time ()
     (multiple-value-bind (sec nsec) (clock-gettime clock-process-cputime-id)
       (+ (* sec internal-time-units-per-second)
          (floor (+ nsec (floor nanoseconds-per-internal-time-unit 2))
                 nanoseconds-per-internal-time-unit))))
-  #+(or sunos avoid-clock-gettime)
+  #-(and os-provides-clock-gettime (not sunos))
   (defun system-internal-run-time ()
     (multiple-value-bind (utime-sec utime-usec stime-sec stime-usec)
         (with-alien ((usage (struct sb-unix::rusage)))
@@ -1169,3 +1171,6 @@ the UNIX epoch (January 1st 1970.)"
   (alien-funcall
    (extern-alien "sb_dirent_name" (function c-string system-area-pointer))
    ent))
+
+(push '("SB-UNIX" unix-opendir unix-readdir unix-closedir unix-dirent-name)
+      *!removable-symbols*)

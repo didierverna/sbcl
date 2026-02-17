@@ -83,6 +83,8 @@ typedef WCHAR console_char;
 typedef CHAR console_char;
 #endif
 
+int sb_GetTID() { return GetCurrentThreadId(); }
+
 /* The exception handling function looks like this: */
 EXCEPTION_DISPOSITION handle_exception(EXCEPTION_RECORD *,
                                        struct lisp_exception_frame *,
@@ -113,7 +115,14 @@ static void set_seh_frame(void *frame)
 
 void alloc_gc_page()
 {
-#ifndef LISP_FEATURE_64_BIT // 64-bit uses the page below the card mark table
+#ifdef LISP_FEATURE_ARM64
+    // ARM64: safepoint page address is reserved by the address space layout
+    // (parms.lisp), but needs to be committed. Use MEM_COMMIT only.
+    gc_assert(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
+                           MEM_COMMIT, PAGE_READWRITE));
+#elif !defined(LISP_FEATURE_64_BIT)
+    // 32-bit: reserve and commit safepoint page.
+    // 64-bit x86-64: allocated as part of static space (extra_above in x86-64-arch.c).
     gc_assert(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                            MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
 #endif
@@ -142,16 +151,20 @@ void alloc_gc_page()
  */
 void map_gc_page()
 {
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
     DWORD oldProt;
     gc_assert(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                              PAGE_READWRITE, &oldProt));
+#endif
 }
 
 void unmap_gc_page()
 {
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
     DWORD oldProt;
     gc_assert(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                              PAGE_NOACCESS, &oldProt));
+#endif
 }
 
 uint32_t os_get_build_time_shared_libraries(uint32_t excl_maximum,
@@ -733,7 +746,6 @@ void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
     DWORD old_prot;
-
     DWORD new_prot = os_protect_modes[prot];
     gc_assert(VirtualProtect(address, length, new_prot, &old_prot)||
               (VirtualAlloc(address, length, MEM_COMMIT, new_prot) &&
@@ -748,16 +760,19 @@ extern int internal_errors_enabled;
 
 extern void exception_handler_wrapper();
 
-#ifdef LISP_FEATURE_X86
+#if defined(LISP_FEATURE_X86)
 #define voidreg(ctxptr,name) ((void*)((ctxptr)->E##name))
-#else
+#elif defined(LISP_FEATURE_X86_64)
 #define voidreg(ctxptr,name) ((void*)((ctxptr)->R##name))
+#else // ARM64 and others. Stub out for now.
+#define voidreg(ctxptr,name) (0)
 #endif
 
 
 static int
 handle_single_step(os_context_t *ctx)
 {
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     if (!single_stepping)
         return -1;
 
@@ -766,19 +781,48 @@ handle_single_step(os_context_t *ctx)
     restore_breakpoint_from_single_step(ctx);
 
     return 0;
+#else
+    return -1;
+#endif
 }
 
-#ifdef LISP_FEATURE_UD2_BREAKPOINTS
-#define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_ILLEGAL_INSTRUCTION
-#define TRAP_CODE_WIDTH 2
-#else
-#define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_BREAKPOINT
-#define TRAP_CODE_WIDTH 1
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+  #ifdef LISP_FEATURE_UD2_BREAKPOINTS
+    #define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_ILLEGAL_INSTRUCTION
+    #define TRAP_CODE_WIDTH 2
+  #else
+    #define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_BREAKPOINT
+    #define TRAP_CODE_WIDTH 1
+  #endif
+#elif defined(LISP_FEATURE_ARM64)
+  // On Windows ARM64, BRK instructions trigger EXCEPTION_ILLEGAL_INSTRUCTION, not EXCEPTION_BREAKPOINT
+  #define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_ILLEGAL_INSTRUCTION
+  #define TRAP_CODE_WIDTH 4 // ARM breakpoint instruction is 4 bytes
 #endif
 
 static int
 handle_breakpoint_trap(os_context_t *ctx, struct thread* self)
 {
+#if defined(LISP_FEATURE_ARM64)
+    uint32_t trap_instruction = *(uint32_t *)OS_CONTEXT_PC(ctx);
+    unsigned int trap;
+
+    // Check for BRK instruction format used by SBCL. The high bits are
+    // 11010100001, which is 0x6a1.
+    if ((trap_instruction >> 21) == 0x6a1) {
+        // Extract 8-bit trap code from bits 5..12 (matching sigtrap_handler on Linux)
+        trap = (trap_instruction >> 5) & 0xFF;
+    } else {
+        // Not a recognized SBCL trap, could be a debugger breakpoint
+        // or a real illegal instruction. Let other handlers deal with it.
+        return -1;
+    }
+
+    /* On ARM64, do NOT advance PC past the BRK instruction here.
+     * The Lisp-side internal-error-args reads the BRK instruction from
+     * the context PC to decode error number and arguments.
+     * PC will be advanced by arch_skip_instruction after error handling. */
+#else /* Not ARM64 */
 #ifdef LISP_FEATURE_UD2_BREAKPOINTS
     if (((unsigned short *)OS_CONTEXT_PC(ctx))[0] != 0x0b0f)
         return -1;
@@ -791,28 +835,34 @@ handle_breakpoint_trap(os_context_t *ctx, struct thread* self)
     /* Now EIP points just after the INT3 byte and aims at the
      * 'kind' value (eg trap_Cerror). */
     unsigned trap = *(unsigned char *)OS_CONTEXT_PC(ctx);
+#endif
 
     /* Before any other trap handler: gc_safepoint ensures that
        inner alloc_sap for passing the context won't trap on
        pseudo-atomic. */
     /* Now that there is no alloc_sap, I don't know what happens here. */
     if (trap == trap_PendingInterrupt) {
-        /* Done everything needed for this trap, except EIP
-           adjustment */
+        /* Advance PC past the trap instruction and any trailing data. */
         arch_skip_instruction(ctx);
+#ifdef LISP_FEATURE_ARM64
+        fake_foreign_function_call(ctx);
+#endif
         thread_interrupted(ctx);
+#ifdef LISP_FEATURE_ARM64
+        undo_fake_foreign_function_call(ctx);
+#endif
         return 0;
     }
 
+#ifndef LISP_FEATURE_ARM64
     /* This is just for info in case the monitor wants to print an
      * approximation. */
-    access_control_stack_pointer(self) =
-        (lispobj *)*os_context_sp_addr(ctx);
+    access_control_stack_pointer(self) = (lispobj *)*os_context_sp_addr(ctx);
+#endif
 
     WITH_GC_AT_SAFEPOINTS_ONLY() {
-        block_blockable_signals(&ctx->sigmask);
+        block_blockable_signals(0);
         handle_trap(ctx, trap);
-        thread_sigmask(SIG_SETMASK,&ctx->sigmask,NULL);
     }
 
     /* Done, we're good to go! */
@@ -838,9 +888,9 @@ handle_access_violation(os_context_t *ctx,
              win32_context->Edi,
              fault_address,
              exception_record->ExceptionInformation[0]);
-#else
+#elif defined(LISP_FEATURE_X86_64)
     odxprint(pagefaults,
-             "SEGV. ThSap %p, Eip %p, Esp %p, Esi %p, Edi %p, "
+             "SEGV. ThSap %p, Rip %p, Rsp %p, Rsi %p, Rdi %p, "
              "Addr %p Access %d\n",
              self,
              win32_context->Rip,
@@ -849,15 +899,34 @@ handle_access_violation(os_context_t *ctx,
              win32_context->Rdi,
              fault_address,
              exception_record->ExceptionInformation[0]);
+#elif defined(LISP_FEATURE_ARM64)
+    odxprint(pagefaults,
+             "SEGV. ThSap %p, Pc %p, Sp %p, "
+             "Addr %p Access %d\n",
+             self,
+             win32_context->Pc,
+             win32_context->Sp,
+             fault_address,
+             exception_record->ExceptionInformation[0]);
 #endif
 
     /* Safepoint pages */
     if (fault_address == (void *) GC_SAFEPOINT_TRAP_ADDR) {
+#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+        /* x86/x86-64: set_csp_from_context arranges for the conservative
+         * stack scan to cover the CONTEXT, so register values are found. */
         thread_in_lisp_raised(ctx);
+#else
+        /* ARM64: separate control and C stacks.  The register context must
+         * be explicitly saved so that GC can scan Lisp register values. */
+        fake_foreign_function_call(ctx);
+        thread_in_lisp_raised(ctx);
+        undo_fake_foreign_function_call(ctx);
+#endif
         return 0;
     }
 
-    if ((1+THREAD_HEADER_SLOTS)+(lispobj*)fault_address == (lispobj*)self) {
+    if (1+(lispobj*)fault_address == (lispobj*)self) {
         thread_in_safety_transition(ctx);
         return 0;
     }
@@ -865,7 +934,15 @@ handle_access_violation(os_context_t *ctx,
     /* dynamic space */
     page_index_t page = find_page_index(fault_address);
 #ifdef LISP_FEATURE_SOFT_CARD_MARKS
-    if (page >= 0) lose("should not get access violation in dynamic space %p", fault_address);
+    if (page >= 0) {
+        /* With soft card marks, pages are never write-protected, so a
+         * dynamic space access violation means the page needs committing.
+         * (Windows reserves the full dynamic space but only commits pages
+         * on demand or via prepare_pages/gc_alloc_large.) */
+        os_commit_memory(PTR_ALIGN_DOWN(fault_address, os_vm_page_size),
+                         os_vm_page_size);
+        return 0;
+    }
 #else
     if (page != -1 && !PAGE_WRITEPROTECTED_P(page)) {
         os_commit_memory(PTR_ALIGN_DOWN(fault_address, os_vm_page_size),
@@ -911,22 +988,24 @@ signal_internal_error_or_lose(os_context_t *ctx,
         /* The exception system doesn't automatically clear pending
          * exceptions, so we lose as soon as we execute any FP
          * instruction unless we do this first. */
+        #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
         asm("fnclex");
+#endif
         /* We're making the somewhat arbitrary decision that having
          * internal errors enabled means that lisp has sufficient
          * marbles to be able to handle exceptions, but exceptions
          * aren't supposed to happen during cold init or reinit
          * anyway. */
-
-        block_blockable_signals(&ctx->sigmask);
+        sigset_t oldmask;
+        block_blockable_signals(&oldmask);
         fake_foreign_function_call(ctx);
 
         WITH_GC_AT_SAFEPOINTS_ONLY() {
             DX_ALLOC_SAP(context_sap, ctx);
             DX_ALLOC_SAP(exception_record_sap, exception_record);
-            thread_sigmask(SIG_SETMASK, &ctx->sigmask, NULL);
+            thread_sigmask(SIG_SETMASK, &oldmask, NULL);
 
-#ifdef LISP_FEATURE_X86_64
+#if defined(LISP_FEATURE_X86_64)
             asm("fninit");
 #endif
 
@@ -937,7 +1016,6 @@ signal_internal_error_or_lose(os_context_t *ctx,
         }
         /* If Lisp doesn't nlx, we need to put things back. */
         undo_fake_foreign_function_call(ctx);
-        thread_sigmask(SIG_SETMASK, &ctx->sigmask, NULL);
         /* FIXME: HANDLE-WIN32-EXCEPTION should be allowed to decline */
         return;
     }
@@ -1001,6 +1079,7 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
     /* For EXCEPTION_ACCESS_VIOLATION only. */
     void *fault_address = (void *)exception_record->ExceptionInformation[1];
 
+    #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     odxprint(seh,
              "SEH: rec %p, ctxptr %p, rip %p, fault %p\n"
              "... code %p, rcx %p, fp-tags %p\n\n",
@@ -1011,6 +1090,15 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
              (void*)(intptr_t)code,
              voidreg(win32_context,cx),
              win32_context->FloatSave.TagWord);
+#else // ARM64
+    odxprint(seh,
+             "SEH: rec %p, ctxptr %p, pc %p, fault %p, code %p\n\n",
+             exception_record,
+             win32_context,
+             (void*)win32_context->Pc,
+             fault_address,
+             (void*)(intptr_t)code);
+#endif
 
     /* This function had become unwieldy.  Let's cut it down into
      * pieces based on the different exception codes.  Each exception
@@ -1055,8 +1143,10 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
         /* All else failed, drop through to the lisp-side exception handler. */
         signal_internal_error_or_lose(ctx, exception_record, fault_address);
 
-    if (self)
+    if (self) {
         thread_extra_data(self)->carried_base_pointer = oldbp;
+        thread_extra_data(self)->blocked_signal_set = context.sigmask;
+    }
 
     errno = lastErrno;
     SetLastError(lastError);
@@ -1091,7 +1181,7 @@ handle_exception(EXCEPTION_RECORD *exception_record,
     return handle_exception_ex(exception_record, exception_frame, win32_context, FALSE);
 }
 
-#ifdef LISP_FEATURE_X86_64
+#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
 
 #define RESTORING_ERRNO()                                       \
     int sbcl__lastErrno = errno;                                \
@@ -1117,7 +1207,11 @@ veh(EXCEPTION_POINTERS *ep)
             return EXCEPTION_CONTINUE_SEARCH;
     }
 
+#if defined(LISP_FEATURE_X86_64)
     DWORD64 rip = ep->ContextRecord->Rip;
+#elif defined(LISP_FEATURE_ARM64)
+    DWORD64 rip = ep->ContextRecord->Pc;
+#endif
     long int code = ep->ExceptionRecord->ExceptionCode;
     BOOL from_lisp =
         (rip >= DYNAMIC_SPACE_START && rip < DYNAMIC_SPACE_START+dynamic_space_size) ||
@@ -1164,7 +1258,7 @@ wos_install_interrupt_handlers
     handler->next_frame = get_seh_frame();
     handler->handler = (void*)exception_handler_wrapper;
     set_seh_frame(handler);
-#else
+#elif defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
     static int once = 0;
     if (!once++)
         AddVectoredExceptionHandler(1,veh);
@@ -1871,12 +1965,6 @@ int sb_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
     }
   }
   return 0;
-}
-
-int sb_pthr_kill(struct thread* thread, int signum)
-{
-    __sync_fetch_and_or(&thread_extra_data(thread)->pending_signal_set, 1<<signum);
-    return 0;
 }
 
 /* Signals */

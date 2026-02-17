@@ -153,11 +153,10 @@
                 (return-from fun-lexically-notinline-p
                   (eq (defined-fun-inlinep fun) 'notinline)))
               (loop for data in (lexenv-user-data env)
-                    when (and (eq (car data) 'no-compiler-macro)
-                              (eq (cdr data) name))
+                    when (and (eq (first data) 'compiler-macro)
+                              (eq (second data) name))
                     do
-                    (return-from fun-lexically-notinline-p
-                      t)))))))
+                    (return-from fun-lexically-notinline-p (eq (third data) 'notinline))))))))
     ;; If ANSWER is NIL, go for the global value
     (eq (or answer (info :function :inlinep name)) 'notinline)))
 
@@ -242,14 +241,16 @@
 ;;; names a macro or special form, then we error out using the
 ;;; supplied context which indicates what we were trying to do that
 ;;; demanded a function.
-(declaim (ftype (sfunction (t string) global-var) find-free-fun))
-(defun find-free-fun (name context &aux (free-funs (free-funs *ir1-namespace*)))
+(declaim (ftype (sfunction (t string &optional boolean) t) find-free-fun))
+(defun find-free-fun (name context &optional (error-on-macro t) &aux (free-funs (free-funs *ir1-namespace*)))
   (or (gethash name free-funs)
       (let ((kind (info :function :kind name)))
         (ecase kind
           ((:macro :special-form)
-           (compiler-error "The ~(~S~) name ~S was found ~A."
-                           kind name context))
+           (if (and (eq kind :macro)
+                    (not error-on-macro))
+               kind
+               (compiler-error "The ~(~S~) name ~S was found ~A." kind name context)))
           ((:function nil)
            (check-fun-name name)
            (let ((expansion (fun-name-inline-expansion name))
@@ -272,16 +273,18 @@
 
 ;;; Return the LEAF structure for the lexically apparent function
 ;;; definition of NAME.
-(declaim (ftype (sfunction (t string) leaf) find-lexically-apparent-fun))
-(defun find-lexically-apparent-fun (name context)
+(declaim (ftype (sfunction (t string &optional t) (or leaf (eql :macro))) find-lexically-apparent-fun))
+(defun find-lexically-apparent-fun (name context &optional (error-on-macro t))
   (let ((var (lexenv-find name funs :test #'equal)))
-    (cond (var
-           (unless (leaf-p var)
-             (aver (and (consp var) (eq (car var) 'macro)))
-             (compiler-error "found macro name ~S ~A" name context))
+    (cond ((leaf-p var)
            var)
+          (var
+           (aver (and (consp var) (eq (car var) 'macro)))
+           (if error-on-macro
+               (compiler-error "found macro name ~S ~A" name context)
+               :macro))
           (t
-           (find-free-fun name context)))))
+           (find-free-fun name context error-on-macro)))))
 
 (declaim (end-block))
 
@@ -552,46 +555,42 @@
 (defun find-source-paths (form tlf-num)
   (declare (type index tlf-num))
   (let ((*current-form-number* 0))
-    (sub-find-source-paths form (list tlf-num)))
+    (sub-find-source-paths form (list tlf-num) 0))
   (values))
-(defun sub-find-source-paths (form path)
+(defun sub-find-source-paths (form path depth)
   (unless (get-source-path form)
     (note-source-path form path)
-    (incf *current-form-number*)
+    (unless (< depth 100) ; ARB, see lp#654289
+      #+sb-xc-host (bug "Unexpected depth of code")
+      #-sb-xc-host (return-from sub-find-source-paths))
     (let ((pos 0)
           (subform form)
           (trail form))
       (declare (fixnum pos))
       (macrolet ((frob ()
                    `(progn
-                      (let ((fm (cond ((comma-p subform)
-                                       (comma-expr subform))
-                                      ((atom subform)
-                                       (return))
-                                      (t
-                                       (car subform)))))
-                        (when (comma-p fm)
-                          (setf fm (comma-expr fm)))
-                        (cond ((consp fm)
-                               ;; If it's a cons, recurse.
-                               (sub-find-source-paths fm (cons pos path)))
-                              ((eq 'quote fm)
-                               ;; Don't look into quoted constants.
-                               ;; KLUDGE: this can't actually know about constants.
-                               ;; e.g. (let ((quote (error "foo")))) or
-                               ;; (list quote (error "foo")) are not
-                               ;; constants and yet are ignored.
-                               (return))
-                              ((not (zerop pos))
-                               ;; Otherwise store the containing form. It's not
-                               ;; perfect, but better than nothing.
-                               (note-source-path subform pos path)))
-                        (incf pos))
-                      (when (comma-p subform)
-                        (return))
-                      (setq subform (cdr subform))
+                      (cond
+                        ;; (a b . ,c) -> (a b comma c)
+                        ((comma-p subform)
+                         (setq subform (list 'comma (comma-expr subform))))
+                        ((atom subform) (return)))
+                      (let ((fm (car subform)))
+                        (cond
+                          ((consp fm)
+                           (incf *current-form-number*)
+                           (sub-find-source-paths fm (cons pos path) (1+ depth)))
+                          ;; (a b ,c d) -> (a b (comma c) d)
+                          ((comma-p fm)
+                           (incf *current-form-number*)
+                           (sub-find-source-paths (list 'comma (comma-expr fm)) (cons pos path) (1+ depth)))
+                          ((not (zerop pos))
+                           (unless (get-source-path subform)
+                             (note-source-path subform pos path)))))
+                      (setq subform (cdr subform)
+                            pos (1+ pos))
                       (when (eq subform trail) (return)))))
         (loop
+         ;; circularity detection by hare and tortoise
          (frob)
          (frob)
          (setq trail (cdr trail)))))))
@@ -604,7 +603,8 @@
                       reference-constant
                       expand-compiler-macro
                       maybe-reanalyze-functional
-                      ir1-convert-common-functoid))
+                      ir1-convert-common-functoid
+                      record-macroexpand-source-path))
 
 ;;; Translate FORM into IR1. The code is inserted as the NEXT of the
 ;;; CTRAN START. RESULT is the LVAR which receives the value of the
@@ -655,7 +655,6 @@
 ;;; FUNCTIONAL is returned.
 (defun maybe-reanalyze-functional (functional)
   (aver (not (functional-kind-eq functional deleted))) ; bug 148
-  (aver-live-component *current-component*)
   ;; When FUNCTIONAL is of a type for which reanalysis isn't a trivial
   ;; no-op
   (when (and (typep functional '(or optional-dispatch clambda))
@@ -889,6 +888,26 @@
                           (find-free-fun fun "shouldn't happen! (no-cmacro)")
                           form))))
 
+(defvar *equal-source-paths*)
+
+;;; Some macros call macroexpand-1 and then copy its results.
+(defun record-macroexpand-source-path (original-form expanded env)
+  (when (boundp '*equal-source-paths*)
+    (let ((env (if (and (boundp '*lexenv*)
+                        (or (not (lexenv-p env))
+                            (null-lexenv-p env)))
+                   *lexenv*
+                   env)))
+      (when (and (lexenv-p env)
+                 (policy env (> debug 1)))
+        (unless *equal-source-paths*
+          (setf *equal-source-paths* (make-hash-table :test #'equal)))
+        (let ((path (get-source-path original-form)))
+          (when path
+            (push path (gethash expanded *equal-source-paths*))
+            (let ((*lexenv* env))
+              (recover-source-paths original-form expanded))))))))
+
 ;;; This may produce false matches when there are multiple copies and
 ;;; they are reordered, duplicated or omitted. Still better than
 ;;; nothing.
@@ -914,7 +933,9 @@
         (let ((seen (alloc-xset)))
           (labels ((rec (form)
                      (unless (xset-member-p form seen)
-                       (let ((original (gethash form equal-table)))
+                       (let ((original (or (gethash form equal-table)
+                                           (and *equal-source-paths*
+                                                (gethash form *equal-source-paths*)))))
                          (when original
                            (let ((location
                                    (if (cdr original)
@@ -963,7 +984,8 @@
                          (t
                           (compiler-error "~@<~A~@:_ ~A~:>"
                                           (wherestring) c))))))
-      (let ((result (funcall (valid-macroexpand-hook) fun form *lexenv*)))
+      (let* (*equal-source-paths*
+             (result (funcall (valid-macroexpand-hook) fun form *lexenv*)))
         #-sb-xc-host
         (recover-source-paths form result)
         result))))
@@ -1450,7 +1472,8 @@
 ;;; defining, set its INLINEP. If a global function, add a new FENV entry.
 (defun process-inline-decl (spec res fvars)
   (let ((sense (first spec))
-        (new-fenv ()))
+        (new-fenv ())
+        user-data)
     (dolist (name (rest spec))
       (let ((fvar (find name fvars
                         :key (lambda (x)
@@ -1460,8 +1483,16 @@
         (if fvar
             (setf (functional-inlinep fvar) sense)
             (let ((found (find-lexically-apparent-fun
-                          name "in an inline or notinline declaration")))
+                          name "in an inline or notinline declaration"
+                          nil)))
               (etypecase found
+                ((eql :macro)
+                 (unless user-data
+                   (setf user-data (lexenv-user-data res)))
+                 (case sense
+                   ((inline notinline)
+                    (setf user-data
+                          (list* (list 'compiler-macro name sense) user-data)))))
                 (functional
                  (when (policy *lexenv* (>= speed inhibit-warnings))
                    (compiler-notify "ignoring ~A declaration not at ~
@@ -1469,11 +1500,12 @@
                                     sense name)))
                 (global-var
                  (let ((type
-                        (cdr (assoc found (lexenv-type-restrictions res)))))
+                         (cdr (assoc found (lexenv-type-restrictions res)))))
                    (push (cons name (make-new-inlinep found sense type))
                          new-fenv))))))))
-    (if new-fenv
-        (make-lexenv :default res :funs new-fenv)
+    (if (or new-fenv user-data)
+        (make-lexenv :default res :funs new-fenv
+                     :user-data user-data)
         res)))
 
 ;;; like FIND-IN-BINDINGS, but looks for #'FOO in the FVARS
@@ -1637,7 +1669,7 @@
        (no-compiler-macro
         (make-lexenv :default res
                      :user-data (list*
-                                 (cons 'no-compiler-macro (second spec))
+                                 (list 'compiler-macro (second spec) 'notinline)
                                  (lexenv-user-data res))))
        (optimize
         (multiple-value-bind (new-policy specified-qualities)
@@ -1916,7 +1948,6 @@
 (defun process-inline-proclamation (kind funs)
   (declare (type (and inlinep (not null)) kind))
   (dolist (name funs)
-    (proclaim-as-fun-name name)
     (let* ((free-funs (free-funs *ir1-namespace*))
            (var (gethash name free-funs)))
       (etypecase var

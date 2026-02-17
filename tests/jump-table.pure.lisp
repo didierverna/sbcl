@@ -1,7 +1,8 @@
-(unless (gethash 'sb-c:jump-table sb-c::*backend-parsed-vops*)
+(unless (gethash 'sb-c:jump-table sb-c::*backend-template-names*)
   (invoke-restart 'run-tests::skip-file))
 
-(with-test (:name :symbol-case-as-jump-table)
+(with-test (:name :symbol-case-as-jump-table
+                  :fails-on :sb-cover-for-internals) ; lp#2131957
   ;; Assert that a prototypical example of (CASE symbol ...)
   ;; was converted to a jump table.
   (let ((c (sb-kernel:fun-code-header #'sb-debug::parse-trace-options)))
@@ -113,7 +114,7 @@
     (a 'is-a)
     (b 'is-b)
     (c 'is-c)
-    ((or d e) 'is-d-or-e)
+    ((or d e) (print 'is-d-or-e))
     (f 'is-f))))
   (defun typecase-jump-table (x) (guts))
   (defun typecase-no-jump-table (x)
@@ -137,9 +138,10 @@
     ((#\a) 0)
     ((#\b) nil)))
 
-(with-test (:name :array-subtype-dispatch-table)
+(with-test (:name :array-subtype-dispatch-table
+                  :fails-on :sb-cover-for-internals) ; lp#2131957
   (assert (> (sb-kernel:code-jump-table-words
-              (sb-kernel:fun-code-header #'sb-kernel:vector-subseq*))
+              (sb-kernel:fun-code-header #'sb-kernel:vector-subseq))
              20)))
 
 (with-test (:name :cleanups)
@@ -182,6 +184,7 @@
            ((-28 -41 -38 -99 -110 -81) 0)
            (t 1)))
     (() 1))
+  #+sb-unicode
   (checked-compile
    `(lambda (p1)
       (declare (type character p1))

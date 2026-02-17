@@ -1098,7 +1098,12 @@
                    (write-string "}"))))
              (write-char #\space)))
           (cdynamic-extent
-           (format t "dynamic extent ~S" (dynamic-extent-values node))))
+           (format t "dynamic extent ~S" (dynamic-extent-values node))
+           (let ((info (dynamic-extent-info node)))
+             (write-string " {info: ")
+             (when info
+               (print-lvar info))
+             (write-string "}"))))
         (when (and *debug-print-types*
                    (valued-node-p node))
           (write-char #\space)
@@ -1368,13 +1373,6 @@
                    (res (global-conflicts-tn gtn))))
                (res)))))))
 
-(defun nth-vop (thing n)
-  "Return the Nth VOP in the IR2-BLOCK pointed to by THING."
-  (let ((block (block-info (block-or-lose thing))))
-    (do ((i 0 (1+ i))
-         (vop (ir2-block-start-vop block) (vop-next vop)))
-        ((= i n) vop))))
-
 (defun show-transform-p (showp fun-name)
   (or (and (listp showp) (member fun-name showp :test 'equal))
       (eq showp t)))
@@ -1382,8 +1380,9 @@
 (defun show-transform (kind name new-form &optional combination)
   (let ((*print-length* 100)
         (*print-level* 50)
-        (*print-right-margin* 128))
-    (format *trace-output* "~&xform (~a) ~S ~% -> ~S~%"
+        (*print-right-margin* 128)
+        (*print-readably* nil))
+    (format *trace-output* "~&xform (~a) ~S~@[ -> ~S~]~% => ~S~%"
             kind
             (if combination
                 (cons name
@@ -1392,6 +1391,8 @@
                                         (lvar-value arg)
                                         (type-specifier (lvar-type arg)))))
                 name)
+            (and combination
+                 (type-specifier (node-derived-type combination)))
             new-form)))
 
 (defun show-type-derivation (combination type)
@@ -1501,6 +1502,14 @@ is replaced with replacement."
 (defun print-conset (conset &optional kind)
   (do-conset-elements (con conset)
     (print-constraint con kind)))
+
+(defun print-conset-difference (set1 set2)
+  (let ((diff1 (conset-difference (copy-conset set1) set2))
+        (diff2 (conset-difference (copy-conset set2) set1)))
+    (format t "Not in set1~%")
+    (print-conset diff1)
+    (format t "Not in set2~%")
+    (print-conset diff2)))
 
 (defun print-constraints (component &optional kind)
   (do-blocks (block component)

@@ -66,8 +66,8 @@
 
 (declaim (inline memmove))
 (define-alien-routine ("memmove" memmove) void ; BUG: technically returns void*
-  (dest (* char))
-  (src (* char))
+  (dest system-area-pointer)
+  (src system-area-pointer)
   (n sb-unix::size-t))
 
 (defun copy-ub8-to-system-area (src src-offset dst dst-offset length)
@@ -84,6 +84,7 @@
   (memmove (sap+ dst dst-offset) (sap+ src src-offset) length)
   (values))
 
+(declaim (maybe-inline get-errno))
 (define-alien-routine ("os_get_errno" get-errno) int)
 (setf (documentation 'get-errno 'function)
       "Return the value of the C library pseudo-variable named \"errno\".")

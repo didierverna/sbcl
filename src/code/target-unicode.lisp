@@ -44,10 +44,9 @@
 (eval-when (:compile-toplevel)
   (defun plist-to-alist (list)
     (loop for (key value) on list by #'cddr collect (cons key value))))
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *proplist-properties*
+(sb-ext:defglobal *proplist-properties*
     (mapcar (lambda (x) (cons (car x) (coerce (cdr x) '(vector (unsigned-byte 32)))))
-            '#.(plist-to-alist (read-lisp-expr-file "misc-properties")))))
+            '#.(plist-to-alist (read-lisp-expr-file "misc-properties"))))
 
 (eval-when (:compile-toplevel)
   (defvar *phash-cache-file-pathname*
@@ -67,6 +66,8 @@
     (or (gethash keys *phash-cache-file-contents*)
         (let ((start (get-internal-real-time))
               (answer (sb-c:make-perfect-hash-lambda keys)))
+          (declare (ignorable start))
+          #+nil
           (format *debug-io* "~&Computed perfect hash of ~D keys: ~F sec (~S)~%"
                   (length keys)
                   (/ (- (get-internal-real-time) start) internal-time-units-per-second)
@@ -887,11 +888,10 @@ disappears when accents are placed on top of it. and NIL otherwise"
     (setf result (nreverse result))
     (coerce result 'string)))
 
-(declaim (type function sb-unix::posix-getenv))
 (defun get-user-locale ()
   (let ((raw-locale
-         #+(or win32 unix) (or (sb-unix::posix-getenv "LC_ALL")
-                                (sb-unix::posix-getenv "LANG"))
+         #+(or win32 unix) (or (sb-ext:posix-getenv "LC_ALL")
+                               (sb-ext:posix-getenv "LANG"))
          #-(or win32 unix) nil))
     (when raw-locale
       (let ((lang-code (string-upcase

@@ -60,7 +60,7 @@ arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
     os_vm_address_t addr;
 
-#if defined(LISP_FEATURE_NETBSD) || defined(LISP_FEATURE_OPENBSD)
+#if defined(LISP_FEATURE_NETBSD) || defined(LISP_FEATURE_OPENBSD) || defined(LISP_FEATURE_FREEBSD)
     addr = (os_vm_address_t) (code->si_addr);
 #else
     addr = (os_vm_address_t) (*os_context_register_addr(context,PT_DAR));
@@ -284,7 +284,7 @@ handle_allocation_trap(os_context_t * context)
 
     struct thread* thread = get_sb_vm_thread();
     gc_assert(!foreign_function_call_active_p(thread));
-    if (gencgc_alloc_profiler && thread->state_word.sprof_enable)
+    if (gencgc_alloc_profiler && thread->sprof_enable)
         record_backtrace_from_context(context, thread);
 
     fake_foreign_function_call(context);

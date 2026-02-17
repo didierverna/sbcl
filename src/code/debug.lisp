@@ -803,6 +803,9 @@ information."
                      (< a (get-lisp-obj-address sb-vm:*control-stack-end*)))
                 sb-thread:*current-thread*)
                (all-threads
+                ;; There aren't many reasons to inquire whether a random object is on any stack.
+                ;; And if performance isn't important, this loop could be changed to
+                ;; a C function that scans all threads while holding the all_threads lock.
                 (macrolet ((in-stack-range-p ()
                              `(and (>= a (sb-thread::thread-control-stack-start thread))
                                    (< a (sb-thread::thread-control-stack-end thread)))))
@@ -2605,8 +2608,7 @@ forms that explicitly control this kind of evaluation.")
 (defun libunwind-backtrace (thread thread-sap context stream)
   (declare (ignorable thread thread-sap))
   (sb-alien:with-alien
-      ((get-sizeof-unw-cursor (function sb-alien:int) :extern)
-       (sb-unw-init (function sb-alien:int system-area-pointer system-area-pointer) :extern)
+      ((sb-unw-init (function sb-alien:int system-area-pointer system-area-pointer) :extern)
        (sb-unw-get-pc (function sb-alien:int system-area-pointer (* sb-alien:unsigned)) :extern)
        (sb-unw-get-proc-name (function sb-alien:int system-area-pointer system-area-pointer
                                        sb-alien:int
@@ -2614,8 +2616,7 @@ forms that explicitly control this kind of evaluation.")
                              :extern)
        (sb-unw-step (function sb-alien:int system-area-pointer) :extern)
        (word sb-alien:unsigned))
-    (let* ((cursor-size (the (mod 2048) (sb-alien:alien-funcall get-sizeof-unw-cursor)))
-           (cursor (make-array cursor-size :element-type '(unsigned-byte 8)))
+    (let* ((cursor (make-array sb-unix::sizeof-unw-cursor :element-type '(unsigned-byte 8)))
            (string (make-array 127 :element-type 'base-char))
            (n 0)
            code)

@@ -13,6 +13,8 @@
 (in-package "SB-IMPL")
 
 
+(defvar *show-putweak* nil)
+
 (!begin-collecting-cold-init-forms)
 
 (declaim (ftype (sfunction (hash-table t maybe-truncated-hash)
@@ -115,7 +117,7 @@
 
 (defun set-hash-fun (table hash-fun hash-fun-state)
   (declare (type fixnum hash-fun-state)
-           (optimize speed (safety 0)))
+           (optimize speed #-sb-hash-table-debug (safety 0)))
   (cond ((= (hash-table-hash-fun-state table) hash-fun-state)
          nil)
         (t
@@ -136,6 +138,10 @@
   ;; is (UNSIGNED-BYTE 32).
   '(unsigned-byte #.(the (integer 0 32) (1+ +max-hash-table-bits+))))
 
+(declaim (inline adaptive-hash-fun-state-p))
+(defun adaptive-hash-fun-state-p (state)
+  (<= 0 state))
+
 ;;; Hash KEY again after a hash function change. This is like
 ;;; HASH-KEY, but it's not inline, and it does not return
 ;;; ADDRESS-BASED-P because we assume that hash function changes
@@ -144,10 +150,10 @@
 (defun rehash-key (hash-table key hash-fun-state)
   (declare (type hash-table hash-table)
            (type fixnum hash-fun-state)
-           (optimize (safety 0)))
+           (optimize #-sb-hash-table-debug (safety 0)))
   (let ((hash-fun (hash-table-hash-fun hash-table)))
     (the maybe-truncated-hash
-         (values (if (<= 0 hash-fun-state)
+         (values (if (adaptive-hash-fun-state-p hash-fun-state)
                      (funcall hash-fun key hash-fun-state)
                      (funcall hash-fun key))))))
 
@@ -180,7 +186,7 @@
                                   (values clipped-hash boolean)) ,name))
        (declaim (inline ,name))
        (defun ,name (,key ,@(when state `(,state)))
-         (declare (optimize (sb-c:verify-arg-count 0)))
+         (declare (optimize #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          ;; It would be ok to pick off SYMBOL here and use its hash
          ;; slot as far as semantics are concerned, but EQ-hash is
          ;; supposed to be the lightest-weight in terms of speed, so
@@ -317,6 +323,11 @@
                    (list 'eq-hash/safe* key)))
         (let (,@(when count-collisions-p `((,count-collisions-p nil))))
           ,@body)))
+     ((eql ,state +hft-non-adaptive+)
+      (macrolet ((eq-hash* (key)
+                   (list 'eq-hash/non-adaptive* key)))
+        (let (,@(when count-collisions-p `((,count-collisions-p nil))))
+          ,@body)))
      (t
       (aver nil))))
 
@@ -330,7 +341,7 @@
 
 (defun guess-eq-hash-fun (table)
   (declare (type hash-table table)
-           (optimize speed (safety 0)))
+           (optimize speed #-sb-hash-table-debug (safety 0)))
   (let* ((kv-vector (hash-table-pairs table))
          (a-key-address (get-lisp-obj-address (aref kv-vector 2)))
          (changed-bits 0))
@@ -368,7 +379,7 @@
 ;;; Switch to a safer hash function if any. Return whether the hash
 ;;; function was changed.
 (defun fall-back-on-eq-hash (table)
-  (declare (optimize (safety 0)))
+  (declare (optimize #-sb-hash-table-debug (safety 0)))
   (let ((hash-fun-state (hash-table-hash-fun-state table)))
     (cond ((eql hash-fun-state +hft-eq-mid+)
            (set-hash-fun table #'eq-hash/safe +hft-safe+))
@@ -407,7 +418,7 @@
 ;;; "safer" hash function.
 (defun adapt-eq-hash-fun-by-n-collisions (table n-buckets n-collisions)
   (declare (type fixnum n-buckets n-collisions)
-           (optimize speed (safety 0)))
+           (optimize speed #-sb-hash-table-debug (safety 0)))
   (let* ((n-keys (hash-table-%count table))
          (too-many-empty-buckets-p
            (cond ((< n-keys 1024)
@@ -503,9 +514,14 @@
 ;;;; hash (SXSTATE-LIMIT) and what the likely maximum number of keys
 ;;;; is in any bucket (SXSTATE-MAX-CHAIN-LENGTH).
 
+;;; For testing
+(export '(+sxstate-max-chain-length-bits+ +sxstate-limit-bits+
+          +highest-sxstate-limit+ make-sxstate sxstate-limit
+          sxstate-max-chain-length))
+
 (defconstant +sxstate-max-chain-length-bits+ 4)
 (defconstant +sxstate-limit-bits+
-  #-64-bit (- sb-vm:n-fixnum-bits +sxstate-max-chain-length-bits+)
+  #-64-bit (- (1- sb-vm:n-fixnum-bits) +sxstate-max-chain-length-bits+)
   ;; Chosen for ease of extracting the limit (e.g. AND REG, -2 on
   ;; x86-64).
   #+64-bit 31)
@@ -520,7 +536,7 @@
     ;; tests/, except that the value at index 2 was decreased from 3
     ;; to 2. See +INITIAL-SXSTATE+ and RAISE-SXSTATE-LIMIT-AND-REHASH
     ;; for related logic.
-    (declare (optimize speed #-sb-xc-host (safety 0)))
+    (declare (optimize speed #-(or sb-xc-host sb-hash-table-debug) (safety 0)))
     (aref #(1 2 3 4 5 6 6 7
             7 7 8 8 8 8 9 9
             9 9 10 10 10 10 11 11
@@ -564,7 +580,7 @@
 (defun maybe-adjust-hash-table-max-chain-length (hash-table)
   (declare (type hash-table hash-table))
   (let ((hash-fun (hash-table-hash-fun hash-table)))
-    (when (locally (declare (optimize (safety 0)))
+    (when (locally (declare (optimize #-sb-hash-table-debug (safety 0)))
             (eq hash-fun #'adaptive-equal-hash))
       (setf (hash-table-%hash-fun-state hash-table)
             (make-sxstate (%sxstate-limit
@@ -598,6 +614,8 @@
                       (logbitp bit ,(ldb (byte 32 0) mask))
                       (logbitp (- bit 32) ,(ash mask -32)))))))
 
+;; For testing
+(export 'truncated-hash-p)
 ;;; ADAPTIVE-EQUAL-HASH indicates in the highest bit just above
 ;;; CLIPPED-HASH whether the hash was computed from a truncated
 ;;; version of the key.
@@ -617,7 +635,7 @@
 (declaim (ftype (sfunction (t t) (values maybe-truncated-hash))
                 perhaps-truncated-equal-hash))
 (defun perhaps-truncated-equal-hash (key limit)
-  (declare (optimize speed (sb-c::verify-arg-count 0)))
+  (declare (optimize speed #-sb-hash-table-debug (sb-c::verify-arg-count 0)))
   (let* ((truncatedp-bits 0)
          (hash (%sxhash key (truly-the fixnum limit) (truly-the fixnum limit)
                         :on-truncate (setq truncatedp-bits 3))))
@@ -627,7 +645,7 @@
                 adaptive-equal-hash))
 (declaim (inline adaptive-equal-hash))
 (defun adaptive-equal-hash (key sxstate)
-  (declare (optimize speed (sb-c::verify-arg-count 0)))
+  (declare (optimize speed #-sb-hash-table-debug (sb-c::verify-arg-count 0)))
   ;; Ultimately we just need to choose between SXHASH or EQ-HASH. As to using
   ;; INSTANCE-SXHASH, it doesn't matter, and in fact it's quicker to use EQ-HASH.
   ;; If the outermost object passed as a key is LIST, then it descends using SXHASH,
@@ -648,7 +666,7 @@
 
 (declaim (ftype (sfunction (t) (values clipped-hash boolean)) equal-hash))
 (defun equal-hash (key)
-  (declare (optimize speed (sb-c::verify-arg-count 0)))
+  (declare (optimize speed #-sb-hash-table-debug (sb-c::verify-arg-count 0)))
   (if (case (lowtag-of key)
         (#.sb-vm:list-pointer-lowtag t)
         ;; pathnames require SXHASH, all other instances are indifferent.
@@ -828,7 +846,8 @@ Examples:
                         (allocate-vector (logior sb-vm::+vector-alloc-mixed-region-bit+
                                                  sb-vm:simple-vector-widetag)
                                          nwords nwords))))
-     (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+     (declare (optimize
+               #-sb-hash-table-debug (sb-c:insert-array-bounds-checks 0)))
      (fill v (make-unbound-marker))
      (setf (kv-vector-high-water-mark v) 0)
      (setf (kv-vector-rehash-stamp v) 0)
@@ -950,7 +969,7 @@ Examples:
     (multiple-value-bind (kind test test-fun hash-fun hash-fun-state)
         (cond ((or (eq test #'eq) (eq test 'eq))
                (if weakness
-                   (values 0 'eq #'eq #'eq-hash/non-adaptive +hft-eq-mid+)
+                   (values 0 'eq #'eq #'eq-hash/non-adaptive +hft-non-adaptive+)
                    (values 0 'eq #'eq #'eq-hash/common +hft-eq-mid+)))
               ((or (eq test #'eql) (eq test 'eql))
                (values 1 'eql #'eql #'eql-hash +hft-non-adaptive+))
@@ -1105,7 +1124,7 @@ Examples:
 ;;; not weak, not synchronized, not a user-defined hash fun and/or comparator.
 (defun make-hash-table-using-defaults (kind)
   (declare ((integer 0 3) kind)
-           (optimize (safety 0)))    ; skip FBOUNDP checks
+           (optimize #-sb-hash-table-debug (safety 0)))  ; skip FBOUNDP checks
   (multiple-value-bind (test test-fun hash-fun hash-fun-state)
       (case kind
         ((0) (values 'eq #'eq #'hash/flat +hft-flat+))
@@ -1204,7 +1223,9 @@ multiple threads accessing the same hash-table without locking."
 (defmacro define-gethash/flat (name test &optional use-eq-pred)
   ;; Maintaining HASH-TABLE-CACHE is not worth it here.
   `(defun ,name (key table default)
-     (declare (optimize speed (sb-c:verify-arg-count 0)
+     (declare (optimize speed)
+              #-sb-hash-table-debug
+              (optimize (sb-c:verify-arg-count 0)
                         (sb-c:insert-array-bounds-checks 0)))
      (let* ((hash-table (truly-the hash-table table))
             (kv-vector (hash-table-pairs hash-table))
@@ -1241,7 +1262,7 @@ multiple threads accessing the same hash-table without locking."
 
 (defmacro define-puthash/flat (name test &optional use-eq-pred)
   `(defun ,name (key hash-table value)
-     (declare (optimize speed (safety 0))
+     (declare (optimize speed #-sb-hash-table-debug (safety 0))
               (type hash-table hash-table))
      (let* ((kv-vector (hash-table-pairs hash-table))
             (empty-kv-index 0)
@@ -1306,7 +1327,7 @@ multiple threads accessing the same hash-table without locking."
              ;; that KEY is not there.
              (return-from ,name (funcall (hash-table-puthash-impl hash-table)
                                          key hash-table value))))
-       (locally (declare (optimize (safety 0)))
+       (locally (declare (optimize #-sb-hash-table-debug (safety 0)))
          (incf (hash-table-%count hash-table)))
        (when (zerop empty-kv-index)
          (setf (kv-vector-high-water-mark kv-vector) (1+ hwm))
@@ -1320,7 +1341,9 @@ multiple threads accessing the same hash-table without locking."
 
 (defmacro define-remhash/flat (name test &optional use-eq-pred)
   `(defun ,name (key table)
-     (declare (optimize speed (sb-c:verify-arg-count 0)
+     (declare (optimize speed)
+              #-sb-hash-table-debug
+              (optimize (sb-c:verify-arg-count 0)
                         (sb-c:insert-array-bounds-checks 0)))
      (let* ((hash-table (truly-the hash-table table))
             (kv-vector (hash-table-pairs hash-table))
@@ -1330,7 +1353,8 @@ multiple threads accessing the same hash-table without locking."
            (loop for i upfrom 2 upto limit by 2
                  do (let ((ht-key (aref kv-vector i)))
                       (when (eq key ht-key)
-                        (locally (declare (optimize (safety 0)))
+                        (locally (declare (optimize #-sb-hash-table-debug
+                                                    (safety 0)))
                           (decf (hash-table-%count hash-table)))
                         (setf (aref kv-vector i) +empty-ht-slot+
                               (aref kv-vector (1+ i)) +empty-ht-slot+)
@@ -1338,7 +1362,8 @@ multiple threads accessing the same hash-table without locking."
            (loop for i upfrom 2 upto limit by 2
                  do (let ((ht-key (aref kv-vector i)))
                       (when (,test key ht-key)
-                        (locally (declare (optimize (safety 0)))
+                        (locally (declare (optimize #-sb-hash-table-debug
+                                                    (safety 0)))
                           (decf (hash-table-%count hash-table)))
                         (setf (aref kv-vector i) +empty-ht-slot+
                               (aref kv-vector (1+ i)) +empty-ht-slot+)
@@ -1352,7 +1377,9 @@ multiple threads accessing the same hash-table without locking."
 ;;; (SB-VM:VECTOR-ADDR-HASHING-FLAG), so we must compute it when
 ;;; switching.
 (defun compute-flat-hash-address-hashing-p (table)
-  (declare (optimize speed (sb-c:verify-arg-count 0)
+  (declare (optimize speed)
+           #-sb-hash-table-debug
+           (optimize (sb-c:verify-arg-count 0)
                      (sb-c:insert-array-bounds-checks 0)))
   (let* ((hash-table (truly-the hash-table table))
          (kv-vector (hash-table-pairs hash-table))
@@ -1432,7 +1459,7 @@ multiple threads accessing the same hash-table without locking."
   (declare (simple-vector kv-vector)
            (type (simple-array hash-table-index (*)) next-vector index-vector)
            (type (or null (simple-array hash-table-index (*))) hash-vector)
-           (optimize (sb-c:insert-array-bounds-checks 0)))
+           (optimize #-sb-hash-table-debug (sb-c:insert-array-bounds-checks 0)))
   (aver (not (flat-hash-table-p table)))
   ;; Cases ordered for performance.
   (if (null hash-vector)
@@ -1443,7 +1470,7 @@ multiple threads accessing the same hash-table without locking."
               ;; Scan backwards so that chains are in ascending index order.
               (do ((i hwm (1- i))) ((zerop i))
                 (declare (type index/2 i)
-                         (optimize (safety 0)))
+                         (optimize #-sb-hash-table-debug (safety 0)))
                 (with-key-and-updated-next-vector (key)
                   (if count-collisions-p
                       (push-in-chain-and-count-collisions
@@ -1453,13 +1480,13 @@ multiple threads accessing the same hash-table without locking."
           (let ((mask (1- (length index-vector))))
             (do ((i hwm (1- i))) ((zerop i))
               (declare (type index/2 i)
-                       (optimize (safety 0)))
+                       (optimize #-sb-hash-table-debug (safety 0)))
               (with-key-and-updated-next-vector (key)
                 (push-in-chain (mask-hash (eql-hash key) mask))))))
       (let ((mask (1- (length index-vector))))
         (do ((i hwm (1- i))) ((zerop i))
           (declare (type index/2 i)
-                   (optimize (safety 0)))
+                   (optimize #-sb-hash-table-debug (safety 0)))
           (with-key-and-updated-next-vector (key)
             (let* ((stored-hash (aref hash-vector i))
                    (hash (if (/= stored-hash +magic-hash-vector-value+)
@@ -1487,7 +1514,9 @@ multiple threads accessing the same hash-table without locking."
 (declaim (ftype (sfunction (t t t) (values maybe-truncated-hash))
                 raise-sxstate-limit-and-rehash))
 (defun raise-sxstate-limit-and-rehash (table key hash)
-  (declare (optimize speed (sb-c::verify-arg-count 0)
+  (declare (optimize speed)
+           #-sb-hash-table-debug
+           (optimize (sb-c::verify-arg-count 0)
                      (sb-c:insert-array-bounds-checks 0)))
   (let* ((table (truly-the hash-table table))
          (hash (truly-the maybe-truncated-hash hash))
@@ -1513,7 +1542,8 @@ multiple threads accessing the same hash-table without locking."
         ;; length, so just bail out. Do the same if the rehashing bit
         ;; is set.
         (not (logtest stamp #b11))
-        (eq (locally (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+        (eq (locally (declare (optimize #-sb-hash-table-debug
+                                        (sb-c:insert-array-bounds-checks 0)))
               (cas (svref kv-vector rehash-stamp-elt)
                    ;; Move to rehashing state (#b______10).
                    stamp (truly-the fixnum (+ stamp 2))))
@@ -1531,7 +1561,7 @@ multiple threads accessing the same hash-table without locking."
                   (type word n-collisions)
                   (type bit has-truncated-flag)
                   (type fixnum limit)
-                  (optimize (safety 0)))
+                  (optimize #-sb-hash-table-debug (safety 0)))
          (loop
            do (fill index-vector 0)
               (setq limit (* 2 limit))
@@ -1541,7 +1571,7 @@ multiple threads accessing the same hash-table without locking."
                   ((rehash-truncated (hash-fun-name)
                      `(do ((i hwm (1- i))) ((zerop i))
                         (declare (type index/2 i)
-                                 (optimize (safety 0)))
+                                 (optimize #-sb-hash-table-debug (safety 0)))
                         (with-key-and-updated-next-vector (key)
                           (let ((hash
                                   (let ((stored-hash (aref hash-vector i)))
@@ -1622,7 +1652,8 @@ multiple threads accessing the same hash-table without locking."
      (let* ((index-vector (hash-table-index-vector table))
             (hwm (kv-vector-high-water-mark kv-vector))
             (result 0))
-       (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+       (declare (optimize #-sb-hash-table-debug
+                          (sb-c:insert-array-bounds-checks 0)))
        (fill index-vector 0)
        (macrolet ((with-key ((key-var) &body body)
                     ;; Process body only if KEY-VAR is nonempty, and also look
@@ -1637,7 +1668,7 @@ multiple threads accessing the same hash-table without locking."
             (let ((mask (1- (length index-vector))))
               (do ((i hwm (1- i))) ((zerop i))
                 (declare (type index/2 i)
-                         (optimize (safety 0)))
+                         (optimize #-sb-hash-table-debug (safety 0)))
                 (with-key (pair-key)
                   (let* ((stored-hash (aref hash-vector i))
                          (hash (if (/= stored-hash +magic-hash-vector-value+)
@@ -1648,7 +1679,7 @@ multiple threads accessing the same hash-table without locking."
             (let ((mask (1- (length index-vector))))
               (do ((i hwm (1- i))) ((zerop i))
                 (declare (type index/2 i)
-                         (optimize (safety 0)))
+                         (optimize #-sb-hash-table-debug (safety 0)))
                 (with-key (pair-key)
                   (push-in-chain (mask-hash (eql-hash pair-key) mask))))))
            (t
@@ -1658,7 +1689,7 @@ multiple threads accessing the same hash-table without locking."
                 (let ((mask (1- (length index-vector))))
                   (do ((i hwm (1- i))) ((zerop i))
                     (declare (type index/2 i)
-                             (optimize (safety 0)))
+                             (optimize #-sb-hash-table-debug (safety 0)))
                     (with-key (pair-key)
                       (push-in-chain (mask-hash (eq-hash* pair-key) mask))))))))))
        (done-rehashing table kv-vector epoch)
@@ -1743,7 +1774,7 @@ multiple threads accessing the same hash-table without locking."
          v)))
 
 (defun recompute-ht-vector-sizes (table)
-  (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+  (declare (optimize #-sb-hash-table-debug (sb-c:insert-array-bounds-checks 0)))
   (let* ((table (truly-the hash-table table))
          (old-size (hash-table-pairs-capacity (hash-table-pairs table)))
          (rehash-size (hash-table-rehash-size table)))
@@ -1797,7 +1828,7 @@ multiple threads accessing the same hash-table without locking."
       ;; Return KV-VECTOR NEXT-VECTOR HASH-VECTOR INDEX-VECTOR)
       ((realloc (size n-buckets initial-stamp &aux (hash-vector-p (hash-table-hash-vector table)))
          (declare (type (integer 0 #.(- array-dimension-limit 2)) size n-buckets)
-                  (optimize (sb-c::type-check 0)))
+                  (optimize #-sb-hash-table-debug (sb-c::type-check 0)))
          (let ((size+1 (1+ size)))
            (allocating-for-hash-table (table)
              (values (%alloc-kv-pairs size)
@@ -2034,6 +2065,7 @@ if there is no such entry. Entries can be added using SETF."
 
   (defun ht-hash-setup (hash-fun-name stateful-hash-p)
     (cond ((null hash-fun-name)
+           (aver (not stateful-hash-p))
            '((hash (clip-hash (the fixnum
                                (funcall (hash-table-hash-fun hash-table) key))))
              (address-based-p nil)))
@@ -2246,7 +2278,9 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
   `(defun ,name (key table default
                      &aux (hash-table (truly-the hash-table table))
                           (kv-vector (hash-table-pairs hash-table)))
-     (declare (optimize speed (sb-c:verify-arg-count 0)
+     (declare (optimize speed)
+              #-sb-hash-table-debug
+              (optimize (sb-c:verify-arg-count 0)
                         (sb-c:insert-array-bounds-checks 0)))
      (let ((index (hash-table-cache hash-table)))
        ;; When INDEX is negative (implies that the hash table is
@@ -2446,11 +2480,19 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
 (defmacro with-weak-hash-table-entry (&body body)
   `(with-pinned-objects (key)
      (binding* (((hash0 address-sensitive-p)
-                 (funcall (hash-table-hash-fun hash-table) key))
+                 (let ((hash-fun (hash-table-hash-fun hash-table))
+                       (hash-fun-state (hash-table-hash-fun-state hash-table)))
+                   (if (adaptive-hash-fun-state-p hash-fun-state)
+                       (funcall hash-fun key hash-fun-state)
+                       (funcall hash-fun key))))
                 (address-sensitive-p
                  (and address-sensitive-p
                       (not (logtest (hash-table-flags hash-table) hash-table-userfun-flag))))
-                (hash (clip-hash (the fixnum hash0))))
+                (hash (clip-hash hash0)))
+       ;; On 32bit platforms, the largest valid MAYBE-TRUNCATED-HASH
+       ;; is higher than MOST-POSITIVE-FIXNUM. On 64bit platforms,
+       ;; it's the other way around.
+       (declare (type (or fixnum maybe-truncated-hash) hash0))
        (dx-flet ((body ()
                    (binding* (((probed-value probed-key physical-index predecessor)
                                (findhash-weak key hash-table hash address-sensitive-p))
@@ -2497,7 +2539,7 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
 ;;; key and hash-table-test whenever some thread is rehashing. If hash-based
 ;;; lookup uses EQ as the comparator for KEY, then linear search does too.
 (defun hash-table-lsearch (hash-table eq-test key hash default)
-  (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+  (declare (optimize #-sb-hash-table-debug (sb-c:insert-array-bounds-checks 0)))
   (declare (type (and fixnum unsigned-byte) hash))
   #+hash-table-metrics (atomic-incf (hash-table-n-lsearch hash-table))
   (let* ((kv-vector (hash-table-pairs hash-table))
@@ -2532,7 +2574,7 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
            (values default nil)))))
 
 (defun make-synchronized-table-methods (getter setter remover hash-fun-state)
-  (declare (optimize (safety 0)))
+  (declare (optimize #-sb-hash-table-debug (safety 0)))
   ;; We might want to think about inlining the guts of
   ;; CALL-WITH-...LOCK into these methods.
   (values
@@ -2540,7 +2582,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
        ;; These lambdas are named to make backtraces slightly more
        ;; readable.
        (named-lambda gethash/state/lock (key table default)
-         (declare (optimize speed (sb-c:verify-arg-count 0)))
+         (declare (optimize speed
+                            #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          (truly-the
           (values t t &optional)
           (let ((table (truly-the hash-table table)))
@@ -2555,7 +2598,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
                            (hash-table-gethash-impl table))
                        key table default)))))
        (named-lambda gethash/lock (key table default)
-         (declare (optimize speed (sb-c:verify-arg-count 0)))
+         (declare (optimize speed
+                            #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          (truly-the
           (values t t &optional)
           (let ((table (truly-the hash-table table)))
@@ -2563,7 +2607,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
               (funcall getter key table default))))))
    (if hash-fun-state
        (named-lambda puthash/state/lock (key table value)
-         (declare (optimize speed (sb-c:verify-arg-count 0)))
+         (declare (optimize speed
+                            #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          (truly-the
           (values t &optional)
           (let ((table (truly-the hash-table table)))
@@ -2574,7 +2619,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
                            (hash-table-puthash-impl table))
                        key table value)))))
        (named-lambda puthash/lock (key table value)
-         (declare (optimize speed (sb-c:verify-arg-count 0)))
+         (declare (optimize speed
+                            #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          (truly-the
           (values t &optional)
           (let ((table (truly-the hash-table table)))
@@ -2582,7 +2628,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
               (funcall setter key table value))))))
    (if hash-fun-state
        (named-lambda remhash/state/lock (key table)
-         (declare (optimize speed (sb-c:verify-arg-count 0)))
+         (declare (optimize speed
+                            #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          (truly-the
           (values t &optional)
           (let ((table (truly-the hash-table table)))
@@ -2593,7 +2640,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
                            (hash-table-remhash-impl table))
                        key table)))))
        (named-lambda remhash/lock (key table)
-         (declare (optimize speed (sb-c:verify-arg-count 0)))
+         (declare (optimize speed
+                            #-sb-hash-table-debug (sb-c:verify-arg-count 0)))
          (truly-the
           (values t &optional)
           (let ((table (truly-the hash-table table)))
@@ -2602,7 +2650,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
 
 (defmacro pick-table-methods-1 (synchronized getter setter remover
                                 &optional hash-fun-state)
-  `(locally (declare (optimize (safety 0)))
+  `(locally (declare (optimize
+                      #-sb-hash-table-debug (safety 0)))
      (if ,synchronized
          (make-synchronized-table-methods #',getter #',setter #',remover
                                           ,hash-fun-state)
@@ -2649,37 +2698,51 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
   (declare (ignore default))
   (%puthash key table new-value))
 
-(defun hash-table-next-smashed-kv (hash-table)
+(defun transfer-culled-cells (hash-table)
   ;; Entries culled by GC are linked into a plain old list of cons cells,
   ;; because we can atomically manipulate that. We can't atomically operate
   ;; on the array-qua-list representation, both because we don't support
   ;; numeric arrays in (CAS AREF) and lockfree deletion from interior nodes
   ;; of singly-linked lists is tricky (a concurrent insert can get lost).
-  (when (hash-table-smashed-cells hash-table)
-    (binding* ((data (atomic-pop (hash-table-smashed-cells hash-table)))
-               ((kv-index bucket) (etypecase data
-                                   (fixnum (values (ldb (byte 14 14) data)
-                                                   (ldb (byte 14 0) data)))
-                                   (cons (values (car data) (cdr data)))))
-               (index-vector (hash-table-index-vector hash-table))
-               (next-vector (hash-table-next-vector hash-table))
-               (this (aref index-vector bucket))
-               (successor (aref next-vector this)))
-      (if (= kv-index this)
-          ;; This pair started a chain. Removing it is easy
-          (setf (aref index-vector bucket) successor)
-          ;; Else, find the kv-index in the chain and snap it out.
-          (do ((predecessor this)
-               (this successor))
-              ((= this 0) (signal-corrupt-hash-table hash-table))
-            (let ((successor (aref next-vector this)))
-              (when (= kv-index this)
-                (return (setf (aref next-vector predecessor) successor)))
-              (setq predecessor this this successor))))
-      ;; Set the 'next' at kv-index to the head of the ordinary freelist
-      ;; so that when INSERT-AT pops the freelist, it stays correct.
-      (setf (aref next-vector kv-index) (hash-table-next-free-kv hash-table))
-      kv-index)))
+  (unless (hash-table-smashed-cells hash-table)
+    (return-from transfer-culled-cells))
+  (let ((index-vector (hash-table-index-vector hash-table))
+        (next-vector (hash-table-next-vector hash-table))
+        (list (hash-table-smashed-cells hash-table)))
+    (loop ; take ownership of the entire list in one CAS operation
+     (let ((old (cas (hash-table-smashed-cells hash-table) list nil)))
+       (if (eq old list) (return))
+       (setq list old)))
+    ;; TODO: special case if count = 0 then just reestablish the
+    ;; initial conditions without processing one cell at a time.
+    (loop
+      (when (null list) (return))
+      (binding* ((data (car list))
+                 ((kv-index bucket) (etypecase data
+                                      (fixnum (values (ldb (byte 14 14) data)
+                                                      (ldb (byte 14 0) data)))
+                                      (cons (values (car data) (cdr data)))))
+                 (this (aref index-vector bucket))
+                 (successor (aref next-vector this)))
+        (let ((cdr (cdr list)))
+          ;; Break up the the list in case GC sees an interior cell as an ambiguous root
+          (rplacd list 0)
+          (setq list cdr))
+        (if (= kv-index this)
+            ;; This pair started a chain. Removing it is easy
+            (setf (aref index-vector bucket) successor)
+            ;; Else, find the kv-index in the chain and snap it out.
+            (do ((predecessor this)
+                 (this successor))
+                ((= this 0) (signal-corrupt-hash-table hash-table))
+              (let ((successor (aref next-vector this)))
+                (when (= kv-index this)
+                  (return (setf (aref next-vector predecessor) successor)))
+                (setq predecessor this this successor))))
+        ;; Update the list headed by hash-table-next-free-kv and linked
+        ;; through the 'next' vector.
+        (setf (aref next-vector kv-index) (hash-table-next-free-kv hash-table)
+              (hash-table-next-free-kv hash-table) kv-index)))))
 
 ;;; We don't need the looping and checking for GC activiy in PUTHASH
 ;;; because insertion can not co-occur with any other operation,
@@ -2688,7 +2751,9 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
                             &optional stateful-hash-p max-chain-length)
   `(defun ,name (key table value &aux (hash-table (truly-the hash-table table))
                                       (kv-vector (hash-table-pairs hash-table)))
-     (declare (optimize speed (sb-c:verify-arg-count 0)
+     (declare (optimize speed)
+              #-sb-hash-table-debug
+              (optimize (sb-c:verify-arg-count 0)
                         (sb-c:insert-array-bounds-checks 0)))
      (block done
        (let ((index (hash-table-cache hash-table)))
@@ -2789,7 +2854,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
                       address-based-p value))))))
 
 (flet ((insert-at (index hash-table key hash address-based-p value)
-         (declare (optimize speed (sb-c:insert-array-bounds-checks 0))
+         (declare (optimize speed #-sb-hash-table-debug
+                                  (sb-c:insert-array-bounds-checks 0))
                   (type (and index/2 (unsigned-byte 32)) index)
                   (type maybe-truncated-hash hash))
          (when (zerop index)
@@ -2847,19 +2913,23 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
              (setf (aref kv-vector i) key
                    (aref kv-vector (truly-the index (1+ i))) value
                    (hash-table-cache hash-table) i)))
-         (locally (declare (optimize (safety 0)))
+         (locally (declare (optimize #-sb-hash-table-debug (safety 0)))
            (incf (hash-table-%count hash-table)))
          value))
 
   (defun puthash/weak (key hash-table value)
     (declare (type hash-table hash-table) (optimize speed))
+    ;; Delaying the transfer of culled cells could causee the linked list
+    ;; denoting the cells to itself be promoted into a higher generation.
+    ;; Ideally the list would be off-heap and not subject to GC. Attempting to
+    ;; do that would engender two other problems: (1) knowing when to free the list
+    ;; if the table becomes garbage and we had not yet processed - and thus freed -
+    ;; the list. (2) GC can't call malloc()
+    (transfer-culled-cells hash-table)
     (with-weak-hash-table-entry
       (declare (ignore predecessor))
       (cond ((= physical-index 0)
-             ;; There are two kinds of freelists. Prefer a smashed cell
-             ;; so that we might shorten the chain it belonged to.
-             (insert-at (or (hash-table-next-smashed-kv hash-table)
-                            (hash-table-next-free-kv hash-table))
+             (insert-at (hash-table-next-free-kv hash-table)
                         hash-table key hash address-sensitive-p value))
             ((or (empty-ht-slot-p (cas (weak-kvv-ref kv-vector (1+ physical-index))
                                        probed-value value))
@@ -2885,7 +2955,9 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
 (defmacro define-remhash (name std-fn hash-fun-name &optional stateful-hash-p)
   `(defun ,name (key table &aux (hash-table (truly-the hash-table table))
                                        (kv-vector (hash-table-pairs hash-table)))
-     (declare (optimize speed (sb-c:verify-arg-count 0)
+     (declare (optimize speed)
+              #-sb-hash-table-debug
+              (optimize (sb-c:verify-arg-count 0)
                         (sb-c:insert-array-bounds-checks 0)))
      ;; The cache provides no benefit to REMHASH. A hit would just mean there is work
      ;; to do in removing the item from a chain, whereas a miss means we don't know
@@ -3060,16 +3132,26 @@ table itself."
                     (setf (kv-vector-rehash-stamp kv-vector) 0))
                   ;; We always deposit empty markers into k/v pairs that are REMHASHed,
                   ;; so a count of 0 implies no clearing need be done.
-                  (when (plusp (hash-table-%count hash-table))
-                    (setf (hash-table-%count hash-table) 0)
-                    ;; Fill all slots with the empty marker.
-                    (fill kv-vector +empty-ht-slot+ :start 2 :end (* (1+ high-water-mark) 2))
+                  (when (or (and (typep hash-table 'general-hash-table)
+                                 ;; The GC might have removed everything in a weak hash-table
+                                 ;; but index-vector is not yet adjusted by TRANSFER-CULLED-CELLS
+                                 (hash-table-smashed-cells hash-table))
+                            (plusp (hash-table-%count hash-table)))
+                    (when (plusp (hash-table-%count hash-table))
+                      ;; Fill all slots with the empty marker.
+                      (fill kv-vector +empty-ht-slot+ :start 2 :end (* (1+ high-water-mark) 2))
+                      ;; Set to 0 only after kv-vector is cleared,
+                      ;; or cull_weak_hash_table_bucket will find new dead entries.
+                      (setf (hash-table-%count hash-table) 0))
+                    (when (typep hash-table 'general-hash-table)
+                      (setf (hash-table-smashed-cells hash-table) nil))
                     ;; Clear the index-vector if in use. Don't need to
                     ;; clear the hash-vector or the next-vector.
                     (unless flatp
                       (fill (hash-table-index-vector hash-table) 0)
                       (when (let ((hash-fun (hash-table-hash-fun hash-table)))
-                              (locally (declare (optimize (safety 0)))
+                              (locally (declare (optimize #-sb-hash-table-debug
+                                                          (safety 0)))
                                 (eq hash-fun #'adaptive-equal-hash)))
                         ;; Reset SXSTATE-MAX-CHAIN-LENGTH, but keep
                         ;; SXSTATE-LIMIT mostly intact to reduce
@@ -3084,8 +3166,6 @@ table itself."
                                  ;; This never goes below 4.
                                  (- limit (ash (+ limit 3) -3))
                                  #.(max-chain-length 8)))))))
-                  (when (typep hash-table 'general-hash-table)
-                    (setf (hash-table-smashed-cells hash-table) nil))
                   (setf (hash-table-next-free-kv hash-table) 1
                         (kv-vector-high-water-mark kv-vector) 0))))
       (if (hash-table-synchronized-p hash-table)
@@ -3240,19 +3320,20 @@ table itself."
 (defun hash-table-freelist (tbl)
   (hash-table-chain tbl (hash-table-next-free-kv tbl)))
 
-(defun show-chains (tbl &aux (nv (hash-table-next-vector tbl))
+(defun show-chains (tbl &optional print &aux (nv (hash-table-next-vector tbl))
                         (tot-len 0) (max-len 0) (n-chains 0))
-  (flet ((show-chain (label next &aux (len 0))
+  (flet ((show-chain (label next &optional print &aux (len 0))
            (unless (eql next 0)
              (write-string label)
              (loop (format t " ~d" next)
+                   (when print (format t "=~A" (aref (hash-table-pairs tbl) (ash next 1))))
                    (incf len)
                    (when (zerop (setq next (aref nv next))) (return)))
              (terpri))
            len))
     (loop for x across (hash-table-index-vector tbl)
           for i from 0
-          do (let ((len (show-chain (format nil "Bucket ~d:" i) x)))
+          do (let ((len (show-chain (format nil "Bucket ~d:" i) x print)))
                (when (plusp len)
                  (incf tot-len len)
                  (setf max-len (max len max-len))

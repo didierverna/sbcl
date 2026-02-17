@@ -353,7 +353,9 @@ If an unsupported TYPE is requested, the function will return NIL.
                   for note = (sb-c::transform-note xform)
                   do (setf (definition-source-description source)
                            (if (consp typespec)
-                               (list (second typespec) note)
+                               (if (eq (third typespec) '*)
+                                   (list (second typespec) note)
+                                   (list (second typespec) (third typespec) note))
                                (list note)))
                   collect source))))
        ((:optimizer)
@@ -374,10 +376,13 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-c::fun-info-folder . sb-c::folder)
                             (sb-c::fun-info-externally-checkable-type . sb-c::externally-checkable-type)
                             (sb-c::fun-info-constants . sb-c::constants)
-                            (sb-c::fun-info-call-type-deriver . sb-c::call-type-deriver))))
+                            (sb-c::fun-info-call-type-deriver . sb-c::call-type-deriver)
+                            (sb-c::fun-info-rewrite-full-call . sb-c::rewrite-full-call)
+                            (sb-c::fun-info-fold-p . sb-c::fold-p)
+                            (sb-c::fun-info-flushable . sb-c::flushable))))
               (loop for (reader . name) in otypes
                     for fn = (funcall reader fun-info)
-                    when fn collect
+                    when (functionp fn) collect
                     (let ((source (find-definition-source fn)))
                       (setf (definition-source-description source)
                             (list name))

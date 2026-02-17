@@ -17,15 +17,13 @@
 
 (!begin-collecting-cold-init-forms)
 
-;;; ### Remaining incorrectnesses:
-;;;
-;;; There are all sorts of nasty problems with open bounds on FLOAT
-;;; types (and probably FLOAT types in general.)
-
 ;;; This condition is signalled whenever we make a UNKNOWN-TYPE so that
 ;;; compiler warnings can be emitted as appropriate.
 (define-condition parse-unknown-type (condition)
   ((specifier :reader parse-unknown-type-specifier :initarg :specifier))
+  (:report (lambda (condition stream)
+             (format stream "Unknown type ~/sb-ext:print-symbol-with-prefix/ parsed"
+                     (parse-unknown-type-specifier condition))))
   (:default-initargs
    :specifier (missing-arg)))
 
@@ -818,8 +816,6 @@
   (declare (type ctype type))
   (cond ((eq type *wild-type*)
          *universal-type*)
-        ((eq type *empty-type*)
-         *empty-type*)
         ((not (values-type-p type))
          type)
         ((car (args-type-required type)))
@@ -911,6 +907,31 @@
                do (res rest))))
         (res))))
 
+(defun values-type-nth (n type &optional (null t))
+  (declare (fixnum n) (type ctype type))
+  (if (not (values-type-p type))
+      (if (and (not (eq type *wild-type*))
+               (zerop n))
+          type
+          *universal-type*)
+      (progn
+        (loop for type in (values-type-required type)
+              when (minusp (decf n))
+              do (return-from values-type-nth type))
+        (loop for type in (values-type-optional type)
+              when (minusp (decf n))
+              do (return-from values-type-nth
+                   (if null
+                       (type-union type (specifier-type 'null))
+                       type)))
+        (if (values-type-rest type)
+            (if null
+                (type-union (values-type-rest type) (specifier-type 'null))
+                (values-type-rest type))
+            (if null
+                (specifier-type 'null)
+                *universal-type*)))))
+
 ;;; Return a list of OPERATION applied to the types in TYPES1 and
 ;;; TYPES2, padding with REST2 as needed. TYPES1 must not be shorter
 ;;; than TYPES2. The second value is T if OPERATION always returned a
@@ -966,7 +987,43 @@
         (make-values-type nil types *universal-type*))))
 
 (defun make-single-value-type (type)
-  (make-values-type (list type)))
+  (if (eq type *empty-type*)
+      type
+      (let* ((list (list type))
+             (required (intern-ctype-list list)))
+        (declare (dynamic-extent list))
+        (new-ctype values-type
+                   (lambda (x)
+                     (type-list-flags (args-type-required x)))
+                   required nil nil))))
+
+(defun convert-to-single-value-type (type)
+  (cond ((or (eq type *wild-type*)
+             (eq type *empty-type*))
+         type)
+        ((eq type (values-specifier-type '(values &optional)))
+         (values-specifier-type '(values null)))
+        (t
+         (let* ((req (values-type-required type))
+                (opt (values-type-optional type))
+                (rest (values-type-rest type))
+                (first (car req)))
+           (if (and first
+                    (not (cdr req))
+                    (not opt)
+                    (eq rest *universal-type*))
+               type
+               (let* ((type (list (or first
+                                      (type-union (if opt
+                                                      (car opt)
+                                                      rest)
+                                                  (specifier-type 'null)))))
+                      (required (intern-ctype-list type)))
+                 (declare (dynamic-extent type))
+                 (new-ctype values-type
+                            (lambda (x)
+                              (type-list-flags (args-type-required x)))
+                            required nil *universal-type*)))))))
 
 ;;; Do the specified OPERATION on TYPE1 and TYPE2, which may be any
 ;;; type, including VALUES types. With VALUES types such as:
@@ -991,7 +1048,7 @@
 ;;; OPERATION returned true as its second value each time we called
 ;;; it. Since we approximate the intersection of VALUES types, the
 ;;; second value being true doesn't mean the result is exact.
-(defun args-type-op (type1 type2 operation nreq)
+(defun args-type-op (type1 type2 operation nreq &optional null-unsupplied)
   (declare (type ctype type1 type2)
            (type function operation nreq))
   (when (eq type1 type2)
@@ -1002,21 +1059,52 @@
         (values-type-types type2)
       (multiple-value-bind (rest rest-exact)
           (funcall operation rest1 rest2)
-        (multiple-value-bind (res res-exact)
-            (if (< (length types1) (length types2))
-                (fixed-values-op types2 types1 rest1 operation)
-                (fixed-values-op types1 types2 rest2 operation))
-          (let* ((req (funcall nreq
-                               (length (args-type-required type1))
-                               (length (args-type-required type2))))
-                 (required (subseq res 0 req))
-                 (opt (subseq res req)))
-            (values required opt rest
-                    (and rest-exact res-exact))))))))
+        (let* ((n-req-1 (length (args-type-required type1)))
+               (n-req-2 (length (args-type-required type2)))
+               (n1 (length types1))
+               (n2 (length types2))
+               old-required
+               cut-required)
+          (when null-unsupplied
+            ;; Intersect (values t &optional) and (values t (not real) &optional)
+            ;; into (values t &optional),
+            ;; unsupplied values are treated as NIL, which fits into (not real).
+            (cond ((and (> n-req-1 n2)
+                        (eq rest2 *empty-type*))
+                   (setf rest2 (specifier-type 'null)
+                         rest1 rest2
+                         old-required n-req-1
+                         cut-required n2))
+                  ((and (> n-req-2 n1)
+                        (eq rest1 *empty-type*))
+                   (setf rest2 (specifier-type 'null)
+                         rest1 rest2
+                         old-required n-req-2
+                         cut-required n1))))
+          (multiple-value-bind (res res-exact)
+              (if (< n1 n2)
+                  (fixed-values-op types2 types1 rest1 operation)
+                  (fixed-values-op types1 types2 rest2 operation))
+            (let* ((req (cond ((not cut-required)
+                               (funcall nreq n-req-1 n-req-2))
+                              ((find *empty-type* res :end old-required)
+                               (return-from args-type-op
+                                 (values (load-time-value (list *empty-type*))
+                                         nil nil
+                                         (and rest-exact res-exact))))
+                              (t
+                               cut-required)))
+                   (required (subseq res 0 req))
+                   (opt (unless cut-required
+                          (subseq res req))))
+              (values required opt rest
+                      (and rest-exact res-exact)))))))))
 
-(defun values-type-op (type1 type2 operation nreq)
+(defun values-type-op (type1 type2 operation nreq &optional null-unsupplied)
   (multiple-value-bind (required optional rest exactp)
-      (args-type-op type1 type2 operation nreq)
+      (args-type-op type1 type2 operation nreq null-unsupplied)
+    (when (member *empty-type* optional)
+      (setf rest nil))
     (values (make-values-type required optional rest)
             exactp)))
 
@@ -1086,7 +1174,8 @@
         (t
          (values (values-type-op type1 (coerce-to-values type2)
                                  #'type-intersection
-                                 #'max)))))
+                                 #'max
+                                 t)))))
 
 ;;; This is like TYPES-EQUAL-OR-INTERSECT, except that it sort of
 ;;; works on VALUES types. Note that due to the semantics of
@@ -1124,30 +1213,37 @@
         (t (setq type2 (coerce-to-values type2))
            (multiple-value-bind (types1 rest1) (values-type-types type1)
              (multiple-value-bind (types2 rest2) (values-type-types type2)
-               (cond ((< (length (values-type-required type1))
-                         (length (values-type-required type2)))
-                      (values nil t))
-                     ((< (length types1) (length types2))
-                      (values nil nil))
-                     (t
-                      (do ((t1 types1 (rest t1))
-                           (t2 types2 (rest t2)))
-                          ((null t2)
-                           (loop named loop
-                                 for type in t1
-                                 do (multiple-value-bind (res win)
-                                        (csubtypep type rest2)
-                                      (unless win
-                                        (return (values nil nil)))
-                                      (unless res
-                                        (return (values nil t)))))
-                           (csubtypep rest1 rest2))
-                        (multiple-value-bind (res win-p)
-                            (csubtypep (first t1) (first t2))
-                          (unless win-p
-                            (return (values nil nil)))
-                          (unless res
-                            (return (values nil t))))))))))))
+               (let ((n-req1 (length (values-type-required type1)))
+                     (n-req2 (length (values-type-required type2))))
+                (loop for i from 0
+                      do
+                      (unless types2
+                        (loop named loop
+                              for type in types1
+                              do (multiple-value-bind (res win)
+                                     (csubtypep type rest2)
+                                   (unless win
+                                     (return (values nil nil)))
+                                   (unless res
+                                     (return (values nil t)))))
+                        (return (csubtypep rest1 rest2)))
+                      (let ((t1 (pop types1))
+                            (t2 (pop types2)))
+                        (cond ((not t1)
+                               (if (eq rest1 *empty-type*)
+                                   (return (values t t))
+                                   (setf t1 rest1)))
+                              ((and t1
+                                    (>= i n-req1)
+                                    (< i n-req2))
+                               (setf t1 (type-union t1 (specifier-type 'null)))))
+
+                       (multiple-value-bind (res win-p)
+                           (csubtypep t1 t2)
+                         (unless win-p
+                           (return (values nil nil)))
+                         (unless res
+                           (return (values nil t))))))))))))
 
 ;;;; type method interfaces
 
@@ -1580,7 +1676,9 @@
     (when builtin (return (fail spec)))
     ;; SPEC has a legal form, so return an unknown type.
     (unless (logtest (type-context-options context) +type-parse-signal-inhibit+)
-      (signal 'parse-unknown-type :specifier spec))
+      (block nil
+        (restart-case (signal 'parse-unknown-type :specifier spec)
+          (muffle-warning () (return)))))
   UNKNOWN
     (setf (type-context-options context)
           (logior (type-context-options context) +type-parse-cache-inhibit+))
@@ -2482,10 +2580,32 @@ expansion happened."
       (values nil t)))
 
 (defun change-array-type-complexp (type complexp)
-  (make-array-type (array-type-dimensions type)
-                   :complexp complexp
-                   :element-type (array-type-element-type type)
-                   :specialized-element-type (array-type-specialized-element-type type)))
+  (if (negation-type-p type)
+      (make-negation-type
+       (change-array-type-complexp (negation-type-type type) complexp))
+      (make-array-type (array-type-dimensions type)
+                       :complexp complexp
+                       :element-type (array-type-element-type type)
+                       :specialized-element-type (array-type-specialized-element-type type))))
+
+(defun change-array-type (type &key (complexp :inherit)
+                                    element-type
+                                    (dimensions :inherit))
+  (if (negation-type-p type)
+      (make-negation-type
+       (change-array-type (negation-type-type type) :complexp complexp
+                                                    :element-type element-type
+                                                    :dimensions dimensions))
+      (make-array-type (if (eq dimensions :inherit)
+                           (array-type-dimensions type)
+                           dimensions)
+                       :complexp (if (eq complexp :inherit)
+                                     (array-type-complexp type)
+                                     complexp)
+                       :element-type (or element-type
+                                         (array-type-element-type type))
+                       :specialized-element-type (or element-type
+                                                     (array-type-specialized-element-type type)))))
 
 (define-type-method (negation :simple-intersection2) (type1 type2)
   (let ((not1 (negation-type-type type1))
@@ -2509,15 +2629,12 @@ expansion happened."
                              ;; (and (not (simple-array t))
                              ;;      (not (and (array t) (not simple-array))))
                              ;; => (not (array t))
-                             (let ((u (type-union type1
-                                                  (change-array-type-complexp type2 :maybe))))
-                               (when (array-type-p u)
-                                 (make-negation-type u))))
-                            ((eql (array-type-complexp type2) :maybe)
-                             ;; Make it canonical
-                             (type-intersection not1
-                                                (make-negation-type
-                                                 (change-array-type-complexp type2 t))))))))))
+                             (let* ((maybe (change-array-type-complexp type2 :maybe))
+                                    (u (type-union type1 maybe)))
+                               (if (array-type-p u)
+                                   (make-negation-type u)
+                                   ;; Make it canonical
+                                   (type-intersection not1 (make-negation-type maybe)))))))))))
          (or (try not1 not2 type1)
              (try not2 not1 type2))))
       ;; Why no analagous clause to the disjoint in the SIMPLE-UNION2
@@ -2615,8 +2732,15 @@ expansion happened."
                         (%type-intersection new)
                         (car new))
                     type2)))
-     (t
-      nil))))
+     ;; (or (and vector (not (simple-array t))) (not (simple-array base-char)))
+     ;; => (or vector (not (simple-array base-char)))
+     ((and (array-type-p not-type2)
+           (intersection-type-p type1))
+      (let ((t1s (intersection-type-types type1)))
+        (loop for type in t1s
+              when (and (negation-type-p type)
+                        (not (types-equal-or-intersect (negation-type-type type) not-type2)))
+              return (type-union type2 (%type-intersection (remove type t1s)))))))))
 
 (define-type-method (negation :simple-=) (type1 type2)
   (type= (negation-type-type type1) (negation-type-type type2)))
@@ -2643,24 +2767,15 @@ expansion happened."
              (rational
               (cond ((and (floatp thing) (float-infinity-p thing))
                      (return-from coerce-numeric-bound nil))
-                    ((or (eql thing -0d0)
-                         (eql thing -0f0))
-                     0)
                     (t
                      (rational thing))))
              ((float single-float)
-              (cond ((or (eql thing -0d0)
-                         (eql thing -0f0))
-                     0f0)
-                    ((sb-xc:<= most-negative-single-float thing most-positive-single-float)
+              (cond ((sb-xc:<= most-negative-single-float thing most-positive-single-float)
                      (coerce thing 'single-float))
                     (t
                      (return-from coerce-numeric-bound nil))))
              (double-float
-              (cond ((or (eql thing -0d0)
-                         (eql thing -0f0))
-                     0d0)
-                    ((sb-xc:<= most-negative-double-float thing most-positive-double-float)
+              (cond ((sb-xc:<= most-negative-double-float thing most-positive-double-float)
                      (coerce thing 'double-float))
                     (t
                      (return-from coerce-numeric-bound nil)))))))
@@ -2735,12 +2850,14 @@ expansion happened."
                                 (format     (numeric-type-format     base))
                                 (complexp   (numeric-type-complexp   base))
                                 (low        (numeric-type-low        base))
-                                (high       (numeric-type-high       base)))
+                                (high       (numeric-type-high       base))
+                                (normalize-zeros t))
   (make-numeric-type :class class
                      :format format
                      :complexp complexp
                      :low low
-                     :high high))
+                     :high high
+                     :normalize-zeros normalize-zeros))
 
 ;;; If it's longer than N
 (defun weaken-numeric-type-union (n type)
@@ -2769,16 +2886,6 @@ expansion happened."
         (t
          type)))
 
-(!cold-init-forms
-  (setf (info :type :kind 'number) :primitive)
-  (setf (info :type :builtin 'number)
-        #+sb-xc-host
-        (hashset-insert *numeric-union-type-hashset*
-                        (!alloc-numeric-union-type #.(make-ctype-bits 'numeric-union)
-                                                   (get-numtype-aspects nil nil nil)
-                                                   (vector nil nil)))
-        #-sb-xc-host (specifier-type 'number)))
-
 (defun upgraded-complex-part-ctype (typespec &optional context)
   (let ((ctype (specifier-type typespec context)))
     (cond
@@ -2805,16 +2912,21 @@ expansion happened."
       (t
        (specifier-type 'real)))))
 
+(defmacro new-numeric-union-type (aspects ranges)
+  `(let ((ranges ,ranges))
+     ;; rebinding staves off dynamic-extent imposed by NEW-CTYPE
+     (new-ctype numeric-union-type 0 ,aspects ranges)))
+
 (def-type-translator complex ((:context context) &optional (typespec '*))
   (declare (inline !compute-numtype-aspect-id))
   (if (eq typespec '*)
       (specifier-type '(complex real))
       (labels ((complex1 (component-type)
-                 (new-ctype numeric-union-type
-                            0 (get-numtype-aspects :complex
-                                                   (numeric-type-class component-type)
-                                                   (numeric-type-format component-type))
-                            (numeric-union-type-ranges component-type))))
+                 (new-numeric-union-type
+                  (get-numtype-aspects :complex
+                                       (numeric-type-class component-type)
+                                       (numeric-type-format component-type))
+                  (numeric-union-type-ranges component-type))))
         (let ((ctype (upgraded-complex-part-ctype typespec context)))
           ;; this is the two types NIL and (EQL 0)
           (if (csubtypep ctype (sb-kernel:specifier-type '(eql 0)))
@@ -2973,6 +3085,8 @@ expansion happened."
 ;;; is useful mainly for allowing types that are technically numbers,
 ;;; but not a NUMERIC-TYPE.
 (defun numeric-contagion (type1 type2 &key (rational t)
+                                           float
+                                           (complex t)
                                            unsigned)
   (cond ((and (numeric-type-p type1) (numeric-type-p type2))
          (let ((class1 (numeric-type-class type1))
@@ -3000,13 +3114,16 @@ expansion happened."
                               (if (eq format1 'long-float)
                                   'long-float
                                   nil)))
-                   :complexp (cond ((and (eq complexp1 :real)
-                                         (eq complexp2 :real))
+                   :complexp (cond ((or (not complex)
+                                        (and (eq complexp1 :real)
+                                             (eq complexp2 :real)))
                                     :real)
                                    ((or (eq complexp1 :complex)
                                         (eq complexp2 :complex))
                                     :complex))))
-                 ((eq class2 'float) (numeric-contagion type2 type1))
+                 ((eq class2 'float) (numeric-contagion type2 type1 :float float :complex complex))
+                 (float
+                  (specifier-type 'single-float))
                  ((and (eq complexp1 :real) (eq complexp2 :real))
                   (if (or rational
                           (or (neq class1 'integer)
@@ -3021,17 +3138,24 @@ expansion happened."
                                  (typep (numeric-type-low type1) 'unsigned-byte)
                                  (typep (numeric-type-low type2) 'unsigned-byte)
                                  0))))
+                 ((and (eq complexp1 :real)
+                       (member class1 '(integer rational))
+                       (eq complexp2 :complex)
+                       (eq class2 'rational))
+                  (specifier-type '(or rational (complex rational))))
+                 ((and (eq complexp2 :real)
+                       (member class2 '(integer rational))
+                       (eq complexp1 :complex)
+                       (eql class1 'rational))
+                  (specifier-type '(or rational (complex rational))))
                  (t
                   (specifier-type 'number)))))
-        ((eq type1 (specifier-type 'ratio))
-         (numeric-contagion (specifier-type 'rational) type2))
-        ((eq type2 (specifier-type 'ratio))
-         (numeric-contagion type1 (specifier-type 'rational)))
         (t
          (flet ((try-union (a b)
                   (let (union)
                     (loop for type in (union-type-types a)
-                          for contagion = (numeric-contagion type b :rational rational :unsigned unsigned)
+                          for contagion = (numeric-contagion type b :rational rational :unsigned unsigned
+                                                                    :float float :complex complex)
                           do (setf union (if union
                                              (type-union union contagion)
                                              contagion))
@@ -3403,23 +3527,54 @@ expansion happened."
                '(cons array-type null)))))
 
 (define-type-method (array :simple-union2) (type1 type2)
-  (multiple-value-bind
-        (result-eltype result-stype eltype-supertype)
-      (unite-array-types-element-types type1 type2)
-    (multiple-value-bind
-          (result-complexp complexp-supertype)
-        (unite-array-types-complexp type1 type2)
-      (multiple-value-bind
-            (result-dimensions dimensions-supertype)
-          (unite-array-types-dimensions type1 type2)
-        (when (and (not (eq result-dimensions :incompatible))
-                   (not (eq result-eltype :incompatible))
-                   (unite-array-types-supertypes-compatible-p
-                    eltype-supertype complexp-supertype dimensions-supertype))
-          (make-array-type result-dimensions
-           :complexp result-complexp
-           :element-type result-eltype
-           :specialized-element-type result-stype))))))
+  (or
+   (multiple-value-bind
+         (result-eltype result-stype eltype-supertype)
+       (unite-array-types-element-types type1 type2)
+     (multiple-value-bind
+           (result-complexp complexp-supertype)
+         (unite-array-types-complexp type1 type2)
+       (multiple-value-bind
+             (result-dimensions dimensions-supertype)
+           (unite-array-types-dimensions type1 type2)
+         (when (and (not (eq result-dimensions :incompatible))
+                    (not (eq result-eltype :incompatible))
+                    (unite-array-types-supertypes-compatible-p
+                     eltype-supertype complexp-supertype dimensions-supertype))
+           (make-array-type result-dimensions
+                            :complexp result-complexp
+                            :element-type result-eltype
+                            :specialized-element-type result-stype)))))
+   ;; (or (and array (not simple-array)) (simple-array t))
+   ;; => (or (and array (not simple-array)) (array t))
+   (labels ((dimensions-subtypep (type1 type2)
+              (let ((dim1 (array-type-dimensions type1))
+                    (dim2 (array-type-dimensions type2)))
+                (or (eq dim2 '*)
+                    (equal dim1 dim2)
+                    (and (listp dim1)
+                         (= (length dim1) (length dim2))
+                         (every (lambda (d1 d2)
+                                  (or (eq d2 '*)
+                                      (eql d1 d2)))
+                                dim1 dim2)))))
+            (et-subtypep (type1 type2)
+              (let ((et1 (array-type-specialized-element-type type1))
+                    (et2 (array-type-specialized-element-type type2)))
+                (or (eq et1 et2)
+                    (eq et2 *wild-type*))))
+            (try (type1 type2)
+              (let ((c1 (array-type-complexp type1))
+                    (c2 (array-type-complexp type2)))
+                (when (and (not (eq c1 c2))
+                           (not (or (eq c1 :maybe)
+                                    (eq c2 :maybe)))
+                           (et-subtypep type1 type2)
+                           (dimensions-subtypep type1 type2))
+                  (type-union (change-array-type type1 :complexp :maybe)
+                              type2)))))
+     (or (try type1 type2)
+         (try type2 type1)))))
 
 (defun array-type-force-specialized (type)
   (flet ((compound (type)
@@ -3506,6 +3661,8 @@ expansion happened."
                                          ((eq eltype1 *wild-type*)
                                           eltype2)
                                          ((eq eltype2 *wild-type*) eltype1)
+                                         ((eq eltype1 *empty-type*) eltype1)
+                                         ((eq eltype2 *empty-type*) eltype2)
                                          (t (let ((int (type-intersection eltype1 eltype2)))
                                               (if (eq int *empty-type*)
                                                   *universal-type*
@@ -3516,8 +3673,8 @@ expansion happened."
 (define-type-method (array :simple-intersection2) (type1 type2)
   (array-intersection type1 type2 nil))
 
-;;; Turn (and (simple-array t) (not vector)) into
-;;; (and (simple-array t) (not simple-vector))
+;;; Turn (and (simple-array t) (not (vector t))) into
+;;; (and (simple-array t) (not vector))
 (define-type-method (array :complex-intersection2) (type1 type2)
   (or
    (block nil
@@ -3526,7 +3683,6 @@ expansion happened."
          (when (array-type-p not-type1)
            (let ((complexp (array-type-complexp type2))
                  (dim (array-type-dimensions type2))
-                 (et (array-type-element-type type2))
                  (sp-et (array-type-specialized-element-type type2))
                  (not-complexp (array-type-complexp not-type1))
                  (not-dim (array-type-dimensions not-type1))
@@ -3536,36 +3692,31 @@ expansion happened."
                  new-dim
                  new-et
                  new-sp-et)
-             (when (and (neq complexp :maybe)
-                        (eq not-complexp :maybe))
-               (setf new-complexp complexp))
-             (when (neq dim '*)
-               (cond ((eq not-dim '*)
-                      (setf new-dim dim))
-                     ((not (= (length dim)
+             (when (and (eq complexp not-complexp)
+                        (neq complexp :maybe))
+               (setf new-complexp :maybe))
+             (when (and (neq dim '*)
+                        (neq not-dim '*))
+               (cond ((not (= (length dim)
                               (length not-dim)))
-                      (return))
+                      (return type2))
                      ((or (equal dim not-dim)
-                          (not (find '* dim :test-not #'eq))
-                          (not (find '* not-dim))))
+                          (not (find '* not-dim :test-not #'eq)))
+                      (setf new-dim '*))
                      (t
                       (let ((maybe-new-dim
                               (loop for d in dim
                                     for not-d in not-dim
-                                    collect (if (and (neq d '*)
-                                                     (eq not-d '*))
-                                                d
+                                    collect (if (eql d not-d)
+                                                '*
                                                 not-d))))
                         (unless (equal maybe-new-dim not-dim)
                           (setf new-dim maybe-new-dim))))))
-             (cond ((and (neq sp-et *wild-type*)
-                         (eq not-sp-et *wild-type*)
-                         (eq not-et *wild-type*))
-                    (setf new-sp-et sp-et))
-                   ((and (eql sp-et not-sp-et)
-                         (not (eql et not-et))
-                         (not (contains-unknown-type-p not-et)))
-                    (setf new-et et)))
+             (when (and (eq sp-et not-sp-et)
+                        (neq sp-et *wild-type*)
+                        (not (contains-unknown-type-p not-et)))
+               (setf new-sp-et *wild-type*
+                     new-et *wild-type*))
              (when (or new-dim new-et new-sp-et
                        (not (eql new-complexp 0)))
                (type-difference type2
@@ -3578,35 +3729,240 @@ expansion happened."
    :call-other-method))
 
 (define-type-method (array :complex-union2) (type1 type2)
-  (when (negation-type-p type1)
-    (let ((not-type1 (negation-type-type type1)))
-      (when (array-type-p not-type1)
-        (cond ((and
-                (not (array-type-complexp type2))
-                (eq (array-type-complexp not-type1) :maybe)
-                (csubtypep not-type1 (change-array-type-complexp type2 :maybe)))
-               ;; (or (not base-string) simple-base-string)
-               ;; => (not (and base-string (not simple-array)))
-               (make-negation-type
-                (change-array-type-complexp not-type1 t)))
-              ((and (eq (array-type-complexp not-type1) :maybe)
-                    (eq (array-type-complexp type2) t)
-                    (neq (array-type-specialized-element-type not-type1) *wild-type*)
-                    (equal (array-type-dimensions not-type1)
-                           (array-type-dimensions type2))
-                    (csubtypep type2 not-type1))
-               ;; (or (not (array t)) (and (array t) (not simple-array)))
-               ;; => (not (simple-array t))
-               (make-negation-type
-                (change-array-type-complexp type2 nil)))
-              ((and (eq (array-type-complexp not-type1) :maybe)
-                    (eq (array-type-complexp type2) t)
-                    (csubtypep not-type1
-                               (change-array-type-complexp type2 :maybe)))
-               ;; (or (not (vector * 10)) (and vector (not simple-array)))
-               ;; => (not (simple-array * (10)))
-               (make-negation-type
-                (change-array-type-complexp not-type1 nil))))))))
+  (typecase type1
+    (negation-type
+     (let ((not-type1 (negation-type-type type1)))
+       (when (array-type-p not-type1)
+         (cond ((and
+                 (not (array-type-complexp type2))
+                 (eq (array-type-complexp not-type1) :maybe)
+                 (csubtypep not-type1 (change-array-type-complexp type2 :maybe)))
+                ;; (or (not base-string) simple-base-string)
+                ;; => (not (and base-string (not simple-array)))
+                (make-negation-type
+                 (change-array-type-complexp not-type1 t)))
+               ((and (eq (array-type-complexp not-type1) :maybe)
+                     (eq (array-type-complexp type2) t)
+                     (neq (array-type-specialized-element-type not-type1) *wild-type*)
+                     (equal (array-type-dimensions not-type1)
+                            (array-type-dimensions type2))
+                     (csubtypep type2 not-type1))
+                ;; (or (not (array t)) (and (array t) (not simple-array)))
+                ;; => (not (simple-array t))
+                (make-negation-type
+                 (change-array-type-complexp type2 nil)))
+               ((and (eq (array-type-complexp not-type1) :maybe)
+                     (eq (array-type-complexp type2) t)
+                     (csubtypep not-type1
+                                (change-array-type-complexp type2 :maybe)))
+                ;; (or (not (vector * 10)) (and vector (not simple-array)))
+                ;; => (not (simple-array * (10)))
+                (make-negation-type
+                 (change-array-type-complexp not-type1 nil)))
+               ;; (or (vector t) (not (array t))) => (or vector (not (array t)))
+               ;; (or (vector t) (not vector)) => (or (array t) (not vector))
+               ((and
+                 (not (and (eq (array-type-complexp not-type1) :maybe)
+                           (eq (array-type-specialized-element-type not-type1) *wild-type*)
+                           (eq (array-type-dimensions not-type1) '*)))
+                 (or (eq (array-type-dimensions not-type1) '*)
+                     (equal (array-type-dimensions not-type1)
+                            (array-type-dimensions type2)))
+                 (csubtypep type2 not-type1))
+                (type-union (change-array-type type2
+                                               :complexp (if (eq (array-type-complexp not-type1) :maybe)
+                                                             :inherit
+                                                             :maybe)
+                                               :element-type (unless (eq (array-type-specialized-element-type not-type1) *wild-type*)
+                                                               *wild-type*)
+                                               :dimensions (if (eq (array-type-dimensions not-type1) '*)
+                                                               :inherit
+                                                               '*))
+                            type1))
+               ;; (or (vector t) (not (simple-array t)))
+               ;; (or vector (not (simple-array t)))
+               ((and (neq (array-type-specialized-element-type not-type1) *wild-type*)
+                     (csubtypep type2
+                                (change-array-type-complexp not-type1 :maybe)))
+                (type-union (change-array-type type2
+                                               :element-type *wild-type*)
+                            type1))))))
+    (intersection-type
+     (let ((t1s (intersection-type-types type1)))
+       (let (supertype
+             negations
+             other
+             not-simple-array-p)
+         (or (when (and
+                    (loop for type in t1s
+                          always (typecase type
+                                   (array-type
+                                    (when supertype
+                                      ;; TODO: handle (and (array unknown1) (array unknown2))
+                                      (return))
+                                    (setf supertype type))
+                                   (negation-type
+                                    (let ((not-type (negation-type-type type)))
+                                      (cond ((array-type-p not-type)
+                                             (when (eq not-type (specifier-type 'simple-array))
+                                               (setf not-simple-array-p t))
+                                             (push type negations))
+                                            (t
+                                             (push type other)))))
+                                   (t
+                                    (push type other))))
+                    negations)
+               ;; Remove redundant negation types, remove the union if
+               ;; it partitions some array type together with the type1
+               ;; supertype
+               (labels ((dimensions-subtypep (type1 type2)
+                          (let ((dim1 (array-type-dimensions type1))
+                                (dim2 (array-type-dimensions type2)))
+                            (or (eq dim2 '*)
+                                (equal dim1 dim2)
+                                (and (listp dim1)
+                                     (= (length dim1) (length dim2))
+                                     (every (lambda (d1 d2)
+                                              (or (eq d2 '*)
+                                                  (eql d1 d2)))
+                                            dim1 dim2)))))
+                        (et-subtypep (type1 type2)
+                          (let ((et1 (array-type-specialized-element-type type1))
+                                (et2 (array-type-specialized-element-type type2)))
+                            (or (eq et1 et2)
+                                (eq et2 *wild-type*))))
+                        (complexp-intersectp (type1 type2)
+                          (let ((c1 (array-type-complexp type1))
+                                (c2 (array-type-complexp type2)))
+                            (or (eq c1 c2)
+                                (eq c1 :maybe)
+                                (eq c2 :maybe))))
+                        (complexp-subtypep (type1 type2)
+                          (let ((c1 (array-type-complexp type1))
+                                (c2 (array-type-complexp type2)))
+                            (or (eq c2 :maybe)
+                                (eq c1 c2))))
+                        (intersectp (type1 type2)
+                          (and (or (et-subtypep type1 type2)
+                                   (et-subtypep type2 type1))
+                               (complexp-intersectp type1 type2)
+                               (or (dimensions-subtypep type1 type2)
+                                   (dimensions-subtypep type2 type1))))
+                        (array-subtypep (type1 type2)
+                          (and (et-subtypep type1 type2)
+                               (dimensions-subtypep type1 type2)
+                               (complexp-subtypep type1 type2))))
+                 (let* (did-something
+                        (new-negations other)
+                        (union (when supertype
+                                 (type-union2 supertype type2)))
+                        (widened (and (union-type-p union)
+                                      (let* ((types (union-type-types union))
+                                             (a (first types)))
+                                        (if (or (eq a type2)
+                                                (eq a supertype))
+                                            (second types)
+                                            a))))
+                        (widenp t)
+                        (union (and (array-type-p union)
+                                    union))
+                        (union-supertype (or union supertype))
+                        (type2-supertype (if union-supertype
+                                             (change-array-type type2
+                                                                :complexp (if (eq (array-type-complexp union-supertype)
+                                                                                  (array-type-complexp type2))
+                                                                              :maybe
+                                                                              :inherit)
+                                                                :dimensions (if (equal (array-type-dimensions union-supertype)
+                                                                                       (array-type-dimensions type2))
+                                                                                '*
+                                                                                :inherit)
+                                                                :element-type (if (eq (array-type-specialized-element-type union-supertype)
+                                                                                      (array-type-specialized-element-type type2))
+                                                                                  *wild-type*))
+                                             (if (and not-simple-array-p
+                                                      (eq (array-type-complexp type2) t))
+                                                 (change-array-type type2
+                                                                    :complexp :maybe)
+                                                 type2)))
+                        union-negations)
+                   (loop for not in negations
+                         for not-type = (negation-type-type not)
+                         do (cond ((csubtypep not-type type2-supertype)
+                                   (setf did-something t))
+                                  ((and union
+                                        (neq (array-type-complexp type2) :maybe)
+                                        (et-subtypep not-type type2-supertype)
+                                        (dimensions-subtypep not-type type2-supertype)
+                                        (complexp-intersectp not-type type2-supertype))
+                                   (cond ((eq (array-type-complexp not-type) :maybe)
+                                          (push (change-array-type not :complexp (not (array-type-complexp type2)))
+                                                union-negations))
+                                         (t
+                                          (setf did-something t)
+                                          (push (change-array-type not :complexp (not (array-type-complexp type2)))
+                                                new-negations))))
+                                  ((and (neq (array-type-complexp type2) :maybe)
+                                        (neq (array-type-complexp not-type) :maybe)
+                                        (neq (array-type-complexp not-type)
+                                             (array-type-complexp type2))
+                                        (et-subtypep not-type type2-supertype)
+                                        (dimensions-subtypep not-type type2-supertype))
+                                   (setf did-something t)
+                                   (push (change-array-type not :complexp :maybe)
+                                         new-negations))
+                                  (t
+                                   (when (intersectp not-type type2-supertype)
+                                     (if (and (not widened)
+                                              widenp
+                                              (et-subtypep type2 not-type)
+                                              (eq (array-type-complexp type2)
+                                                  (array-type-complexp not-type))
+                                              (neq (array-type-dimensions type2) '*)
+                                              (equal (array-type-dimensions type2)
+                                                     (array-type-dimensions not-type))
+                                              (or (not supertype)
+                                                  (array-subtypep type2 supertype)))
+                                         (setf widened
+                                               (change-array-type type2 :dimensions '*))
+                                         (setf widenp nil))
+                                     (setf union nil))
+                                   (push not new-negations))))
+                   (when (and union union-negations)
+                     (setf new-negations (nconc union-negations new-negations)
+                           did-something t))
+                   (unless widenp
+                     (setf widened nil))
+                   (when (or did-something widened)
+                     (let ((intersections (%type-intersection new-negations)))
+                       (if union
+                           (type-intersection union intersections)
+                           (type-union (or widened type2)
+                                       (if supertype
+                                           (type-intersection supertype intersections)
+                                           intersections))))))))
+             ;; This is the same as in the intersection-simple-union2-type-method,
+             ;; but it doesn't stop if type-union produces a new union type:
+             ;; (or (and vector (not (simple-array t))) simple-vector)
+             ;; => vector
+             (let (unions
+                   non-compound)
+               (do ((t1s t1s (cdr t1s)))
+                   ((null t1s))
+                 (let ((union (or (type-union2 type2 (car t1s))
+                                  (return-from array-complex-union2-type-method))))
+                   (if (typep union '(or compound-type negation-type))
+                       (push union unions)
+                       (setf non-compound (if non-compound
+                                              (type-intersection non-compound union)
+                                              union)))))
+               (when non-compound
+                 (loop for (union . more) on unions
+                       do (setf non-compound (type-intersection non-compound union))
+                       if (and more
+                               (typep non-compound '(or compound-type negation-type)))
+                       return nil
+                       finally (return non-compound))))))))))
 
 ;;; Check a supplied dimension list to determine whether it is legal,
 ;;; and return it in canonical form (as either '* or a list).
@@ -3640,7 +3996,7 @@ expansion happened."
 
 ;; Return possibly a union of a MEMBER type and a NUMERIC type,
 ;; or just one or the other, or *EMPTY-TYPE* depending on what's in the XSET
-;; and the FP-ZEROES. XSET must not contains characters or real numbers.
+;; XSET must not contains characters or real numbers.
 ;; MEMBER types go into one of three hash containers:
 ;;  - *EQL-TYPE-CACHE* holds singleton types. A weak hash-table suffices for this.
 ;;  - *MEMBER-TYPE-HASHSET* holds types whose members are {NUMBER|CHARACTER|SYMBOL}.
@@ -3648,104 +4004,68 @@ expansion happened."
 ;;    hash-cons XSETs without complications for EQ-comparable keys.
 ;;  - *MEMBER/EQ-TYPE-HASHSET* is the general case, allowing a mixture of objects
 ;;;   hashed by content-dependent hash and/or pseudorandom opaque hash.
-(defun make-member-type (xset fp-zeroes)
-  ;; if we have a pair of zeros (e.g. 0.0d0 and -0.0d0), then we can
-  ;; canonicalize to (DOUBLE-FLOAT 0.0d0 0.0d0), because numeric
-  ;; ranges are compared by arithmetic operators (while MEMBERship is
-  ;; compared by EQL).  -- CSR, 2003-04-23
+(defun make-member-type (xset)
   (declare (sb-c::tlab :system))
   (map-xset (lambda (elt)
               (when (or (characterp elt) (realp elt))
                 (bug "MEMBER type contains ~S" elt)))
             xset)
-  (let ((presence 0)
-        (unpaired nil)
-        (float-types nil))
-    (cond
-     (fp-zeroes ; avoid doing two passes of nothing
-      (dotimes (pass 2)
-        (dolist (z fp-zeroes)
-          (let ((sign (float-sign-bit z))
-                (pair-idx
-                  (etypecase z
-                    (single-float 0)
-                    (double-float 2
-                    #+long-float (long-float 4)))))
-            (cond ((= pass 0) ; first pass: track presence of +-0 of each float format
-                   (setf (ldb (byte 1 (+ pair-idx sign)) presence) 1))
-                  ;; second pass: if not both signs present, then it's an unpaired zero
-                  ((/= (ldb (byte 2 pair-idx) presence) #b11)
-                   (push z unpaired))
-                  ((= sign 0) ; take the +0 as canonical when both +-0 are present
-                   (push (make-numeric-type :complexp :real :class 'float :low z :high z
-                                            :format (float-format-name z))
-                         float-types)))))))
-     ((and (= (xset-count xset) 1)
-           (eq (car (xset-members xset)) nil))
-      ;; Bypass the hashset for type NULL because it's so important
-      (return-from make-member-type
-        (inline-cache-ctype (!alloc-member-type (make-ctype-bits 'member)
-                                                (!new-xset '(nil) 1)
-                                                '())
-                            null))))
-    (let* ((count (+ (length unpaired) (xset-count xset)))
-           (member-type
-            (unless (= count 0)
-              (dx-let ((temp (!alloc-member-type (ctype-class-bits 'member)
-                                                 xset unpaired)))
-                (cond
-                  ((= count 1)
-                   (let ((container *eql-type-cache*)
-                         (key (first (or unpaired (xset-data xset)))))
-                     (with-system-mutex ((hash-table-lock container))
-                       ;; This is like ENSURE-GETHASH but it potentially copies the key
-                       (or (gethash key container)
-                           (let ((copy (copy-ctype temp)))
-                             ;; re-fetch KEY from XSET in case it was copied.
-                             ;; hope no off-heap pointers buried within KEY.
-                             (setf (gethash (first (member-type-members copy)) container)
-                                   copy))))))
-                  ((xset-every (lambda (x) (typep x '(or symbol number character))) xset)
-                   (hashset-insert-if-absent *member-type-hashset* temp #'copy-ctype))
-                  (t
-                   (binding*
-                       ((container *member/eq-type-hashset*)
-                        ((result foundp)
-                         (with-system-mutex (*xset-mutex*)
-                           (xset-generate-stable-hashes xset)
-                           (acond ((hashset-find container temp)
-                                   (xset-delete-stable-hashes xset) ; inside the mutex scope
-                                   (values it t))
-                                  (t
-                                   (values (hashset-insert container (copy-ctype temp))
-                                           nil))))))
-                     (unless foundp ; "use" the var binding if #+sb-xc-host
-                       #-sb-xc-host ; attach finalizer (outside the mutex scope)
-                       (let ((xset (member-type-xset result))) ; in case XSET was copied
-                         (finalize
-                          result (lambda ()
-                                   (with-system-mutex (*xset-mutex*)
-                                     (xset-delete-stable-hashes xset))))))
-                     result)))))))
-      ;; The actual member-type contains the XSET (with no FP zeroes),
-      ;; and a list of unpaired zeroes.
-      (if (not float-types)
-          (or member-type *empty-type*)
-          (let ((types (if member-type
-                           (cons member-type float-types)
-                           float-types)))
-            (if (cdr types)
-                (make-union-type t types)
-                (car types)))))))
+  (cond
+    ((and (= (xset-count xset) 1)
+          (eq (car (xset-members xset)) nil))
+     ;; Bypass the hashset for type NULL because it's so important
+     (return-from make-member-type
+       (inline-cache-ctype (!alloc-member-type (make-ctype-bits 'member)
+                                               (!new-xset '(nil) 1))
+                           null))))
+  (let* ((count (xset-count xset))
+         (member-type
+           (unless (= count 0)
+             (dx-let ((temp (!alloc-member-type (ctype-class-bits 'member)
+                                                xset)))
+               (cond
+                 ((= count 1)
+                  (let ((container *eql-type-cache*)
+                        (key (first (xset-data xset))))
+                    (with-system-mutex ((hash-table-lock container))
+                      ;; This is like ENSURE-GETHASH but it potentially copies the key
+                      (or (gethash key container)
+                          (let ((copy (copy-ctype temp)))
+                            ;; re-fetch KEY from XSET in case it was copied.
+                            ;; hope no off-heap pointers buried within KEY.
+                            (setf (gethash (first (member-type-members copy)) container)
+                                  copy))))))
+                 ((xset-every (lambda (x) (typep x '(or symbol number character))) xset)
+                  (hashset-insert-if-absent *member-type-hashset* temp #'copy-ctype))
+                 (t
+                  (binding*
+                      ((container *member/eq-type-hashset*)
+                       ((result foundp)
+                        (with-system-mutex (*xset-mutex*)
+                          (xset-generate-stable-hashes xset)
+                          (acond ((hashset-find container temp)
+                                  (xset-delete-stable-hashes xset) ; inside the mutex scope
+                                  (values it t))
+                            (t
+                             (values (hashset-insert container (copy-ctype temp))
+                                     nil))))))
+                    (unless foundp ; "use" the var binding if #+sb-xc-host
+                      #-sb-xc-host ; attach finalizer (outside the mutex scope)
+                      (let ((xset (member-type-xset result))) ; in case XSET was copied
+                        (finalize
+                         result (lambda ()
+                                  (with-system-mutex (*xset-mutex*)
+                                    (xset-delete-stable-hashes xset))))))
+                    result)))))))
+    ;; The actual member-type contains the XSET (with no FP zeroes),
+    ;; and a list of unpaired zeroes.
+    (or member-type *empty-type*)))
 
 (defun member-type-size (type)
-  (+ (length (member-type-fp-zeroes type))
-     (xset-count (member-type-xset type))))
+  (xset-count (member-type-xset type)))
 
 (defun member-type-member-p (x type)
-  (if (fp-zero-p x)
-      (and (member x (member-type-fp-zeroes type)) t)
-      (xset-member-p x (member-type-xset type))))
+  (xset-member-p x (member-type-xset type)))
 
 (defun mapcar-member-type-members (function type)
   (declare (function function))
@@ -3753,43 +4073,18 @@ expansion happened."
     (map-xset (lambda (x)
                 (results (funcall function x)))
               (member-type-xset type))
-    (dolist (zero (member-type-fp-zeroes type))
-      (results (funcall function zero)))
     (results)))
 
 (defun mapc-member-type-members (function type)
   (declare (function function))
-  (map-xset function (member-type-xset type))
-  (dolist (zero (member-type-fp-zeroes type))
-    (funcall function zero)))
+  (map-xset function (member-type-xset type)))
 
 (defun member-type-members (type)
-  (append (member-type-fp-zeroes type)
-          (xset-members (member-type-xset type))))
+  (xset-members (member-type-xset type)))
 
+;;; REMOVE?
 (define-type-method (member :negate) (type)
-  (let ((xset (member-type-xset type))
-        (fp-zeroes (member-type-fp-zeroes type)))
-    (if fp-zeroes
-        ;; Hairy case, which needs to do a bit of float type
-        ;; canonicalization.
-        (apply #'type-intersection
-               (if (xset-empty-p xset)
-                   *universal-type*
-                   (make-negation-type (make-member-type xset nil)))
-               (mapcar
-                (lambda (x)
-                  (let* ((opposite (sb-xc:- x))
-                         (type (ctype-of opposite)))
-                    (type-union
-                     (make-negation-type
-                      (modified-numeric-type type :low nil :high nil))
-                     (modified-numeric-type type :low nil :high (list opposite))
-                     (make-eql-type opposite)
-                     (modified-numeric-type type :low (list opposite) :high nil))))
-                fp-zeroes))
-        ;; Easy case
-        (make-negation-type type))))
+  (make-negation-type type))
 
 (define-type-method (member :unparse) (flags type)
   (cond ((eq type (specifier-type 'null)) 'null) ; NULL type is EQ-comparable
@@ -3802,11 +4097,9 @@ expansion happened."
       (values nil nil)))
 
 (define-type-method (member :simple-subtypep) (type1 type2)
-   (values (and (xset-subset-p (member-type-xset type1)
-                               (member-type-xset type2))
-                (subsetp (member-type-fp-zeroes type1)
-                         (member-type-fp-zeroes type2)))
-           t))
+  (values (xset-subset-p (member-type-xset type1)
+                         (member-type-xset type2))
+          t))
 
 (define-type-method (member :complex-subtypep-arg1) (type1 type2)
   (block punt
@@ -3831,13 +4124,10 @@ expansion happened."
 
 (define-type-method (member :simple-intersection2) (type1 type2)
   (make-member-type (xset-intersection (member-type-xset type1)
-                                       (member-type-xset type2))
-                    (intersection (member-type-fp-zeroes type1)
-                                  (member-type-fp-zeroes type2))))
+                                       (member-type-xset type2))))
 
 (define-type-method (member :complex-intersection2) (type1 type2)
   (let ((xset (alloc-xset))
-        (fp-zeroes nil)
         (not-sure)
         (any-skipped))
     (mapc-member-type-members
@@ -3846,15 +4136,13 @@ expansion happened."
          (when (not sure)
            (setf not-sure t))
          (if (or ok (not sure))
-             (if (fp-zero-p member)
-                 (pushnew member fp-zeroes)
-                 (add-to-xset member xset))
+             (add-to-xset member xset)
              (setf any-skipped t))))
      type2)
     (let ((member
-            (if (and (xset-empty-p xset) (not fp-zeroes))
+            (if (xset-empty-p xset)
                 *empty-type*
-                (make-member-type xset fp-zeroes))))
+                (make-member-type xset))))
       (if not-sure
           (and any-skipped
                (type-intersection type1 member))
@@ -3865,9 +4153,7 @@ expansion happened."
 ;;; union type method.
 (define-type-method (member :simple-union2) (type1 type2)
   (make-member-type (xset-union (member-type-xset type1)
-                                (member-type-xset type2))
-                    (union (member-type-fp-zeroes type1)
-                           (member-type-fp-zeroes type2))))
+                                (member-type-xset type2))))
 
 (define-type-method (member :complex-=) (type1 type2)
   (if (type-enumerable type1)
@@ -3881,21 +4167,24 @@ expansion happened."
   ;; "* may appear as an argument to a MEMBER type specifier, but it indicates the
   ;;  literal symbol *, and does not represent an unspecified value."
   (if members
-      (let ((xset (alloc-xset)) fp-zeros other-reals characters)
-        ;; Calling REMOVE-DUPLICATES up front as used to be done is wasteful because the XSET can't
-        ;; have dups in it. Elements that don't go in the XSET have to be de-duplicated.
-        ;; There are at most 4 fp-zeros, so calling PUSHNEW is fine. For the rest, we can suppose
-        ;; that DELETE-DUPLICATES is as good as it gets. (It could/should use a hash-table above
-        ;; a cetain length input, but does not)
+      (let ((xset (alloc-xset))
+            characters
+            rationals
+            double-floats
+            single-floats)
         (dolist (m members)
           (typecase m
-            (character (push m characters))
-            (real (if (fp-zero-p m) (pushnew m fp-zeros) (push m other-reals)))
-            (t (add-to-xset m xset))))
-        (apply #'type-union
-               (make-member-type xset fp-zeros)
-               (character-set-type-from-characters characters)
-               (mapcar #'ctype-of-number (delete-duplicates other-reals))))
+            (character    (push m characters))
+            (double-float (push m double-floats))
+            (single-float (push m single-floats))
+            (rational     (push m rationals))
+            (t            (add-to-xset m xset))))
+        (type-union
+         (make-member-type xset)
+         (character-set-type-from-characters characters)
+         (member-rational rationals)
+         (member-float 'double-float double-floats)
+         (member-float 'single-float single-floats)))
       *empty-type*))
 (defun make-eql-type (elt)
   ;; Start by looking in the hash-table, there's no reason not to.
@@ -3916,27 +4205,18 @@ expansion happened."
            #-sb-xc-host (declare (dynamic-extent pairs))
            (make-character-set-type pairs)))
         (real
-         (unless (fp-zero-p elt)
-           ;; we do see singleton fp zeros in self-build but not other floats
-           #+sb-xc-host (bug "Unexpected singleton REAL type")
-           ;; This is a little redundant with CTYPE-OF-NUMBER,
-           ;; but imho easier to understand.
-           (multiple-value-bind (class format)
-               (typecase elt
-                 (float (values 'float (float-format-name elt)))
-                 (ratio 'rational)
-                 (t 'integer))
-             (make-numeric-type :class class :format format :low elt :high elt)))))
-      ;; The thing is definitely implemented as a MEMBER type. Just a question of
-      ;; whether to put ELT in the XSET.
-      (multiple-value-bind (xset fp-zeros)
-          (if (realp elt) ; is a floating-point zero
-              (values (load-time-value (alloc-xset) t) ; an always-empty XSET
-                      (list elt))
-              (let ((xset (alloc-xset)))
-                (add-to-xset elt xset)
-                (values xset nil)))
-        (make-member-type xset fp-zeros))))
+         #+sb-xc-host (bug "Unexpected singleton REAL type")
+         (multiple-value-bind (class format)
+             (typecase elt
+               (float (values 'float (float-format-name elt)))
+               (ratio 'rational)
+               (t 'integer))
+           (make-numeric-type :class class :format format :low elt :high elt
+                              :normalize-zeros nil))))
+      ;; The thing is definitely implemented as a MEMBER type.
+      (make-member-type (let ((xset (alloc-xset)))
+                          (add-to-xset elt xset)
+                          (values xset nil)))))
 
 ;;;; intersection types
 ;;;;
@@ -4057,10 +4337,12 @@ expansion happened."
        (null (set-difference list2 list1))))
 
 (defun class-type-p (type)
-  (or (classoid-p type)
-      (eq type *extended-sequence-type*)
+  (or (eq type *extended-sequence-type*)
       (eq type *funcallable-instance-type*)
-      (eq type *instance-type*)))
+      (eq type *instance-type*)
+      (and (classoid-p type)
+           (not (structure-classoid-p type))
+           (not (classoid-non-instance-p type)))))
 
 ;;; FIXME: This will look eeriely familiar to readers of the UNION
 ;;; :SIMPLE-INTERSECTION2 :COMPLEX-INTERSECTION2 method.  That's
@@ -4130,7 +4412,24 @@ expansion happened."
                                                         (some #'class-type-p classoids-2))
                                                (type-union type1 (%type-intersection classoids-2)))))
                                       (or (try type1 classoids-1 non-classoids-1 classoids-2 non-classoids-2)
-                                          (try type2 classoids-2 non-classoids-2 classoids-1 non-classoids-1)))))))))))))
+                                          (try type2 classoids-2 non-classoids-2 classoids-1 non-classoids-1))))
+                                   ;; (or (and (not double-float) (not standard-object)) (and standard-object function))
+                                   ;; => (or function (and (not double-float) (not standard-object)))
+                                   ((flet ((try (type1 type2)
+                                             (unless (some #'negation-type-p (intersection-type-types type1))
+                                               (let (empty-ints
+                                                     non-empty)
+                                                 (loop for typea in (intersection-type-types type1)
+                                                       for int = (type-intersection typea type2)
+                                                       if (eq (type-intersection typea type2) *empty-type*)
+                                                       do (setf empty-ints t)
+                                                       else do (push typea non-empty))
+                                                 (when (and empty-ints
+                                                            non-empty)
+                                                   (type-union (%type-intersection non-empty)
+                                                               type2))))))
+                                      (or (try type1 type2)
+                                          (try type2 type1)))))))))))))
         ;; (or (and (not integer) (not vector) (not (array t))) vector)
         ;; =>
         ;; (or (and (not integer) (not (array t))) vector)
@@ -4142,6 +4441,21 @@ expansion happened."
                                 (eq (negation-type-type type1) type)))
                     return (type-union type1
                                        (%type-intersection (remove type (intersection-type-types type2)))))))
+        ;; (or (and vector (not (array fixnum))) (and (not integer) (not (array t))))
+        ;; => (or vector (and (not integer) (not (array t))))
+        ((and (intersection-type-p type1)
+              (flet ((try (type1 type2)
+                       (loop for t1 in (intersection-type-types type1)
+                             when
+                             (and (negation-type-p t1)
+                                  (loop for t2 in (intersection-type-types type2)
+                                        always (and (negation-type-p t2)
+                                                    (not (types-equal-or-intersect (negation-type-type t1)
+                                                                                   (negation-type-type t2))))))
+                             return (type-union (%type-intersection (remove t1 (intersection-type-types type1)))
+                                                type2))))
+                (or (try type1 type2)
+                    (try type1 type2)))))
         (t
          (let ((accumulator *universal-type*))
            (do ((t2s (intersection-type-types type2) (cdr t2s)))
@@ -4283,7 +4597,7 @@ expansion happened."
     ;; This is order-sensitive. Prefer to recognize SEQUENCE
     ;; and extract 4 components (NULL,CONS,VECTOR,EXTENDED-SEQUENCE)
     ;; before considering LIST and extracting 2, etc.
-    '(sequence list real float complex bignum)))
+    '(sequence list number real float complex bignum)))
 
 (defun union-unparse (flags types)
   (declare (ignorable flags))
@@ -4389,7 +4703,7 @@ expansion happened."
                 (high (numeric-type-high single)))
             (labels ((n= (x y)
                        (and (not (float-infinity-or-nan-p x))
-                            (sb-xc:= x y)))
+                            (fp= x y)))
                      (match (x y)
                        ;; equalp doesn't work on floats in sb-xc-host
                        (cond ((null x)
@@ -4403,27 +4717,39 @@ expansion happened."
               (when (and (match low (numeric-type-low double))
                          (match high (numeric-type-high double)))
                 (setf remainder (delq1 double (delq1 single remainder)))
-                (cond ((or (and rational
-                                (match low (numeric-type-low rational))
-                                (match high (numeric-type-high rational)))
-                           (and (setf rational integer)
-                                (numberp (numeric-type-low rational))
-                                (eql (numeric-type-low rational)
-                                     (numeric-type-high rational)) ;; (rational 1 1) is an integer.
-                                (match low (numeric-type-low rational))
-                                (match high (numeric-type-high rational))))
-                       (setf remainder (delq1 rational remainder))
-                       (let ((low (numeric-type-low rational))
-                             (high (numeric-type-high rational)))
-                         (recognized (cond (high
-                                            `(real ,(or low '*) ,high))
-                                           (low
-                                            `(real ,low))))))
-                      (t
-                       (recognized (cond (high
-                                          `(float ,(or low '*) ,high))
-                                         (low
-                                          `(float ,low)))))))))))
+                (multiple-value-bind (low high zero) (float-type-split-zeros low high)
+                  (cond ((and (not zero)
+                              (or (and rational
+                                       (match low (numeric-type-low rational))
+                                       (match high (numeric-type-high rational)))
+                                  (and (setf rational integer)
+                                       (numberp (numeric-type-low rational))
+                                       (eql (numeric-type-low rational)
+                                            (numeric-type-high rational)) ;; (rational 1 1) is an integer.
+                                       (match low (numeric-type-low rational))
+                                       (match high (numeric-type-high rational)))))
+                         (setf remainder (delq1 rational remainder))
+                         (let ((low (numeric-type-low rational))
+                               (high (numeric-type-high rational)))
+                           (recognized (cond (high
+                                              `(real ,(or low '*) ,high))
+                                             (low
+                                              `(real ,low))))))
+                        (t
+                         (flet ((gen (low high)
+                                  (cond
+                                    (high `(float ,(or low '*) ,high))
+                                    (low
+                                     `(float ,low)))))
+                           (recognized
+                            (if zero
+                                (let ((zero `(member ,(coerce zero 'double-float)
+                                                     ,(coerce zero 'single-float))))
+                                  (if (or low high)
+                                      `(or ,zero
+                                           ,(gen low high))
+                                      zero))
+                                (gen low high))))))))))))
       (let ((list (nconc (recognized)
                          (type-unparse flags (delete nil remainder)))))
         (if (cdr list) `(or ,@list) (car list))))))
@@ -5178,7 +5504,8 @@ expansion happened."
                          :format (and (floatp num) (float-format-name num))
                          :complexp complexp
                          :low low
-                         :high high))))
+                         :high high
+                         :normalize-zeros nil))))
 
 ;;; The following function is a generic driver for approximating
 ;;; set-valued functions over types.  Putting this here because it'll
@@ -5432,7 +5759,7 @@ expansion happened."
 (defconstant range-ratio-run 2)
 (defconstant range-rational-run 3)
 
-(defun make-numeric-type (&key class format (complexp :real) low high)
+(defun make-numeric-type (&key class format (complexp :real) low high (normalize-zeros t))
   (declare (type (member integer rational float nil) class))
   (declare (inline !compute-numtype-aspect-id))
   (let ((union-type (%make-union-numeric-type
@@ -5456,17 +5783,25 @@ expansion happened."
       (return-from make-numeric-type *empty-type*))
     (when (and (eq class 'rational) (integerp low) (eql low high))
       (setf class 'integer))
-    (flet ((normalize-zero (x)
+    (flet ((normalize-low-zero (x)
              (cond
-               ((eql x -0d0) 0d0)
-               ((eql x -0f0) 0f0)
+               ((not normalize-zeros) x)
+               ((eql x 0d0) -0d0)
+               ((eql x 0f0) -0f0)
                ((equal x '(-0d0)) '(0d0))
                ((equal x '(-0f0)) '(0f0))
+               (t x)))
+           (normalize-high-zero (x)
+             (cond
+               ((not normalize-zeros) x)
+               ((eql x -0d0) 0d0)
+               ((eql x -0f0) 0f0)
+               ((equal x '(0d0)) '(-0d0))
+               ((equal x '(0f0)) '(-0f0))
                (t x))))
-      (declare (inline normalize-zero))
-      (let ((low (normalize-zero low))
-            (high (normalize-zero high)))
-        (new-ctype numeric-union-type 0 (get-numtype-aspects complexp class format)
+      (let ((low (normalize-low-zero low))
+            (high (normalize-high-zero high)))
+        (new-numeric-union-type (get-numtype-aspects complexp class format)
                    (case class
                      (integer
                       (vector range-integer-run low high))
@@ -5475,52 +5810,82 @@ expansion happened."
                      (t
                       (vector low high))))))))
 
+(defun float-type-split-zeros (low high)
+  (cond ((fp-zero-p low)
+         (if (eql low high)
+             (values nil nil low)
+             (if (float-sign-bit-set-p low)
+                 (values (sb-xc:- low) high nil)
+                 (values (list low) high low))))
+        ((and (fp-zero-p high)
+              (float-sign-bit-set-p high))
+         (values low (list (sb-xc:- high)) high))
+        ((typep high '(cons (satisfies fp-zero-p)))
+         (values low (list (abs (car high)))))
+        (t
+         (values low high nil))))
+
 (defun number-unparse (type)
   (let* ((complexp (numeric-type-complexp type))
          (low (numeric-type-low type))
          (high (numeric-type-high type))
-         (base (case (numeric-type-class type)
+         (class (numeric-type-class type))
+         (base (case class
                  (integer 'integer)
                  (rational 'rational)
                  (float (or (numeric-type-format type) 'float))
                  (t 'real))))
-    (let ((base+bounds
-            (cond ((and (eq base 'integer) high low)
-                   (let ((high-count (logcount high))
-                         (high-length (integer-length high)))
-                     (cond ((= low 0)
-                            (cond ((= high 0) '(integer 0 0))
-                                  ((= high 1) 'bit)
-                                  ((and (= high-count high-length)
-                                        (plusp high-length))
-                                   `(unsigned-byte ,high-length))
-                                  (t
-                                   `(mod ,(1+ high)))))
-                           ((and (= low most-negative-fixnum)
-                                 (= high most-positive-fixnum))
-                            'fixnum)
-                           ((and (= low (lognot high))
-                                 (= high-count high-length)
-                                 (> high-count 0))
-                            `(signed-byte ,(1+ high-length)))
-                           (t
-                            `(integer ,low ,high)))))
-                  (high `(,base ,(or low '*) ,high))
-                  (low
-                   (if (and (eq base 'integer) (= low 0))
-                       'unsigned-byte
-                       `(,base ,low)))
-                  (t base))))
-      (ecase complexp
-        (:real
-         (aver (neq base 'real))
-         base+bounds)
-        (:complex
-         (aver (neq base 'real))
-         `(complex ,base+bounds))
-        ((nil)
-         (aver (eq base+bounds 'real))
-         'number)))))
+    (flet ((gen (low high)
+             (cond
+               (high `(,base ,(or low '*) ,high))
+               (low
+                (if (and (eq base 'integer) (= low 0))
+                    'unsigned-byte
+                    `(,base ,low)))
+               (t base))))
+      (let ((base+bounds
+              (cond ((and (eq base 'integer) high low)
+                     (let ((high-count (logcount high))
+                           (high-length (integer-length high)))
+                       (cond ((= low 0)
+                              (cond ((= high 0) '(integer 0 0))
+                                    ((= high 1) 'bit)
+                                    ((and (= high-count high-length)
+                                          (plusp high-length))
+                                     `(unsigned-byte ,high-length))
+                                    (t
+                                     `(mod ,(1+ high)))))
+                             ((and (= low most-negative-fixnum)
+                                   (= high most-positive-fixnum))
+                              'fixnum)
+                             ((and (= low (lognot high))
+                                   (= high-count high-length)
+                                   (> high-count 0))
+                              `(signed-byte ,(1+ high-length)))
+                             (t
+                              `(integer ,low ,high)))))
+                    ((eq class 'float)
+                     (multiple-value-bind (low high zero)
+                         (float-type-split-zeros low high)
+                       (if zero
+                           (let ((zero `(member ,zero)))
+                             (if (or low high)
+                                 `(or ,zero
+                                      ,(gen low high))
+                                 zero))
+                           (gen low high))))
+                    (t
+                     (gen low high)))))
+        (ecase complexp
+          (:real
+           (aver (neq base 'real))
+           base+bounds)
+          (:complex
+           (aver (neq base 'real))
+           `(complex ,base+bounds))
+          ((nil)
+           (aver (eq base+bounds 'real))
+           'number))))))
 
 (define-type-method (numeric-union :unparse) (flags type)
   (if (numeric-type-p type)
@@ -5639,6 +6004,56 @@ expansion happened."
           (t
            min))))
 
+;;; Order -0.0 before 0.0
+
+(defun fp> (a b)
+  (cond ((and (eql a 0f0)
+              (eql b -0f0)))
+        ((and (eql a 0d0)
+              (eql b -0d0)))
+        (t
+         (sb-xc:> a b))))
+
+(defun fp>= (a b)
+  (cond ((and (eql a -0f0)
+              (eql b 0f0))
+         nil)
+        ((and (eql a -0d0)
+              (eql b 0d0))
+         nil)
+        (t
+         (sb-xc:>= a b))))
+
+(defun fp< (a b)
+  (cond ((and (eql a -0f0)
+              (eql b 0f0)))
+        ((and (eql a -0d0)
+              (eql b 0d0)))
+        (t
+         (sb-xc:< a b))))
+
+(defun fp<= (a b)
+  (cond ((and (eql a 0f0)
+              (eql b -0f0))
+         nil)
+        ((and (eql a 0d0)
+              (eql b -0d0))
+         nil)
+        (t
+         (sb-xc:<= a b))))
+
+(defun fp= (a b)
+  (cond ((or (eql a -0f0)
+             (eql a -0d0))
+         (or (eql b -0f0)
+             (eql b -0d0)))
+        ((or (eql a 0f0)
+             (eql a 0d0))
+         (or (eql b 0f0)
+             (eql b 0d0)))
+        (t
+         (sb-xc:= a b))))
+
 (defun low-le-low-p (a b)
   (cond ((not a)
          t)
@@ -5650,6 +6065,20 @@ expansion happened."
              (sb-xc:< (car a) b)))
         (t
          (sb-xc:<= a (if (consp b)
+                         (car b)
+                         b)))))
+
+(defun fp-low-le-low-p (a b)
+  (cond ((not a)
+         t)
+        ((not b)
+         nil)
+        ((consp a)
+         (if (consp b)
+             (fp<= (car a) (car b))
+             (fp< (car a) b)))
+        (t
+         (fp<= a (if (consp b)
                          (car b)
                          b)))))
 
@@ -5667,6 +6096,20 @@ expansion happened."
                          (car b)
                          b)))))
 
+(defun fp-high-ge-high-p (a b)
+  (cond ((not a)
+         t)
+        ((not b)
+         nil)
+        ((consp a)
+         (if (consp b)
+             (fp>= (car a) (car b))
+             (fp> (car a) b)))
+        (t
+         (fp>= a (if (consp b)
+                     (car b)
+                     b)))))
+
 (defun high-gt-high-p (a b)
   (cond ((not a)
          b)
@@ -5682,6 +6125,21 @@ expansion happened."
                       a)
                   b))))
 
+(defun fp-high-gt-high-p (a b)
+  (cond ((not a)
+         b)
+        ((not b)
+         nil)
+        ((consp b)
+         (if (consp a)
+             (fp> (car a) (car b))
+             (fp>= a (car b))))
+        (t
+         (fp> (if (consp a)
+                  (car a)
+                  a)
+              b))))
+
 (defun low-gt-high-p (a b)
   (cond ((not a)
          nil)
@@ -5694,6 +6152,19 @@ expansion happened."
          (sb-xc:>= a (car b)))
         (t
          (sb-xc:> a b))))
+
+(defun fp-low-gt-high-p (a b)
+  (cond ((not a)
+         nil)
+        ((not b)
+         nil)
+        ((consp a)
+         (fp>= (car a) (if (consp b)
+                           (car b) b)))
+        ((consp b)
+         (fp>= a (car b)))
+        (t
+         (fp> a b))))
 
 (defun coerce-rational-bound (x low run)
   (when x
@@ -6095,9 +6566,9 @@ expansion happened."
   (declare (simple-vector ranges2))
   (loop for i2 below (length ranges2) by 2
         do
-        (cond ((low-gt-high-p (aref ranges2 i2) float)
+        (cond ((fp-low-gt-high-p (aref ranges2 i2) float)
                (return))
-              ((low-gt-high-p float (aref ranges2 (1+ i2))))
+              ((fp-low-gt-high-p float (aref ranges2 (1+ i2))))
               (t
                (return t)))))
 
@@ -6117,14 +6588,19 @@ expansion happened."
                             (open-right-low (if (consp right-low)
                                                 (car right-low)
                                                 right-low)))
+                        ;; -0.0 can join 0.0
+                        ;; -0.0 can't join (0.0)
                         (if (and (consp left-high)
                                  (consp right-low))
                             (sb-xc:< open-right-low open-left-high)
-                            (sb-xc:<= open-right-low open-left-high))))))
+                            (if (or (consp left-high)
+                                    (consp right-low))
+                                (fp<= open-right-low open-left-high)
+                                (sb-xc:<= open-right-low open-left-high)))))))
              (store (low high)
                (let ((last-high (car result)))
                  (cond ((and result
-                             (high-ge-high-p last-high high)))
+                             (fp-high-ge-high-p last-high high)))
                        ((and result
                              (join-p last-high low))
                         (setf (car result) high))
@@ -6146,7 +6622,7 @@ expansion happened."
               (return))
              ((let ((low1 (aref ranges1 i1))
                     (low2 (aref ranges2 i2)))
-                (cond ((low-le-low-p low1 low2)
+                (cond ((fp-low-le-low-p low1 low2)
                        (store low1
                               (aref ranges1 (1+ i1)))
                        (incf i1 2))
@@ -6172,18 +6648,18 @@ expansion happened."
                          (high1 (aref ranges1 (1+ i1)))
                          (low2 (aref ranges2 i2))
                          (high2 (aref ranges2 (1+ i2))))
-                     (cond ((low-gt-high-p low2 high1)
+                     (cond ((fp-low-gt-high-p low2 high1)
                             (incf i1 2))
-                           ((low-gt-high-p low1 high2)
+                           ((fp-low-gt-high-p low1 high2)
                             (incf i2 2))
                            (t
-                            (store (if (low-le-low-p low1 low2)
+                            (store (if (fp-low-le-low-p low1 low2)
                                        low2
                                        low1)
-                                   (if (high-ge-high-p high1 high2)
+                                   (if (fp-high-ge-high-p high1 high2)
                                        high2
                                        high1))
-                            (if (high-gt-high-p high2 high1)
+                            (if (fp-high-gt-high-p high2 high1)
                                 (incf i1 2)
                                 (incf i2 2)))))))))
     (coerce (reverse result) 'vector)))
@@ -6194,6 +6670,10 @@ expansion happened."
         (i2 0)
         (result))
     (labels ((store (low high)
+               (when (typep low '(cons (member -0d0 -0f0)))
+                 (setf low (sb-xc:- (car low))))
+               (when (typep high '(cons (member 0d0 0f0)))
+                 (setf high (sb-xc:- (car high))))
                (push low result)
                (push high result)))
       (loop (cond ((= i1 (length ranges1))
@@ -6210,13 +6690,13 @@ expansion happened."
                            do
                            (let ((low2 (aref ranges2 i2))
                                  (high2 (aref ranges2 (1+ i2))))
-                             (cond ((low-gt-high-p low2 high1)
+                             (cond ((fp-low-gt-high-p low2 high1)
                                     (loop-finish))
-                                   ((low-gt-high-p low1 high2)
+                                   ((fp-low-gt-high-p low1 high2)
                                     (incf i2 2))
                                    (t
-                                    (let ((top (high-ge-high-p high2 high1))
-                                          (bottom (low-le-low-p low2 low1)))
+                                    (let ((top (fp-high-ge-high-p high2 high1))
+                                          (bottom (fp-low-le-low-p low2 low1)))
                                       (flet ((flip-exclusion (x)
                                                (if (consp x)
                                                    (car x)
@@ -6250,16 +6730,74 @@ expansion happened."
                        (high1 (aref ranges1 (1+ i1)))
                        (low2 (aref ranges2 i2))
                        (high2 (aref ranges2 (1+ i2))))
-                   (cond ((low-gt-high-p low2 high1)
+                   (cond ((fp-low-gt-high-p low2 high1)
                           (return))
-                         ((low-gt-high-p low1 high2)
+                         ((fp-low-gt-high-p low1 high2)
                           (incf i2 2))
                          (t
                           (unless (and
-                                   (low-le-low-p low2 low1)
-                                   (high-ge-high-p high2 high1))
+                                   (fp-low-le-low-p low2 low1)
+                                   (fp-high-ge-high-p high2 high1))
                             (return))
                           (incf i1 2)))))))))
+
+(defun member-rational (members)
+  (declare (inline !compute-numtype-aspect-id))
+  (if members
+      (let ((result)
+            (mask 0))
+        (flet ((store (run low high)
+                 (setf (values result mask)
+                       (store-rational-range low high run mask result))))
+          (loop for member in (sort (copy-list members) #'<)
+                do (store (if (integerp member)
+                              range-integer-run
+                              range-ratio-run)
+                          member member))
+          (new-numeric-union-type
+           (get-numtype-aspects :real
+                                (case mask
+                                  (#.range-integer-run 'integer)
+                                  (t 'rational))
+                                nil)
+           (coerce (reverse result) 'vector))))
+      *empty-type*))
+
+(defun member-float (type members)
+  (declare (inline !compute-numtype-aspect-id))
+  (if members
+      (let ((result))
+        (labels ((join-p (left-high right-low)
+                   (cond ((not right-low)
+                          t)
+                         ((not left-high)
+                          t)
+                         ((let ((open-left-high (if (consp left-high)
+                                                    (car left-high)
+                                                    left-high))
+                                (open-right-low (if (consp right-low)
+                                                    (car right-low)
+                                                    right-low)))
+                            (if (and (consp left-high)
+                                     (consp right-low))
+                                (sb-xc:< open-right-low open-left-high)
+                                (sb-xc:<= open-right-low open-left-high))))))
+                 (store (low high)
+                   (let ((last-high (car result)))
+                     (cond ((and result
+                                 (fp-high-ge-high-p last-high high)))
+                           ((and result
+                                 (join-p last-high low))
+                            (setf (car result) high))
+                           (t
+                            (push low result)
+                            (push high result))))))
+          (loop for member in (sort (copy-list members) #'fp<)
+                do (store member member))
+          (new-numeric-union-type
+           (get-numtype-aspects :real 'float type)
+           (coerce (reverse result) 'vector))))
+      *empty-type*))
 
 (define-type-method (numeric-union :simple-union2) (type1 type2)
   (declare (inline !compute-numtype-aspect-id))
@@ -6292,18 +6830,18 @@ expansion happened."
                     (multiple-value-bind (ranges mask) (union-rational (numeric-union-type-ranges type1)
                                                                        (numeric-union-type-ranges type2))
 
-                      (new-ctype numeric-union-type 0
-                                 (get-numtype-aspects (numtype-aspects-complexp aspects1)
-                                                      (case mask
-                                                        (#.range-integer-run 'integer)
-                                        ; FIXME: add a new class for ratios, for faster operations that use different types.
-                                                        (t 'rational))
-                                                      nil)
-                                 ranges))))))
+                      (new-numeric-union-type
+                       (get-numtype-aspects (numtype-aspects-complexp aspects1)
+                                            (case mask
+                                              (#.range-integer-run 'integer)
+                                              ;; FIXME: add a new class for ratios, for faster operations that use different types.
+                                              (t 'rational))
+                                            nil)
+                       ranges))))))
           (t
-           (new-ctype numeric-union-type 0 aspects1
-                      (union-float (numeric-union-type-ranges type1)
-                                   (numeric-union-type-ranges type2)))))))
+           (new-numeric-union-type aspects1
+                                   (union-float (numeric-union-type-ranges type1)
+                                                (numeric-union-type-ranges type2)))))))
 
 (define-type-method (numeric-union :simple-intersection2) (type1 type2)
   (declare (inline !compute-numtype-aspect-id))
@@ -6337,20 +6875,20 @@ expansion happened."
                                                                              (numeric-union-type-ranges type2))
                         (if (= (length ranges) 0)
                             *empty-type*
-                            (new-ctype numeric-union-type 0
-                                       (get-numtype-aspects (numtype-aspects-complexp aspects1)
-                                                            (case mask
-                                                              (#.range-integer-run 'integer)
-                                                              (t 'rational))
-                                                            nil)
-                                       ranges)))))
+                            (new-numeric-union-type
+                             (get-numtype-aspects (numtype-aspects-complexp aspects1)
+                                                  (case mask
+                                                    (#.range-integer-run 'integer)
+                                                    (t 'rational))
+                                                  nil)
+                             ranges)))))
                *empty-type*))
           (t
            (let ((ranges (intersect-float (numeric-union-type-ranges type1)
                                           (numeric-union-type-ranges type2))))
              (if (= (length ranges) 0)
                  *empty-type*
-                 (new-ctype numeric-union-type 0 aspects1 ranges)))))))
+                 (new-numeric-union-type aspects1 ranges)))))))
 
 (define-type-method (numeric-union :complex-intersection2) (type1 type2)
   (declare (inline !compute-numtype-aspect-id))
@@ -6381,20 +6919,20 @@ expansion happened."
                                                                                      (numeric-union-type-ranges type1))
                                (if (= (length ranges) 0)
                                    *empty-type*
-                                   (new-ctype numeric-union-type 0
-                                              (get-numtype-aspects (numtype-aspects-complexp aspects1)
-                                                                   (case mask
-                                                                     (#.range-integer-run 'integer)
-                                                                     (t 'rational))
-                                                                   nil)
-                                              ranges)))))
+                                   (new-numeric-union-type
+                                    (get-numtype-aspects (numtype-aspects-complexp aspects1)
+                                                         (case mask
+                                                           (#.range-integer-run 'integer)
+                                                           (t 'rational))
+                                                         nil)
+                                    ranges)))))
                       type2))
                  (t
                   (let ((ranges (difference-float (numeric-union-type-ranges type2)
                                                   (numeric-union-type-ranges type1))))
                     (if (= (length ranges) 0)
                         *empty-type*
-                        (new-ctype numeric-union-type 0 aspects1 ranges)))))))
+                        (new-numeric-union-type aspects1 ranges)))))))
         (:call-other-method)))
 
 (define-type-method (numeric-union :complex-union2) (type1 type2)
@@ -6462,18 +7000,18 @@ expansion happened."
               for low = (aref ranges (+ i 1))
               for high = (aref ranges (+ i 2))
               collect
-              (new-ctype numeric-union-type 0
-                         (get-numtype-aspects (numtype-aspects-complexp aspects)
-                                              (case run
-                                                (#.range-integer-run 'integer)
-                                                (t 'rational))
-                                              nil)
-                         (vector run low high)))
+              (new-numeric-union-type
+               (get-numtype-aspects (numtype-aspects-complexp aspects)
+                                    (case run
+                                      (#.range-integer-run 'integer)
+                                      (t 'rational))
+                                    nil)
+               (vector run low high)))
         (loop for i below (length ranges) by 2
               for low = (aref ranges i)
               for high = (aref ranges (1+ i))
               collect
-              (new-ctype numeric-union-type 0 aspects (vector low high))))))
+              (new-numeric-union-type aspects (vector low high))))))
 
 (defun numeric-union-bounds (type)
   (let ((ranges (numeric-union-type-ranges type))
@@ -6486,17 +7024,17 @@ expansion happened."
   (let ((ranges (numeric-union-type-ranges type))
         (aspects (numeric-union-type-aspects type)))
     (if (memq (numtype-aspects-class aspects) '(integer rational))
-        (new-ctype numeric-union-type 0
-                   aspects
-                   (vector (ecase (numtype-aspects-class aspects)
-                             (rational range-rational-run)
-                             (integer range-integer-run))
-                           (aref ranges 1)
-                           (aref ranges (1- (length ranges)))))
-        (new-ctype numeric-union-type 0
-                   aspects
-                   (vector (aref ranges 0)
-                           (aref ranges (1- (length ranges))))))))
+        (new-numeric-union-type
+         aspects
+         (vector (ecase (numtype-aspects-class aspects)
+                   (rational range-rational-run)
+                   (integer range-integer-run))
+                 (aref ranges 1)
+                 (aref ranges (1- (length ranges)))))
+        (new-numeric-union-type
+         aspects
+         (vector (aref ranges 0)
+                 (aref ranges (1- (length ranges))))))))
 
 (defun numeric-union-typep (object type)
   (if (eq type (specifier-type 'number))
@@ -6511,10 +7049,14 @@ expansion happened."
                        (typep-rational object range-integer-run (numeric-union-type-ranges type)))))
                    (single-float
                     (and (eq (numeric-type-format type) 'single-float)
-                         (typep-float object (numeric-union-type-ranges type))))
+                         (if (float-nan-p object)
+                             (equalp (numeric-union-type-ranges type) #(nil nil))
+                             (typep-float object (numeric-union-type-ranges type)))))
                    (double-float
                     (and (eq (numeric-type-format type) 'double-float)
-                         (typep-float object (numeric-union-type-ranges type))))
+                         (if (float-nan-p object)
+                             (equalp (numeric-union-type-ranges type) #(nil nil))
+                             (typep-float object (numeric-union-type-ranges type)))))
                    (ratio
                     (and (eq (numeric-type-class type) 'rational)
                          (typep-rational object range-ratio-run (numeric-union-type-ranges type)))))))
@@ -6531,11 +7073,7 @@ expansion happened."
             (high (numeric-type-high type)))
         (if (and low
                  (eql low high)
-                 (eql (numeric-type-complexp type) :real)
-                 (if (eq (numeric-type-class type) 'float)
-                     ;; (float 0.0 0.0) fits both -0.0 and 0.0
-                     (not (zerop low))
-                     (member (numeric-type-class type) '(integer rational))))
+                 (eql (numeric-type-complexp type) :real))
             (values t low)
             (values nil nil)))
       (values nil nil)))

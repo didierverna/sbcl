@@ -191,7 +191,7 @@
                              (+ x0 x1 x6 x7) (+ x2 x3 x4 x5)))))))
 
 (with-test (:name (:nan :comparison)
-            :fails-on (or :sparc))
+            :fails-on (or :sparc :loongarch64))
   (sb-int:with-float-traps-masked (:invalid)
     (macrolet ((test (form)
                  (let ((nform (subst '(/ 0.0 0.0) 'nan form)))
@@ -238,7 +238,7 @@
       (test (not (> nan 1.0))))))
 
 (with-test (:name (:nan :comparison :non-float)
-            :fails-on (or :sparc))
+            :fails-on (or :sparc :loongarch64))
   (sb-int:with-float-traps-masked (:invalid)
     (let ((nan (/ 0.0 0.0))
           (reals (list 0 1 -1 1/2 -1/2 (expt 2 300) (- (expt 2 300))))
@@ -789,12 +789,13 @@
     (assert (floatp (funcall f 3)))
     (assert-error (funcall f #c(1 2)))))
 
-(with-test (:name :imagpart-real-negative-zero-derived-type)
+(with-test (:name :imagpart-real-negative-zero)
   (checked-compile-and-assert
    ()
    `(lambda (x)
-      (eql (imagpart (the real x)) -0.0))
-   ((-1.0) t)))
+      (eql (imagpart (the real x)) 0.0))
+   ((-1.0) t))
+  (assert (eql (imagpart (opaque-identity -1.0)) 0.0)))
 
 (with-test (:name :negative-zero-in-ranges)
   (checked-compile-and-assert

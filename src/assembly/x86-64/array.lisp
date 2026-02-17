@@ -145,7 +145,7 @@
   (inst mov :byte temp (ea (- other-pointer-lowtag) array))
 
   (inst cmp :byte temp simple-array-widetag)
-  (inst jmp :eq SKIP)
+  (inst jmp :e SKIP)
   (inst cmp :byte temp complex-base-string-widetag)
   (inst jmp :l DONE)
   SKIP
@@ -160,27 +160,19 @@
                           (:translate %data-vector-and-index/check-bound)
                           (:policy :fast-safe)
                           (:arg-types t positive-fixnum)
-                          (:result-types t positive-fixnum))
+                          (:result-types t positive-fixnum)
+                          (:save-p :compute-only))
     ((:arg array descriptor-reg rdx-offset)
      (:arg index any-reg rdi-offset)
      (:temp temp any-reg rcx-offset)
      (:res result descriptor-reg rdx-offset)
      (:res offset any-reg rdi-offset))
   (declare (ignore result offset))
-  (let ((error
-          (assemble (:elsewhere)
-            error
-            ;; Fake up a stack frame so that backtraces come out right.
-            (inst push rbp-tn)
-            (inst mov rbp-tn rsp-tn)
-            (emit-error-break nil error-trap
-                              (error-number-or-lose 'invalid-array-index-error)
-                              (list array temp index))
-            (progn error))))
+  (let ((error (generate-error-code nil 'invalid-array-index-error array temp index)))
     (assemble ()
       (inst mov :byte temp (ea (- other-pointer-lowtag) array))
       (inst cmp :byte temp simple-array-widetag)
-      (inst jmp :eq HEADER)
+      (inst jmp :e HEADER)
       (inst cmp :byte temp complex-base-string-widetag)
       (inst jmp :ge HEADER)
 
@@ -200,7 +192,7 @@
 
       (inst mov :byte temp (ea (- other-pointer-lowtag) array))
       (inst cmp :byte temp simple-array-widetag)
-      (inst jmp :eq LOOP)
+      (inst jmp :e LOOP)
       (inst cmp :byte temp complex-base-string-widetag)
       (inst jmp :ge LOOP)
 
@@ -210,30 +202,20 @@
                           (:translate %data-vector-pop)
                           (:policy :fast-safe)
                           (:arg-types t)
-                          (:result-types t positive-fixnum))
+                          (:result-types t positive-fixnum)
+                          (:save-p :compute-only)
+                          (:check-type t))
     ((:arg array descriptor-reg rdx-offset)
      (:temp temp any-reg rcx-offset)
      (:res result descriptor-reg rdx-offset)
      (:res offset any-reg rdi-offset))
   (declare (ignore result))
-  (let ((error
-          (assemble (:elsewhere)
-            error
-            ;; Fake up a stack frame so that backtraces come out right.
-            (inst push rbp-tn)
-            (inst mov rbp-tn rsp-tn)
-            (emit-error-break nil error-trap
-                              (error-number-or-lose 'fill-pointer-error)
-                              (list array))
-            (progn error))))
+  (let ((error (generate-error-code nil 'fill-pointer-error array)))
     (assemble ()
-      (inst mov :dword temp (ea (- other-pointer-lowtag) array))
-      (inst cmp :byte temp complex-base-string-widetag)
-      (inst jmp :l ERROR)
 
-      (inst test :word temp (ash sb-vm:+array-fill-pointer-p+
-                                 sb-vm:array-flags-data-position))
-      (inst jmp :nz ERROR)
+      (multiple-value-bind (imm8 shift) (header-byte-imm8 (ash +array-fill-pointer-p+ array-flags-data-position))
+        (inst test :byte (ea (- (1+ shift) other-pointer-lowtag) array) imm8))
+      (inst jmp :z ERROR)
 
       (loadw offset array array-fill-pointer-slot other-pointer-lowtag)
       (inst test offset offset)
@@ -248,7 +230,7 @@
 
       (inst mov :byte temp (ea (- other-pointer-lowtag) array))
       (inst cmp :byte temp simple-array-widetag)
-      (inst jmp :eq LOOP)
+      (inst jmp :e LOOP)
       (inst cmp :byte temp complex-base-string-widetag)
       (inst jmp :ge LOOP)
 
@@ -258,30 +240,19 @@
                           (:translate %data-vector-push)
                           (:policy :fast-safe)
                           (:arg-types t)
-                          (:result-types t t))
+                          (:result-types t t)
+                          (:save-p :compute-only)
+                          (:check-type t))
     ((:arg array descriptor-reg rdx-offset)
      (:temp temp any-reg rcx-offset)
      (:res result descriptor-reg rdx-offset)
      (:res offset descriptor-reg rdi-offset))
   (declare (ignore result))
-  (let ((error
-          (assemble (:elsewhere)
-            error
-            ;; Fake up a stack frame so that backtraces come out right.
-            (inst push rbp-tn)
-            (inst mov rbp-tn rsp-tn)
-            (emit-error-break nil error-trap
-                              (error-number-or-lose 'fill-pointer-error)
-                              (list array))
-            (progn error))))
+  (let ((error (generate-error-code nil 'fill-pointer-error array)))
     (assemble ()
-      (inst mov :dword temp (ea (- other-pointer-lowtag) array))
-      (inst cmp :byte temp complex-base-string-widetag)
-      (inst jmp :l ERROR)
-
-      (inst test :word temp (ash sb-vm:+array-fill-pointer-p+
-                                 sb-vm:array-flags-data-position))
-      (inst jmp :nz ERROR)
+      (multiple-value-bind (imm8 shift) (header-byte-imm8 (ash +array-fill-pointer-p+ array-flags-data-position))
+        (inst test :byte (ea (- (1+ shift) other-pointer-lowtag) array) imm8))
+      (inst jmp :z ERROR)
 
       (loadw offset array array-fill-pointer-slot other-pointer-lowtag)
       (loadw temp array array-elements-slot other-pointer-lowtag)
@@ -294,14 +265,13 @@
       (inst lea temp (ea (fixnumize 1) offset))
       (storew temp array array-fill-pointer-slot other-pointer-lowtag)
 
-
       LOOP
       (inst add offset (object-slot-ea array array-displacement-slot other-pointer-lowtag))
       (loadw array array array-data-slot other-pointer-lowtag)
 
       (inst mov :byte temp (ea (- other-pointer-lowtag) array))
       (inst cmp :byte temp simple-array-widetag)
-      (inst jmp :eq LOOP)
+      (inst jmp :e LOOP)
       (inst cmp :byte temp complex-base-string-widetag)
       (inst jmp :ge LOOP)
 

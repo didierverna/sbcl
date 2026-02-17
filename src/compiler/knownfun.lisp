@@ -20,8 +20,7 @@
 
 ;;; an IR1 transform
 (defstruct (transform (:copier nil)
-                      (:predicate nil)
-                      #-sb-xc-host :no-constructor-defun)
+                      (:predicate nil))
   ;; the function type which enables this transform.
   ;;
   ;; (Note that declaring this :TYPE FUN-TYPE probably wouldn't
@@ -33,8 +32,7 @@
   ;; the transformation function. Takes the COMBINATION node and
   ;; returns a lambda expression, or THROWs out.
   (function (missing-arg) :type function)
-  ;; T if we should emit a failure note even if SPEED=INHIBIT-WARNINGS.
-  (important nil :type (member nil :slightly t))
+  (important nil :type boolean)
   ;; A function with NODE as an argument that checks wheteher the
   ;; transform applies in its policy.
   ;; It used to be checked in the FUNCTION body but it would produce
@@ -43,11 +41,18 @@
   ;; or if another transform could be applied with the right policy.
   (policy nil :type (or null function)))
 
+;;; A normal transform inserted before VOP-TRANSFORMs
+(defstruct (before-vop-transform (:copier nil)
+                                 (:predicate nil)
+                                 (:include transform)))
+
 ;;; A transform inserted at the front of fun-info-transforms and stops
 ;;; other from firing if it has a VOP that can do the job.
 (defstruct (vop-transform (:copier nil)
                           (:predicate nil)
                           (:include transform)))
+
+(declaim (freeze-type transform))
 
 (defun transform-note (transform)
   (or #+sb-xc-host (documentation (transform-function transform) 'function)
@@ -63,15 +68,20 @@
 ;;; one with the same type and note.
 ;;; Argument order is: policy constraint, ftype constraint, consequent.
 ;;; (think "qualifiers + specializers -> method")
-(defun %deftransform (name policy type fun &optional (important :slightly))
+(defun %deftransform (name policy type fun &optional (important t)
+                                                     priority)
   (declare (inline make-transform))
   (let* ((ctype (specifier-type type))
          (info (fun-info-or-lose name))
          (transforms (fun-info-transforms info))
          (old (find-if (lambda (transform)
-                         (and (if (eq important :vop)
-                                  (typep transform 'vop-transform)
-                                  (not (typep transform 'vop-transform)))
+                         (and (case important (eq important :vop)
+                                    (:vop
+                                     (typep transform 'vop-transform))
+                                    (:before-vop
+                                     (typep transform 'before-vop-transform))
+                                    (t
+                                     (not (typep transform '(or vop-transform before-vop-transform)))))
                               (type= (transform-type transform)
                                      ctype)))
                        transforms)))
@@ -79,22 +89,36 @@
            (style-warn 'redefinition-with-deftransform :transform old)
            (setf (transform-function old) fun
                  (transform-policy old) policy)
-           (unless (eq important :vop)
+           (unless (or (eq important :vop)
+                       (eq important :before-vop))
              (setf (transform-important old) important)))
           (t
            ;; Put vop-transform at the front.
-           (if (eq important :vop)
-               (push (make-vop-transform :type ctype :function fun
-                                         :policy policy)
-                     (fun-info-transforms info))
-               (let ((normal (member-if (lambda (transform)
-                                          (not (typep transform 'vop-transform)))
-                                        transforms))
-                     (transform (make-transform :type ctype :function fun
-                                                :important important
-                                                :policy policy)))
-                 (setf (fun-info-transforms info)
-                       (append (ldiff transforms normal) (list* transform normal)))))))
+           (case important
+             (:before-vop
+              (push (make-before-vop-transform :type ctype :function fun
+                                               :policy policy)
+                    (fun-info-transforms info)))
+             (:vop
+              (let ((normal (member-if (lambda (transform)
+                                         (not (eq (type-of transform) 'before-vop-transform)))
+                                       transforms))
+                    (transform (make-vop-transform :type ctype :function fun
+                                                   :policy policy)))
+                (setf (fun-info-transforms info)
+                      (append (ldiff transforms normal) (list* transform normal)))))
+             (t
+              (let ((normal (member-if (lambda (transform)
+                                         (not (typep transform '(or vop-transform
+                                                                 before-vop-transform))))
+                                       transforms))
+                    (transform (make-transform :type ctype :function fun
+                                               :important important
+                                               :policy policy)))
+                (setf (fun-info-transforms info)
+                      (if (eq priority :last)
+                          (append transforms (list transform))
+                          (append (ldiff transforms normal) (list* transform normal)))))))))
     name))
 
 ;;; Make a FUN-INFO structure with the specified type, attributes
@@ -151,14 +175,14 @@
                        (fun-info-read-only-args old-fun-info) read-only))
                 (t
                  (setf (info :function :info name)
-                       (make-fun-info :attributes attributes
-                                      :derive-type derive-type
-                                      :optimizer optimizer
-                                      :result-arg result-arg
-                                      :call-type-deriver call-type-deriver
-                                      :annotation annotation
-                                      :folder folder
-                                      :read-only-args read-only))))
+                       (make-fun-info attributes
+                                      derive-type
+                                      optimizer
+                                      result-arg
+                                      call-type-deriver
+                                      annotation
+                                      folder
+                                      read-only))))
           (if location
               (setf (getf (info :source-location :declaration name) 'defknown)
                     location)
@@ -203,7 +227,9 @@
     (pushnew 'no-verify-arg-count attributes))
 
   (multiple-value-bind (type annotation read-only)
-      (split-type-info arg-types result-type)
+      (split-type-info name arg-types result-type (and (member 'call attributes)
+                                                       (or (member 'foldable attributes)
+                                                           (member 'foldable-read-only attributes))))
     `(%defknown ',(if (and (consp name)
                            (not (legal-fun-name-p name)))
                       name
@@ -230,7 +256,7 @@
   key
   returns)
 
-(defun split-type-info (arg-types result-type)
+(defun split-type-info (name arg-types result-type foldable-call)
   (if (eq arg-types '*)
       `(sfunction ,arg-types ,result-type)
       (multiple-value-bind (llks required optional rest keys)
@@ -247,10 +273,13 @@
               return-annotation
               (read-only 0))
           (labels ((annotation-p (x)
-                     (typep x '(or (cons (member function function-designator modifying
-                                          inhibit-flushing))
-                                (member type-specifier proper-sequence proper-list
-                                 proper-or-dotted-list proper-or-circular-list))))
+                     (or (typep x '(or (cons (member function function-designator modifying
+                                              inhibit-flushing))
+                                    (member type-specifier proper-sequence proper-list
+                                     proper-or-dotted-list proper-or-circular-list)))
+                         (when (and foldable-call
+                                    (member x '(function-designator function)))
+                           (error "Missing function annotation for a foldable function: ~a" name))))
                    (strip-annotation (x)
                      (if (consp x)
                          (ecase (car x)
@@ -378,8 +407,7 @@
                                        preserve-vector-type
                                        string-designator)
   (lambda (call)
-    (declare (type combination call))
-    (let ((lvar (nth n (combination-args call))))
+    (let ((lvar (nth n (basic-combination-args call))))
       (when lvar
         (let* ((type (lvar-type lvar))
                (result type))
@@ -425,8 +453,8 @@
 ;;; Derive the type to be the type specifier which is the Nth arg.
 (defun result-type-specifier-nth-arg (n)
   (lambda (call)
-    (declare (type combination call))
-    (let ((lvar (nth n (combination-args call))))
+    (declare (type basic-combination call))
+    (let ((lvar (nth n (basic-combination-args call))))
       (when (and lvar (constant-lvar-p lvar))
         (careful-specifier-type (lvar-value lvar))))))
 
@@ -441,10 +469,9 @@
 ;;;    => (SIMPLE-BIT-VECTOR 9)
 ;;; 2. Because we *know* that a hairy array won't be produced,
 ;;;    why does derivation preserve the non-simpleness, if so specified?
-(defun creation-result-type-specifier-nth-arg (n)
+(defun creation-result-type-specifier-nth-arg (n &optional nil-nil)
   (lambda (call)
-    (declare (type combination call))
-    (let ((lvar (nth n (combination-args call))))
+    (let ((lvar (nth n (basic-combination-args call))))
       (when (and lvar (constant-lvar-p lvar))
         (let* ((specifier (lvar-value lvar))
                (lspecifier (if (atom specifier) (list specifier) specifier)))
@@ -461,6 +488,9 @@
                (declare (ignore simple-string))
                (careful-specifier-type
                 `(simple-array character ,@(if size (list size) '((*)))))))
+            ((and nil-nil
+                  (eq specifier 'nil))
+             (specifier-type 'null))
             (t
              (let ((ctype (careful-specifier-type specifier)))
                (cond ((not (array-type-p ctype))

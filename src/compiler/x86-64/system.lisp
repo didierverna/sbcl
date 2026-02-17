@@ -13,6 +13,19 @@
 
 ;;;; type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg) :target res))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:generator 1
+    ;; This produces 31 bits of significance which is fine- it avoids a raw constant
+    ;; (bit index 31 of the result can be on, which is still a positive fixnum because the
+    ;; lispword size is 64 bits, so we're only losing the fixnum tag)
+    (move res arg :dword)
+    (inst and :dword res (lognot fixnum-tag-mask))))
+
 ;;; For non-list pointer descriptors, return the header's widetag byte.
 ;;; For lists and non-pointers, return the low 8 descriptor bits.
 ;;; We need not return exactly list-pointer-lowtag for lists - the high 4 bits
@@ -151,18 +164,20 @@
     ;; merge in the widetag
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
     (storew temp x 0 other-pointer-lowtag)))
-(flet ((header-byte-imm8 (bits)
-         ;; return an imm8 and a shift amount expressed in bytes
-         (cond ((typep bits '(unsigned-byte 8))
-                (values bits 0))
-               ((and (not (logtest bits #xff))
-                     (typep (ash bits -8) '(unsigned-byte 8)))
-                (values (ash bits -8) 1))
-               ((and (not (logtest bits #xffff))
-                     (typep (ash bits -16) '(unsigned-byte 8)))
-                (values (ash bits -16) 2))
-               (t
-                (bug "Can't construct mask from ~x" bits)))))
+
+(defun header-byte-imm8 (bits)
+  ;; return an imm8 and a shift amount expressed in bytes
+  (cond ((typep bits '(unsigned-byte 8))
+         (values bits 0))
+        ((and (not (logtest bits #xff))
+              (typep (ash bits -8) '(unsigned-byte 8)))
+         (values (ash bits -8) 1))
+        ((and (not (logtest bits #xffff))
+              (typep (ash bits -16) '(unsigned-byte 8)))
+         (values (ash bits -16) 2))
+        (t
+         (bug "Can't construct mask from ~x" bits))))
+
 (define-vop (logior-header-bits)
   (:translate logior-header-bits)
   (:policy :fast-safe)
@@ -210,7 +225,7 @@
   (:conditional :ne)
   (:generator 1
     (multiple-value-bind (imm8 shift) (header-byte-imm8 mask)
-      (inst test :byte (ea (- (1+ shift) other-pointer-lowtag) array) imm8)))))
+      (inst test :byte (ea (- (1+ shift) other-pointer-lowtag) array) imm8))))
 
 ;;;; allocation
 

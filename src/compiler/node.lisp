@@ -503,23 +503,23 @@
   (dominator nil :type (or null cblock))
   ;; the component this block is in, or NIL temporarily during IR1
   ;; conversion and in deleted blocks
-  (component (progn
-               (aver-live-component *current-component*)
-               *current-component*)
-             :type (or component null))
+  (component *current-component* :type (or component null))
   ;; a flag used by various graph-walking code to determine whether
   ;; this block has been processed already or what. We make this
   ;; initially NIL so that FIND-INITIAL-DFO doesn't have to scan the
   ;; entire initial component just to clear the flags.
   (flag nil)
   ;; some kind of info used by the back end
-  (info nil)
+  (info nil :type (or ir2-block null))
   ;; what macroexpansions and source transforms happened "in" this block, used
   ;; for xref
   (xrefs nil :type list)
   ;; Cache the environment of a block during lifetime analysis. :NONE
   ;; if no cached value has been stored yet.
-  (environment-cache :none :type (or null environment (member :none))))
+  (environment-cache :none :type (or null environment (member :none)))
+  ;; A table for keeping track of which source-paths have already had
+  ;; a %MARK-COVERAGE function converted for them.
+  (source-path-marks nil :type (or null hash-table)))
 (defmethod print-object ((cblock cblock) stream)
   (if (boundp '*compilation*)
       (print-unreadable-object (cblock stream :type t :identity t)
@@ -553,8 +553,7 @@
                       (:constructor make-component
                        (head tail &aux (last-block tail)
                                        (outer-loop
-                                        (make-loop :outer head (list tail)))))
-                      #-sb-xc-host :no-constructor-defun)
+                                        (make-loop :outer head (list tail))))))
   ;; space where this component will be allocated in
   ;; :auto won't make any codegen optimizations pertinent to immobile space,
   ;; but will place the code there given sufficient available space.
@@ -634,7 +633,7 @@
   ;; some sort of name for the code in this component
   (name "<unknown>" :type t)
   ;; some kind of info used by the back end.
-  (info nil)
+  (info nil :type (or null ir2-component))
   ;; a map from combination nodes to things describing how an
   ;; optimization of the node failed. The description is an alist
   ;; (TRANSFORM . ARGS), where TRANSFORM is the structure describing
@@ -663,16 +662,6 @@
   (unless (eq (component-reoptimize component) t)
     (setf (component-reoptimize component) kind)))
 
-;;; Check that COMPONENT is suitable for roles which involve adding
-;;; new code. (gotta love imperative programming with lotso in-place
-;;; side effects...)
-(defun aver-live-component (component)
-  ;; FIXME: As of sbcl-0.pre7.115, we're asserting that
-  ;; COMPILE-COMPONENT hasn't happened yet. Might it be even better
-  ;; (certainly stricter, possibly also correct...) to assert that
-  ;; IR1-FINALIZE hasn't happened yet?
-  (aver (not (eql (component-info component) :dead))))
-
 ;;; A CLEANUP structure represents some dynamic binding action. Blocks
 ;;; are annotated with the current CLEANUP so that dynamic bindings
 ;;; can be removed when control is transferred out of the binding
@@ -692,7 +681,8 @@
   (kind (missing-arg)
         :type (member :special-bind :catch :unwind-protect
                       :block :tagbody :dynamic-extent
-                      #-c-stack-is-control-stack :restore-nsp))
+                      #-c-stack-is-control-stack :restore-nsp)
+        :read-only t)
   ;; the node that messes things up. This is the last node in the
   ;; non-messed-up environment. Null only temporarily. This could be
   ;; deleted due to unreachability.
@@ -710,8 +700,7 @@
 
 ;;; The ENVIRONMENT structure represents the result of environment analysis.
 (defstruct (environment (:copier nil)
-                        (:constructor make-environment (lambda))
-                        #-sb-xc-host :no-constructor-defun)
+                        (:constructor make-environment (lambda)))
   ;; the function that allocates this environment
   (lambda (missing-arg) :type clambda :read-only t)
   ;; a list of all the LAMBDA-VARs and NLX-INFOs needed from enclosing
@@ -761,8 +750,7 @@
 ;;; ENVIRONMENT-NLX-INFO.
 (defstruct (nlx-info
             (:copier nil)
-            (:constructor make-nlx-info (cleanup block))
-            #-sb-xc-host :no-constructor-defun)
+            (:constructor make-nlx-info (cleanup block)))
   ;; the cleanup associated with this exit. In a catch or
   ;; unwind-protect, this is the :CATCH or :UNWIND-PROTECT cleanup,
   ;; and not the cleanup for the escape block. The CLEANUP-KIND of
@@ -1328,8 +1316,7 @@
 (defstruct (optional-dispatch
             (:include functional) (:copier nil)
             (:constructor make-optional-dispatch
-                (arglist allowp keyp %source-name %debug-name source-path))
-            #-sb-xc-host :no-constructor-defun)
+                (arglist allowp keyp %source-name %debug-name source-path)))
   ;; the original parsed argument list, for anyone who cares
   (arglist nil :type list)
   ;; true if &ALLOW-OTHER-KEYS was supplied
@@ -1531,7 +1518,10 @@
   (same-refs nil :type (or null cons)))
 (defprinter (ref :identity t)
   (%source-name :test (neq %source-name '.anonymous.))
-  leaf)
+  (leaf :prin1 (if (and (constant-p leaf)
+                        (not (symbolp (constant-value leaf))))
+                   (constant-value leaf)
+                   leaf)))
 
 (defstruct (multiple-successors-node
             (:constructor nil)
@@ -1560,8 +1550,7 @@
 
 (defstruct (jump-table (:include multiple-successors-node)
                        (:constructor make-jump-table (index))
-                       (:copier nil)
-                       #-sb-xc-host :no-constructor-defun)
+                       (:copier nil))
   (index (missing-arg) :type lvar)
   (targets nil :type list))
 
@@ -1574,8 +1563,7 @@
                  (:conc-name set-)
                  (:predicate set-p)
                  (:constructor make-set (var value))
-                 (:copier nil)
-                 #-sb-xc-host :no-constructor-defun)
+                 (:copier nil))
   ;; descriptor for the variable set
   (var (missing-arg) :type basic-var)
   ;; LVAR for the value form
@@ -1640,7 +1628,10 @@
   (pass-nargs t :type boolean)
   (or-chain-computed nil :type boolean))
 (defprinter (combination :identity t)
-  (fun :prin1 (lvar-uses fun))
+  (fun :prin1 (let ((uses (lvar-uses fun)))
+                (or (and (ref-p uses)
+                         (ref-fun-name uses t))
+                    uses)))
   (args :prin1 (mapcar (lambda (x)
                          (if x
                              (lvar-uses x)
@@ -1652,8 +1643,7 @@
 ;;; receiving forms.
 (defstruct (mv-combination (:include basic-combination)
                            (:constructor make-mv-combination (fun))
-                           (:copier nil)
-                           #-sb-xc-host :no-constructor-defun))
+                           (:copier nil)))
 (defprinter (mv-combination)
   (fun :prin1 (lvar-uses fun))
   (args :prin1 (mapcar #'lvar-uses args)))
@@ -1677,8 +1667,7 @@
                     (:conc-name return-)
                     (:predicate return-p)
                     (:constructor make-return (result lambda))
-                    (:copier nil)
-                    #-sb-xc-host :no-constructor-defun)
+                    (:copier nil))
   ;; the lambda we are returning from. Null temporarily during
   ;; ir1tran.
   (lambda nil :type (or clambda null))
@@ -1699,8 +1688,7 @@
 (defstruct (cast (:include valued-node)
                  (:copier nil)
                  (:constructor %make-cast
-                     (asserted-type type-to-check value derived-type context))
-                 #-sb-xc-host :no-constructor-defun)
+                     (asserted-type type-to-check value derived-type context)))
   (asserted-type (missing-arg) :type ctype)
   (type-to-check (missing-arg) :type ctype)
   ;; an indication of what we have proven about how this type

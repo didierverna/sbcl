@@ -81,7 +81,6 @@
 (defconstant eexist 17) ; #x11
 (defconstant eloop 40) ; #x28
 (defconstant epipe 32) ; #x20
-(defconstant espipe 29) ; #x1d
 (defconstant ewouldblock 11) ; #xb
 
 (defconstant sc-nprocessors-onln 84) ; #x54
@@ -163,6 +162,7 @@
 
 (defconstant sizeof-timespec 16) ; #x10
 (defconstant sizeof-timeval 16) ; #x10
+(defconstant sizeof-unw-cursor 0) ; #x0
 
 ;;; sysctl(3) names
 (in-package "SB-IMPL")

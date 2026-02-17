@@ -13,6 +13,7 @@
 #define _INCLUDE_INTERRUPT_H_
 
 #include "runtime.h"
+#include <signal.h> // for NSIG
 #include <stdbool.h>
 #include <string.h>
 #include "genesis/static-symbols.h"
@@ -101,6 +102,7 @@ typedef lispobj (*call_into_lisp_lookalike)(
 extern bool interrupt_handler_pending_p(void);
 extern void interrupt_init(void);
 extern void fake_foreign_function_call(os_context_t* context);
+extern void fake_foreign_function_call_noassert(os_context_t *context);
 extern void undo_fake_foreign_function_call(os_context_t* context);
 extern void arrange_return_to_c_function(
     os_context_t *, call_into_lisp_lookalike, lispobj);
@@ -141,11 +143,30 @@ extern void lisp_memory_fault_error(os_context_t *context,
 
 extern void lower_thread_control_stack_guard_page(struct thread *th);
 extern void reset_thread_control_stack_guard_page(struct thread *th);
+extern void lower_thread_alien_stack_guard_page(struct thread *th);
+extern void reset_thread_alien_stack_guard_page(struct thread *th);
+extern void lower_thread_binding_stack_guard_page(struct thread *th);
+extern void reset_thread_binding_stack_guard_page(struct thread *th);
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT) && !defined(LISP_FEATURE_WIN32)
 # ifdef LISP_FEATURE_SB_SAFEPOINT
 void thruption_handler(int signal, siginfo_t *info, os_context_t *context);
 # endif
 #endif
+
+#ifdef LISP_FEATURE_WIN32
+# define REAL_SIGSET_SIZE_BYTES (4)
+#else
+/* FIXME: do not rely on NSIG being a multiple of 8.
+ * In fact it is *not* a multiple of 8 - it it 65 on x86-64-linux */
+# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+#endif
+
+static inline void sigcopyset(sigset_t *to, sigset_t *from) {
+#ifdef ADDRESS_SANITIZER
+    sigemptyset(to);
+#endif
+    memcpy(to, from, REAL_SIGSET_SIZE_BYTES);
+}
 
 #endif

@@ -299,9 +299,9 @@
         (let ((set-bit (logand lowtag-mask (logandc2 lowtag set)))
               (clear-bit (logandc2 lowtag-mask (logior lowtag clear))))
           (cond ((plusp set-bit)
-                 (values (sb-kernel::first-bit-set set-bit) 1))
+                 (values (count-trailing-zeros set-bit) 1))
                 ((plusp clear-bit)
-                 (values (sb-kernel::first-bit-set clear-bit) 0))))))))
+                 (values (count-trailing-zeros clear-bit) 0))))))))
 
 (defun fun-or-other-pointer-tn-ref-p (tn-ref &optional permit-nil)
   (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
@@ -566,7 +566,7 @@
   ;; occurs at the end. In that case, we can not prevent stop-for-GC
   ;; from occurring in the C code, because foreign code is allowed
   ;; to run during GC; it just can't go back into Lisp until GC is over.
-  #-sb-safepoint
+  #-(or sb-safepoint nonstop-foreign-call)
   (loop for e = (sb-c::node-lexenv (sb-c::vop-node vop))
         then (sb-c::lexenv-parent e)
         while e

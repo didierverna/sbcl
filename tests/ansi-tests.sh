@@ -1,9 +1,14 @@
 #!/bin/sh -e
 
+# Usage: ansi-tests.sh [options]
+#
+# Currently the only option with any effect is `--coverage`, which
+# will collect coverage information from running the tests if the host
+# SBCL is built with :sb-cover-for-internals.
+
 if [ ! -e ansi-test ]; then
    git clone --depth 1 https://github.com/sbcl/ansi-test.git
 fi
-
 
 cd ansi-test
 rm -fr sandbox/scratch
@@ -13,16 +18,17 @@ rm -fr sandbox/scratch
                   --eval '(setf *default-pathname-defaults* (truename #P"sandbox/"))' \
                   --eval '(in-package :cl-test)' \
                   --eval '(disable-note :nil-vectors-are-strings)' \
+                  --eval '(when (member "--coverage" sb-ext:*posix-argv* :test (function equal)) (require :sb-cover) (funcall (intern "RESET-COVERAGE" "SB-COVER")))' \
                   --eval '(time (do-tests))' \
+                  --eval '(when (member "--coverage" sb-ext:*posix-argv* :test (function equal)) (funcall (intern "SAVE-COVERAGE-IN-FILE" "SB-COVER") "../../ansi-tests.coverage"))' \
                   --eval '(let* ((expected (list* "APROPOS-LIST.ERROR.2" "APROPOS.ERROR.2" "COMPILE-FILE.2"
- "DEFINE-COMPILER-MACRO.8" "DESTRUCTURING-BIND.ERROR.10"
  "EXP.ERROR.10" "EXP.ERROR.11" "EXP.ERROR.8"
  "EXP.ERROR.9" "EXPT.ERROR.10" "EXPT.ERROR.11" "EXPT.ERROR.8" "EXPT.ERROR.9"
  "FORMAT.A.29" "FORMAT.A.57" "FORMAT.A.58" "FORMAT.B.27" "FORMAT.B.28"
  "FORMAT.B.29" "FORMAT.D.27" "FORMAT.D.28" "FORMAT.D.29" "FORMAT.F.45"
  "FORMAT.F.46" "FORMAT.F.46B" "FORMAT.F.5" "FORMAT.F.8" "FORMAT.O.27"
  "FORMAT.O.28" "FORMAT.O.29" "FORMAT.R.37" "FORMAT.R.38" "FORMAT.S.29"
- "FORMAT.E.1" "FORMAT.E.2" "FORMAT.E.6" "FORMAT.E.20"
+ "FORMAT.E.6" "FORMAT.E.20"
  "FORMAT.X.27" "FORMAT.X.28" "FORMAT.X.29" "FORMATTER.A.57" "FORMATTER.A.58"
  "FORMATTER.B.27" "FORMATTER.B.28" "FORMATTER.B.29" "FORMATTER.D.27"
  "FORMATTER.D.28" "FORMATTER.D.29" "FORMATTER.F.45" "FORMATTER.F.46"
@@ -42,8 +48,16 @@ rm -fr sandbox/scratch
  "SHIFTF.7"
  "SXHASH.17" "SXHASH.18" "SXHASH.19" "PRINT-STRUCTURE.1"
  "UNION.FOLD.1" "SUBTYPEP-COMPLEX.8" "FORMAT./.17"
- (append #+win32 (list "PROBE-FILE.4")
-         #+x86 (list "CIS.4")
+ "REMOVE-DUPLICATES.FOLD.4" "REMOVE-DUPLICATES.FOLD.3"
+ "REMOVE-DUPLICATES.FOLD.2" "REMOVE-DUPLICATES.FOLD.1" "REMOVE-IF-NOT.FOLD.2"
+ "REMOVE-IF.FOLD.4" "REMOVE-IF.FOLD.3" "REMOVE-IF.FOLD.1"
+ "REMOVE.FOLD.4" "REMOVE.FOLD.3" "REMOVE.FOLD.2" "REMOVE.FOLD.1"
+ "SUBSTITUTE-IF-NOT.FOLD.2" "SUBSTITUTE-IF-NOT.FOLD.1" "SUBSTITUTE-IF.FOLD.4"
+ "SUBSTITUTE-IF.FOLD.3" "SUBSTITUTE-IF.FOLD.2" "SUBSTITUTE-IF.FOLD.1"
+ "SUBSTITUTE.FOLD.4" "SUBSTITUTE.FOLD.3" "SUBSTITUTE.FOLD.2"
+ "SUBSTITUTE.FOLD.1"  "SUBSTITUTE-IF-NOT.FOLD.3"
+ "MISC.598" "IMAGPART.4"
+ (append #+x86 (list "CIS.4")
          #+(or arm (and arm64 (not darwin)))
            (list "EXP.ERROR.4" "EXP.ERROR.5" "EXP.ERROR.6" "EXP.ERROR.7" "EXPT.ERROR.4"
                  "EXPT.ERROR.5" "EXPT.ERROR.6" "EXPT.ERROR.7")
@@ -52,17 +66,18 @@ rm -fr sandbox/scratch
              (list "INTERSECTION.FOLD.1" "UNION.FOLD.1" "SET-DIFFERENCE.FOLD.1"
                    "SET-EXCLUSIVE-OR.FOLD.1"
                    "ALL-STRUCTURE-CLASSES-ARE-SUBTYPES-OF-STRUCTURE-OBJECT.2" "TRACE.8")
-             (list "MAP.48" "SYMBOL-FUNCTION.ERROR.5"))
+             (list "MAP.48" "SYMBOL-FUNCTION.ERROR.5"
+                   "SUBSTITUTE-IF-NOT.FOLD.4" "REMOVE-IF.FOLD.2"
+                    "REMOVE-IF-NOT.FOLD.1" "REMOVE-IF-NOT.FOLD.3" "REMOVE-IF-NOT.FOLD.4"))
 
          #+sb-unicode (list "BOTH-CASE-P.2" "CHAR-DOWNCASE.2" "CHAR-UPCASE.2"))))
-                         (failing (remove "FORMAT.E.26"
-                                          (mapcar (function string) regression-test:*failed-tests*)
-                                          :test (function equal)))
-                         #+sb-devel
-                         (failing (remove "COMMON-LISP-PACKAGE-NICKNAMES" failing :test (function equal)))
+                         (failing (mapcar (function string) regression-test:*failed-tests*))
+                         (failing (set-difference failing (list "FORMAT.E.26" #+sb-devel "COMMON-LISP-PACKAGE-NICKNAMES")
+                          :test (function equal)))
                          (diff1 (set-difference failing  expected :test (function equal)))
                          (diff2 (set-difference expected failing :test (function equal))))
    (cond ((or diff1 diff2)
            (format t "Difference ~@[added ~a~] ~@[removed ~a~]~%" diff1 diff2)
            (sb-ext:exit :code 1))
-         ((sb-ext:exit))))'
+         ((sb-ext:exit))))' \
+                  $*

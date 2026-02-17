@@ -45,7 +45,8 @@
   (defreg r5 15)
   (defreg r6 16)
   (defreg r7 17)
-  (defreg #-darwin r8 #+darwin reserved 18)
+  ;; x18 is reserved on Darwin (macOS) and Windows (TEB pointer)
+  (defreg #-(or darwin win32) r8 #+(or darwin win32) reserved 18)
   (defreg r9 19)
 
   (defreg r10 20)
@@ -56,10 +57,10 @@
   (defreg nargs 23)
   (defreg nfp 24)
   (defreg ocfp 25)
-  (defreg cfp 26)
+  (defreg null 26)
   (defreg csp 27)
   (defreg cardtable 28) ; preserved across C calls
-  (defreg null 29)
+  (defreg cfp 29)
   (defreg lr 30)
   (defreg nsp 31)
   (defreg zr 31)
@@ -68,7 +69,7 @@
       null cfp nsp lr)
 
   (defregset descriptor-regs
-      r0 r1 r2 r3 r4 r5 r6 r7 #-darwin r8 r9 r10 #-sb-thread r11 lexenv)
+      r0 r1 r2 r3 r4 r5 r6 r7 #-(or darwin win32) r8 r9 r10 #-sb-thread r11 lexenv)
 
   ;; nl9 can't be selected by PACK as it is a freely usable temp reg
   (defregset non-descriptor-regs
@@ -76,7 +77,7 @@
 
   (defregset boxed-regs
       r0 r1 r2 r3 r4 r5 r6
-      r7 #-darwin r8 r9 r10 #-sb-thread r11 lexenv)
+      r7 #-(or darwin win32) r8 r9 r10 #-sb-thread r11 lexenv)
 
   ;; registers used to pass arguments
   ;;
@@ -85,7 +86,7 @@
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2 r3)
   (defconstant-eqx register-arg-names '(r0 r1 r2 r3) #'equal)
-  (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 #-darwin r8 r9 r10)
+  (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 #-(or darwin win32) r8 r9 r10)
   (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8)
   (defglobal *float-regs* (loop for i below 32 collect i)))
 
@@ -195,15 +196,18 @@
               :save-p t
               :alternate-scs (double-stack))
 
+  (complex-single-immediate immediate-constant)
+  (complex-double-immediate immediate-constant)
+
   (complex-single-reg float-registers
                       :locations #.(loop for i below 32 collect i)
-                      :constant-scs ()
+                      :constant-scs (complex-single-immediate)
                       :save-p t
                       :alternate-scs (complex-single-stack))
 
   (complex-double-reg float-registers
                       :locations #.(loop for i below 32 collect i)
-                      :constant-scs ()
+                      :constant-scs (complex-double-immediate)
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
@@ -233,6 +237,9 @@
   (defregtn lr any-reg)
   #+sb-thread
   (defregtn thread any-reg))
+
+(defglobal wzr-tn (make-random-tn (sc-or-lose '32-bit-reg) zr-offset))
+
 
 ;;; If VALUE can be represented as an immediate constant, then return the
 ;;; appropriate SC number, otherwise return NIL.
@@ -251,6 +258,10 @@
      double-immediate-sc-number)
     (single-float
      single-immediate-sc-number)
+    ((complex double-float)
+     complex-double-immediate-sc-number)
+    ((complex single-float)
+     complex-single-immediate-sc-number)
     (structure-object
      (when (eq value sb-lockless:+tail+)
        immediate-sc-number))))

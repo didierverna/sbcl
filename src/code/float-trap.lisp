@@ -158,7 +158,9 @@ sets the floating point modes to their current values (and thus is a no-op)."
 ;;; disabled by default. Joe User can explicitly enable them if
 ;;; desired.
 (define-load-time-global *saved-floating-point-modes*
-  '(:traps (:overflow #-(or netbsd ppc) :invalid :divide-by-zero)
+  '(:traps (#-(and arm64 win32) :overflow
+            #-(or netbsd ppc (and arm64 win32)) :invalid
+            #-(and arm64 win32) :divide-by-zero)
     :rounding-mode :nearest :current-exceptions nil
     :accrued-exceptions nil :fast-mode nil
     #+x86 :precision #+x86 :53-bit))
@@ -201,10 +203,8 @@ sets the floating point modes to their current values (and thus is a no-op)."
   (let ((code (sb-unix::siginfo-code info)))
     (multiple-value-bind (op operands) (sb-di::decode-arithmetic-error-operands context)
       (with-interrupts
-        ;; Reset the accumulated exceptions, may be needed on other
-        ;; platforms too, at least Linux doesn't seem to require it.
-        #+sunos (setf (ldb sb-vm:float-sticky-bits (floating-point-modes)) 0)
-        (setf (ldb sb-vm:float-sticky-bits (floating-point-modes)) 0)
+        ;; Reset the accumulated exceptions
+        (setf (ldb float-sticky-bits (floating-point-modes)) 0)
         (destructuring-bind (&optional (condition 'floating-point-exception) trap-mask)
             (cdr (assoc code +sigfpe-code-error-alist+))
           (declare (ignorable trap-mask))

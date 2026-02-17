@@ -121,6 +121,12 @@ tree structure resulting from the evaluation of EXPRESSION."
          (not (or (fun-type-optional type)
                   (fun-type-keyp type)
                   (fun-type-rest type)))
+         (if (boundp 'sb-c:*compilation*)
+             ;; Don't mix block compilation and specialized xeps. It
+             ;; appears to break things and it's unclear which calling
+             ;; convention needs to be preferred.
+             (not (sb-c::block-compile sb-c:*compilation*))
+             (eq *evaluator-mode* :compile))
          (multiple-value-bind (llks required) (parse-lambda-list lambda-list)
            (and (zerop llks)
                 (= (length required)
@@ -144,7 +150,8 @@ tree structure resulting from the evaluation of EXPRESSION."
     (values
      `(named-lambda ,xep-name ,vars
         (declare (notinline ,name)
-                 (muffle-conditions warning))
+                 (muffle-conditions warning)
+                 (optimize inhibit-warnings))
         (funcall ',name ,@vars))
      xep-name)))
 
@@ -605,7 +612,7 @@ evaluated as a PROGN."
   ;; optional dispatch mechanism for the M-V-B gets increasingly
   ;; hairy.
   (let ((val (and (constantp n env) (constant-form-value n env))))
-    (if (and (integerp val) (<= 0 val (or #+(or x86-64 arm64 riscv) ;; better DEFAULT-UNKNOWN-VALUES
+    (if (and (integerp val) (<= 0 val (or #+(or x86-64 arm64 riscv loongarch64) ;; better DEFAULT-UNKNOWN-VALUES
                                           1000
                                           10))) ; Arbitrary limit.
         (let ((dummy-list (make-gensym-list val))
@@ -987,7 +994,7 @@ invoked. In that case it will store into PLACE and start over."
 ;;; In fact as far as I can tell, redefining a standard class doesn't require a new hash
 ;;; because the obsolete layout always gets clobbered to 0, and cache lookups always check
 ;;; for a match on both the hash and the layout.
-(defun expand-struct-typecase (keyform normal-clauses type-specs default errorp)
+(defun expand-struct-typecase (keyform normal-clauses type-specs default errorp env)
   (let* ((n (length type-specs))
          (n-base-types 0)
          (layout-lists (make-array n))
@@ -1021,7 +1028,8 @@ invoked. In that case it will store into PLACE and start over."
       ;; For each clause, if it effectively an OR over acceptable instance types,
       ;; collect the layouts of those types.
       (loop for i from 0 for spec in type-specs
-            do (let ((parse (specifier-type spec)))
+            do (let ((parse (handler-bind ((parse-unknown-type #'muffle-warning))
+                              (specifier-type spec))))
                  (setf (aref layout-lists i) (or (get-layouts parse)
                                                  (return-from expand-struct-typecase nil)))))
       ;; The number of base types is an upper bound on the number of different TYPEP
@@ -1039,13 +1047,44 @@ invoked. In that case it will store into PLACE and start over."
       ;; I don't know if these criteria are sane: Use hashing only if either all sealed,
       ;; or very large? Why is this an additional restriction beyond the above heuristics?
       (when (or all-sealed (>= n-base-types 8))
+        (when all-sealed
+          (let ((i -1) (consts (make-array (length normal-clauses))))
+            (dolist (clause normal-clauses)
+              (let ((expr `(progn ,@(cdr clause))))
+                ;; If compiling to file, the constants allowed are restricted because
+                ;; there are inevitably complications arising from creating arrays of
+                ;; constants the user didn't ask for, such as when the value of a form
+                ;; is a self-evaluating object lacking a make-load-form.
+                (cond ((and (constantp expr env)
+                            (let ((val (setf (aref consts (incf i))
+                                             (constant-form-value expr env))))
+                              (if (sb-c::producing-fasl-file)
+                                  (sb-xc:typep val '(or symbol number))
+                                  t))))
+                      (t
+                       (setq consts nil)
+                       (return)))))
+            (when consts ; use an array of values
+              (return-from expand-struct-typecase
+                `(let* ((,temp ,keyform)
+                        (#1=#:index (sb-kernel::%typecase-index ,layout-lists ,temp t)))
+                   (if (eq #1# 0)
+                       ,(if errorp
+                            `(etypecase-failure ,temp ',type-specs)
+                            `(progn ,@(cdr default)))
+                       (svref ,consts (1- #1#))))))))
         `(let ((,temp ,keyform))
            (case (sb-kernel::%typecase-index ,layout-lists ,temp ,all-sealed)
-             ,@(loop for i from 1 for clause in normal-clauses
+             ,@(loop for i from 1
+                     for clause in normal-clauses
                      collect `(,i
-                                   ;; CLAUSE is ((TYPEP #:G 'a-type) . forms)
-                                   (sb-c::%type-constraint ,temp ,(third (car clause)))
-                                   ,@(cdr clause)))
+                               ;; CLAUSE is ((TYPEP #:G 'a-type) . forms)
+                               (sb-c::%type-constraint
+                                ,temp
+                                ,(third (if (eq (caar clause) 'sb-c::with-source-form)
+                                            (third (car clause))
+                                            (car clause))))
+                               ,@(cdr clause)))
              (0 ,@(if errorp
                           `((etypecase-failure ,temp ',type-specs))
                           (cdr default)))))))))
@@ -1072,7 +1111,8 @@ invoked. In that case it will store into PLACE and start over."
 ;;; and gets the compiled code that the host produced in make-host-1.
 ;;; If recompiled, you do not want an interpreted definition that might come
 ;;; from EVALing a toplevel form - the stack blows due to infinite recursion.
-(defun case-body (whole lexenv test errorp
+(defun parse-case-clauses
+    (whole lexenv test errorp
                   &aux (clauses ())
                        (case-clauses (if (eq test 'typep) '(0))) ; generalized boolean
                        (keys))
@@ -1099,8 +1139,13 @@ invoked. In that case it will store into PLACE and start over."
                  (dolist (k case-keys)
                    (setf (gethash k keys-seen) record))))
              (testify (k)
-               `(,test ,keyform-value
-                       ,(if (and (eq test 'eql) (self-evaluating-p k)) k `',k))))
+               (wrap-if
+                (and (eq test 'typep)
+                     (sb-c::compiling-p lexenv))
+                `(sb-c::with-source-form ,clause)
+                `(,test
+                  ,keyform-value
+                  ,(if (and (eq test 'eql) (self-evaluating-p k)) k `',k)))))
         (unless (list-of-length-at-least-p clause 1)
           (with-current-source-form (cases)
             (warn "~S -- bad clause in ~S" clause name)
@@ -1184,44 +1229,60 @@ invoked. In that case it will store into PLACE and start over."
     (when (eq errorp :none)
       (setq errorp nil))
 
+    ;; For a TYPECASE, attempt to inform the user if a later clause is shadowed by
+    ;; an earlier one, unless converting to CASE which will warn about it as well.
+    ;; However, this seems not to do exactly what it attempts to.
+    ;; single-float followed by short-float avoids warning, but the opposite order warns.
+    ;; Same for double then long does not warn; flipped warns.
+    (when (and (eq test 'typep) (not case-clauses))
+      (loop with types = nil
+            for clause in specified-clauses
+            do
+        (with-current-source-form (clause)
+          (let* ((key (car clause))
+                 (type (unless (eq key 'otherwise)
+                         (handler-bind ((parse-unknown-type #'muffle-warning))
+                           (specifier-type key)))))
+            (when (and type (neq type *empty-type*))
+              (let ((existing
+                     (loop for (prev . spec) in types
+                           when
+                           (and (csubtypep type prev)
+                                (not (or (and (eq prev (specifier-type 'single-float))
+                                              (eq key 'short-float))
+                                         #-long-float
+                                         (and (eq prev (specifier-type 'double-float))
+                                              (eq key 'long-float))
+                                         (and (csubtypep type (specifier-type 'array))
+                                              ;; Ignore due to upgrading
+                                              (sb-kernel::ctype-array-any-specialization-p prev)))))
+                           return spec)))
+                (if existing
+                    (style-warn "Clause ~s is shadowed by ~s" key existing)
+                    (push (cons type key) types))))))))
+    (list* keyform-value keys errorp
+           (if case-clauses
+               (list t (append (cdr (reverse case-clauses)) ; 1st elt was a boolean flag
+                               (when (eq (caar clauses) t) (list (car clauses)))))
+               (list nil clauses)))))
+
+(defun case-body (whole lexenv test errorp)
+  (destructuring-bind (keyform-value keys errorp expand-as-case clauses
+                              &aux (name (car whole))
+                                   (keyform (cadr whole)))
+      (parse-case-clauses whole lexenv test errorp)
     ;; [EC]CASE has an advantage over [EC]TYPECASE in that we readily notice when
     ;; the expansion can use symbol-hash to pick the clause.
-    (when case-clauses
+    (when expand-as-case
       (return-from case-body
         `(,(cond ((not errorp) 'case) ((eq name 'ctypecase) 'ccase) (t 'ecase))
-           ,keyform
-          ,@(cdr (reverse case-clauses)) ; 1st elt was a boolean flag
-          ,@(when (eq (caar clauses) t) (list (car clauses))))))
+          ,keyform ,@clauses)))
 
     (setq keys
           (nreverse (mapcon (lambda (tail)
                               (unless (member (car tail) (cdr tail))
                                 (list (car tail))))
                             keys)))
-    (when (eq test 'typep)
-      (let (types)
-        (loop for key in keys
-              for clause in specified-clauses
-              do
-              (with-current-source-form (clause)
-                (let ((type (specifier-type key)))
-                  (when (and type
-                             (neq type *empty-type*))
-                    (let ((existing (loop for (prev . spec) in types
-                                          when (and (csubtypep type prev)
-                                                    (not (or (and (eq prev (specifier-type 'single-float))
-                                                                  (eq key 'short-float))
-                                                             #-long-float
-                                                             (and (eq prev (specifier-type 'double-float))
-                                                                  (eq key 'long-float))
-                                                             (and (csubtypep type (specifier-type 'array))
-                                                                  ;; Ignore due to upgrading
-                                                                  (sb-kernel::ctype-array-any-specialization-p prev)))))
-                                          return spec)))
-                      (if existing
-                          (style-warn "Clause ~s is shadowed by ~s"
-                                      key existing)
-                          (push (cons type key) types)))))))))
     ;; Try hash-based dispatch only if expanding for the compiler
     (when (and (neq errorp 'cerror)
                (sb-c::compiling-p lexenv)
@@ -1235,7 +1296,7 @@ invoked. In that case it will store into PLACE and start over."
         ;; depending on constant-ness of results.
         (cond ((eq test 'typep)
                (awhen (expand-struct-typecase keyform normal-clauses keys
-                                              default errorp)
+                                              default errorp lexenv)
                  (return-from case-body it))))))
 
     (setq clauses (nreverse clauses))
@@ -1693,7 +1754,7 @@ invoked. In that case it will store into PLACE and start over."
 ;;;; SB-EXT:COMPARE-AND-SWAP is the public API for now.
 ;;;;
 ;;;; Internally our interface has CAS, GET-CAS-EXPANSION,
-;;;; DEFCAS, and #'(CAS ...) functions.
+;;;; and #'(CAS ...) functions.
 
 (defun expand-structure-slot-cas (info name place)
   (let* ((dd (car info))
@@ -1704,9 +1765,9 @@ invoked. In that case it will store into PLACE and start over."
          (casser
            (case (dsd-raw-type slotd)
              ((t) '%instance-cas)
-             #+(or arm64 ppc ppc64 riscv x86 x86-64)
+             #+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
              ((word) '%raw-instance-cas/word)
-             #+(or arm64 riscv x86 x86-64)
+             #+(or arm64 loongarch64 riscv x86 x86-64)
              ((sb-vm:signed-word) '%raw-instance-cas/signed-word))))
     (unless casser
       (error "Cannot use COMPARE-AND-SWAP with structure accessor ~

@@ -389,7 +389,6 @@
                    (hi (symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type)))
                    (bignum-hash (symbolicate 'sxhash-bignum- type)))
                `(let ((key ,key))
-                  (declare (inline float-infinity-p))
                   (cond (;; This clause allows FIXNUM-sized integer
                          ;; values to be handled without consing.
                          (<= ,lo key ,hi)
@@ -624,3 +623,7 @@
 ;;; Not needed post-build
 (clear-info :function :inlining-data '%sxhash-simple-substring)
 (clear-info :function :inlining-data '%sxhash-simple-substring/truncating)
+
+;; interpreter stubs that are needed as soon as possible in warm build
+(defun get-lisp-obj-address (x) (get-lisp-obj-address x))
+(defun descriptor-hash32 (x) (descriptor-hash32 x))

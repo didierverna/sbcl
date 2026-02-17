@@ -5,7 +5,10 @@
 #include "interrupt.h" // for sig_stop_for_gc_handler
 #include "gc.h" // for gencgc_handle_wp_violation
 #include <image.h>
+#include <pthread.h>
 #include <stdio.h>
+
+int sb_GetTID() { return get_pthread_thread_id(pthread_self()); }
 
 os_vm_address_t
 os_alloc_gc_space(int __attribute__((unused)) space_id,
@@ -58,6 +61,10 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
            context->uc_mcontext.rip, info->si_addr);*/
     os_vm_address_t addr = arch_get_bad_addr(signal, info, context);
     if (gencgc_handle_wp_violation(context, addr)) return;
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, addr)) return;
+#endif
 
     if (!handle_guard_page_triggered(context, addr)) {
         //interrupt_handle_now(signal, info, context);

@@ -71,7 +71,7 @@ and submit it as a patch."
   (cond ((not (sb-vm:is-lisp-pointer (get-lisp-obj-address object))) 0)
         ((eq object nil) (ash sb-vm::sizeof-nil-in-words sb-vm:word-shift))
         ((simple-fun-p object) (code-object-size (fun-code-header object)))
-        #-(or x86 x86-64 arm64 riscv) ((lra-p object) 1)
+        #-(or x86 x86-64 arm64 riscv loongarch64) ((lra-p object) 1)
         (t
          (with-alien ((sizer (function unsigned unsigned) :extern "primitive_object_size"))
            (with-pinned-objects (object)
@@ -132,6 +132,8 @@ run in any thread.")
   #-64-bit 0)
 
 (defun sub-gc (gen)
+  ;; Can't instrument GC-EPOCH cons in a foreign thead with no *CURRENT-THREAD* yet
+  (declare (optimize (sb-c::instrument-consing 0)))
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
          nil)
@@ -341,13 +343,6 @@ Note: currently changes to this value are lost when saving core."
     (when (< val current)
       (decf (extern-alien "auto_gc_trigger" os-vm-size-t) (- current val))))
   (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t) val))
-
-(declaim (inline maybe-handle-pending-gc))
-(defun maybe-handle-pending-gc ()
-  (when (and (not *gc-inhibit*)
-             (or #+sb-thread *stop-for-gc-pending*
-                 *gc-pending*))
-    (sb-unix::receive-pending-interrupt)))
 
 ;;;; GENCGC specifics
 ;;;;

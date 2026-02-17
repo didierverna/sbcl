@@ -16,6 +16,7 @@
 ;;;; more information.
 
 (cl:in-package :cl-user)
+(load "compiler-test-util.lisp")
 
 ;;; In sbcl-0.6.10, Douglas Brebner reported that (SETF EXTERN-ALIEN)
 ;;; was messed up so badly that trying to execute expressions like
@@ -366,30 +367,6 @@
     (test nil)
     (test t)))
 
-;;; Skip for MSAN. Instead of returning 0, the intercepted malloc is configured
-;;; to cause process termination by default on failure to allocate memory.
-;;; Skip also for UBSAN which has a smaller ARRAY-TOTAL-SIZE-LIMIT
-;;; and so doesn't get ENOMEM.
-;;; Unfortunately, even without an intercepted malloc, and depending on SBCL build
-;;; parameters (notably GC card-size) you might not get a failure right away,
-;;; but instead suffer process death, or cause your kernel to churn for a while
-;;; as it looks for swap space and then decides to OOM-kill you. This will typically
-;;; occur when ARRAY-TOTAL-SIZE-LIMIT is "too small" to get instant failure.
-;;; Instead, your malloc() thinks the request is reasonable, and tries to fulfill it.
-;;; But we're constrained by the maximum BYTES argument to MAKE-%ALIEN which
-;;; is declared as INDEX even though we want to pass something ludicrously
-;;; big like half the maximum value of size_t.
-#+64-bit (unless (>= (integer-length array-total-size-limit) 45)
-           (push :skip-malloc-test *features*))
-(with-test (:name :malloc-failure ; for lp#891268
-                  :skipped-on (or :ubsan :msan :skip-malloc-test))
-  (assert (eq :enomem
-              (handler-case
-                  (loop repeat 128
-                        collect (sb-alien:make-alien char (1- array-total-size-limit)))
-                (storage-condition ()
-                  :enomem)))))
-
 (with-test (:name :bug-985505)
   ;; Check that correct octets are reported for a c-string-decoding error.
   (assert
@@ -585,6 +562,30 @@
         (assert (= i j k 1)))
       (multiple-value-bind (i j k) (funcall fun (addr a) (addr a) nil)
         (assert (= i j k 1))))))
+
+;;; Permanent fnames are omitted from the list of referenced Lisp linkage table
+;;; indices in the code header. Prevent that behavior.
+(sb-int:encapsulate 'sb-int:permanent-fname-p 'test-shim #'sb-int:constantly-nil)
+(with-test (:name :string-passing-no-conversion :skipped-on (:not :sb-unicode))
+  (flet ((has-call (arg-type)
+           (let ((f (compile nil`(lambda (s)
+                                   (with-alien ((getenv (function unsigned utf8-string) :extern))
+                                     (alien-funcall getenv (the ,arg-type s)))))))
+             (find 'sb-alien::string-to-c-string (ctu:find-named-callees f)))))
+    ;; Positive assertion that passing STRING may (in theory) do a conversion
+    (assert (has-call 'string))
+    ;; Negative assertion that passing SIMPLE-BASE-STRING will never do a conversion
+    (assert (not (has-call 'simple-base-string)))))
+
+(with-test (:name :not-quite-literal-alien-name :skipped-on (:not :unix))
+  ;; There are valid reasons for the first argument to EXTERN-ALIEN to be an expression
+  ;; producing a constant string such as through a global constant or a macro that selects
+  ;; a name based on environmental aspects such as compilation mode and/or foreign toolchain.
+  (let ((f (compile nil
+            '(lambda (s)
+              (macrolet ((something () "getenv"))
+                (alien-funcall (extern-alien (something) (function c-string c-string)) s))))))
+    (assert (string= (funcall f "SBCL_HOME") (sb-ext:posix-getenv "SBCL_HOME")))))
 
 (cl:in-package "SB-KERNEL")
 (test-util:with-test (:name :hash-consing)

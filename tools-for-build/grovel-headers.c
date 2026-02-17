@@ -74,6 +74,10 @@
 #include "gc-typedefs.h" // for page_index_t
 #include "os.h" // for os_vm_size_t
 
+#ifdef HAVE_LIBUNWIND
+#include <libunwind.h>
+#endif
+
 #if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_64_BIT
 # define CAST_SIZEOF (unsigned long)
 #else
@@ -257,7 +261,6 @@ main(int argc, char __attribute__((unused)) *argv[])
     deferrno("eexist", EEXIST);
     deferrno("eloop", ELOOP);
     deferrno("epipe", EPIPE);
-    deferrno("espipe", ESPIPE);
     deferrno("ewouldblock", EWOULDBLOCK);
     printf("\n");
 
@@ -355,7 +358,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 #endif // !WIN32
     printf("\n");
 
-#if !defined(LISP_FEATURE_AVOID_CLOCK_GETTIME)
+#ifdef LISP_FEATURE_OS_PROVIDES_CLOCK_GETTIME
 #ifdef LISP_FEATURE_UNIX
     DEFCONSTANT("clock-realtime", CLOCK_REALTIME);
     DEFCONSTANT("clock-monotonic", CLOCK_MONOTONIC);
@@ -408,6 +411,11 @@ main(int argc, char __attribute__((unused)) *argv[])
 #ifdef LISP_FEATURE_ANDROID
     defconstant("path-max", PATH_MAX);
     printf("\n");
+#endif
+#ifdef HAVE_LIBUNWIND
+    defconstant("sizeof-unw-cursor", sizeof (unw_cursor_t));
+#else
+    defconstant("sizeof-unw-cursor", 0);
 #endif
 
 #ifdef LISP_FEATURE_BSD

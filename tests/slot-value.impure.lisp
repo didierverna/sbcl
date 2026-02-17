@@ -85,16 +85,73 @@
             :skipped-on (not (or :x86 :x86-64)))
   (let* ((method (find-method #'read-a-struct-x nil (list (find-class 'a-struct))))
          (lines (ctu:disassembly-lines (sb-mop:method-function method))))
-    (assert (notany (lambda (x) (search "CALL" x)) lines))))
+    (assert (notany (lambda (x) (search "CALL" x)) lines))
+    (assert (notany (lambda (x) (search "JMP" x)) lines))))
+
+(with-test (:name :structure-slot-value-in-method-no-callees)
+  (let* ((method (find-method #'read-a-struct-x nil (list (find-class 'a-struct))))
+         (mf (sb-mop:method-function method))
+         (fmf (sb-pcl::%method-function-fast-function mf))
+         (callees (ctu:find-named-callees fmf))
+         (pcl-callees '(sb-pcl::method-function-from-fast-function sb-pcl::%make-method-function)))
+    (ecase sb-ext:*evaluator-mode*
+      (:interpret)
+      (:compile
+       (assert (null (set-difference pcl-callees callees)))
+       (assert (null (set-difference callees pcl-callees)))))))
 
 (with-test (:name :structure-missing-slot-value-in-method-calls-global
             :skipped-on (not (or :x86 :x86-64)))
   (let* ((method (find-method #'read-a-struct-y nil (list (find-class 'a-struct))))
          (lines (ctu:disassembly-lines (sb-mop:method-function method))))
-    (assert (some (lambda (x) (search "CALL" x)) lines))))
+    (assert (some (lambda (x) (search "SB-PCL::STRUCTURE-SLOT-VALUE" x)) lines))))
+
+(with-test (:name :structure-missing-slot-value-in-method-single-callee)
+  (let* ((method (find-method #'read-a-struct-y nil (list (find-class 'a-struct))))
+         (mf (sb-mop:method-function method))
+         (fmf (sb-pcl::%method-function-fast-function mf))
+         (callees (ctu:find-named-callees fmf))
+         (pcl-callees '(sb-pcl::method-function-from-fast-function sb-pcl::%make-method-function)))
+    (ecase sb-ext:*evaluator-mode*
+      (:interpret)
+      (:compile
+       (assert (null (set-difference pcl-callees callees)))
+       (assert (equal (set-difference callees pcl-callees) '(sb-pcl::structure-slot-value)))))))
 
 (define-condition a-condition () ((a :initarg :a)))
 (defmethod sb-mop:slot-value-using-class :around (class (c a-condition) slotd)
   (list :a-slot-value (call-next-method)))
 (with-test (:name :condition-slot-value-using-class-method)
   (assert (equal (slot-value (make-condition 'a-condition :a 4) 'a) '(:a-slot-value 4))))
+
+(defstruct cfg-struct-type1 name)
+(defstruct cfg-struct-type2 identifier name)
+(defstruct cfg-struct-type3 name)
+(defun configuration-structure-name-good (x)
+  (slot-value (the (or cfg-struct-type1 cfg-struct-type2 cfg-struct-type3) x) 'name))
+(defun configuration-structure-name-best (x)
+  (slot-value (the (or cfg-struct-type1 cfg-struct-type2) x) 'name))
+(compile 'configuration-structure-name-good)
+(compile 'configuration-structure-name-best)
+(with-test (:name :structure-slot-value-2-possible-instance-types)
+  (let ((callees (ctu:find-named-callees #'configuration-structure-name-good)))
+    (assert (find 'sb-pcl::structure-slot-value callees)))
+  (let ((callees (ctu:find-named-callees #'configuration-structure-name-best)))
+    (assert (not (find 'sb-pcl::structure-slot-value callees)))))
+
+(defun read-slot-of-maybe-struct (x)
+  (declare (type (or null cfg-struct-type3) x))
+  (with-slots (name) x name))
+
+(compile 'read-slot-of-maybe-struct)
+
+(defmethod slot-missing ((class (eql (find-class 'null))) the-object slot op &optional new)
+  (declare (ignore new))
+  (if (and (eq slot 'name) (eq op 'slot-value)) :i-was-called))
+
+(with-test (:name :slot-value-nullable-instance)
+  (let ((callees (ctu:find-named-callees #'read-slot-of-maybe-struct)))
+    (assert (and (sb-int:singleton-p callees)
+                 (eq (car callees) 'sb-pcl::nil-not-slot-object)))
+    (assert (eq 'steve (read-slot-of-maybe-struct (make-cfg-struct-type3 :name 'steve))))
+    (assert (eq :i-was-called (read-slot-of-maybe-struct nil)))))

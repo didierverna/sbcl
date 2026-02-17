@@ -33,7 +33,7 @@
 ;;;   > #define HASHSET_LAYOUT_ID 283
 ;;;   > #define HASHSET_STORAGE_LAYOUT_ID 284
 ;;;
-(defparameter *popular-structure-types* (mapcar 'list '(
+(defglobal *popular-structure-types* (mapcar 'list '(
 SB-KERNEL:CTYPE
 HASH-TABLE
 PACKAGE
@@ -267,10 +267,12 @@ SB-C::DXABLE-ARGS
 ;;; but only if layout IDs can be negative.
 (defglobal *condition-layout-uniqueid-counter* -128) ; decremented before use
 
+#-sb-xc
 (defun choose-layout-id (name conditionp)
   (case name
     ((t) 0)
     (structure-object 1)
+    (sb-impl::buffer 2)
     (layout 3)
     (sb-lockless::list-node 4)
     (sb-brothertree::unary-node 5)

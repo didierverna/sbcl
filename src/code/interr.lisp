@@ -201,14 +201,14 @@
                        max)
                  (sb-vm::incf-context-pc *current-internal-error-context*
                                          restart)))
-             #+(or x86-64 arm64)
+             #+(or x86-64 arm64 loongarch64)
              (replace-function (value)
                :report (lambda (stream)
                          (format stream "Call a different function with the same arguments"))
                :interactive read-evaluated-form
                (sb-vm::context-call-function *current-internal-error-context*
                                              (fdefinition value)))
-             #+(or x86-64 arm64)
+             #+(or x86-64 arm64 loongarch64)
              (call-form (form)
                :report (lambda (stream)
                          (format stream "Call a different form"))
@@ -300,8 +300,9 @@
     (when (listp tag)
       (binding* ((frame (find-interrupted-frame))
                  (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame)))
-                 (down (and (eq name 'throw) ; is this tautological ?
-                            (sb-di:frame-down frame)) :exit-if-null))
+                 (down (if (eq name 'throw)
+                           (sb-di:frame-down frame)
+                           frame)))
         (case (sb-di:debug-fun-name (sb-di:frame-debug-fun down))
          ((return-from)
           (setq text "attempt to RETURN-FROM an exited block: ~S"
@@ -585,9 +586,9 @@
   (deferr ash-overflow2-error (x y)
     (let ((type (or (sb-di:error-context)
                     'fixnum)))
-      (if (numberp x)
+      (if (integerp x)
           (object-not-type-error (ash x y) type nil)
-          (object-not-type-error x 'number nil))))
+          (object-not-type-error x 'integer nil))))
 
   (deferr negate-overflow-error (x)
     (let ((type (or (sb-di:error-context)
@@ -596,9 +597,35 @@
           (object-not-type-error (- x) type nil)
           (object-not-type-error x 'number nil)))))
 
+(deferr op-not-type1-error (a)
+  (let* ((context-p (sb-di:error-context))
+         (context (or context-p
+                      a)))
+    (multiple-value-bind (type op) (if (consp context)
+                                       (values (car context) (cdr context))
+                                       (values 'fixnum context))
+      (cond (context-p
+             (unless (typep a 'number)
+               (object-not-type-error a 'number nil))
+             (object-not-type-error (funcall op a) type nil))
+            (t
+             (object-not-type-error "#<no debug info>" type nil))))))
+
 (deferr op-not-type2-error (a b)
-  (destructuring-bind (type . op) (sb-di:error-context)
-   (object-not-type-error (funcall op a b) type nil)))
+  (let* ((context-p (sb-di:error-context))
+         (context (or context-p
+                      b)))
+    (multiple-value-bind (type op) (if (consp context)
+                                       (values (car context) (cdr context))
+                                       (values 'fixnum context))
+      (cond (context-p
+             (unless (typep a 'number)
+               (object-not-type-error a 'number nil))
+             (unless (typep b 'number)
+               (object-not-type-error b 'number nil))
+             (object-not-type-error (funcall op a b) type nil))
+            (t
+             (object-not-type-error "#<no debug info>" type nil))))))
 
 (deferr fill-pointer-error (array)
   (declare (notinline fill-pointer-error))

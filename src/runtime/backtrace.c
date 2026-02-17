@@ -347,6 +347,51 @@ lisp_backtrace(int nframes)
     print_lisp_backtrace(nframes, stdout);
 }
 
+void print_backtrace_frame(char *pc, void *fp, int i, FILE *f) {
+    if (i != -1) {
+#ifdef BACKTRACE_SHOW_FRAME_SIZE
+        // This display is a little confusing.  It's the size of the frame that this
+        // frame will return to.
+        fprintf(f, "%4d: fp=%p [%5x] pc=%p ", i, fp, (int)(*(char**)fp-(char*)fp), pc);
+#else
+        fprintf(f, "%4d: fp=%p pc=%p ", i, fp, pc);
+#endif
+    }
+
+    struct code *code = (void*)component_ptr_from_pc(pc);
+    if (code) {
+        lispobj name = debug_function_name_from_pc(code, pc);
+        if (name)
+            print_entry_name(barrier_load(&name), f);
+        else
+            fprintf(f, "{code_serialno=%x}", code_serialno(code));
+    } else if (gc_managed_heap_space_p((uword_t)pc)) {
+#ifdef LISP_FEATURE_X86
+        // can't actually have a PC inside a random object, it's got to be a frame
+        // that didn't set up the pointer chain, quite possibly a signal frame such as:
+        //   7: fp=0xd78c8460 pc=0xf7fb51b0 Foreign function __kernel_rt_sigreturn
+        //   8: fp=0xd78c8478 pc=0xd9c43159 (bad PC)
+        //   9: fp=0xd78c84ec pc=0xd849a17e (FLET SB-C::DO-1-USE :IN SB-C::TENSION-IF-IF-1)
+        // where, if you print the PC actually from the context, line 8 would be 0xd823ea78.
+        fprintf(f, "(bad PC)");
+#else
+        // It could be a generic-function with self-contained tramponline code,
+        // or the executable JMP instruction in an fdefn.
+        fprintf(f, "(unknown lisp object)");
+#endif
+    } else {
+#ifdef LISP_FEATURE_OS_PROVIDES_DLADDR
+        Dl_info info;
+        if (dladdr(pc, &info)) {
+            fprintf(f, "Foreign function %s", info.dli_sname);
+        } else
+#endif
+            fprintf(f, "Foreign function");
+    }
+
+    putc('\n', f);
+}
+
 #if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
 
 /* KLUDGE: Sigh ... I know what the call frame looks like and it had
@@ -660,48 +705,6 @@ describe_thread_state(void)
     printf("Pending handler = %p\n", data->pending_handler);
 }
 
-static void print_backtrace_frame(char *pc, void *fp, int i, FILE *f) {
-#ifdef BACKTRACE_SHOW_FRAME_SIZE
-    // This display is a little confusing.  It's the size of the frame that this
-    // frame will return to.
-    fprintf(f, "%4d: fp=%p [%5x] pc=%p ", i, fp, (int)(*(char**)fp-(char*)fp), pc);
-#else
-    fprintf(f, "%4d: fp=%p pc=%p ", i, fp, pc);
-#endif
-    struct code *code = (void*)component_ptr_from_pc(pc);
-    if (code) {
-        lispobj name = debug_function_name_from_pc(code, pc);
-        if (name)
-            print_entry_name(barrier_load(&name), f);
-        else
-            fprintf(f, "{code_serialno=%x}", code_serialno(code));
-    } else if (gc_managed_heap_space_p((uword_t)pc)) {
-#ifdef LISP_FEATURE_X86
-        // can't actually have a PC inside a random object, it's got to be a frame
-        // that didn't set up the pointer chain, quite possibly a signal frame such as:
-        //   7: fp=0xd78c8460 pc=0xf7fb51b0 Foreign function __kernel_rt_sigreturn
-        //   8: fp=0xd78c8478 pc=0xd9c43159 (bad PC)
-        //   9: fp=0xd78c84ec pc=0xd849a17e (FLET SB-C::DO-1-USE :IN SB-C::TENSION-IF-IF-1)
-        // where, if you print the PC actually from the context, line 8 would be 0xd823ea78.
-        fprintf(f, "(bad PC)");
-#else
-        // It could be a generic-function with self-contained tramponline code,
-        // or the executable JMP instruction in an fdefn.
-        fprintf(f, "(unknown lisp object)");
-#endif
-    } else {
-#ifdef LISP_FEATURE_OS_PROVIDES_DLADDR
-        Dl_info info;
-        if (dladdr(pc, &info)) {
-            fprintf(f, "Foreign function %s", info.dli_sname);
-        } else
-#endif
-            fprintf(f, "Foreign function");
-    }
-
-    putc('\n', f);
-}
-
 /* This function has been split from lisp_backtrace() to enable Lisp
  * backtraces from gdb with call backtrace_from_fp(...). Useful for
  * example when debugging threading deadlocks. (SBCL internals call
@@ -789,8 +792,6 @@ static bool __attribute__((unused)) print_lisp_fun_name(char* pc, FILE* f)
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 int sbcl_have_libunwind() { return 1; }
-int get_sizeof_unw_context() { return sizeof (unw_context_t); }
-int get_sizeof_unw_cursor() { return sizeof (unw_cursor_t); }
 #ifdef LISP_FEATURE_DARWIN // slightly different libunwind. And it doesn't work for me
 int sb_unw_init(void* a, void* b) { return unw_init_local(a, b); }
 int sb_unw_get_pc(void* a, void* b) { return unw_get_reg(a, UNW_REG_IP, b); }
@@ -805,8 +806,6 @@ int sb_unw_step(void* a) { return unw_step(a); }
 # include <ucontext.h>
 #endif
 int sbcl_have_libunwind() { return 0; }
-int get_sizeof_unw_context() { return 0; }
-int get_sizeof_unw_cursor() { return 0; }
 int sb_unw_init(void* a, void* b) { lose("unw_init %p %p", a, b); }
 int sb_unw_get_proc_name(void* a, void* b, int c, void* d) { lose("unw_get_proc_name %p %p %d %p", a, b, c, d); }
 int sb_unw_step(void* a) { lose("unw_step %p", a); }
@@ -838,6 +837,68 @@ void libunwind_bt_from_sigcontext(void* context)
     } while (unw_step(&cursor));
 }
 
+#ifdef LISP_FEATURE_64_BIT
+# define unfixnumize_tid(thread) fixnum_value(thread->os_tid)
+#else // stored as raw 32-bit integer
+# define unfixnumize_tid(thread) thread->os_tid
+#endif
+void perform_backtrace(struct thread *th, os_context_t* context, FILE* f)
+{
+    fprintf(f, "Lisp thread @ %p, tid %d", th, (int)unfixnumize_tid(LISPTHREAD(th)));
+    // the TLS area is not used if #-sb-thread. And if so, it must be "main thread"
+    struct thread_instance* lispthread = (void*)native_pointer(th->lisp_thread);
+    if (lispthread->_name != NIL) {
+        fprintf(f, " (\"");
+        print_string(VECTOR(lispthread->_name), f);
+        fprintf(f, "\")");
+    }
+    putc('\n', f);
+    // In case you get no backtrace whatsoever, maybe at least see where the
+    // signal was received, probably in a function without the standard
+    // frame pointer setup.
+    fprintf(f, " interrupted @ PC %p\n", (void*)OS_CONTEXT_PC(context));
+    if (lispthread->waiting_for != NIL) {
+        fprintf(f, "waiting for %p", (void*)lispthread->waiting_for);
+        if (instancep(lispthread->waiting_for)) {
+            // THREAD-WAITING-FOR can be a mutex or a waitqueue (if not a cons).
+            // Accessing it as if it's a mutex works because both a waitqueue
+            // and a mutex have a name at the same slot offset (if #+sb-futex).
+            // So to reiterate the comment from linux-os.c -
+            // "Use this only if you know what you're doing"
+            struct lispmutex* lispmutex = (void*)native_pointer(lispthread->waiting_for);
+            if (lispmutex->name != NIL) {
+                fprintf(f, " (MUTEX:\"");
+                print_string(VECTOR(lispmutex->name), f);
+                fprintf(f, "\")");
+            }
+        }
+        putc('\n', f);
+    }
+#ifdef HAVE_LIBUNWIND
+    char procname[100];
+    unw_cursor_t cursor;
+    unw_init_local(&cursor, context);
+    // This thread performs the backtrace of the other thread, so it matters not
+    // whether libunwind functions are interrupt-safe (though they do claim to be)
+    do {
+        uword_t offset;
+        char *pc;
+        unw_get_reg(&cursor, UNW_TDEP_IP, (uword_t*)&pc);
+        if (print_lisp_fun_name(pc, f)) {
+            // printed
+        } else if (!unw_get_proc_name(&cursor, procname, sizeof procname, &offset)) {
+            fprintf(f, " %p [%s]\n", pc, procname);
+        } else {
+            fprintf(f, " %p ?\n", pc);
+        }
+    } while (unw_step(&cursor));
+#else
+    // If you don't have libunwind, this will almost surely not work,
+    // because we can't figure out how to get backwards past a signal frame.
+    print_backtrace_from_fp(th, (void*)*os_context_fp_addr(context), 100, 0, stderr);
+#endif
+}
+
 static sem_t bt_suspend_sem;
 static os_context_t *bt_suspension_context;
 void libunwind_backtrace(struct thread *th, FILE* f)
@@ -861,59 +922,7 @@ void libunwind_backtrace(struct thread *th, FILE* f)
 #endif
         bt_suspension_context = &ucontext;
     }
-    fprintf(f, "Lisp thread @ %p, tid %d", th, (int)th->os_kernel_tid);
-    // the TLS area is not used if #-sb-thread. And if so, it must be "main thread"
-    struct thread_instance* lispthread = (void*)native_pointer(th->lisp_thread);
-    if (lispthread->_name != NIL) {
-        fprintf(f, " (\"");
-        print_string(VECTOR(lispthread->_name), f);
-        fprintf(f, "\")");
-    }
-    putc('\n', f);
-    // In case you get no backtrace whatsoever, maybe at least see where the
-    // signal was received, probably in a function without the standard
-    // frame pointer setup.
-    fprintf(f, " interrupted @ PC %p\n", (void*)OS_CONTEXT_PC(bt_suspension_context));
-    if (lispthread->waiting_for != NIL) {
-        fprintf(f, "waiting for %p", (void*)lispthread->waiting_for);
-        if (instancep(lispthread->waiting_for)) {
-            // THREAD-WAITING-FOR can be a mutex or a waitqueue (if not a cons).
-            // Accessing it as if it's a mutex works because both a waitqueue
-            // and a mutex have a name at the same slot offset (if #+sb-futex).
-            // So to reiterate the comment from linux-os.c -
-            // "Use this only if you know what you're doing"
-            struct lispmutex* lispmutex = (void*)native_pointer(lispthread->waiting_for);
-            if (lispmutex->name != NIL) {
-                fprintf(f, " (MUTEX:\"");
-                print_string(VECTOR(lispmutex->name), stderr);
-                fprintf(f, "\")");
-            }
-        }
-        putc('\n', f);
-    }
-#ifdef HAVE_LIBUNWIND
-    char procname[100];
-    unw_cursor_t cursor;
-    unw_init_local(&cursor, bt_suspension_context);
-    // This thread performs the backtrace of the other thread, so it matters not
-    // whether libunwind functions are interrupt-safe (though they do claim to be)
-    do {
-        uword_t offset;
-        char *pc;
-        unw_get_reg(&cursor, UNW_TDEP_IP, (uword_t*)&pc);
-        if (print_lisp_fun_name(pc, f)) {
-            // printed
-        } else if (!unw_get_proc_name(&cursor, procname, sizeof procname, &offset)) {
-            fprintf(f, " %p [%s]\n", pc, procname);
-        } else {
-            fprintf(f, " %p ?\n", pc);
-        }
-    } while (unw_step(&cursor));
-#else
-    // If you don't have libunwind, this will almost surely not work,
-    // because we can't figure out how to get backwards past a signal frame.
-    print_backtrace_from_fp(th, (void*)*os_context_fp_addr(context), 100, 0, stderr);
-#endif
+    perform_backtrace(th, bt_suspension_context, f);
     bt_suspension_context = 0;
     if (th != get_sb_vm_thread()) pthread_kill(th->os_thread, SIGXCPU);
 }

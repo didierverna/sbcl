@@ -116,10 +116,8 @@
   (sc-case dst-tn
     ((descriptor-reg any-reg)
      'move-if/t)
-    (unsigned-reg
-     'move-if/unsigned)
-    (signed-reg
-     'move-if/signed)
+    ((unsigned-reg signed-reg)
+     'move-if/word)
     ;; FIXME: Can't use CMOV with byte registers, and characters live
     ;; in such outside of unicode builds. A better solution then just
     ;; disabling MOVE-IF/CHAR should be possible, though.
@@ -143,6 +141,12 @@
       (when (location= res then)
         (rotatef then else)
         (setf not-p (not not-p)))
+      (cond ((and (sc-is then immediate)
+                  (null (tn-value then)))
+             (setf then null-tn))
+            ((and (sc-is else immediate)
+                  (null (tn-value else)))
+             (setf else null-tn)))
       (flet ((load-immediate (dst constant-tn
                               &optional (sc-reg dst))
                (let ((bits (immediate-tn-repr constant-tn
@@ -153,7 +157,7 @@
                      (setf size :qword))
                  (if (nil-relative-p bits)
                      (move-immediate dst bits)
-                 ;; Can't use ZEROIZE, since XOR will affect the flags.
+                     ;; Can't use ZEROIZE, since XOR will affect the flags.
                      (inst mov dst bits)))))
         (cond ((null (rest flags))
                (cond ((sc-is else immediate)
@@ -200,22 +204,21 @@
 
 (macrolet ((def-move-if (name type reg stack)
              `(define-vop (,name move-if)
-                (:args (then :scs (immediate ,@(ensure-list reg) ,stack) :to :eval
+                (:args (then :scs (immediate ,@(ensure-list reg) ,@stack) :to :eval
                              :load-if (not (or (sc-is then immediate)
-                                               (and (sc-is then ,stack)
+                                               (and (sc-is then ,@stack)
                                                     (not (location= else res))))))
-                       (else :scs (immediate ,@(ensure-list reg) ,stack) :target res
-                             :load-if (not (sc-is else immediate ,stack))))
+                       (else :scs (immediate ,@(ensure-list reg) ,@stack) :target res
+                             :load-if (not (sc-is else immediate ,@stack))))
                 (:arg-types ,type ,type)
                 (:results (res :scs ,(ensure-list reg)))
                 (:result-types ,type))))
-  (def-move-if move-if/t t (descriptor-reg any-reg) control-stack)
-  (def-move-if move-if/unsigned unsigned-num unsigned-reg unsigned-stack)
-  (def-move-if move-if/signed signed-num signed-reg signed-stack)
+  (def-move-if move-if/t t (descriptor-reg any-reg) (control-stack))
+  (def-move-if move-if/word (:or unsigned-num signed-num) (unsigned-reg signed-reg) (unsigned-stack signed-stack))
   ;; FIXME: See convert-conditional-move-p above.
   #+sb-unicode
-  (def-move-if move-if/char character character-reg character-stack)
-  (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
+  (def-move-if move-if/char character character-reg (character-stack))
+  (def-move-if move-if/sap system-area-pointer sap-reg (sap-stack)))
 
 ;;; Return a hint about how to calculate the answer from X,Y and flags.
 ;;; Return NIL to give up.
@@ -333,7 +336,7 @@
                ((and (zerop value) (sc-is x any-reg descriptor-reg))
                 (inst test x x))
                (immediate
-                (inst cmp x immediate))
+                (emit-optimized-cmp x value temp (tn-ref-type x-tn-ref)))
                ((not (sc-is x control-stack))
                 (inst cmp x (constantize value)))
                (t
@@ -359,8 +362,6 @@
                 (:variant-cost ,cost))))
   (def fast-if-eq-character fast-char=/character 3)
   (def fast-if-eq-character/c fast-char=/character/c 2)
-  (def fast-if-eq-fixnum fast-eql/fixnum 3)
-  (def fast-if-eq-fixnum/c fast-eql-c/fixnum 2)
   (def fast-if-eq-signed fast-if-eql/signed 5)
   (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
   (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
@@ -385,6 +386,37 @@
                 (ash (+ slot instance-slots-offset) word-shift))
              instance)
          (encode-value-if-immediate x))))
+
+(define-vop (%instance-types=)
+  (:args (a :scs (descriptor-reg))
+         (b :scs (descriptor-reg)))
+  (:arg-refs args)
+  (:translate %instance-types=)
+  (:temporary (:sc unsigned-reg) temp)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+    (let* ((t1 (tn-ref-type args))
+           (t2 (tn-ref-type (tn-ref-across args)))
+           (check1 (not (csubtypep t1 (specifier-type 'instance))))
+           (check2 (not (csubtypep t2 (specifier-type 'instance)))))
+      ;; Since we know that at least one arg is STRUCTURE-OBJECT, then if both are INSTANCE,
+      ;; no lowtag check is required on either arg. Just read and compare layouts
+      (cond ((and check1 check2) (bug "~S on two unknowns" '%instance-types=))
+            ((or check1 check2)
+             ;; Whichever is not INSTANCE, check it. INSTANCEP has an interesting capability
+             ;; that can't be replicated, which is that if the object is known to be
+             ;; a pointer, then a bit test can reject incorrect lowtags.
+             ;; To do that, it changes the conditional flags which won't work here.
+             (inst lea :dword temp (ea (- instance-pointer-lowtag) (if check2 b a)))
+             (inst test :byte temp lowtag-mask)
+             (inst jmp :ne OUT))))
+    (multiple-value-bind (operand-size disp)
+        #+compact-instance-header (values :dword (- 4 instance-pointer-lowtag))
+        #-compact-instance-header (values :qword (- 8 instance-pointer-lowtag))
+      (inst mov operand-size temp (ea disp a))
+      (inst cmp operand-size temp (ea disp b)))
+    OUT))
 
 ;;; See comment below about ASSUMPTIONS
 (eval-when (:compile-toplevel)

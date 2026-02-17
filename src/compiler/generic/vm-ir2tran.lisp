@@ -384,7 +384,9 @@
 
 ;;; ...conses
 (defoptimizer (cons stack-allocate-result) ((&rest args))
-  t)
+  (bug "Shouldn't get here")) ; due to source-transform of cons -> list*
+(when-vop-existsp (:translate acons)
+  (defoptimizer (acons stack-allocate-result) ((&rest args)) t))
 (defoptimizer (%make-complex stack-allocate-result) ((&rest args))
   t)
 
@@ -504,3 +506,16 @@
   (:results (res :scs (any-reg)))
   (:result-types fixnum)
   (:generator 1 (inst #+mips addu #-mips add res x y)))
+
+;;; This vop is safe even if the user calls ALIEN-SAP by hand - the compiler will assert
+;;; the arg to be of type SB-ALIEN-INTERNALS:ALIEN-VALUE (unless checking is dsabled).
+;;; *** produces a bad build on ppc and ppc64 - why? ***
+#+(or arm64 loongarch64 riscv x86 x86-64)
+(define-vop (alien-sap)
+  (:translate alien-sap)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:results (r :scs (descriptor-reg)))
+  (:generator 1
+   (loadw r x (+ (get-dsd-index alien-value sb-kernel::sap) instance-slots-offset)
+          instance-pointer-lowtag)))

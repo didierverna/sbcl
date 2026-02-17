@@ -338,7 +338,8 @@
   ;; call/return VOPs
   (move-args nil :type (member nil :local-call :full-call :known-return :fixed))
   (before-load :unspecified :type (or (member :unspecified) list))
-  (gc-barrier nil))
+  (gc-barrier nil)
+  (check-type nil))
 (declaim (freeze-type vop-parse))
 (defprinter (vop-parse)
   name
@@ -366,9 +367,9 @@
 ;;; The list of slots in the structure, not including the OPERANDS slot.
 ;;; Order here is insignificant; it happens to be alphabetical.
 (defglobal vop-parse-slot-names
-    '(arg-types args before-load body conditional-p cost gc-barrier guard ignores info-args inherits
-      ltn-policy more-args more-results move-args name node-var note optional-results result-types
-      results save-p source-location temps translate variant variant-vars vop-var))
+    '(arg-types args before-load body check-type conditional-p cost gc-barrier guard ignores info-args
+      inherits ltn-policy more-args more-results move-args name node-var note optional-results
+      result-types results save-p source-location temps translate variant variant-vars vop-var))
 ;; A sanity-check. Of course if this fails, the likelihood is that you can't even
 ;; get this far in cross-compilaion. So it's probably not worth much.
 (eval-when (#+sb-xc :compile-toplevel)
@@ -408,7 +409,7 @@
                                        (vop-parse-or-lose name)))))))
 
        (let ((vop (template-or-lose ',name)))
-         (setf (vop-info-move-vop-p vop) t)
+         (setf (vop-info-move-vop-p vop) ,kind)
          (do-sc-pairs (from-sc to-sc ',scs)
            (dolist (dest-sc (cons to-sc (sc-alternate-scs to-sc)))
              (let ((vec (,accessor dest-sc)))
@@ -510,6 +511,7 @@
 ;;;; generation of emit functions
 
 (defun compute-temporaries-description (parse)
+  #+sb-show (declare (optimize (debug 1))) ; workaround for something, I don't know what
   (let ((temps (vop-parse-temps parse))
         (element-type '(unsigned-byte 16)))
     (when temps
@@ -530,6 +532,7 @@
         results))))
 
 (defun compute-ref-ordering (parse)
+  #+sb-show (declare (optimize (debug 1))) ; workaround for something, I don't know what
   (let* ((num-args (+ (length (vop-parse-args parse))
                       (if (vop-parse-more-args parse) 1 0)))
          (num-results (+ (length (vop-parse-results parse))
@@ -940,11 +943,6 @@
     (dolist (name (cddr spec))
       (unless (symbolp name)
         (error "bad temporary name: ~S" name))
-      ;; It's almost always a mistake to have overlaps in the operand names.
-      ;; But I guess that some users think it's fine?
-      #+sb-xc-host
-      (when (member name (vop-parse-temps parse) :key #'operand-parse-name)
-        (warn "temp ~s already exists in ~s" name (vop-parse-name parse)))
       (incf *parse-vop-operand-count*)
       (let ((res (list :born (parse-time-spec :load)
                        :dies (parse-time-spec :save))))
@@ -1085,11 +1083,6 @@
          (setf (vop-parse-translate parse) (rest spec)))
         (:guard
          (setf (vop-parse-guard parse) (vop-spec-arg spec t)))
-        ;; FIXME: :LTN-POLICY would be a better name for this. It
-        ;; would probably be good to leave it unchanged for a while,
-        ;; though, at least until the first port to some other
-        ;; architecture, since the renaming would be a change to the
-        ;; interface between
         (:policy
             (setf (vop-parse-ltn-policy parse)
                   (vop-spec-arg spec 'ltn-policy)))
@@ -1103,6 +1096,8 @@
                        (rest spec))))
         (:gc-barrier
          (setf (vop-parse-gc-barrier parse) (rest spec)))
+        (:check-type
+         (setf (vop-parse-check-type parse) (rest spec)))
         (t
          (error "unknown option specifier: ~S" (first spec)))))
     (cond (arg-refs-p
@@ -1520,6 +1515,7 @@
 
     `(make-vop-info
       :name ',(vop-parse-name parse)
+      :translate ',(vop-parse-translate parse)
       ,@(make-vop-info-types parse)
       :guard ,(awhen (vop-parse-guard parse)
                 (if (typep it '(cons (eql lambda)))
@@ -1544,7 +1540,26 @@
       :after-sc-selection
       ;; TODO: inherit it?
       ,(make-after-sc-function parse)
-      :gc-barrier ',(vop-parse-gc-barrier parse))))
+      :gc-barrier ',(vop-parse-gc-barrier parse)
+      :check-type ,(let ((mask 0)
+                         (spec (vop-parse-check-type parse)))
+                     (unless (equal spec '(t))
+                       (loop for arg in spec
+                             do (setf (ldb (byte 1 (position arg (vop-parse-operands parse) :key #'operand-parse-name))
+                                           mask)
+                                      1)))
+                     mask)
+      #+(and (not sb-xc-host) sb-devel)
+      :optimizer
+      #+(and (not sb-xc-host) sb-devel)
+      ,(let ((old (gethash (vop-parse-name parse) *backend-template-names*)))
+         (when (and old
+                    (vop-info-optimizer old))
+           (let ((optimizer (vop-info-optimizer old)))
+             (if (consp optimizer)
+                 `(cons (function ,(nth-value 2 (function-lambda-expression (car optimizer))))
+                        ',(cdr optimizer))
+                 `(function ,(nth-value 2 (function-lambda-expression optimizer))))))))))
 
 ;;; Define the symbol NAME to be a Virtual OPeration in the compiler.
 ;;; If specified, INHERITS is the name of a VOP that we default
@@ -1705,6 +1720,9 @@
 ;;; :MOVE-ARGS {NIL | :FULL-CALL | :LOCAL-CALL | :KNOWN-RETURN}
 ;;;     Indicates if and how the more args should be moved into a
 ;;;     different frame.
+;;;
+;;; :CHECK-TYPE Boolean
+;;;     Sets FUN-INFO-EXTERNALLY-CHECKABLE-TYPE for the :TRANSLATE function.
 (defmacro define-vop ((&optional name inherits) &body specs)
   (%define-vop name inherits specs t))
 
@@ -1774,6 +1792,11 @@
                `((let ((,n-res ,(set-up-vop-info inherited-parse parse)))
                    (store-vop-info ,n-res)
                    ,@(set-up-fun-translation parse n-res))))
+           ,@(when (equal (vop-parse-check-type parse) '(t))
+               `((setf ,@(loop for name in (or (vop-parse-translate parse)
+                                               (list name))
+                               collect `(fun-info-externally-checkable-type (fun-info-or-lose ',name))
+                               collect :full))))
            ',name)
         `(let ((info ,(set-up-vop-info inherited-parse parse)))
            (setf (vop-info-type info)

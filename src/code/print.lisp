@@ -779,6 +779,11 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;; A FSM-like thingie that determines whether a symbol is a potential
 ;;; number or has evil characters in it.
+;;; CLHS 22.1.3.3
+;;;  When printing a symbol, the printer inserts enough single escape and/or multiple escape characters
+;;;  (backslashes and/or vertical-bars) so that if read were called with the same *readtable* and with
+;;;  *read-base* bound to the current output base, it would return the same symbol (if it is not
+;;;  apparently uninterned) or an uninterned symbol with the same print name (otherwise).
 (defun symbol-quotep (name readtable)
   (declare (simple-string name))
   (macrolet ((advance (tag &optional (at-end t))
@@ -792,6 +797,10 @@ variable: an unreadable object representing the error is printed instead.")
                               ((upper-case-p current) uppercase-attribute)
                               ((lower-case-p current) lowercase-attribute)
                               (t other-attribute)))
+                 (when (and (= index 0) (get-macro-character current readtable))
+                   (return t))
+                 (when (and (> index 0) (terminating-macro-p current readtable))
+                   (return t))
                  (incf index)
                  (go ,tag)))
              (test (&rest attributes)
@@ -834,15 +843,17 @@ variable: an unreadable object representing the error is printed instead.")
                           letter-attribute)))
         (do ((i (1- index) (1+ i)))
             ((= i len) (return-from symbol-quotep nil))
-          (unless (zerop (logand (let* ((char (schar name i))
-                                        (code (char-code char)))
-                                   (cond
+          (let* ((char (schar name i))
+                 (code (char-code char)))
+            (when (terminating-macro-p char readtable)
+              (return-from symbol-quotep t))
+            (unless (zerop (logand (cond
                                      ((< code 160) (aref attributes code))
                                      ((upper-case-p char) uppercase-attribute)
                                      ((lower-case-p char) lowercase-attribute)
-                                     (t other-attribute)))
-                                 mask))
-            (return-from symbol-quotep t))))
+                                     (t other-attribute))
+                                   mask))
+              (return-from symbol-quotep t)))))
 
      START
       (when (digitp)
@@ -1528,13 +1539,14 @@ variable: an unreadable object representing the error is printed instead.")
 ;;;
 ;;; FLOAT-DIGITS actually generates the digits for positive numbers;
 ;;; see below for comments.
-
-(defun flonum-to-string (x &optional width fdigits scale fmin)
+(defun flonum-to-string (x &optional width fdigits scale fmin exponent-zero)
   (declare (type float x))
   (multiple-value-bind (e string)
       (if fdigits
-          (flonum-to-digits x (min (- (+ fdigits (or scale 0)))
-                                   (- (or fmin 0))))
+          (flonum-to-digits x (+ (min (- (+ fdigits (or scale 0)))
+                                    (- (or fmin 0)))
+                                 (or exponent-zero
+                                     0)))
           (if (and width (> width 1))
               (let ((w (multiple-value-list
                         (flonum-to-digits x
@@ -1551,11 +1563,18 @@ variable: an unreadable object representing the error is printed instead.")
                    (values-list w))
                   (t (values-list f))))
               (flonum-to-digits x)))
-    (let ((e (if (zerop x)
-                 e
-                 (+ e (or scale 0))))
-          (stream (make-string-output-stream)))
-      (if (plusp e)
+    (let* ((e (if exponent-zero
+                  (if (zerop x)
+                      0
+                      (- e exponent-zero))
+                  e))
+           (e (if (zerop x)
+                  e
+                  (+ e (or scale 0))))
+           (stream (make-string-output-stream)))
+      (if (or (and (= e 0)
+                   exponent-zero)
+              (plusp e))
           (progn
             (write-string string stream :end (min (length string) e))
             (dotimes (i (- e (length string)))
@@ -1793,48 +1812,17 @@ variable: an unreadable object representing the error is printed instead.")
            (print-float-exponent float 0 stream)
            (print-float-exponent float (1- k) stream)))
      float)))
-
-;;; Given a non-negative floating point number, SCALE-EXPONENT returns
-;;; a new floating point number Z in the range (0.1, 1.0] and an
-;;; exponent E such that Z * 10^E is (approximately) equal to the
-;;; original number. There may be some loss of precision due the
-;;; floating point representation. The scaling is always done with
-;;; long float arithmetic, which helps printing of lesser precisions
-;;; as well as avoiding generic arithmetic.
-;;;
-;;; When computing our initial scale factor using EXPT, we pull out
-;;; part of the computation to avoid over/under flow. When
-;;; denormalized, we must pull out a large factor, since there is more
-;;; negative exponent range than positive range.
 
-(defun scale-exponent (original-x)
-  (let* ((x (coerce original-x 'long-float)))
-    (multiple-value-bind (sig exponent) (decode-float x)
-      (declare (ignore sig))
-      (if (= x 0.0l0)
-          (values (float 0.0l0 original-x) 1)
-          (let* ((ex (locally (declare (optimize (safety 0)))
-                       (the fixnum
-                         (round (* exponent (log 2l0 10))))))
-                 (x (if (minusp ex)
-                        (if (float-denormalized-p x)
-                            #-long-float
-                            (* x 1.0l16 (expt 10.0l0 (- (- ex) 16)))
-                            #+long-float
-                            (* x 1.0l18 (expt 10.0l0 (- (- ex) 18)))
-                            (* x 10.0l0 (expt 10.0l0 (- (- ex) 1))))
-                        (/ x 10.0l0 (expt 10.0l0 (1- ex))))))
-            (do ((d 10.0l0 (* d 10.0l0))
-                 (y x (/ x d))
-                 (ex ex (1+ ex)))
-                ((< y 1.0l0)
-                 (do ((m 10.0l0 (* m 10.0l0))
-                      (z y (* y m))
-                      (ex ex (1- ex)))
-                     ((>= z 0.1l0)
-                      (values (float z original-x) ex))
-                   (declare (long-float m) (integer ex))))
-              (declare (long-float d))))))))
+;;; flonum-to-digits without producing a string
+(defun flonum-exponent (float)
+  (if (zerop float)
+      (values 1)
+      (%flonum-to-digits
+       (lambda (d)
+         (declare (ignore d)))
+       (lambda (k) k)
+       (lambda (k) (values k))
+       float)))
 
 ;;;; entry point for the float printer
 
@@ -1987,7 +1975,7 @@ variable: an unreadable object representing the error is printed instead.")
       (format stream " {~X..~X}"
               a (+ (logandc2 a sb-vm:lowtag-mask) (code-object-size component))))))
 
-#-(or x86 x86-64 arm64 riscv)
+#-(or x86 x86-64 arm64 riscv loongarch64)
 (defmethod print-object ((lra lra) stream)
   (print-unreadable-object (lra stream :identity t)
     (write-string "return PC object" stream)))

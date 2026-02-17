@@ -72,12 +72,34 @@ future."
 (sb-ext:define-load-time-global *profiled-threads* :all)
 (declaim (type (or (eql :all) list) *profiled-threads*))
 
-(sb-xc:defstruct (thread (:constructor %make-thread (%name %ephemeral-p semaphore))
+;; allocator histogram capacity
+(defconstant n-histogram-bins-small 32)
+(defconstant n-histogram-bins-large 32)
+;; small bins store just a count, large bins store a count and total size
+(defconstant alloc-histogram-words
+  (+ n-histogram-bins-small (* 2 n-histogram-bins-large)))
+
+;;; the #+allocation-size-histogram has an exact count of objects allocated
+;;; for all sizes up to (* cons-size n-word-bytes n-histogram-bins-small).
+;;; Larger allocations are grouped by the binary log of the size.
+;;; The small bins account for at least 99% of all allocations.
+(defconstant first-large-histogram-bin-log2size
+  (integer-length (* n-histogram-bins-small 16)))
+
+(sb-xc:defstruct (thread (:constructor %make-thread (%name ephemeral-p semaphore))
                          (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
   (%name         nil :type (or null simple-string)) ; C code could read this
-  (%ephemeral-p  nil :type boolean :read-only t)
+  ;; When true, the thread is (supposedy) internal, and the runtime knows how to start/stop
+  ;; it around certain operations like SB-POSIX:FORK. There are two other important aspects:
+  ;; - it promises to cleanly exit prior to core saving, never causing an error about
+  ;;   more than 1 thread running.
+  ;; - returning from it never commences forcible termination of other threads.
+  ;; At present only 1 thread ever has this slot being T by default, namely the finalizer.
+  ;; Allegedly users could specify it too, but git rev a5511496 removed the option
+  ;; and no complaints have arisen due to its absence.
+  (ephemeral-p  nil :type boolean :read-only t)
   ;; This is one of a few different views of a lisp thread:
   ;;  1. the memory space (thread->os_addr in C)
   ;;  2. 'struct thread' at some offset into the memory space, coinciding
@@ -88,6 +110,8 @@ in future versions."
   ;; This value is 0 if the thread is not considered alive, though the pthread
   ;; may be running its termination code (unlinking from all_threads etc)
   (primitive-thread 0 :type sb-vm:word)
+  ;; Caution: the identified thread may have exited by the time you've read this slot
+  (os-tid 0 :type (unsigned-byte 32) :read-only t)
   ;; This is a redundant copy of the pthread identifier from the primitive thread.
   ;; It's needed in the SB-THREAD:THREAD as well because there are valid reasons to
   ;; manipulate the new thread before it has assigned 'th->os_thread = pthread_self()'.
@@ -110,7 +134,7 @@ in future versions."
   ;; correspond to an OS thread, it could be the case that the threading model has
   ;; user-visible threads that do not map directly to OSs threads (or LWPs).
   ;; Any use of THREAD-OS-THREAD from lisp should take care to ensure validity of
-  ;; the thread id by holding the INTERRUPTIONS-LOCK.
+  ;; the thread id by holding THREAD-STORAGE-LOCK.
   ;; Not needed for win32 threads.
   #-win32 (os-thread 0 :type sb-vm:word)
   ;; Keep a copy of the stack range for use in SB-EXT:STACK-ALLOCATED-P so that
@@ -123,15 +147,18 @@ in future versions."
   ;; At the beginning of the thread's life, this is a vector of data required
   ;; to start the user code. At the end, is it pointer to the 'struct thread'
   ;; so that it can be either freed or reused.
-  (startup-info 0 :type (or fixnum (simple-vector 6)))
+  (startup-info 0 :type (or fixnum (simple-vector 7)))
   ;; Whether this thread should be returned in LIST-ALL-THREADS.
   ;; This is almost-but-not-quite the same as what formerly
   ;; might have been known as the %ALIVE-P flag.
   (%visible 1 :type fixnum)
   (interruptions nil :type list)
-  (interruptions-lock
-   (make-mutex :name "thread interruptions lock")
-   :type mutex :read-only t)
+  ;; This lock ensures that accessing the so-called "primitive thread" for this
+  ;; instance from a different thread does not engender a use-after-free error,
+  ;; as the lock must be acquired to free the mmapped backing store..
+  ;; It also protects the queue of interruptions from concurrent access,
+  ;; though that could potentially become a lockfree list.
+  (storage-lock (make-mutex :name "thread memory") :type mutex :read-only t)
 
   ;; Per-thread memoization of GET-INTERNAL-REAL-TIME, for race-free update.
   ;; This might be a bignum, which is why we bother.
@@ -145,6 +172,11 @@ in future versions."
             :type sb-vm:signed-word)
   #-64-bit (internal-real-time)
 
+  (alloc-histogram (or #+allocation-size-histogram
+                       (make-array alloc-histogram-words :element-type 'sb-vm:word))
+                   :type (or (simple-array sb-vm:word 1) null))
+  (tot-bytes-alloc-boxed 0 :type sb-vm:word)
+  (tot-bytes-alloc-unboxed 0 :type sb-vm:word)
   (max-stw-pause 0 :type sb-vm:word) ; microseconds
   (sum-stw-pause 0 :type sb-vm:word) ; "
   (ct-stw-pauses 0 :type sb-vm:word) ; to compute the avg
@@ -169,7 +201,8 @@ in future versions."
 (sb-xc:defstruct (foreign-thread
                   (:copier nil)
                   (:include thread (%name "callback"))
-                  (:constructor make-foreign-thread ())
+                  (:constructor !make-foreign-thread
+                      (primitive-thread #+unix os-thread os-tid startup-info))
                   (:conc-name "THREAD-"))
   "Type of native threads which are attached to the runtime as Lisp threads
 temporarily.")

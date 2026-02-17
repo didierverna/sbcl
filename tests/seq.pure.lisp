@@ -11,6 +11,8 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(setq *random-state* (make-random-state t))
+
 ;;; As reported by Paul Dietz from his ansi-test suite for gcl, REMOVE
 ;;; malfunctioned when given :START, :END and :FROM-END arguments.
 ;;; Make sure it doesn't happen again.
@@ -237,7 +239,7 @@
              (case safety
                (0 (= speed 0))
                (t t)))
-           (extra-safe (&key speed safety &allow-other-keys)
+           (extra-safe (&key safety &allow-other-keys)
              (>= safety 2))
            (test (type expr &key (filter #'safe))
              (checked-compile-and-assert
@@ -985,3 +987,104 @@
    (lambda (x)
      (length (the (or null (simple-string 10)) x)))
    (or (integer 0 0) (integer 10 10))))
+
+(with-test (:name :replace-vector-list)
+  (checked-compile-and-assert
+      ()
+      `(lambda (l)
+         (let ((v (copy-seq #(1 2))))
+           (replace v (the list l))
+           v))
+    (('(a)) #(a 2) :test #'equalp)))
+
+(with-test (:name :coerce-to-list-type)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-string 10) x))
+     (coerce x 'list))
+   cons)
+  (assert-type
+   (lambda (x)
+     (declare (optimize speed)
+              ((simple-string 10) x))
+     (coerce x 'list))
+   cons))
+
+(with-test (:name :position-if-nil)
+  (assert-type
+   (lambda (f)
+     (position-if f nil))
+   null)
+  (assert-type
+   (lambda (f)
+     (declare (optimize speed))
+     (position-if f nil))
+   null)
+  (assert-type
+   (lambda (f)
+     (find-if f nil))
+   null)
+  (assert-type
+   (lambda (f)
+     (declare (optimize speed))
+     (find-if f nil))
+   null))
+
+(with-test (:name :mismastch-or-null)
+  (assert-type
+   (lambda (a b e)
+     (declare ((or null (eql 4)) e)
+              ((simple-string 9) a))
+     (mismatch a b :start1 5 :end1 e))
+   (or (integer 5 9) null)))
+
+(with-test (:name :reduce-append)
+  (checked-compile-and-assert
+      ()
+      `(lambda (l)
+         (reduce #'append l :initial-value '(1)))
+    (('((a b c))) '(1 a b c) :test #'equal)
+    ((#((a b c))) '(1 a b c) :test #'equal))
+  (checked-compile-and-assert
+      ()
+      `(lambda (l)
+         (reduce #'append l :initial-value '(1) :from-end t))
+    (('((a b c))) '(a b c 1) :test #'equal)
+    ((#((a b c))) '(a b c 1) :test #'equal))
+  (checked-compile-and-assert
+      ()
+      `(lambda (l)
+         (reduce #'append l :end 1 :initial-value '(1)))
+    (('((a b c) (0))) '(1 a b c) :test #'equal)
+    ((#((a b c) (0))) '(1 a b c) :test #'equal))
+  (checked-compile-and-assert
+      ()
+      `(lambda (l)
+         (reduce #'append l :end 1 :initial-value '(1) :from-end t))
+    (('((a b c) (0))) '(a b c 1) :test #'equal)
+    ((#((a b c) (0))) '(a b c 1) :test #'equal)))
+
+(with-test (:name :strings-in-sequences)
+  (assert-type
+   (lambda (n)
+     (let ((l '("a" "b")))
+       (dolist (e l)
+         (when (equal e n)
+           (return e)))))
+   (or null simple-string))
+  (assert-type
+   (lambda (n)
+     (aref #("a" "b") n))
+   simple-string))
+
+(with-test (:name :member-test-eq-reoptimize)
+  (assert (null
+           (ctu:ir1-named-calls
+            `(lambda (l m)
+               (unless l
+                 (and (member m (or l '(3 5 7)) :test #'eq) t))))))
+  (assert (null
+           (ctu:ir1-named-calls
+            `(lambda (l m)
+               (unless l
+                 (and (member m (or l '(3 5 7))) t)))))))

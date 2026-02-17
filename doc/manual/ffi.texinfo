@@ -534,6 +534,21 @@ contain named structure or union types with the slots specified.
 Within the lexical scope of the binding specifiers and body, a locally
 defined foreign structure type @var{foo} can be referenced by its name
 using @code{(struct @var{foo})}.
+
+When a foreign function returns a structure by value, using
+@code{alien-funcall} as the @var{initial-value} allows the returned
+struct to be stack-allocated directly into the local variable's
+storage, avoiding heap allocation:
+
+@lisp
+(with-alien ((result (struct point)
+                     (alien-funcall
+                      (extern-alien "make_point"
+                                    (function (struct point) double double))
+                      1.0d0 2.0d0)))
+  (values (slot result 'x) (slot result 'y)))
+@end lisp
+
 @end defmac
 
 @node  External Foreign Variables
@@ -717,6 +732,7 @@ the only documentation.  Users of a Lisp built with the
 
 @menu
 * The alien-funcall Primitive::
+* The alien-funcall-into Primitive::
 * The define-alien-routine Macro::
 * define-alien-routine Example::
 @end menu
@@ -738,17 +754,11 @@ The type of @code{alien-function} must be @code{(alien (function
 ...))}  or @code{(alien (* (function ...)))}.  The function type is
 used to determine how to call the function (as though it was declared
 with a prototype.)  The type need not be known at compile time, but
-only known-type calls are efficiently compiled.  Limitations:
+only known-type calls are efficiently compiled.
 
-@itemize
-
-@item
-Structure type return values are not implemented.
-
-@item
-Passing of structures by value is not implemented.
-
-@end itemize
+On unix-like x86-64 and ARM64 systems, structures may be passed and
+returned by value.  The implementation follows the System V AMD64 ABI
+and AAPCS64 specifications respectively.
 
 @end defun
 
@@ -772,6 +782,43 @@ the @code{(* (struct foo))} objects filled in by the foreign call:
         (setf (svref result i) (deref (deref a) i)))
       ;; Voila.
       result)))
+@end lisp
+
+@node  The alien-funcall-into Primitive
+@comment  node-name,  next,  previous,  up
+@subsection The @code{alien-funcall-into} Primitive
+
+@defun @sbalien{alien-funcall-into} @var{alien-function} @var{result-buffer} &rest @var{arguments}
+
+The @code{alien-funcall-into} function calls a foreign function that
+returns a structure by value, writing the result directly into a
+caller-provided buffer rather than heap-allocating.
+
+@var{alien-function} is the foreign function to call.
+@var{result-buffer} is a @code{system-area-pointer} pointing to memory
+where the struct result will be written.  The buffer is typically
+stack-allocated using @code{with-alien}.
+
+The function returns no values.  The caller accesses the result
+through the buffer.
+
+This function is only available on x86-64 and ARM64.
+
+@end defun
+
+Here is an example that calls a C function returning a struct,
+writing the result to a stack-allocated buffer:
+
+@lisp
+(define-alien-type nil (struct point (x double) (y double)))
+
+(with-alien ((result (struct point)))
+  (alien-funcall-into
+   (extern-alien "make_point"
+                 (function (struct point) double double))
+   (alien-sap (addr result))
+   1.0d0 2.0d0)
+  (values (slot result 'x) (slot result 'y)))
 @end lisp
 
 @node  The define-alien-routine Macro
@@ -1034,6 +1081,8 @@ an interface for calling into Lisp as a shared library directly from C.
 
 The @code{define-alien-callable} macro wraps Lisp code and creates a C
 foreign function which can be called with the C calling convention.
+On x86-64 and ARM64, callbacks may receive and return structures by
+value.
 
 @include macro-sb-alien-define-alien-callable.texinfo
 

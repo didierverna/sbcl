@@ -85,6 +85,8 @@
 
 (define-alien-variable alloc-profile-buffer system-area-pointer)
 (defun aprof-reset ()
+  (setf (extern-alien "close_region_nfillers" int) 0)
+  (setf (extern-alien "close_region_tot_bytes_wasted" unsigned) 0)
   (let ((buffer alloc-profile-buffer))
     (unless (= (sap-int buffer) 0)
       (alien-funcall (extern-alien "memset" (function void system-area-pointer int size-t))
@@ -198,16 +200,16 @@
         (incf total-n-patched n-patched)))
     (values total-n-patch-points total-n-patched)))
 
-(defglobal *tag-to-type*
+(defconstant-eqx +tag-to-type+
   (map 'vector
        (lambda (x)
-        (cond ((sb-vm::specialized-array-element-type-properties-p x)
-               (let ((et (sb-vm:saetp-specifier x)))
-                 (sb-kernel:type-specifier
-                  (sb-kernel:specifier-type `(simple-array ,et 1)))))
-              (x
-               (sb-vm::room-info-name x))))
-       sb-vm::*room-info*))
+        (if (sb-vm::specialized-array-element-type-properties-p x)
+            (let ((et (sb-vm:saetp-specifier x)))
+              (sb-kernel:type-specifier
+                  (sb-kernel:specifier-type `(simple-array ,et 1))))
+            x))
+       sb-vm::+room-info+)
+  #'equalp)
 
 (defun layout-name (ptr)
   (if (eql (valid-tagged-pointer-p (int-sap ptr)) 0)
@@ -562,7 +564,7 @@
               (setq nbytes nil))
             (cond ((and (member type '(fixed+header var-array var-xadd any))
                         (typep header '(or sb-vm:word sb-vm:signed-word)))
-                   (setq type (aref *tag-to-type* (logand header #xFF)))
+                   (setq type (aref +tag-to-type+ (logand header #xFF)))
                    (when (register-p nbytes)
                      (setq nbytes nil))
                    (when (eq type 'instance)
@@ -605,10 +607,15 @@
          (dstate (sb-disassem:make-dstate nil))
          (collection (make-hash-table :test 'equal)))
     (when stream
-      (format stream "~&~d (of ~d max) profile entries consumed~2%"
-              n-hit metadata-len))
+      (format stream "~&~d (of ~d max) profile entries consumed, ~D GCs done~2%"
+              n-hit metadata-len (extern-alien "n_gcs_done" int)))
     (loop
      (when (>= index n-counters)
+       ;; Add an item accounting for waste caused by closing regions on unfull pages
+       (let ((count (extern-alien "close_region_nfillers" int))
+             (total-bytes (extern-alien "close_region_tot_bytes_wasted" unsigned)))
+         (push (make-alloc total-bytes count 'sb-vm::filler 0)
+               (gethash 'sb-vm::filler collection)))
        (return collection))
      (let ((count (sap-ref-word sap (* index 8))))
        (multiple-value-bind (code pc-offset total-bytes)
@@ -693,45 +700,49 @@
     (let ((emitted-newline t))
       (dolist (x sorted)
         (destructuring-bind (name bytes . data) x
-          (when detail
-            (when collapse
-              (setq data (collapse-by-type data)))
-            (setq data (sort data #'> :key #'alloc-bytes)))
-          (assert (eq bytes (reduce #'+ data :key #'alloc-bytes)))
-          (when (and detail (cdr data) (not emitted-newline))
-            (terpri stream))
-          (incf sum-pct (float (/ bytes total-bytes)))
-          ;; Show summary for the function
-          (cond ((not detail)
-                 (format stream " ~5,1,2f      ~5,1,2f ~12d~15d   ~s~%"
-                         (/ bytes total-bytes)
-                         sum-pct
-                         bytes
-                         (reduce #'+ data :key #'alloc-count)
-                         name))
-                (t
-                 (format stream " ~5,1,2f   ~12d   ~:[~10@t~;~:*~10d~]~@[~14@a~]    ~s~@[ - ~s~]~%"
-                         (/ bytes total-bytes)
-                         bytes
-                         (if (cdr data) nil (alloc-count (car data)))
-                         (cond (collapse nil)
-                               ((cdr data) "")
-                               (t (write-to-string (alloc-pc (car data)) :base 16)))
-                         name
-                         (if (cdr data) nil (alloc-type (car data)))
-                         )))
-          (when (and detail (cdr data))
-            (dolist (point data)
-              (format stream "     ~5,1,2f ~12d ~10d~@[~14x~]~@[        ~s~]~%"
-                        (/ (alloc-bytes point) bytes) ; fraction within function
+          (let ((bytes/total-bytes (if (plusp total-bytes)
+                                       (/ bytes total-bytes)
+                                       0)))
+            (when detail
+              (when collapse
+                (setq data (collapse-by-type data)))
+              (setq data (sort data #'> :key #'alloc-bytes)))
+            (assert (eq bytes (reduce #'+ data :key #'alloc-bytes)))
+            (when (and detail (cdr data) (not emitted-newline))
+              (terpri stream))
+            (incf sum-pct (float bytes/total-bytes))
+            ;; Show summary for the function
+            (cond ((not detail)
+                   (format stream " ~5,1,2f      ~5,1,2f ~12d~15d   ~s~%"
+                           bytes/total-bytes
+                           sum-pct
+                           bytes
+                           (reduce #'+ data :key #'alloc-count)
+                           name))
+                  (t
+                   (format stream " ~5,1,2f   ~12d   ~:[~10@t~;~:*~10d~]~@[~14@a~]    ~s~@[ - ~s~]~%"
+                           bytes/total-bytes
+                           bytes
+                           (if (cdr data) nil (alloc-count (car data)))
+                           (cond (collapse nil)
+                                 ((cdr data) "")
+                                 (t (write-to-string (alloc-pc (car data)) :base 16)))
+                           name
+                           (if (cdr data) nil (alloc-type (car data))))))
+            (when (and detail (cdr data))
+              (dolist (point data)
+                (format stream "     ~5,1,2f ~12d ~10d~@[~14x~]~@[        ~s~]~%"
+                        (if (zerop bytes)
+                            0
+                            (/ (alloc-bytes point) bytes)) ; fraction within function
                         (alloc-bytes point)
                         (alloc-count point)
                         (if collapse nil (alloc-pc point))
                         (alloc-type point))))
-          (incf sum-bytes bytes)
-          (when (and detail
-                     (setq emitted-newline (not (null (cdr data)))))
-            (terpri stream)))
+            (incf sum-bytes bytes)
+            (when (and detail
+                       (setq emitted-newline (not (null (cdr data)))))
+              (terpri stream))))
         (incf i)
         (if (and (neq top-n :all) (>= i top-n)) (return))))
 ;    (assert (= sum-bytes total-bytes))

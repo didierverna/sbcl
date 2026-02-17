@@ -485,8 +485,7 @@ NOTE: This interface is experimental and subject to change."
 
 ;;;; hash cache utility
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *profile-hash-cache* nil))
+(defglobal *profile-hash-cache* nil)
 
 ;;; Define a hash cache that associates some number of argument values
 ;;; with a result value. The TEST-FUNCTION paired with each ARG-NAME
@@ -945,7 +944,7 @@ NOTE: This interface is experimental and subject to change."
 (declaim (inline swapped-args-fun))
 (defun swapped-args-fun (fun)
   (declare (type function fun))
-  (lambda (x y)
+  (named-lambda "FUN" (x y) ; prevent the lambda from retaining #:SWAPPED-ARGS-FUN
     (funcall fun y x)))
 
 ;;; Return the numeric value of a type bound, i.e. an interval bound
@@ -1457,6 +1456,7 @@ NOTE: This interface is experimental and subject to change."
 
 (in-package "SB-KERNEL")
 
+(declaim (inline fp-zero-p))
 (defun fp-zero-p (x)
   (typecase x
     (single-float (zerop x))
@@ -1509,19 +1509,88 @@ NOTE: This interface is experimental and subject to change."
     (cons nil)
     (t t)))
 
-(declaim (inline first-bit-set))
-(defun first-bit-set (x)
-  #+(and x86-64 (not sb-xc-host))
-  (truly-the (values (mod #.sb-vm:n-word-bits) &optional)
-             (%primitive sb-vm::unsigned-word-find-first-bit (the word x)))
-  #-(and x86-64 (not sb-xc-host))
-  (1- (integer-length (logand x (- x)))))
+(defun count-trailing-zeros (integer)
+  (let ((integer (ldb (byte sb-vm:n-word-bits 0) integer)))
+    (integer-length (ldb (byte sb-vm:n-word-bits 0) (1- (logand integer (- integer)))))))
 
 (defun integer-float-p (float)
   (and (floatp float)
        (multiple-value-bind (significand exponent) (integer-decode-float float)
          (or (plusp exponent)
-             (<= (- exponent) (first-bit-set significand))))))
+             (<= (- exponent)
+                 ;; count-trailing-zeros, but wider for 32-bit platforms
+                 (integer-length (ldb (byte 64 0) (lognor significand (- significand)))))))))
 
+(defmacro make-defs (vars &body body)
+  (labels ((subst-if-with (test tree)
+             (labels ((s (subtree)
+                        (multiple-value-bind (new replace)
+                            (funcall test subtree)
+                          (cond (replace new)
+                                ((comma-p subtree)
+                                 (let ((new (s (comma-expr subtree))))
+                                   (if (eq subtree new)
+                                       subtree
+                                       (unquote new (comma-kind subtree)))))
+                                ((atom subtree) subtree)
+                                (t (let ((car (s (car subtree)))
+                                         (cdr (s (cdr subtree))))
+                                     (if (and (eq car (car subtree))
+                                              (eq cdr (cdr subtree)))
+                                         subtree
+                                         (cond ((and (typep car '(cons symbol))
+                                                     (string= (car car) "$WHEN"))
+                                                (if (eval (second car))
+                                                    (append (cddr car) cdr)
+                                                    cdr))
+                                               ((and (typep car '(cons symbol))
+                                                     (string= (car car) "$UNLESS"))
+                                                (if (eval (second car))
+                                                    cdr
+                                                    (append (cddr car) cdr)))
+                                               ((and (typep car '(cons symbol))
+                                                     (string= (car car) "$IF"))
+                                                (cons
+                                                 (if (eval (second car))
+                                                     (third car)
+                                                     (fourth car))
+                                                 cdr))
+                                               (t
+                                                (cons car cdr))))))))))
+               (s tree)))
+           (test (pattern with)
+             (lambda (x)
+               (when (symbolp x)
+                 (let* ((str (string x))
+                        (start (search pattern str)))
+                   (when start
+                     (values
+                      (if (equal str pattern)
+                          with
+                          (let ((package (position #\: str)))
+                            (if package
+                                (package-symbolicate (subseq str 0 package)
+                                                     (subseq str (1+ package) start)
+                                                     with
+                                                     (subseq str (+ start (length pattern))))
+                                (symbolicate (subseq str 0 start)
+                                             with
+                                             (subseq str (+ start (length pattern)))))))
+                      t))))))
+           (gen (vars body)
+             (if vars
+                 (loop for with in (cdar vars)
+                       append
+                       (gen (cdr vars)
+                            (let ((body body)
+                                  (patterns (sort (loop for v in (ensure-list (caar vars))
+                                                        for w in (ensure-list with)
+                                                        collect (cons v w))
+                                                  #'> :key (lambda (x) (length (string (car x)))))))
+                              (loop for (v . w) in patterns
+                                    do (setf body (subst-if-with (test (string v) w) body)))
+                              body)))
+                 body)))
+    `(progn ,@(gen vars body))))
 
 (defvar *top-level-form-p* nil)
