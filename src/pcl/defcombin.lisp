@@ -82,8 +82,8 @@
                 :reader method-combination-type-lambda-list)
    ;; A reader without "type" in the name seems more readable to me.
    (%constructor :reader method-combination-%constructor)
-   (%cache :initform (make-hash-table :test #'equal)
-           :reader method-combination-type-%cache))
+   (%instances :initform (make-hash-table :test #'equal)
+           :reader method-combination-type-%instances))
   (:documentation "Metaclass for standard method combination types.
 It is the base class for short and long method combination types metaclasses.
 This only class directly implemented as this class is the standard method
@@ -136,8 +136,8 @@ Otherwise, a (potentially new) method combination object is returned.
 The GENERIC-FUNCTION argument is ignored."
   (let ((type (find-method-combination-type name nil)))
     (when type
-      (or (gethash options (method-combination-type-%cache type))
-          (setf (gethash options (method-combination-type-%cache type))
+      (or (gethash options (method-combination-type-%instances type))
+          (setf (gethash options (method-combination-type-%instances type))
                 (funcall (method-combination-%constructor type)
                   options))))))
 
@@ -147,11 +147,11 @@ The GENERIC-FUNCTION argument is ignored."
 This function takes care of any potential redefinition of an existing method
 combination type."
   (when old
-    (setf (slot-value new '%cache) (method-combination-type-%cache old))
+    (setf (slot-value new '%instances) (method-combination-type-%instances old))
     (maphash (lambda (options combination)
                (declare (ignore options))
                (change-class combination new))
-             (method-combination-type-%cache new)))
+             (method-combination-type-%instances new)))
   (setf (gethash name **method-combination-types**) new)
   (setf (random-documentation name 'method-combination) documentation)
   name)
@@ -830,7 +830,7 @@ combination object."
             (method-combination-error
              "The standard method combination accepts no options."))
           instance))
-  (setf (gethash nil (method-combination-type-%cache class)) instance)
+  (setf (gethash nil (method-combination-type-%instances class)) instance)
   (setf (gethash 'standard **method-combination-types**) class)
   (substitute-method-combination instance *standard-method-combination*)
   (setq *standard-method-combination* instance))
@@ -856,7 +856,7 @@ combination object."
        (or-instance (funcall (method-combination-%constructor or-class)
                       '(:most-specific-first))))
   (setf (gethash '(:most-specific-first)
-                 (method-combination-type-%cache or-class))
+                 (method-combination-type-%instances or-class))
         or-instance)
   (substitute-method-combination or-instance *or-method-combination*)
   (setq *or-method-combination* or-instance))
