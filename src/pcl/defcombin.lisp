@@ -91,9 +91,9 @@ combination class."))
 
 (defmethod validate-superclass
     ((class standard-method-combination-type) (superclass standard-class))
-  "Validate the creation of subclasses of METHOD-COMBINATION implemented as
+  "Validate the creation of method combinations implemented as
 STANDARD-METHOD-COMBINATION-TYPE."
-  t)
+  (subtypep superclass 'standard-method-combination))
 
 
 (defclass short-method-combination-type (standard-method-combination-type)
@@ -105,6 +105,12 @@ STANDARD-METHOD-COMBINATION-TYPE."
     :reader short-method-combination-type-identity-with-one-argument))
   (:documentation "Metaclass for short method combination types."))
 
+(defmethod validate-superclass
+    ((class short-method-combination-type) (superclass standard-class))
+  "Validate the creation of method combinations implemented as
+SHORT-METHOD-COMBINATION-TYPE."
+  (subtypep superclass 'short-method-combination))
+
 
 (defclass long-method-combination-type (standard-method-combination-type)
   ((%args-lambda-list :initform nil :initarg :args-lambda-list
@@ -112,6 +118,12 @@ STANDARD-METHOD-COMBINATION-TYPE."
    (%function :initarg :function
               :reader long-method-combination-type-%function))
   (:documentation "Metaclass for long method combination types."))
+
+(defmethod validate-superclass
+    ((class long-method-combination-type) (superclass standard-class))
+  "Validate the creation of method combinations implemented as
+LONG-METHOD-COMBINATION-TYPE."
+  (subtypep superclass 'long-method-combination))
 
 
 (defglobal **method-combination-types** (make-hash-table :test 'eq)
@@ -286,19 +298,6 @@ combination type."
                                    mct-spec
                                    (car mct-spec)))))
   "Register a new short method combination type under NAME."
-  (unless (subtypep mc-class 'short-method-combination)
-    (method-combination-error
-     "Invalid method combination class: ~A.~%~
-      When defining a method combination type in short form, the provided~%~
-      method combination class must be a subclass of SHORT-METHOD-COMBINATION."
-     mc-class))
-  (unless (subtypep mct-class 'short-method-combination-type)
-    (method-combination-error
-     "Invalid method combination type class: ~A.~%~
-      When defining a method combination type in short form, the provided~%~
-      method combination type class must be a subclass of
-      SHORT-METHOD-COMBINATION-TYPE."
-     mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
   (let ((new (apply #'make-instance mct-class
@@ -408,19 +407,6 @@ combination type."
      source-location
      &aux (mc-class (find-class mc-class))
           (mct-class (find-class (car mct-spec))))
-  (unless (subtypep mc-class 'long-method-combination)
-    (method-combination-error
-     "Invalid method combination class: ~A.~%~
-      When defining a method combination type in long form, the provided~%~
-      method combination class must be a subclass of LONG-METHOD-COMBINATION."
-     mc-class))
-  (unless (subtypep mct-class 'long-method-combination-type)
-    (method-combination-error
-     "Invalid method combination type class: ~A.~%~
-      When defining a method combination type in long form, the provided~%~
-      method combination type class must be a subclass of
-      LONG-METHOD-COMBINATION-TYPE."
-     mct-class))
   ;; #### NOTE: we can't change-class class metaobjects, so we need to
   ;; recreate a brand new one.
   ;; -- didier
