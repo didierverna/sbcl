@@ -154,8 +154,8 @@ The GENERIC-FUNCTION argument is ignored."
                   options))))))
 
 (defun load-defcombin
-    (name new documentation &aux (old (find-method-combination-type name nil)))
-  "Register NEW method combination type under NAME with DOCUMENTATION.
+    (name new &aux (old (find-method-combination-type name nil)))
+  "Register NEW method combination type under NAME.
 This function takes care of any potential redefinition of an existing method
 combination type."
   (when old
@@ -165,7 +165,6 @@ combination type."
                (change-class combination new))
              (method-combination-type-%instances new)))
   (setf (gethash name **method-combination-types**) new)
-  (setf (random-documentation name 'method-combination) documentation)
   name)
 
 
@@ -253,9 +252,6 @@ combination type."
   (:metaclass standard-method-combination-type)
   (:documentation "The standard method combination."))
 
-(setf (random-documentation 'standard 'method-combination)
-      "The standard method combination.")
-
 (defmethod compute-primary-methods
     ((gf generic-function)
      (combin standard-standard-method-combination)
@@ -322,7 +318,7 @@ combination type."
               ;; different yet identical instances (so possibly 3 in total if
               ;; :MOST-SPECIFIC-LAST appears as well). Not such a big deal.
               new :options (or options '(:most-specific-first)))))
-    (load-defcombin name new documentation)))
+    (load-defcombin name new)))
 
 (defmethod invalid-qualifiers
     ((gf generic-function) (combin short-method-combination) method)
@@ -421,7 +417,7 @@ combination type."
                     (cdr mct-spec))))
     (setf (slot-value new '%constructor)
           (lambda (options) (funcall #'make-instance new :options options)))
-    (load-defcombin name new documentation)))
+    (load-defcombin name new)))
 
 (defmethod compute-effective-method
     ((function generic-function)

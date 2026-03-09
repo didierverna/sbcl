@@ -298,6 +298,9 @@
 ;; #### NOTE: (DOCUMENTATION OBJECT T) is automatically supported on method
 ;; combination types because we set the documentation class slot when we
 ;; create them in LOAD-*-DEFCOMBIN.
+;; Also, when there's no corresponding method combination type, we at least
+;; make DOCUMENTATION work on the symbol, but there's not much point in it
+;; anyway.
 ;; -- didier
 
 (defmethod documentation
@@ -306,39 +309,36 @@
 
 (defmethod (setf documentation)
     (value (x method-combination-type) (doc-type (eql 'method-combination)))
-  (setf (documentation x t) value))
+  (setf (documentation x t) (canonical-docstring value)))
 
-(defmethod documentation ((x standard-method-combination) (doc-type (eql t)))
+(defmethod documentation ((x method-combination) (doc-type (eql t)))
   (documentation (class-of x) t))
 
 (defmethod (setf documentation)
-    (value (x standard-method-combination) (doc-type (eql t)))
-  (setf (documentation (class-of x) t) value))
+    (value (x method-combination) (doc-type (eql t)))
+  (setf (documentation (class-of x) t) (canonical-docstring value)))
 
 (defmethod documentation
-    ((x standard-method-combination) (doc-type (eql 'method-combination)))
+    ((x method-combination) (doc-type (eql 'method-combination)))
   (documentation (class-of x) t))
 
 (defmethod (setf documentation)
-    (value (x standard-method-combination) (doc-type (eql 'method-combination)))
-  (setf (documentation (class-of x) t) value))
+    (value (x method-combination) (doc-type (eql 'method-combination)))
+  (setf (documentation (class-of x) t) (canonical-docstring value)))
 
 (defmethod documentation ((x symbol) (doc-type (eql 'method-combination)))
-  (random-documentation x 'method-combination))
+  (let ((mct (find-method-combination-type x nil)))
+    (if mct
+      (documentation mct t)
+      (random-documentation x doc-type))))
 
 (defmethod (setf documentation)
-    (new-value (x method-combination) (doc-type (eql 't)))
-  (setf (slot-value x '%documentation) (canonical-docstring new-value))
-  new-value)
+    (value (x symbol) (doc-type (eql 'method-combination)))
+  (let ((mct (find-method-combination-type x nil)))
+    (if mct
+      (setf (documentation mct t) (canonical-docstring value))
+      (setf (random-documentation x doc-type) (canonical-docstring value)))))
 
-(defmethod (setf documentation)
-    (new-value (x method-combination) (doc-type (eql 'method-combination)))
-  (setf (slot-value x '%documentation) (canonical-docstring new-value))
-  new-value)
-
-(defmethod (setf documentation)
-    (new-value (x symbol) (doc-type (eql 'method-combination)))
-  (setf (random-documentation x 'method-combination) new-value))
 
 ;;; methods
 (defmethod documentation ((x standard-method) (doc-type (eql 't)))
