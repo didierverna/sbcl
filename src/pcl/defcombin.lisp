@@ -154,8 +154,8 @@ The GENERIC-FUNCTION argument is ignored."
                   options))))))
 
 (defun load-defcombin
-    (name new &aux (old (find-method-combination-type name nil)))
-  "Register NEW method combination type under NAME.
+    (name new documentation &aux (old (find-method-combination-type name nil)))
+  "Register NEW method combination type under NAME with DOCUMENTATION.
 This function takes care of any potential redefinition of an existing method
 combination type."
   (when old
@@ -164,6 +164,7 @@ combination type."
                (declare (ignore options))
                (change-class combination new))
              (method-combination-type-%instances new)))
+  (setf (random-documentation name 'method-combination) documentation)
   (setf (gethash name **method-combination-types**) new)
   name)
 
@@ -318,7 +319,7 @@ combination type."
               ;; different yet identical instances (so possibly 3 in total if
               ;; :MOST-SPECIFIC-LAST appears as well). Not such a big deal.
               new :options (or options '(:most-specific-first)))))
-    (load-defcombin name new)))
+    (load-defcombin name new documentation)))
 
 (defmethod invalid-qualifiers
     ((gf generic-function) (combin short-method-combination) method)
@@ -417,7 +418,7 @@ combination type."
                     (cdr mct-spec))))
     (setf (slot-value new '%constructor)
           (lambda (options) (funcall #'make-instance new :options options)))
-    (load-defcombin name new)))
+    (load-defcombin name new documentation)))
 
 (defmethod compute-effective-method
     ((function generic-function)
