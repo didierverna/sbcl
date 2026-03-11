@@ -89,8 +89,7 @@
 
 (defmethod print-object ((combination standard-method-combination) stream)
   (print-unreadable-object (combination stream :type t :identity t)
-    (format stream "~S ~:S"
-      (slot-value-for-printing (class-of combination) 'type-name)
+    (format stream "~:S"
       (slot-value-for-printing combination 'options))))
 
 (defun named-object-print-function (instance stream
