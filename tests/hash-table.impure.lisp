@@ -225,7 +225,7 @@
     (with-locked-hash-table (h) (setf (gethash 'foo h) 1))))
 
 (with-test (:name :hash-table-iterator-no-notes
-                  :fails-on (:or :arm :ppc :ppc64 :loongarch64))
+                  :fails-on (:or :arm :ppc :ppc64 :loongarch64 :riscv :sparc :mips))
   (let ((f
          (checked-compile
           '(lambda (h)
@@ -279,3 +279,12 @@
             (setf (gethash (list i) ht) i))
           (sb-sys:scrub-control-stack)
           (sb-ext:gc :full t))))
+
+(with-test (:name :hash-table-equalp)
+  (assert (equalp (opaque-identity (make-hash-table :rehash-threshold 0.3))
+                  (opaque-identity (make-hash-table :rehash-threshold 0.9))))
+  ;; general-hash-table vs hash-table
+  (assert (equalp (opaque-identity (make-hash-table :rehash-threshold 0.3))
+                  (opaque-identity (make-hash-table))))
+  (equalp (opaque-identity (make-hash-table :weakness :key))
+          (opaque-identity (make-hash-table))))

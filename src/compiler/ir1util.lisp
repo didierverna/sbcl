@@ -480,6 +480,10 @@
   (when (= (length args) n-args)
     (values-list args)))
 
+(defun check-min-args (args n-args)
+  (when (>= (length args) n-args)
+    (values-list args)))
+
 (defmacro combination-match (lvar spec &body body)
   (let (bound-vars)
     (labels ((ensure-or (x)
@@ -506,7 +510,10 @@
                      (spec (ensure-or spec)))
                  (labels ((gen (&optional sub)
                             (destructuring-bind (name . args) (pop spec)
-                              (let* ((vars (make-gensym-list (length args) "ARG"))
+                              (let* ((variable (position '&rest args))
+                                     (arg-count (or variable
+                                                    (length args)))
+                                     (vars (make-gensym-list arg-count "ARG"))
                                      (names (ensure-or name))
                                      (commutative (and (loop for name in names
                                                              always (or (typep name '(cons (eql :commutative)))
@@ -521,7 +528,9 @@
                                                               (second name)
                                                               name))))
                                 (setf bound-vars old-bound-vars)
-                                (let ((args `(or (multiple-value-bind ,vars (check-args args ,(length args))
+                                (let ((args `(or (multiple-value-bind ,vars ,(if variable
+                                                                                 `(check-min-args args ,arg-count)
+                                                                                 `(check-args args ,arg-count))
                                                    (declare (ignorable ,@vars))
                                                    (when ,(car vars)
                                                      ,(expand lvars specs
@@ -4086,3 +4095,55 @@ is :ANY, the function name is not checked."
   `(types-equal-or-intersect (lvar-type ,lvar) (specifier-type ',type)))
 (defmacro lvar-csubtypep  (lvar type)
   `(csubtypep (lvar-type ,lvar) (specifier-type ',type)))
+
+(defun replace-node-type (node type)
+  (setf (node-derived-type node) type
+        (lvar-%derived-type (node-lvar node)) nil))
+
+(defun creation-result-type-specifier (lvar &optional nil-nil)
+  (flet ((handle-constant (specifier)
+           (let ((lspecifier (if (atom specifier) (list specifier) specifier)))
+             (cond
+               ((eq (car lspecifier) 'string)
+                (destructuring-bind (string &rest size)
+                    lspecifier
+                  (declare (ignore string))
+                  (careful-specifier-type
+                   `(vector character ,@(when size size)))))
+               ((eq (car lspecifier) 'simple-string)
+                (destructuring-bind (simple-string &rest size)
+                    lspecifier
+                  (declare (ignore simple-string))
+                  (careful-specifier-type
+                   `(simple-array character ,@(if size (list size) '((*)))))))
+               ((and nil-nil
+                     (eq specifier 'nil))
+                (specifier-type 'null))
+               (t
+                (let ((ctype (careful-specifier-type specifier)))
+                  (cond ((not (array-type-p ctype))
+                         ctype)
+                        ((unknown-type-p (array-type-element-type ctype))
+                         (make-array-type (array-type-dimensions ctype)
+                                          :complexp (array-type-complexp ctype)
+                                          :element-type *wild-type*
+                                          :specialized-element-type *wild-type*))
+                        ((eq (array-type-specialized-element-type ctype)
+                             *wild-type*)
+                         (make-array-type (array-type-dimensions ctype)
+                                          :complexp (array-type-complexp ctype)
+                                          :element-type *universal-type*
+                                          :specialized-element-type *universal-type*))
+                        (t
+                         ctype))))))))
+    (cond ((constant-lvar-p lvar)
+           (handle-constant (lvar-value lvar)))
+          ((member-type-p (lvar-type lvar))
+           (let ((types (mapcar #'handle-constant (member-type-members (lvar-type lvar)))))
+             (unless (member nil types)
+               (sb-kernel::%type-union types))))
+          (t
+           (combination-match lvar ((:or list list*) (:constant type) &rest *)
+             (case type
+               ((array simple-array vector)
+                (specifier-type 'simple-array))))))))

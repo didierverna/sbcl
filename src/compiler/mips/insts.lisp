@@ -636,7 +636,7 @@
 
 (defun emit-relative-branch (segment opcode r1 r2 target)
   (emit-chooser
-   segment 20 2
+   segment 24 2
       #'(lambda (segment chooser posn magic-value)
           (declare (ignore chooser magic-value))
           (let ((delta (ash (- (label-position target) (+ posn 4)) -2)))
@@ -671,19 +671,22 @@
                                  opcode
                                  (if (fixnump r1) r1 (reg-tn-encoding r1))
                                  (if (fixnump r2) r2 (reg-tn-encoding r2))
-                                 4)
+                                 5)
             (emit-nop segment)
             (emit-back-patch segment 8
               #'(lambda (segment posn)
                   (declare (ignore posn))
-                  (emit-immediate-inst segment #b001111 0
-                                       (reg-tn-encoding lip-tn)
-                                       (ldb (byte 16 16)
-                                            (label-position target)))
-                  (emit-immediate-inst segment #b001101 0
-                                       (reg-tn-encoding lip-tn)
-                                       (ldb (byte 16 0)
-                                            (label-position target)))))
+                  (let ((code-offset (+ (component-header-length)
+                                        (label-position target)
+                                        (- sb-vm:other-pointer-lowtag))))
+                    (emit-immediate-inst segment #b001111 0
+                                         (reg-tn-encoding lip-tn)
+                                         (ldb (byte 16 16) code-offset))
+                    (emit-immediate-inst segment #b001101 (reg-tn-encoding lip-tn)
+                                         (reg-tn-encoding lip-tn)
+                                         (ldb (byte 16 0) code-offset)))))
+            (assemble (segment)
+              (inst add lip-tn sb-vm::code-tn))
             (emit-register-inst segment special-op (reg-tn-encoding lip-tn)
                                 0 (if linked 31 0) 0
                                 (if linked #b001001 #b001000))))))
@@ -1135,14 +1138,6 @@
   (:emitter
    (emit-header-data segment simple-fun-widetag)))
 
-(define-instruction lra-header-word (segment)
-  :pinned
-  (:cost 0)
-  (:delay 0)
-  (:emitter
-   (emit-header-data segment return-pc-widetag)))
-
-
 (defun emit-compute-inst (segment vop dst src label temp calc)
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
@@ -1178,8 +1173,7 @@
                              (label-position label posn delta-if-after)
                              (component-header-length))))))
 
-;; code = lra - other-pointer-tag - header - label-offset + other-pointer-tag
-;;      = lra - (header + label-offset)
+;; code = lra  - header - label-offset + other-pointer-tag
 (define-instruction compute-code-from-lra (segment dst src label temp)
   (:declare (type tn dst src temp) (type label label))
   (:attributes variable-length)
@@ -1189,11 +1183,11 @@
   (:emitter
    (emit-compute-inst segment vop dst src label temp
                       #'(lambda (label posn delta-if-after)
-                          (- (+ (label-position label posn delta-if-after)
-                                (component-header-length)))))))
+                          (+ (- (+ (label-position label posn delta-if-after)
+                                 (component-header-length)))
+                             other-pointer-lowtag)))))
 
-;; lra = code + other-pointer-tag + header + label-offset - other-pointer-tag
-;;     = code + header + label-offset
+;; lra = code + header + label-offset - other-pointer-tag
 (define-instruction compute-lra-from-code (segment dst src label temp)
   (:declare (type tn dst src temp) (type label label))
   (:attributes variable-length)
@@ -1203,8 +1197,9 @@
   (:emitter
    (emit-compute-inst segment vop dst src label temp
                       #'(lambda (label posn delta-if-after)
-                          (+ (label-position label posn delta-if-after)
-                             (component-header-length))))))
+                          (- (+ (label-position label posn delta-if-after)
+                              (component-header-length))
+                             other-pointer-lowtag)))))
 
 
 ;;;; Loads and Stores

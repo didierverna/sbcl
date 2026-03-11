@@ -176,3 +176,47 @@
                        ((vector t) 1)
                        (t
                         (coerce x '(vector t)))))))
+
+(with-test (:name :coerce-object-type)
+  (assert-type
+     (lambda (x y)
+       (coerce (the float x) y))
+     (or float (complex float)))
+  (assert-type
+     (lambda (x y)
+       (coerce (the array x) y))
+     (or array sequence character))
+  (assert-type
+     (lambda (y)
+       (coerce "ab" y))
+     (or list (simple-array * (*)) sb-kernel:extended-sequence))
+  (assert-type
+   (lambda (x y)
+     (coerce (the function x) y))
+   (or function sequence))
+  (assert-type
+   (lambda (x y)
+     (coerce (the (and symbol (not null)) x) y))
+   (or (and symbol (not null)) function character))
+  (assert-type
+   (lambda (x y)
+     (coerce (the symbol x) y))
+   (or symbol (simple-array * (0)) sb-kernel:extended-sequence function character))
+  (assert-type
+   (lambda (x y)
+     (coerce (the (not single-float) x) y))
+   t))
+
+(with-test (:name :coerce-constructed-type)
+  (assert-type
+   (lambda (x n)
+     (coerce x `(vector ,n)))
+   vector)
+  (assert-type
+   (lambda (x n)
+     (coerce (the list x) `(vector ,n)))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (x n)
+     (coerce n (if x 'single-float 'double-float)))
+   float))

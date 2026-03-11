@@ -15,7 +15,6 @@
      (:temp lra descriptor-reg lra-offset)
 
      ;; These are just needed to facilitate the transfer
-     (:temp lip interior-reg lip-offset)
      (:temp count any-reg nl2-offset)
      (:temp src any-reg nl3-offset)
      (:temp dst any-reg cfunc-offset)
@@ -74,7 +73,7 @@
   (inst add csp-tn ocfp-tn temp)
 
   ;; Return.
-  (lisp-return lra lip))
+  (lisp-return lra :multiple t :mflr nil :mtlr nil))
 
 
 
@@ -97,13 +96,14 @@
      (:temp dst any-reg nl2-offset)
      (:temp count any-reg nl3-offset)
      (:temp temp descriptor-reg l0-offset)
-     (:temp lip interior-reg lip-offset)
+     (:temp lip any-reg lip-offset)
 
      ;; These are needed so we can get at the register args.
      (:temp a0 descriptor-reg a0-offset)
      (:temp a1 descriptor-reg a1-offset)
      (:temp a2 descriptor-reg a2-offset)
-     (:temp a3 descriptor-reg a3-offset))
+     (:temp a3 descriptor-reg a3-offset)
+     (:temp lra descriptor-reg lra-offset))
 
 
   ;; Calculate NARGS (as a fixnum)
@@ -135,7 +135,9 @@
   DONE
   ;; We are done.  Do the jump.
   (loadw lip lexenv closure-fun-slot fun-pointer-lowtag) ; RAW ADDR
-  (inst mtctr lip) (inst bctr))
+  (inst mtctr lip)
+  (inst mtlr lra)
+  (inst bctr))
 
 
 ;;;; Non-local exit noise.
@@ -148,7 +150,6 @@
                           (:arg start (any-reg descriptor-reg) ocfp-offset)
                           (:arg count (any-reg descriptor-reg) nargs-offset)
                           (:temp lra descriptor-reg lra-offset)
-                          (:temp lip interior-reg lip-offset)
                           (:temp cur-uwp any-reg nl0-offset)
                           (:temp next-uwp any-reg nl1-offset)
                           (:temp target-uwp any-reg nl2-offset))
@@ -170,7 +171,8 @@
   (loadw cfp-tn cur-uwp unwind-block-cfp-slot)
   (loadw code-tn cur-uwp unwind-block-code-slot)
   (loadw lra cur-uwp unwind-block-entry-pc-slot)
-  (lisp-return lra lip)
+  (inst mtlr lra)
+  (inst blr)
 
   DO-UWP
 

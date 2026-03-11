@@ -195,8 +195,9 @@
 
 (let* ((n-saved-registers (length c-saved-registers))
        (n-saved-float-registers (length c-saved-float-registers))
-       (framesize (+ (* n-word-bytes n-saved-registers)
-                     (* 8 n-saved-float-registers))))
+       (framesize (align-up (+ (* n-word-bytes n-saved-registers)
+                               (* 8 n-saved-float-registers))
+                            (1+ +number-stack-alignment-mask+))))
   (defun save-c-registers ()
     (inst subi nsp-tn nsp-tn framesize)
     (loop for offset from 0
@@ -266,7 +267,7 @@
 
      ;; Don't want these to overlap with C args.
      (:temp pa-temp non-descriptor-reg nl6-offset)
-     (:temp temp non-descriptor-reg nl7-offset))
+     (:temp temp non-descriptor-reg tmp-offset))
   (save-c-registers)
 
   (initialize-boxed-regs (list function arg-ptr nargs #+sb-thread tls-ptr))
@@ -313,7 +314,7 @@
      (:temp value0-pass (any-reg) (result-reg-offset 0))
      (:temp value1-pass (any-reg) (result-reg-offset 1))
      (:temp pa-temp (any-reg) nl6-offset)
-     (:temp temp (any-reg) nl7-offset))
+     (:temp temp (unsigned-reg) tmp-offset))
   ;; The C stack frame and argument registers should have already been
   ;; set up in Lisp.
 
@@ -336,8 +337,7 @@
   (move value0-pass ca0)
   (move value1-pass ca1)
 
-  ;; FIXME: Don't need to initialize all. e.g. callee saved or ones that get initialized anyway.
-  (initialize-boxed-regs (list #+sb-thread thread-base-tn))
+  (initialize-boxed-regs)
 
   (pseudo-atomic (pa-temp)
     ;; FIXME: We could do some trickery like in other backends where

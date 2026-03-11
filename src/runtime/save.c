@@ -206,13 +206,10 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
         printf("writing %lu bytes from the %s space at %p\n",
                (long unsigned)bytes, names[id], addr);
 
-    /* FIXME: it sure would be nice to discover and document the behavior of this function
-     * with regard to aligning up the byte count as pertains to bytes spanned by a rounded
-     * up count that were not zeroized and would not have been written had we not rounded.
-     * That seems quite bogus to operate on bytes that the caller didn't promise were OK
-     * to be saved out (and didn't contain, say, a password and social security number) */
-    data = write_bytes(file, (char *)addr, ALIGN_UP(bytes, os_vm_page_size),
-                       file_offset, core_compression_level);
+    size_t aligned = ALIGN_UP(bytes, os_vm_page_size);
+    if (aligned > bytes && id != READ_ONLY_CORE_SPACE_ID)
+        memset((char*)addr + bytes, 0, aligned - bytes);
+    data = write_bytes(file, (char *)addr, aligned, file_offset, core_compression_level);
 
     write_lispobj(data, file);
     write_lispobj((uword_t)addr, file);
@@ -277,7 +274,7 @@ static lispobj required_foreign_symbols()
     gc_assert(instancep(CONS(value)->car));
     struct hash_table* ht = (void*)native_pointer(CONS(value)->car);
     gc_assert(simple_vector_p(ht->pairs));
-    struct vector* kvv = (void*)native_pointer(ht->pairs);
+    __attribute__((unused)) struct vector* kvv = (void*)native_pointer(ht->pairs);
     gc_assert(fixnum_value(ht->_count) == fixnum_value(kvv->data[0])); // high-water mark
     return ht->pairs;
 }
@@ -620,7 +617,9 @@ prepare_to_save(char *filename, bool prepend_runtime, void **runtime_bytes,
     // SB-IMPL::DEINIT already checked for exactly 1 thread,
     // so this really shouldn't happen.
     if (all_threads->next) {
-        fprintf(stderr, "Can't save image with more than one executing thread");
+        extern void list_lisp_threads(int regions, FILE* f);
+        list_lisp_threads(0, stderr);
+        fprintf(stderr, "Can't save image with more than one executing thread\n");
         return NULL;
     }
 
@@ -935,7 +934,7 @@ gc_and_save(char *filename, int core_format, bool purify,
         filename[strlen(filename)-4] = '\0'; // chop ".tmp" from the end
         fseek(file, 0, SEEK_END);
         generate_elfcore_obj(filename, file, elf_c_symbols, n_symbols);
-        printf("[Converted to ELF]\n");
+        if (verbose) printf("[Converted to ELF]\n");
     }
 #endif
     exit(0);

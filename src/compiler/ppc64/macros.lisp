@@ -84,32 +84,20 @@
 
 ;;; Macros to handle the fact that we cannot use the machine native call and
 ;;; return instructions.
-
-(defmacro lisp-jump (function lip)
-  "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
-  `(progn
-    ;; something is deeply bogus.  look at this
-    ;; (loadw ,lip ,function function-code-offset function-pointer-type)
-    (inst addi ,lip ,function (- (* n-word-bytes simple-fun-insts-offset) fun-pointer-lowtag))
-    (inst mtctr ,lip)
-    (inst bctr)))
-
-(defmacro lisp-return (return-pc lip &key (offset 0))
+(defmacro lisp-return (return-pc &key multiple (mtlr t) (mflr t))
   "Return to RETURN-PC."
   `(progn
-     (inst addi ,lip ,return-pc
-           (+ (- other-pointer-lowtag) n-word-bytes (* ,offset 4)))
-     (inst mtlr ,lip)
+     ;; The caller needs to get the address from LRA to compute its CODE
+     (assert (location= ,return-pc lra-tn))
+     ,(if mtlr
+          `(inst mtlr ,return-pc)
+          (and mflr
+               `(inst mflr ,lra-tn)))
+     ;; Set a flag for single/multiple return values
+     (inst cmpd null-tn ,(if multiple
+                             'csp-tn
+                             'null-tn))
      (inst blr)))
-
-(defmacro emit-return-pc (label)
-  "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
-  `(progn
-     (emit-alignment n-lowtag-bits)
-     (emit-label ,label)
-     (inst lra-header-word)))
-
-
 
 ;;;; Stack TN's
 

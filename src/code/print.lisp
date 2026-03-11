@@ -480,12 +480,6 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;;; level and length abbreviations
 
-;;; The current level we are printing at, to be compared against
-;;; *PRINT-LEVEL*. See the macro DESCEND-INTO for a handy interface to
-;;; depth abbreviation.
-(defvar *current-level-in-print* 0)
-(declaim (index *current-level-in-print*))
-
 ;;; Automatically handle *PRINT-LEVEL* abbreviation. If we are too
 ;;; deep, then a #\# is printed to STREAM and BODY is ignored.
 (defmacro descend-into ((stream) &body body)
@@ -1974,11 +1968,6 @@ variable: an unreadable object representing the error is printed instead.")
     (let ((a (get-lisp-obj-address component)))
       (format stream " {~X..~X}"
               a (+ (logandc2 a sb-vm:lowtag-mask) (code-object-size component))))))
-
-#-(or x86 x86-64 arm64 riscv loongarch64)
-(defmethod print-object ((lra lra) stream)
-  (print-unreadable-object (lra stream :identity t)
-    (write-string "return PC object" stream)))
 
 (defmethod print-object ((fdefn fdefn) stream)
   (print-unreadable-object (fdefn stream :type t)

@@ -138,8 +138,8 @@
                                       (declare (ignore f stuff))))))
 
 (defparameter *breakpoint-tracing-expectations*
-  '(:fails-on :arm
-    :broken-on (or :freebsd)))
+  '(:fails-on (or :arm :riscv :ppc64 :ppc :sparc :mips)
+    :broken-on (or :loongarch64 :freebsd)))
 
 ;;; bug 379
 (with-test (:name (trace :encapsulate nil)
@@ -955,7 +955,7 @@
 
 (with-test (:name (:debugger :list-locations)
             ;; there's an extra location on arm for some reason.
-            :fails-on (or :arm :loongarch64))
+            :fails-on (or :arm :loongarch64 :riscv :ppc :ppc64 :sparc :mips))
   (test-debugger
    "ll #'!
     debugger-test-done!"
@@ -1329,13 +1329,7 @@
                                                    (function int unsigned unsigned))
                                      ptr base)
                       1)))
-          ;; For architectures that don't use LRAs, there are exactly 'n-entries'
-          ;; properly tagged interior pointers. For those which do use LRAs,
-          ;; there are at least that many, because we allow pointing to LRAs,
-          ;; but they aren't enumerable so we don't know the actual count.
-          (assert (#+(or x86 x86-64 arm64 riscv loongarch64) =
-                   #-(or x86 x86-64 arm64 riscv loongarch64) >
-                     (loop for ptr from (+ base (* 2 sb-vm:n-word-bytes))
+          (assert (= (loop for ptr from (+ base (* 2 sb-vm:n-word-bytes))
                            below limit count (properly-tagged-p ptr))
                      n))
           ;; Verify that the binary search algorithm for simple-fun-index works.

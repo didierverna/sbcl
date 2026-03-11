@@ -23,7 +23,7 @@
 #define reg_R2          REG(2)
 #define reg_LEXENV      REG(3)
 #define reg_NL2         REG(4)
-#define reg_CODE        REG(5)
+#define reg_CSP         REG(5)
 #define reg_NL3         REG(6)
 #define reg_OCFP        REG(7)
 #define reg_R8          REG(8)
@@ -34,3 +34,6 @@
 #define reg_NSP         REG(13)
 #define reg_LR          REG(14)
 #define reg_PC          REG(15)
+
+#define reg_RA reg_LR
+#define reg_LINK_RETURN reg_LR

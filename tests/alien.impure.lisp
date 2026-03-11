@@ -271,11 +271,9 @@
 (declaim (inline bug-316075))
 ;; KLUDGE: This win32 reader conditional masks a bug, but allows the
 ;; test to fail cleanly.
-#-win32
 (locally (declare (muffle-conditions style-warning))
   (sb-alien:define-alien-routine bug-316075 void (result char :out)))
-(with-test (:name :bug-316075 :fails-on :win32)
-  #+win32 (error "fail")
+(with-test (:name :bug-316075)
   (checked-compile '(lambda () (multiple-value-list (bug-316075)))))
 
 ;;; Bug #316325: "return values of alien calls assumed truncated to
@@ -330,7 +328,7 @@
         (values (alien-funcall sys-execv1 program argv))))
    :allow-notes nil))
 
-(with-test (:name :bug-721087 :fails-on :win32)
+(with-test (:name :bug-721087)
   (assert (typep nil '(alien c-string)))
   (assert (not (typep nil '(alien (c-string :not-null t)))))
   (assert (eq :ok
@@ -338,8 +336,8 @@
                   (posix-getenv nil)
                 (type-error (e)
                   (when (and (null (type-error-datum e))
-                             (equal (type-error-expected-type e)
-                                    '(alien (c-string :not-null t))))
+                             #-win32 (equal (type-error-expected-type e)
+                                            '(alien (c-string :not-null t))))
                     :ok))))))
 
 (with-test (:name :make-alien-string)
@@ -586,6 +584,33 @@
               (macrolet ((something () "getenv"))
                 (alien-funcall (extern-alien (something) (function c-string c-string)) s))))))
     (assert (string= (funcall f "SBCL_HOME") (sb-ext:posix-getenv "SBCL_HOME")))))
+
+(with-test (:name :alien-128bit-value-passing
+            :skipped-on (or (not :x86-64) :win32))
+  (compile-so "alien-128.c" "alien-128.so")
+  ;; Verify that both halves of a 128-bit alien value survive the FFI call.
+  (let ((val (+ (ash #xDEADBEEFCAFEBABE 64) #x0123456789ABCDEF)))
+    (assert (= (alien-funcall
+                (extern-alien "uint128_low_64"
+                              (function (unsigned 64) (unsigned 128)))
+                val)
+               #x0123456789ABCDEF))
+    (assert (= (alien-funcall
+                (extern-alien "uint128_high_64"
+                              (function (unsigned 64) (unsigned 128)))
+                val)
+               #xDEADBEEFCAFEBABE)))
+  (let ((val (+ (ash #x-DEADBEEFCAFEBAB 64) #x0123456789ABCDEF)))
+    (assert (= (alien-funcall
+                (extern-alien "int128_low_64"
+                              (function (unsigned 64) (signed 128)))
+                val)
+               #x0123456789ABCDEF))
+    (assert (= (alien-funcall
+                (extern-alien "int128_high_64"
+                              (function (signed 64) (signed 128)))
+                val)
+               #x-DEADBEEFCAFEBAB))))
 
 (cl:in-package "SB-KERNEL")
 (test-util:with-test (:name :hash-consing)

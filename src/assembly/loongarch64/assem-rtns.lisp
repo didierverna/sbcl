@@ -171,8 +171,9 @@
 ;;;; Some runtime routines.
 (let* ((n-saved-registers (length c-saved-registers))
        (n-saved-float-registers (length c-saved-float-registers))
-       (framesize (+ (* n-word-bytes n-saved-registers)
-                     (* 8 n-saved-float-registers))))
+       (framesize (align-up (+ (* n-word-bytes n-saved-registers)
+                               (* 8 n-saved-float-registers))
+                            (1+ +number-stack-alignment-mask+))))
   (defun save-c-registers ()
     (inst subi nsp-tn nsp-tn framesize)
     (loop for offset from 0
@@ -294,7 +295,7 @@
   (move value0-pass ca0)
   (move value1-pass ca1)
 
-  (initialize-boxed-regs (list #+sb-thread thread-base-tn))
+  (initialize-boxed-regs)
 
   (pseudo-atomic (pa-temp)
     (set-up-lisp-context csp-tn cfp-tn temp)

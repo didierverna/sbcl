@@ -80,7 +80,7 @@
   (defregset boxed-regs
       fdefn code lexenv ocfp lra
       a0 a1 a2 a3
-      l0 l1 thread)
+      l0 l1)
 
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
@@ -180,11 +180,6 @@
   (non-descriptor-reg registers
    :locations #.non-descriptor-regs)
 
-  ;; Pointers to the interior of objects.  Used only as a temporary.
-  (interior-reg registers
-   :locations (#.lip-offset))
-
-
   ;; **** Things that can go in the floating point registers.
 
   ;; Non-Descriptor single-floats.
@@ -231,7 +226,7 @@
                  `(defparameter ,tn-sym
                    (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
-  (defregtn lip interior-reg)
+  (defregtn lip any-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
   (defregtn lra descriptor-reg)
@@ -266,10 +261,6 @@
       (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
-
-;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 

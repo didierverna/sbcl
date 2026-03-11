@@ -16,7 +16,7 @@
 (defvar *weak-vect* (make-weak-vector 8))
 (defmacro wvref (v i) `(sb-int:weak-vector-ref ,v ,i))
 (with-test (:name :weak-vector
-            :fails-on :win32)
+            :fails-on (and :c-stack-is-control-stack :win32))
   (let ((a *weak-vect*)
         (random-symbol (make-symbol "FRED")))
     (flet ((x ()
@@ -529,13 +529,13 @@
            (assert (= (sb-sys:sap-ref-word sap (ash i sb-vm:word-shift)))))))))
 
 (with-test (:name :rospace-strings
-                  :fails-on :darwin-jit)
+                  :fails-on (or :darwin-jit :sparc))
   (let ((err (handler-case (setf (char (opaque-identity (symbol-name '*readtable*)) 0) #\*)
                (sb-sys:memory-fault-error (c)
                  (write-to-string c :escape nil)))))
     (assert (search "modify a read-only object" err))))
 
 (with-test (:name :time-measures
-                  :skipped-on (:not (:and (:or :linux :darwin) :sb-thread)))
+            :skipped-on (:not (:and (:or :linux :darwin) :sb-thread)))
   (assert (plusp (sb-thread::thread-sum-stw-pause sb-thread:*current-thread*)))
   (assert (plusp (sb-thread::thread-gc-virtual-time sb-thread:*current-thread*))))

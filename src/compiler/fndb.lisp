@@ -591,7 +591,9 @@
     (character character) boolean
   (movable foldable flushable no-verify-arg-count))
 
-(defknown character (t) character (movable foldable unsafely-flushable))
+(defknown character ((or character (string 1) symbol))
+    character
+    (movable foldable unsafely-flushable))
 (defknown char-code (character) %char-code (movable foldable flushable))
 (defknown (char-upcase char-downcase) (character) character
   (movable foldable flushable))
@@ -697,7 +699,8 @@
 (defknown %map (type-specifier (function-designator ((rest-args :sequence t))
                                                     (nth-arg 0 :sequence-type t))
                                &rest sequence) consed-sequence
-  (call no-verify-arg-count foldable-read-only))
+  (call no-verify-arg-count foldable-read-only)
+  :derive-type (creation-result-type-specifier-nth-arg 0 t))
 (defknown %map-for-effect-arity-1 (function-designator sequence) null
   (call no-verify-arg-count))
 (defknown %map-to-list-arity-1 ((function-designator ((nth-arg 1 :sequence t))) sequence) list
@@ -1306,7 +1309,7 @@
 (defknown hash-table-size (hash-table) index (flushable))
 (defknown hash-table-test (hash-table) function-designator (foldable flushable))
 (defknown (sxhash psxhash) (t) hash-code (foldable flushable))
-(defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
+(defknown hash-table-equalp (hash-table instance) boolean (foldable flushable))
 (defknown sb-impl:install-hash-table-lock (hash-table) sb-thread:mutex ())
 (defknown sb-vm::quick-try-mutex (sb-thread:mutex) boolean)
 ;; To avoid emitting code to test for nil-function-returned
@@ -1355,9 +1358,12 @@
     (values (integer 128 255) (integer 0 7))
     (flushable foldable))
 
-(defknown sb-vm::%vector-widetag-and-n-bits-shift (type-specifier)
+(defknown sb-vm::%vector-widetag-and-n-bits-shift ((read-only type-specifier))
     (values (integer 128 255) (integer 0 7))
     (flushable foldable recursive no-verify-arg-count))
+(defknown sb-vm::%vector-widetag-and-n-bits-shift-list (&rest t)
+    (values (integer 128 255) (integer 0 7))
+    (flushable))
 
 (defknown sb-vm::%string-widetag-and-n-bits-shift (type-specifier)
     (values (member #+sb-unicode #.sb-vm:simple-character-string-widetag
@@ -1882,6 +1888,7 @@
   sb-impl::%pathname-version (flushable))
 
 (defknown pathname= (pathname pathname) boolean (movable foldable flushable))
+(defknown pathname-equalp (pathname instance) boolean (movable foldable flushable))
 
 (defknown (namestring file-namestring directory-namestring host-namestring)
   (pathname-designator) (or simple-string null)
@@ -2207,7 +2214,7 @@
 (defknown string-hairy-data-vector-set/check-bounds (string index t) t (no-verify-arg-count))
 
 (defknown %caller-frame () t (flushable))
-(defknown %caller-pc () system-area-pointer (flushable))
+(defknown %caller-pc () #-c-stack-is-control-stack fixnum #+c-stack-is-control-stack system-area-pointer (flushable))
 (defknown %with-array-data (array index (or index null))
   (values (simple-array * (*)) index index index)
   (foldable flushable no-verify-arg-count))

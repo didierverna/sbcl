@@ -19,7 +19,7 @@
             lsl lsr asr ror cpsr @) "SB-VM")
   ;; Imports from SB-VM into this package
   (import '(sb-vm:nil-value sb-vm::registers sb-vm::null-tn sb-vm::null-offset
-            sb-vm::pc-tn sb-vm::pc-offset sb-vm::code-offset)))
+            sb-vm::pc-tn sb-vm::pc-offset)))
 
 
 
@@ -392,10 +392,6 @@
 (define-instruction simple-fun-header-word (segment)
   (:emitter
    (emit-header-data segment simple-fun-widetag)))
-
-(define-instruction lra-header-word (segment)
-  (:emitter
-   (emit-header-data segment return-pc-widetag)))
 
 ;;;; Addressing mode 1 support
 
@@ -1064,13 +1060,7 @@
             (emit-dp-instruction segment cond-bits #b01 1
                                  (compute-opcode direction mode)
                                  (tn-offset base) (tn-offset data)
-                                 (encode-shifter-operand offset))))))
-
-      #+(or)
-      (tn
-       ;; FIXME: This is for stack TN references, and needs must be
-       ;; implemented.
-       ))))
+                                 (encode-shifter-operand offset)))))))))
 
 (macrolet
     ((define-load/store-instruction (name kind width)
@@ -1197,34 +1187,43 @@
   (define-misc-load/store-instruction ldrsb 1 #b1101 nil)
   (define-misc-load/store-instruction ldrsh 1 #b1111 nil))
 
-;;;; Boxed-object computation instructions (for LRA and CODE)
 
-;;; Compute the address of a CODE object by parsing the header of a
-;;; nearby LRA or SIMPLE-FUN.
-(define-instruction compute-code (segment code lip object-label temp)
+(define-instruction load-constant (segment dest index)
   (:vop-var vop)
   (:emitter
-   (emit-back-patch
-    segment 16
-    (lambda (segment position)
-      (assemble (segment vop)
-        ;; Calculate the address of the code component.  This is an
-        ;; exercise in excess cleverness.  First, we calculate (from
-        ;; our program counter only) the address of OBJECT-LABEL plus
-        ;; OTHER-POINTER-LOWTAG.  The extra two words are to
-        ;; compensate for the offset applied by ARM CPUs when reading
-        ;; the program counter.
-        (inst sub lip pc-tn (- ;; The 8 below is the displacement
-                               ;; from reading the program counter.
-                               (+ position 8)
-                               (+ (label-position object-label)
-                                  other-pointer-lowtag)))
-        ;; Next, we read the function header.
-        (inst ldr temp (@ lip (- other-pointer-lowtag)))
-        (inst bic temp temp widetag-mask)
-        ;; And finally we use the header value (a count in words),
-        ;; to compute the boxed address of the code component.
-        (inst sub code lip (lsr temp (- 8 word-shift))))))))
+   (labels ((compute-delta (position &optional magic-value)
+              (+ (- (label-position (segment-origin segment)
+                                    (when magic-value position)
+                                    magic-value)
+                    (component-header-length)
+                    (+ position 8))
+                 index))
+            (multi-instruction-emitter (segment position)
+              (let* ((delta (compute-delta position))
+                     (abs-delta (abs delta))
+                     (high (mask-field (byte 8 12) abs-delta))
+                     (low (ldb (byte 12 0) abs-delta)))
+                (assemble (segment vop)
+                  (if (minusp delta)
+                      (inst sub dest pc-tn high)
+                      (inst add dest pc-tn high))
+                  (inst ldr dest (@ dest (if (minusp delta)
+                                             (- low)
+                                             low))))))
+            (one-instruction-emitter (segment position)
+              (assemble (segment vop)
+                (inst ldr dest (@ pc-tn (compute-delta position)))))
+            (multi-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
+              (let ((delta (compute-delta posn magic-value)))
+                (when (typep (abs delta) '(unsigned-byte 12))
+                  (emit-back-patch segment 4
+                                   #'one-instruction-emitter)
+                  t))))
+     (emit-chooser
+      segment 8 2
+      #'multi-instruction-maybe-shrink
+      #'multi-instruction-emitter))))
 
 ;;; Compute the address of a nearby LRA object by dead reckoning from
 ;;; the location of the current instruction.
@@ -1241,10 +1240,9 @@
    ;; megabyte segment (24 bits of displacement) is ridiculous), so we
    ;; need to cover a range of up to three octets of displacement.
    (labels ((compute-delta (position &optional magic-value)
-              (- (+ (label-position lra-label
-                                    (when magic-value position)
-                                    magic-value)
-                    other-pointer-lowtag)
+              (- (label-position lra-label
+                                 (when magic-value position)
+                                 magic-value)
                  ;; The 8 below is the displacement
                  ;; from reading the program counter.
                  (+ position 8)))
@@ -1788,22 +1786,40 @@
   nil)
 
 (define-instruction store-coverage-mark (segment mark-index temp)
+  (:vop-var vop)
   (:emitter
-   ;; No backpatch is needed to compute the offset into the code header
-   ;; because COMPONENT-HEADER-LENGTH is known at this point.
-   (let* ((offset (+ (component-header-length)
-                     ;; skip over jump table word and entries
-                     (* (1+ (component-n-jump-table-entries))
-                        n-word-bytes)
-                     mark-index
-                     (- other-pointer-lowtag)))
-          (addr
-           (@ sb-vm::code-tn
-              (etypecase offset
-                ((integer 0 4095) offset)
-                ((unsigned-byte 31)
-                 (inst* segment 'movw temp (logand offset #xffff))
-                 (when (ldb-test (byte 16 16) offset)
-                   (inst* segment 'movt temp (ldb (byte 16 16) offset)))
-                 temp)))))
-     (inst* segment 'strb sb-vm::null-tn addr))))
+   (labels ((compute-delta (position &optional magic-value)
+              (+ (- (label-position (segment-origin segment)
+                                    (when magic-value position)
+                                    magic-value)
+                    (+ position 8))
+                 ;; skip over jump table word and entries
+                 (* (1+ (component-n-jump-table-entries))
+                    n-word-bytes)
+                 mark-index))
+            (multi-instruction-emitter (segment position)
+              (let* ((delta (compute-delta position))
+                     (abs-delta (abs delta))
+                     (high (mask-field (byte 8 12) abs-delta))
+                     (low (ldb (byte 12 0) abs-delta)))
+                (assemble (segment vop)
+                  (if (minusp delta)
+                      (inst sub temp pc-tn high)
+                      (inst add temp pc-tn high))
+                  (inst strb sb-vm::null-tn (@ temp (if (minusp delta)
+                                                        (- low)
+                                                        low))))))
+            (one-instruction-emitter (segment position)
+              (assemble (segment vop)
+                (inst strb sb-vm::null-tn (@ pc-tn (compute-delta position)))))
+            (multi-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
+              (let ((delta (compute-delta posn magic-value)))
+                (when (typep (abs delta) '(unsigned-byte 12))
+                  (emit-back-patch segment 4
+                                   #'one-instruction-emitter)
+                  t))))
+     (emit-chooser
+      segment 8 2
+      #'multi-instruction-maybe-shrink
+      #'multi-instruction-emitter))))

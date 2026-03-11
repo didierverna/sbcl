@@ -65,7 +65,8 @@
   (defreg l0 22)     ; s6
   (defreg nl6 23)    ; s7
   (defreg l1 24)     ; s8
-  (defreg nl7 25)    ; s9
+  ;; A register needed to load constants into descriptor-regs
+  (defreg tmp 25)    ; s9
   (defreg #-sb-thread l2 #+sb-thread thread 26) ; s10
 
   (defreg cfunc 27)  ; s11
@@ -74,13 +75,11 @@
   (defreg code 30)   ; t5
   (defreg nargs 31)  ; t6
 
-  (defregset non-descriptor-regs nl0 nl1 nl2 ra nl3 nl4 nl5 nl6 nl7 nargs nfp cfunc)
+  (defregset non-descriptor-regs nl0 nl1 nl2 ra nl3 nl4 nl5 nl6 nargs nfp cfunc)
   (defregset descriptor-regs a0 a1 a2 a3 a4 a5 l0 l1 #-sb-thread l2 ocfp lexenv)
   (defregset reserve-descriptor-regs lexenv)
   (defregset reserve-non-descriptor-regs cfunc)
-  (defregset boxed-regs a0 a1 a2 a3 a4 a5 l0 l1
-    #-sb-thread l2 #+sb-thread thread
-    ocfp lexenv code)
+  (defregset boxed-regs a0 a1 a2 a3 a4 a5 l0 l1 #-sb-thread l2 ocfp lexenv code)
 
   (define-argument-register-set a0 a1 a2 a3 a4 a5))
 
@@ -123,9 +122,6 @@
 
  ;; Random objects that must not be seen by GC.  Used only as temporaries.
  (non-descriptor-reg registers :locations #.non-descriptor-regs)
-
- ;; Pointers to the interior of objects.  Used only as a temporary.
- (interior-reg registers :locations (#.lip-offset))
 
  (character-stack non-descriptor-stack)
 
@@ -198,7 +194,7 @@
                  `(defglobal ,tn-sym
                    (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
   (defregtn zero any-reg)
-  (defregtn lip interior-reg)
+  (defregtn lip any-reg)
   (defregtn code descriptor-reg)
   (defregtn null descriptor-reg)
 
@@ -212,7 +208,9 @@
   (defregtn ocfp any-reg)
   (defregtn nfp any-reg)
 
-  (defregtn ra any-reg))
+  (defregtn ra any-reg)
+
+  (defregtn tmp unsigned-reg))
 
 ;;; If VALUE can be represented as an immediate constant, then return the
 ;;; appropriate SC number, otherwise return NIL.
@@ -236,9 +234,6 @@
        #+64-bit
        ((integer #x-80000800 #x7ffff7ff)
         immediate-sc-number)))
-    #-sb-xc-host ; There is no such object type in the host
-    (system-area-pointer
-     immediate-sc-number)
     (character
      immediate-sc-number)
     (structure-object
@@ -250,11 +245,6 @@
       (eql sc immediate-sc-number)))
 
 ;;;; Function Call Parameters
-
-;;; The SC numbers for register and stack arguments/return values.
-;;;
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; Offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)

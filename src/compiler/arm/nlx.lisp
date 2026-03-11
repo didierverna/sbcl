@@ -15,7 +15,7 @@
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 (defun make-nlx-entry-arg-start-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn r8-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number r8-offset))
 
 ;;; Save and restore dynamic environment.
 ;;;
@@ -53,7 +53,7 @@
 (define-vop (current-stack-pointer)
   (:results (res :scs (any-reg descriptor-reg)))
   (:generator 1
-    (load-csp res)))
+    (move res csp-tn)))
 
 (define-vop (current-binding-pointer)
   (:results (res :scs (any-reg descriptor-reg)))
@@ -80,16 +80,15 @@
   (:info entry-label)
   (:results (block :scs (any-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 22
     (composite-immediate-instruction add block cfp-tn
                                      (tn-byte-offset tn))
     (load-symbol-value temp *current-unwind-protect-block*)
     (storew temp block unwind-block-uwp-slot)
     (storew cfp-tn block unwind-block-cfp-slot)
-    (storew code-tn block unwind-block-code-slot)
-    (inst compute-lra temp lip entry-label)
-    (storew temp block catch-block-entry-pc-slot)))
+    (inst compute-lra lip lip entry-label)
+    (storew lip block catch-block-entry-pc-slot)))
 
 ;;; Like Make-Unwind-Block, except that we also store in the specified tag, and
 ;;; link the block into the Current-Catch list.
@@ -100,16 +99,15 @@
   (:results (block :scs (any-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 44
     (composite-immediate-instruction
      add result cfp-tn (tn-byte-offset tn))
     (load-symbol-value temp *current-unwind-protect-block*)
     (storew temp result catch-block-uwp-slot)
     (storew cfp-tn result catch-block-cfp-slot)
-    (storew code-tn result catch-block-code-slot)
-    (inst compute-lra temp lip entry-label)
-    (storew temp result catch-block-entry-pc-slot)
+    (inst compute-lra lip lip entry-label)
+    (storew lip result catch-block-entry-pc-slot)
 
     (storew tag result catch-block-tag-slot)
     (load-symbol-value temp *current-catch-block*)
@@ -158,7 +156,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
     (cond ((zerop nvals))
           ((= nvals 1)
@@ -179,23 +177,20 @@
                   (loadw move-temp start i 0 :ge)
                   (store-stack-tn tn move-temp :ge)
                   (store-stack-tn tn null-tn :lt)))))))
-    (load-stack-tn move-temp sp)
-    (store-csp move-temp)))
+    (load-stack-tn csp-tn sp)))
 
 (define-vop (nlx-entry-single)
   (:args (sp)
          (value))
   (:results (res :from :load))
-  (:temporary (:scs (descriptor-reg)) move-temp)
   (:info label)
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
     (move res value)
-    (load-stack-tn move-temp sp)
-    (store-csp move-temp)))
+    (load-stack-tn csp-tn sp)))
 
 (define-vop (nlx-entry-multiple)
   (:args (top :target result) (src) (count))
@@ -209,7 +204,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
 
     ;; Setup results, and test for the zero value case.
@@ -232,8 +227,7 @@
 
     ;; Reset the CSP.
     DONE
-    (inst add temp result num)
-    (store-csp temp)))
+    (inst add csp-tn result num)))
 
 ;;; This VOP is just to force the TNs used in the cleanup onto the stack.
 ;;;
@@ -244,7 +238,7 @@
   (:ignore block start count)
   (:vop-var vop)
   (:generator 0
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)))
 
 ;;; Doesn't handle NSP and is disabled.
@@ -258,7 +252,7 @@
   (:temporary (:sc descriptor-reg :offset r8-offset) saved-function)
   (:temporary (:sc unsigned-reg :offset r0-offset) block)
   (:temporary (:sc descriptor-reg :offset lexenv-offset) lexenv)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:temporary (:sc descriptor-reg :offset nargs-offset) nargs)
   (:vop-var vop)
   (:generator 22
@@ -271,9 +265,8 @@
       (move saved-function function)
 
       ;; Allocate space for magic UWP block.
-      (load-csp block)
-      (inst add temp block (* unwind-block-size n-word-bytes))
-      (store-csp temp)
+      (move block csp-tn)
+      (inst add csp-tn csp-tn (* unwind-block-size n-word-bytes))
 
       ;; Set up magic catch / UWP block.
 
@@ -285,8 +278,8 @@
       ;; it's not going to be used and will be overwritten after the
       ;; function call
 
-      (inst compute-lra temp lip entry-label)
-      (storew temp block catch-block-entry-pc-slot)
+      (inst compute-lra lip lip entry-label)
+      (storew lip block catch-block-entry-pc-slot)
 
       ;; Run any required UWPs.
       (assemble (:elsewhere vop)
@@ -294,7 +287,7 @@
         (inst word (make-fixup 'unwind :assembly-routine)))
       (inst load-from-label pc-tn lr-tn uwp-label)
 
-      (emit-return-pc ENTRY-LABEL)
+      (emit-label ENTRY-LABEL)
       (inst mov nargs 0)
 
       (move lexenv saved-function)

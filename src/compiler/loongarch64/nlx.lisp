@@ -14,7 +14,7 @@
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 (defun make-nlx-entry-arg-start-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ocfp-offset))
 
 ;;; Save and restore dynamic environment.
 ;;;
@@ -80,7 +80,7 @@
   (:info entry-label)
   (:results (block :scs (any-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 22
     (add-imm block cfp-tn (tn-byte-offset tn) 'make-unwind-block temp)
     (load-current-unwind-protect-block temp)
@@ -96,7 +96,7 @@
   (:results (block :scs (any-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 44
     (do ((src-operand cfp-tn)
          (imm (tn-byte-offset tn)))

@@ -113,7 +113,7 @@ $(TARGET): $(LIBSBCL)
 # tests/heap-reloc/fake-mman.c assumes #+linux, so this recipe
 # only works on linux.
 heap-reloc-test: ../../tests/heap-reloc/fake-mman.c $(OBJS)
-	$(CC) ${LINKFLAGS} -o $@ ../../tests/heap-reloc/fake-mman.c $(filter-out linux-mman.o,$(OBJS)) $(LIBS)
+	$(CC) ${LINKFLAGS} $(CPPFLAGS) -o $@ ../../tests/heap-reloc/fake-mman.c $(filter-out linux-mman.o,$(OBJS)) $(LIBS)
 
 # Enable compiling gencgc with even more assertions and/or
 # data collection, with COMPILING_TESTS. Not really used yet.
@@ -168,7 +168,8 @@ semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
 # to get in there so using the same link options as for the ordinary "sbcl"
 # is just easiest.
 embedcore-sbcl: $(LIBSBCL)
-	../../run-sbcl.sh --eval '(save-lisp-and-die "wrappedcore.o" :executable :elf-object)'
+	../../run-sbcl.sh --no-sysinit --no-userinit \
+	    --eval '(save-lisp-and-die "wrappedcore.o" :executable :elf-object)'
 	$(CC) -no-pie $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
  $(CFLAGS) -o $@ wrappedcore.o $^ $(LIBS)
 

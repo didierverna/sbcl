@@ -12,6 +12,10 @@
 
 (in-package "SB-IMPL")
 
+;;; TODO: the computation of +internal-features+ could be moved
+;;; from its current home in make-target-2-load to here.
+(define-load-time-global +internal-features+ nil)
+
 ;;; Define a variable that is assigned into TLS either in INIT-INITIAL-THREAD
 ;;; or NEW-LISP-THREAD-TRAMPOLINE before any other Lisp code runs.
 ;;; !COLD-INIT gets these assignents via INIT-INITIAL-THREAD.
@@ -48,6 +52,9 @@
        #+sb-thread (setf (info :variable :wired-tls ',name) :always-thread-local)
        ,@(when always-boundp
            `((setf (info :variable :always-bound ',name) :always-bound))))))
+;;; Having exported the above macro for convenience, it needs to be removed
+;;; when done because it only works during self-build.
+(push '("SB-IMPL" define-thread-local) *!removable-symbols*)
 
 (eval-when (:compile-toplevel :execute)
   (defvar sb-thread::*thread-local-specials* (list :not-final))
@@ -80,15 +87,21 @@
 ;;; a list of handlers maintained by HANDLER-BIND
 (define-thread-local *handler-clusters* sb-kernel::**initial-handler-clusters**)
 
-(declaim (special sb-debug:*in-the-debugger*
-                  sb-debug:*stack-top-hint*
-                  *gc-inhibit* *gc-pending*
+(define-thread-local *compile-file-pathname* nil)
+(define-thread-local *compile-file-truename* nil)
+(define-thread-local *load-pathname* nil)
+#+ansi-compliant-load-truename (define-thread-local *load-truename* nil)
+
+(defvar *default-external-format* :utf-8)
+(defvar *default-source-external-format*
+  #+win32 '(:default :newline :crlf)
+  #-win32 :default)
+(declaim (always-bound *default-external-format* *default-source-external-format*))
+
+(declaim (special *gc-inhibit* *gc-pending*
                   #+sb-thread *stop-for-gc-pending*
                   *posix-argv*
-                  *default-external-format*
-                  *default-source-external-format*
                   *free-interrupt-context-index*))
-(declaim (always-bound *default-external-format* *default-source-external-format*))
 (declaim (type (integer 0 #.sb-vm::max-interrupts) *free-interrupt-context-index*))
 
 ;;; A unique GC id. This is supplied for code that needs to detect
@@ -135,5 +148,5 @@
 ;;; When we trace using encapsulation, we bind this variable and add
 ;;; (NIL . CONDITION-SATISFIED), so a NIL "cookie" marks an
 ;;; encapsulated tracing.
-(sb-impl::define-thread-local *traced-entries* ())
+(sb-impl:define-thread-local *traced-entries* ())
 (declaim (list *traced-entries*))

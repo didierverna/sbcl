@@ -1460,7 +1460,7 @@ Experimental: interface subject to change."
                  nil))
 
   (defun find-symbol (name &optional (package (sane-package)))
-  "Return the symbol named STRING in PACKAGE. If such a symbol is found
+  "Return the symbol named NAME in PACKAGE. If such a symbol is found
   then the second value is :INTERNAL, :EXTERNAL or :INHERITED to indicate
   how the symbol is accessible. If no symbol is found then both values
   are NIL."
@@ -1890,7 +1890,7 @@ PACKAGE."
         (deduped-packages (remove-duplicates (package-listify packages-to-use) :from-end t))
         (packages))
     ;; "packages-to-use ... The KEYWORD package may not be supplied."
-    (when (memq *keyword-package* packages)
+    (when (memq *keyword-package* deduped-packages)
       (error "Can not USE-PACKAGE ~S" *keyword-package*))
     (with-package-graph ()
       (with-single-package-locked-error ()

@@ -83,8 +83,7 @@
   (defregset descriptor-regs a0 a1 a2 a3 a4 l0 l1 #-sb-thread l2 lexenv ocfp)
   (defregset reserve-descriptor-regs lexenv)
   (defregset reserve-non-descriptor-regs cfunc)
-  (defregset boxed-regs a0 a1 a2 a3 a4 a5 l0 l1 #-sb-thread l2 #+sb-thread thread
-  ocfp lexenv code)
+  (defregset boxed-regs a0 a1 a2 a3 a4 a5 l0 l1 #-sb-thread l2 ocfp lexenv code)
 
   (define-argument-register-set a0 a1 a2 a3 a4 a5))
 
@@ -122,9 +121,6 @@
 
  ;; Random objects that must not be seen by GC.  Used only as temporaries.
  (non-descriptor-reg registers :locations #.non-descriptor-regs)
-
- ;; Pointers to the interior of objects.  Used only as a temporary.
- (interior-reg registers :locations (#.lip-offset))
 
  (character-stack non-descriptor-stack)
 
@@ -196,7 +192,7 @@
        (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
 (defregtn zero any-reg)
-(defregtn lip interior-reg)
+(defregtn lip any-reg)
 (defregtn code descriptor-reg)
 (defregtn null descriptor-reg)
 (defregtn t7 any-reg)
@@ -226,9 +222,6 @@
          nil))
     ((integer #.most-negative-fixnum #.most-positive-fixnum)
      immediate-sc-number)
-    #-sb-xc-host
-    (system-area-pointer
-     immediate-sc-number)
     (character
      immediate-sc-number)
     (structure-object
@@ -238,11 +231,6 @@
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc zero-sc-number)
       (eql sc immediate-sc-number)))
-
-;;;; Function Call Parameters
-;;; The SC numbers for register and stack arguments/return values.
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (defconstant ocfp-save-offset 0)
 (defconstant ra-save-offset 1)

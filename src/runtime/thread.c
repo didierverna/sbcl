@@ -121,17 +121,6 @@ unlink_thread(struct thread *th)
         th->next->prev = th->prev;
 }
 
-/* Not safe in general, but if your thread names are all
- * simple-base-string and won't move, this is slightly ok */
-char* vm_thread_name(struct thread* th)
-{
-    if (!th) return "non-lisp";
-    struct thread_instance *lispthread = (void*)INSTANCE(th->lisp_thread);
-    lispobj name = lispthread->_name;
-    if (simple_base_string_p(name)) return vector_sap(name);
-    return "?";
-}
-
 #if HAVE_GC_STW_SIGNAL
 
 
@@ -702,6 +691,8 @@ static void attach_os_thread(init_thread_data *scribble)
     stack_size = stack.ss_size;
     stack_addr = (void*)((size_t)stack.ss_sp - stack_size);
 # elif defined LISP_FEATURE_SUNOS
+    #include "/usr/include/thread.h"
+    #include <signal.h>
     stack_t stack;
     thr_stksegment(&stack);
     stack_size = stack.ss_size;

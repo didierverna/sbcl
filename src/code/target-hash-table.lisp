@@ -13,8 +13,7 @@
 (in-package "SB-IMPL")
 
 
-(defvar *show-putweak* nil)
-
+(declaim (freeze-type general-hash-table))
 (!begin-collecting-cold-init-forms)
 
 (declaim (ftype (sfunction (hash-table t maybe-truncated-hash)
@@ -1092,11 +1091,13 @@ Examples:
                 (pick-table-methods (logtest flags hash-table-synchronized-flag)
                                     (if userfunp nil test) hash-fun-state)))
            (table
-            (funcall (if weakp #'%alloc-general-hash-table #'%alloc-hash-table)
-                               flags getter setter remover hash-fun-state
-                               test test-fun hash-fun
-                               rehash-size rehash-threshold
-                               kv-vector index-vector next-vector hash-vector)))
+            (if (or (/= rehash-threshold 1) (/= rehash-size default-rehash-size) userfunp weakp)
+                (%alloc-general-hash-table flags getter setter remover hash-fun-state
+                                           test test-fun hash-fun
+                                           rehash-size rehash-threshold
+                                           kv-vector index-vector next-vector hash-vector)
+                (%alloc-hash-table flags getter setter remover hash-fun-state test-fun hash-fun
+                                   kv-vector index-vector next-vector hash-vector))))
       (declare (type index scaled-size))
       ;; The trailing metadata element is either the table itself or the hash-vector
       ;; depending on weakness. Non-weak hashing vectors can be GCed without looking
@@ -2494,6 +2495,13 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
        ;; it's the other way around.
        (declare (type (or fixnum maybe-truncated-hash) hash0))
        (dx-flet ((body ()
+                   ;; Delaying the transfer of culled cells could causee the linked list
+                   ;; denoting the cells to itself be promoted into a higher generation.
+                   ;; Ideally the list would be off-heap and not subject to GC. Attempting to
+                   ;; do that would engender two other problems: (1) knowing when to free the list
+                   ;; if the table becomes garbage and we had not yet processed - and thus freed -
+                   ;; the list. (2) GC can't call malloc()
+                   (transfer-culled-cells hash-table)
                    (binding* (((probed-value probed-key physical-index predecessor)
                                (findhash-weak key hash-table hash address-sensitive-p))
                               (kv-vector (hash-table-pairs hash-table)))
@@ -2507,6 +2515,8 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
            ;; Use the private slot accessor for the lock because it's known
            ;; to have a mutex.
            (sb-thread::call-with-recursive-system-lock #'body (hash-table-%lock hash-table))
+           ;; Question: can we assert that any weak table without a mutex has
+           ;; some _other_ mutex that guards it?
            (body))))))
 
 (defun gethash/weak (key hash-table default)
@@ -2919,13 +2929,6 @@ nnnn 1_    any       linear scan (don't try to read when rehash already in progr
 
   (defun puthash/weak (key hash-table value)
     (declare (type hash-table hash-table) (optimize speed))
-    ;; Delaying the transfer of culled cells could causee the linked list
-    ;; denoting the cells to itself be promoted into a higher generation.
-    ;; Ideally the list would be off-heap and not subject to GC. Attempting to
-    ;; do that would engender two other problems: (1) knowing when to free the list
-    ;; if the table becomes garbage and we had not yet processed - and thus freed -
-    ;; the list. (2) GC can't call malloc()
-    (transfer-culled-cells hash-table)
     (with-weak-hash-table-entry
       (declare (ignore predecessor))
       (cond ((= physical-index 0)
@@ -3284,6 +3287,18 @@ table itself."
 ;;; It can't go in src/code/pred whose forms execute *before* the defstruct,
 ;;; so its effect would just get clobbered by the defstruct.
 (sb-kernel::assign-equalp-impl 'hash-table #'hash-table-equalp)
+(sb-kernel::assign-equalp-impl 'general-hash-table #'hash-table-equalp)
+
+(defun hash-table-test (hash-table)
+  (if (typep hash-table 'general-hash-table)
+      (hash-table-%test hash-table)
+      (aref #(eq eql equal equalp) (ht-flags-kind (hash-table-flags hash-table)))))
+(defun hash-table-rehash-threshold (hash-table)
+  (if (typep hash-table 'general-hash-table) (hash-table-%rehash-threshold hash-table) 1.0f0))
+(defun hash-table-rehash-size (hash-table)
+  (if (typep hash-table 'general-hash-table)
+      (hash-table-%rehash-size hash-table)
+      default-rehash-size))
 
 (!defun-from-collected-cold-init-forms !hash-table-cold-init)
 

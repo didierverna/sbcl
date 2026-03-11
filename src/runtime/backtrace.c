@@ -407,9 +407,6 @@ code_pointer(lispobj object)
     switch (widetag_of(headerp)) {
         case CODE_HEADER_WIDETAG:
             break;
-#ifdef RETURN_PC_WIDETAG
-        case RETURN_PC_WIDETAG:
-#endif
         case SIMPLE_FUN_WIDETAG:
             len = (HeaderValue(*headerp) & FUN_HEADER_NWORDS_MASK);
             if (len == 0)
@@ -491,6 +488,7 @@ int lisp_frame_previous(struct thread *thread, struct call_info *info)
     if (info->frame == NULL || info->frame == this_frame)
         return 0;
     lra = info->lra;
+
     if (lra == NIL) {
         /* We were interrupted. Find the correct signal context. */
         free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
@@ -505,16 +503,8 @@ int lisp_frame_previous(struct thread *thread, struct call_info *info)
         }
     } else if (fixnump(lra)) {
         info->code =
-#ifdef reg_CODE
-        (struct code*)native_pointer(this_frame->code);
-#else
         (struct code*)component_ptr_from_pc((char *)lra);
-#endif
-#ifdef reg_LRA
-        info->pc = lra;
-#else
         info->pc = (char*)native_pointer(lra) - (char*)info->code;
-#endif
         info->lra = NIL;
     } else {
         info->code = code_pointer(lra);
@@ -887,7 +877,7 @@ void perform_backtrace(struct thread *th, os_context_t* context, FILE* f)
         if (print_lisp_fun_name(pc, f)) {
             // printed
         } else if (!unw_get_proc_name(&cursor, procname, sizeof procname, &offset)) {
-            fprintf(f, " %p [%s]\n", pc, procname);
+            fprintf(f, " %p [%s+%#x]\n", pc, procname, (int)offset);
         } else {
             fprintf(f, " %p ?\n", pc);
         }

@@ -326,6 +326,7 @@
       (bf :field ,(ppc-byte 6 8) :type 'crf)
       (bfa :field ,(ppc-byte 11 13) :type 'crf)
       (bi :field ,(ppc-byte 11 15) :type 'bi-field)
+      (bc :field ,(ppc-byte 21 25) :type 'bi-field)
       (bo :field ,(ppc-byte 6 10) :type 'bo-field)
       (bt :field ,(ppc-byte 6 10) :type 'bi-field)
       (d :field ,(ppc-byte 16 31) :sign-extend t)
@@ -552,6 +553,9 @@
 
 (def-ppc-iformat (a '(:name :tab frt "," fra "," frb "," frc))
   frt fra frb frc (xo xo26-30) rc)
+
+(def-ppc-iformat (a-i '(:name :tab rt "," ra "," rb "," bc))
+  rt ra rb bc (xo xo26-30) rc)
 
 (def-ppc-iformat (a-tab '(:name :tab frt "," fra "," frb))
   frt fra frb (xo xo26-30) rc)
@@ -1211,6 +1215,7 @@
     (:emitter (emit-d-form-inst segment 3 (valid-tcond-encoding tcond) (reg-tn-encoding ra) si)))
 
   (define-instruction isel (segment rt ra rb bc)
+    (:printer a-i ((op 31) (xo 15) (rc 0)))
     (:emitter
      (emit-a-form-inst segment 31
                        (reg-tn-encoding rt)
@@ -1641,19 +1646,19 @@
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 0 5) 339 0)))
 
   (define-instruction mfxer (segment rt)
-    (:printer xfx ((op 31) (xo 339) (spr 1)) '(:name :tab rt))
+    (:printer xfx ((op 31) (xo 339) (spr (ash 1 5))) '(:name :tab rt))
     (:delay 1)
     (:dependencies (reads :xer) (writes rt))
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 1 5) 339 0)))
 
   (define-instruction mflr (segment rt)
-    (:printer xfx ((op 31) (xo 339) (spr 8)) '(:name :tab rt))
+    (:printer xfx ((op 31) (xo 339) (spr (ash 8 5))) '(:name :tab rt))
     (:delay 1)
     (:dependencies (reads :lr) (writes rt))
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 8 5) 339 0)))
 
   (define-instruction mfctr (segment rt)
-    (:printer xfx ((op 31) (xo 339) (spr 9)) '(:name :tab rt))
+    (:printer xfx ((op 31) (xo 339) (spr (ash 9 5))) '(:name :tab rt))
     (:delay 1)
     (:dependencies (reads rt) (reads :ctr))
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 9 5) 339 0)))
@@ -2288,13 +2293,6 @@
   (:delay 0)
   (:emitter
    (emit-header-data segment simple-fun-widetag)))
-
-(define-instruction lra-header-word (segment)
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-header-data segment return-pc-widetag)))
-
 
 ;;;; Instructions for converting between code objects, functions, and lras.
 (defun emit-compute-inst (segment vop dst src label temp calc)
@@ -2332,22 +2330,7 @@
                              (label-position label posn delta-if-after)
                              (component-header-length))))))
 
-;; code = lra - other-pointer-tag - header - label-offset + code-tn-lowtag
-(define-instruction compute-code-from-lra (segment dst src label temp)
-  (:declare (type tn dst src temp) (type label label))
-  (:attributes variable-length)
-  (:dependencies (reads src) (writes dst) (writes temp))
-  (:delay 0)
-  (:vop-var vop)
-  (:emitter
-   (emit-compute-inst segment vop dst src label temp
-                      #'(lambda (label posn delta-if-after)
-                          (- code-tn-lowtag
-                             (label-position label posn delta-if-after)
-                             (component-header-length)
-                             other-pointer-lowtag)))))
-
-;; lra = code - code-tn-lowtag + header + label-offset + other-pointer-tag
+;; lra = code - code-tn-lowtag + header + label-offset
 (define-instruction compute-lra-from-code (segment dst src label temp)
   (:declare (type tn dst src temp) (type label label))
   (:attributes variable-length)
@@ -2359,7 +2342,6 @@
                       #'(lambda (label posn delta-if-after)
                           (+ (label-position label posn delta-if-after)
                              (component-header-length)
-                             other-pointer-lowtag
                              (- code-tn-lowtag))))))
 
 ;;; Unboxed constant support
@@ -2481,3 +2463,12 @@
                (inst* segment 'lis temp (ldb (byte 15 16) offset))
                (inst* segment 'ori temp (ldb (byte 16 16) offset))
                temp))))))
+
+(defun emit-long-nop (segment amount)
+  (declare (type sb-assem:segment segment)
+           (type index amount))
+  (if (= amount 4)
+      (assemble (segment)
+        (inst nop))
+      (loop repeat amount
+            do (emit-byte segment 0))))

@@ -169,26 +169,18 @@ Low Address
 	/* load gc_card_mark */
 	ld reg_CARDTABLE, (-LIST_POINTER_LOWTAG-16)(reg_NULL)
 
-	/* Calculate LRA */
-	lis reg_LRA,lra@h
-	ori reg_LRA,reg_LRA,lra@l
-	addi reg_LRA,reg_LRA,OTHER_POINTER_LOWTAG
-
 	/* Function is an indirect closure */
 	addi reg_NL0,reg_LEXENV,SIMPLE_FUN_SELF_OFFSET
 	ld reg_CODE,0(reg_NL0)
 	addi reg_LIP,reg_CODE,0
-	mtctr reg_LIP
 	sldi reg_NARGS, reg_NL2, N_FIXNUM_TAG_BITS
-	bctr
 
-	.align 3
-lra:
-	.quad RETURN_PC_WIDETAG
+        .p2align 3,,0x60000000
+	mtctr reg_LIP
+	bctrl
 
-	/* Blow off any extra values. */
-	mr reg_CSP,reg_OCFP
-	nop
+        /* Clear the stack allocated for multiple values, if any */
+        iseleq reg_CSP, reg_CSP, reg_OCFP
 
 	/* Return the one value. */
 	mr REG(3),reg_A0
@@ -238,6 +230,7 @@ lra:
 	mr reg_CFP,reg_CSP
 	la reg_CSP,32(reg_CSP)
 	std reg_OCFP,0(reg_CFP)
+	std reg_LIP,8(reg_CFP)
 	std reg_CODE,16(reg_CFP)
 	/* The pseudo-atomic mechanism wants to use reg_NL3, but that
 	may be an outgoing C argument.  Copy reg_NL3 to something that's
@@ -246,13 +239,6 @@ lra:
 
 	/* Turn on pseudo-atomic */
 	BEGIN_PSEUDO_ATOMIC
-
-	/* Convert the return address to an offset and save it on the stack. */
-	sub reg_NFP,reg_LIP,reg_CODE
-#if 	N_FIXNUM_TAG_BITS == 3
-	sldi reg_NFP,reg_NFP,1
-#endif
-	std reg_NFP,8(reg_CFP)
 
 	/* Store Lisp state */
 	std reg_BSP,THREAD_BINDING_STACK_POINTER_OFFSET(reg_THREAD)
@@ -331,11 +317,7 @@ lra:
 
 	/* Get the return address back. */
 	ld reg_LIP,8(reg_CFP)
-#if 	N_FIXNUM_TAG_BITS == 3
-	srdi reg_LIP,reg_LIP,1
-#endif
 	ld reg_CODE,16(reg_CFP)
-	add reg_LIP,reg_CODE,reg_LIP
 
         /* Debugger expects LR to be valid when we come out of PA */
 	mtlr reg_LIP
@@ -372,7 +354,7 @@ lra:
 	mr reg_OCFP, reg_CSP
 
 	/* Reserve a save location for the one value we have. */
-	addi reg_CSP, reg_CSP, 4
+	addi reg_CSP, reg_CSP, N_WORD_BYTES
 
 	/* Record the number of values we have as a FIXNUM. */
 	li reg_NARGS, 1<<N_FIXNUM_TAG_BITS

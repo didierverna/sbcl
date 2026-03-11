@@ -1831,7 +1831,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "COMPLEX-VECTOR"
            "LIST-TO-VECTOR" "LIST-TO-WEAK-VECTOR" "VECTOR-TO-LIST"
            "LOGICAL-HOST" "LOGICAL-HOST-DESIGNATOR"
-           "LRA" "LRA-CODE-HEADER" "LRA-P"
            "MAKE-ALIEN-TYPE-TYPE"
            "MAKE-ARRAY-HEADER" "MAKE-ARRAY-TYPE" "MAKE-CONS-TYPE"
            "%MAKE-DOUBLE-FLOAT"
@@ -2471,7 +2470,9 @@ be submitted as a CDR")
            "TOKEN-DELIMITERP" "WHITESPACE[2]P" "WITH-READ-BUFFER"
            ;; other
 
+           "+INTERNAL-FEATURES+"
            "INSTALL-HASH-TABLE-LOCK"
+           "DEFINE-THREAD-LOCAL"
            "%MAKUNBOUND")
   (:use "CL" "SB-ALIEN" "SB-BIGNUM" "SB-EXT"
         "SB-GRAY" "SB-INT" "SB-KERNEL" "SB-SYS"))
@@ -2632,7 +2633,7 @@ be submitted as a CDR")
            "BRANCH"
            "CALL" "CALL-LOCAL" "CALL-NAMED" "CALL-VARIABLE"
            "CALL-OUT" "CALL-OUT-NAMED"
-           "CALLEE-NFP-TN" "CALLEE-RETURN-PC-TN"
+           "CALLEE-NFP-TN"
            "CATCH-BLOCK" "UNWIND-BLOCK"
            "CLOSURE-INIT" "CLOSURE-REF" "CLOSURE-INIT-FROM-FP"
            "CODE-IMMOBILE-P"
@@ -3012,7 +3013,7 @@ structure representations")
            "INSTANCE-DATA-START"
            "INSTANCE-WIDETAG" "INSTANCE-POINTER-LOWTAG"
            "INSTANCE-SLOTS-OFFSET" "INSTANCE-USAGE"
-           "INTERIOR-REG-SC-NUMBER" "INTERNAL-ERROR-ARGS"
+           "INTERNAL-ERROR-ARGS"
            "IS-LISP-POINTER"
            "LARGE-OBJECT-SIZE"
            "LDB-MONITOR"
@@ -3066,7 +3067,6 @@ structure representations")
            "RATIO-DENOMINATOR-SLOT" "RATIO-NUMERATOR-SLOT"
            "RATIO-SIZE" "RATIO-WIDETAG"
            "*READ-ONLY-SPACE-FREE-POINTER*"
-           "RETURN-PC-WIDETAG"
            "RETURN-PC-RETURN-POINT-OFFSET" "RETURN-PC-SAVE-OFFSET"
            "SAETP-CTYPE" "SAETP-INITIAL-ELEMENT-DEFAULT"
            "SAETP-N-BITS" "SAETP-TYPECODE" "SAETP-PRIMITIVE-TYPE-NAME"

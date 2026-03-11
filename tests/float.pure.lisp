@@ -133,8 +133,7 @@
     (mapc #'test '(sin cos tan))))
 
 (with-test (:name (:addition-overflow :bug-372)
-            :fails-on (or (and :arm64 (not :darwin))
-                          :arm
+            :fails-on (or :no-float-traps
                           (and :ppc :openbsd)
                           (and :ppc :darwin)
                           (and :x86 :netbsd)))
@@ -155,8 +154,7 @@
 ;; the preceeding "pure" test files aren't as free of side effects as
 ;; we might like.
 (with-test (:name (:addition-overflow :bug-372 :take-2)
-            :fails-on (or (and :arm64 (not :darwin))
-                          :arm
+            :fails-on (or :no-float-traps
                           (and :ppc :openbsd)
                           (and :ppc :darwin)
                           (and :x86 :netbsd)))
@@ -191,7 +189,7 @@
                              (+ x0 x1 x6 x7) (+ x2 x3 x4 x5)))))))
 
 (with-test (:name (:nan :comparison)
-            :fails-on (or :sparc :loongarch64))
+            :fails-on (or :no-float-traps :sparc :loongarch64))
   (sb-int:with-float-traps-masked (:invalid)
     (macrolet ((test (form)
                  (let ((nform (subst '(/ 0.0 0.0) 'nan form)))
@@ -683,7 +681,12 @@
                        t)
          :test #'car-type-equal)))))
 
-(with-test (:name :comparison-transform-overflow)
+;; figure out whether the floating-point environment is as expected
+(handler-case (eval '(* 1.0e30 1.0e30))
+  (division-by-zero () (push :skip-=-xform-test *features*)) ; strange result
+  (floating-point-overflow ())) ; normal result
+
+(with-test (:name :comparison-transform-overflow :skipped-on :skip-=-xform-test)
   (checked-compile-and-assert
    ()
    `(lambda (a)

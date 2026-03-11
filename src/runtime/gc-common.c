@@ -485,28 +485,6 @@ static sword_t size_code_blob(lispobj *where)
     return code_total_nwords((struct code*)where);
 }
 
-#ifdef RETURN_PC_WIDETAG
-static sword_t
-scav_return_pc_header(lispobj *where, lispobj object)
-{
-    lose("attempted to scavenge a return PC header where=%p object=%"OBJ_FMTX,
-         where, object);
-    return 0; /* bogus return value to satisfy static type checking */
-}
-
-static lispobj
-trans_return_pc_header(lispobj object)
-{
-    struct simple_fun *return_pc = (struct simple_fun *) native_pointer(object);
-    uword_t offset = HeaderValue(return_pc->header) * N_WORD_BYTES;
-
-    /* Transport the whole code object */
-    struct code *code = trans_code((struct code *) ((uword_t) return_pc - offset));
-
-    return make_lispobj((char*)code + offset, OTHER_POINTER_LOWTAG);
-}
-#endif /* RETURN_PC_WIDETAG */
-
 #if FUN_SELF_FIXNUM_TAGGED
 /* Closures hold a pointer to the raw simple-fun entry address instead of the
  * tagged object so that a native call instruction can be used more easily */
@@ -1327,6 +1305,18 @@ void smash_weak_pointers(void)
         }
     }
     weak_vectors = 0;
+
+    if (!tlsindex_to_symbol_map) return;
+    /* If the weak map is present, Lisp could potentially recycle unused TLS indices
+     * by finding an empty element below the free TLS index.  Not currently done */
+    int i;
+    int n_elements = dynamic_values_bytes / bytes_per_tls_symbol;
+    for (i=0; i<n_elements; ++i) {
+        lispobj symbol = tlsindex_to_symbol_map[i];
+        if (symbol != NO_TLS_VALUE_MARKER) {
+            TEST_WEAK_CELL(tlsindex_to_symbol_map[i], symbol, NO_TLS_VALUE_MARKER);
+        }
+    }
 }
 
 
@@ -1981,6 +1971,10 @@ size_lose(lispobj *where)
          (void*)where, widetag_of(where));
     return 1; /* bogus return value to satisfy static type checking */
 }
+
+bool sized_widetag_p(unsigned char widetag) {
+    return sizetab[widetag] != size_lose;
+}
 
 /*
  * initialization
@@ -2141,20 +2135,6 @@ properly_tagged_p_internal(lispobj pointer, lispobj *start_addr)
                                  (struct simple_fun*)potential_fun) >= 0)
                 return 1;
         }
-#ifdef RETURN_PC_WIDETAG
-        /* LRA objects are similar to simple-funs in that they are
-         * embedded objects. We can't actually do as precise a test
-         * as for simple-funs, since we don't know where the LRAs are.
-         * Nonetheless, the check of header validity should produce
-         * very few false positives */
-        if (lowtag_of(pointer) == OTHER_POINTER_LOWTAG) {
-            lispobj *potential_lra = native_pointer(pointer);
-            if ((widetag_of(potential_lra) == RETURN_PC_WIDETAG) &&
-                ((potential_lra - HeaderValue(potential_lra[0])) == start_addr)) {
-                return 1; /* It's as good as we can verify. */
-            }
-        }
-#endif
     }
     return 0; // no good
 }
@@ -2459,266 +2439,6 @@ scavenge_control_stack(struct thread *th)
         }
     }
 }
-
-#ifdef reg_CODE
-/* Scavenging Interrupt Contexts */
-
-static int boxed_registers[] = BOXED_REGISTERS;
-
-// Nothing uses os_context_pc_addr any more, except ACCESS_INTERIOR_POINTER_pc.
-// I didn't see a good way to remove that one.
-extern os_context_register_t* os_context_pc_addr(os_context_t*);
-
-/* The GC has a notion of an "interior pointer" register, an unboxed
- * register that typically contains a pointer to inside an object
- * referenced by another pointer.  The most obvious of these is the
- * program counter, although many compiler backends define a "Lisp
- * Interior Pointer" register known to the runtime as reg_LIP, and
- * various CPU architectures have other registers that also partake of
- * the interior-pointer nature.  As the code for pairing an interior
- * pointer value up with its "base" register, and fixing it up after
- * scavenging is complete is horribly repetitive, a few macros paper
- * over the monotony.  --AB, 2010-Jul-14 */
-
-/* These macros are only ever used over a lexical environment which
- * defines a pointer to an os_context_t called context, thus we don't
- * bother to pass that context in as a parameter. */
-
-/* Define how to access a given interior pointer. */
-#define ACCESS_INTERIOR_POINTER_pc \
-    *os_context_pc_addr(context)
-#define ACCESS_INTERIOR_POINTER_lip \
-    *os_context_register_addr(context, reg_LIP)
-#define ACCESS_INTERIOR_POINTER_lr \
-    *os_context_lr_addr(context)
-#define ACCESS_INTERIOR_POINTER_npc \
-    *os_context_npc_addr(context)
-#define ACCESS_INTERIOR_POINTER_ctr \
-    *os_context_ctr_addr(context)
-
-#define INTERIOR_POINTER_VARS(name) \
-    uword_t name##_offset;    \
-    int name##_register_pair
-
-#define PAIR_INTERIOR_POINTER(name)                             \
-    pair_interior_pointer(context,                              \
-                          ACCESS_INTERIOR_POINTER_##name,       \
-                          &name##_offset,                       \
-                          &name##_register_pair,                \
-                          #name)
-
-/* One complexity here is that if a paired register is not found for
- * an interior pointer, then that pointer does not get updated.
- * Originally, there was some commentary about using an index of -1
- * when calling os_context_register_addr() on SPARC referring to the
- * program counter, but the real reason is to allow an interior
- * pointer register to point to the runtime, read-only space, or
- * static space without problems. */
-#define FIXUP_INTERIOR_POINTER(name)                                    \
-    do {                                                                \
-        /* fprintf(stderr, "Fixing interior ptr "#name"\n"); */         \
-        if (name##_register_pair >= 0) {                                \
-            ACCESS_INTERIOR_POINTER_##name =                            \
-                (*os_context_register_addr(context,                     \
-                                           name##_register_pair)        \
-                 & ~LOWTAG_MASK)                                        \
-                + name##_offset;                                        \
-        }                                                               \
-    } while (0)
-
-#ifdef LISP_FEATURE_PPC64
-// reg_CODE holds a native pointer on PPC64
-#define plausible_base_register(val,reg) (is_lisp_pointer(val)||reg==reg_CODE)
-#else
-#define plausible_base_register(val,reg) (is_lisp_pointer(val))
-#endif
-
-static void
-pair_interior_pointer(os_context_t *context, uword_t pointer,
-                      uword_t *saved_offset, int *register_pair,
-                      char *regname)
-{
-    unsigned int i;
-
-    /*
-     * I (RLT) think this is trying to find the boxed register that is
-     * closest to the LIP address, without going past it.  Usually, it's
-     * reg_CODE or reg_LRA.  But sometimes, nothing can be found.
-     */
-    /* 0x7FFFFFFF on 32-bit platforms;
-       0x7FFFFFFFFFFFFFFF on 64-bit platforms */
-    *saved_offset = (((uword_t)1) << (N_WORD_BITS - 1)) - 1;
-    *register_pair = -1;
-    for (i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
-        uword_t offset;
-
-        int regindex = boxed_registers[i];
-        uword_t regval = *os_context_register_addr(context, regindex);
-
-        /* An interior pointer is never relative to a non-pointer
-         * register (an oversight in the original implementation).
-         * The simplest argument for why this is true is to consider
-         * the fixnum that happens by coincide to be the word-index in
-         * memory of the header for some object plus two.  This is
-         * happenstance would cause the register containing the fixnum
-         * to be selected as the register_pair if the interior pointer
-         * is to anywhere after the first two words of the object.
-         * The fixnum won't be changed during GC, but the object might
-         * move, thus destroying the interior pointer.  --AB,
-         * 2010-Jul-14 */
-
-        // Note this can produce weird pairings that seem not to adversely
-        // affect anything. For instance if reg_LIP points lower than anything
-        // in a boxed register except for let's say register A0 which is
-        // currently NIL, then we'll say that LIP was based on A0 + huge offset.
-        // NIL doesn't move, so we won't alter LIP. But what if A0 had something
-        // random in it and lower than LIP? It will pair with LIP and then
-        // adjust LIP to point to garbage.  This is "harmless" because
-        // we never actually treat LIP as an exact root.
-
-        if (plausible_base_register(regval, regindex) &&
-            ((regval & ~LOWTAG_MASK) <= pointer)) {
-            offset = pointer - (regval & ~LOWTAG_MASK);
-            if (offset < *saved_offset) {
-                *saved_offset = offset;
-                *register_pair = regindex;
-            }
-        }
-    }
-#if 0
-    if (*register_pair >= 0)
-        fprintf(stderr, "pair_interior_ptr: %-3s=%p based on %s=%p + %x\n",
-                regname, (void*)pointer,
-                lisp_register_names[*register_pair],
-                (void*)(((uword_t)*os_context_register_addr(context, *register_pair))
-                        & ~LOWTAG_MASK),
-                (int)*saved_offset);
-    else
-        fprintf(stderr, "pair_interior_ptr: %-3s=%#lx not based\n", regname, pointer);
-#endif
-}
-
-static void
-scavenge_interrupt_context(os_context_t * context)
-{
-    unsigned int i;
-
-    /* FIXME: The various #ifdef noise here is precisely that: noise.
-     * Is it possible to fold it into the macrology so that we have
-     * one set of #ifdefs and then INTERIOR_POINTER_VARS /et alia/
-     * compile out for the registers that don't exist on a given
-     * platform? */
-
-#ifdef reg_LRA
-    INTERIOR_POINTER_VARS(pc);
-#endif
-
-#ifdef reg_LIP
-    INTERIOR_POINTER_VARS(lip);
-#endif
-#ifdef ARCH_HAS_LINK_REGISTER
-    INTERIOR_POINTER_VARS(lr);
-#endif
-#ifdef ARCH_HAS_NPC_REGISTER
-    INTERIOR_POINTER_VARS(npc);
-#endif
-#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
-    INTERIOR_POINTER_VARS(ctr);
-#endif
-
-    /* Platforms without LRA pin on-stack code. Furthermore, the PC
-       must not be paired, as even on platforms with $CODE, there is
-       nothing valid to pair PC with immediately upon function
-       return. */
-#ifdef reg_LRA
-    PAIR_INTERIOR_POINTER(pc);
-#endif
-
-#ifdef reg_LIP
-    PAIR_INTERIOR_POINTER(lip);
-#endif
-
-#ifdef ARCH_HAS_LINK_REGISTER
-    {
-      PAIR_INTERIOR_POINTER(lr);
-    }
-#endif
-
-#ifdef ARCH_HAS_NPC_REGISTER
-    PAIR_INTERIOR_POINTER(npc);
-#endif
-#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
-    PAIR_INTERIOR_POINTER(ctr);
-#endif
-
-    /* Scavenge all boxed registers in the context. */
-    for (i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
-        os_context_register_t *boxed_reg;
-        lispobj datum;
-
-        /* We can't "just" cast os_context_register_addr() to a
-         * pointer to lispobj and pass it to scavenge, because some
-         * systems can have a wider register width than we use for
-         * lisp objects, and on big-endian systems casting a pointer
-         * to a narrower target type doesn't work properly.
-         * Therefore, we copy the value out to a temporary lispobj
-         * variable, scavenge there, and copy the value back in.
-         *
-         * FIXME: lispobj is unsigned, os_context_register_t may be
-         * signed or unsigned, are we truncating or sign-extending
-         * values here that shouldn't be modified?  Possibly affects
-         * any architecture that has 32-bit and 64-bit variants where
-         * we run in 32-bit mode on 64-bit hardware when the OS is set
-         * up for 64-bit from the start.  Or an environment with
-         * 32-bit addresses and 64-bit registers. */
-
-        boxed_reg = os_context_register_addr(context, boxed_registers[i]);
-        datum = *boxed_reg;
-        if (compacting_p()) scavenge(&datum, 1); else gc_mark_obj(datum);
-        *boxed_reg = datum;
-    }
-
-    /* Now that the scavenging is done, repair the various interior
-     * pointers. */
-#ifdef reg_LRA
-    FIXUP_INTERIOR_POINTER(pc);
-#endif
-
-#ifdef reg_LIP
-    FIXUP_INTERIOR_POINTER(lip);
-#endif
-#ifdef ARCH_HAS_LINK_REGISTER
-
-    {
-        FIXUP_INTERIOR_POINTER(lr);
-    }
-#endif
-#ifdef ARCH_HAS_NPC_REGISTER
-    FIXUP_INTERIOR_POINTER(npc);
-#endif
-#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
-    FIXUP_INTERIOR_POINTER(ctr);
-#endif
-}
-
-void
-scavenge_interrupt_contexts(struct thread *th)
-{
-    int i, index;
-    os_context_t *context;
-
-    index = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
-
-#if defined(DEBUG_PRINT_CONTEXT_INDEX)
-    printf("Number of active contexts: %d\n", index);
-#endif
-
-    for (i = 0; i < index; i++) {
-        context = nth_interrupt_context(i, th);
-        scavenge_interrupt_context(context);
-    }
-}
-#endif /* !REG_CODE */
 #endif /* x86oid targets */
 
 /* Finalizer table based on Split-Ordered Lists */
@@ -3572,3 +3292,14 @@ void thread_accrue_stw_time(void* opaque_thread,
     }
 }
 #endif
+
+/* Not safe in general, but if your thread names are all
+ * simple-base-string and won't move, this is slightly ok */
+char* vm_thread_name(struct thread* th)
+{
+    if (!th) return "non-lisp";
+    struct thread_instance *lispthread = (void*)INSTANCE(th->lisp_thread);
+    lispobj name = lispthread->_name;
+    if (simple_base_string_p(name)) return vector_sap(name);
+    return "?";
+}

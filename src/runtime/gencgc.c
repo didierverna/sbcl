@@ -1451,7 +1451,7 @@ static lispobj conservative_root_p(lispobj addr, page_index_t addr_page_index)
         && plausible_tag_p(addr)) return AMBIGUOUS_POINTER;
     return 0;
 }
-#elif defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64
+#elif defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_PPC
 /* Consider interior pointers to code as roots.
  * But most other pointers are *unambiguous* conservative roots.
  * This is not "less conservative" per se, than the non-precise code,
@@ -2007,7 +2007,7 @@ static void impart_mark_stickiness(lispobj word)
 }
 #endif
 
-#if !GENCGC_IS_PRECISE || defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64
+#if !GENCGC_IS_PRECISE || defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_PPC
 /* Take a possible pointer to a Lisp object and mark its page in the
  * page_table so that it will not be relocated during a GC.
  *
@@ -2063,16 +2063,18 @@ static void NO_SANITIZE_MEMORY preserve_pointer(os_context_register_t word, void
     lispobj* found = search_dynamic_space((void*)word);
     if (found) gc_mark_obj(compute_lispobj(found));
 }
-#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+
 static void sticky_preserve_pointer(os_context_register_t register_word, void* arg)
 {
     // registers can be wider than words. This could accept uword_t as the arg type
     // but I like it to be directly callable with os_context_register.
     uword_t word = register_word;
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
     if (is_lisp_pointer(word)) impart_mark_stickiness(word);
+#endif
     preserve_pointer(word, arg);
 }
-#endif
+
 #endif
 
 /* Pin an unambiguous descriptor object which may or may not be a pointer.
@@ -2104,9 +2106,6 @@ static void pin_exact_root(lispobj obj)
     lispobj *object_start = native_pointer(obj);
     switch (widetag_of(object_start)) {
     case SIMPLE_FUN_WIDETAG:
-#ifdef RETURN_PC_WIDETAG
-    case RETURN_PC_WIDETAG:
-#endif
         obj = make_lispobj(fun_code_header((struct simple_fun*)object_start),
                            OTHER_POINTER_LOWTAG);
     }
@@ -3047,30 +3046,7 @@ static void __attribute__((unused)) maybe_pin_code(lispobj addr) {
 }
 #endif
 
-#if defined reg_RA
-static void conservative_pin_code_from_return_addresses(struct thread* th) {
-    lispobj *object_ptr;
-    // We need more information to reliably backtrace through a call
-    // chain, as these backends may generate leaf functions where the
-    // return address does not get spilled. Therefore, fall back to
-    // scanning the entire stack for potential interior code pointers.
-    for (object_ptr = th->control_stack_start;
-         object_ptr < access_control_stack_pointer(th);
-         object_ptr++)
-        maybe_pin_code(*object_ptr);
-    int i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
-    // Scan program counters and return registers in interrupted
-    // frames: They may contain interior code pointers that weren't
-    // spilled onto the stack, as is the case for leaf functions.
-    for (i = i - 1; i >= 0; --i) {
-        os_context_t* context = nth_interrupt_context(i, th);
-        maybe_pin_code(os_context_pc(context));
-        maybe_pin_code((lispobj)*os_context_register_addr(context, reg_RA));
-    }
-}
-#endif
-
-#if defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64
+#if defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_PPC
 static void semiconservative_pin_stack(struct thread* th,
                                        generation_index_t gen) {
     /* Stack can only pin code, since it contains return addresses.
@@ -3094,49 +3070,73 @@ static void semiconservative_pin_stack(struct thread* th,
             if (gen == 0) sticky_preserve_pointer(word, (void*)1);
             else preserve_pointer(word, (void*)1);
         }
-#elif defined LISP_FEATURE_PPC64
+#elif defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_PPC
         static int boxed_registers[] = BOXED_REGISTERS;
         for (j = (int)(sizeof boxed_registers / sizeof boxed_registers[0])-1; j >= 0; --j) {
             lispobj word = *os_context_register_addr(context, boxed_registers[j]);
             if (gen == 0) sticky_preserve_pointer(word, (void*)1);
             else preserve_pointer(word, (void*)1);
         }
-        // What kinds of data do we put in the Count register?
-        // maybe it's count (raw word), maybe it's a PC. I just don't know.
-        preserve_pointer(*os_context_lr_addr(context), (void*)1);
-        preserve_pointer(*os_context_ctr_addr(context), (void*)1);
+        /* LIP has the target address before moving to CTR */
+        maybe_pin_code((lispobj)*os_context_register_addr(context, reg_LIP));
+        /* CTR has the target address before a call */
+        maybe_pin_code((lispobj)*os_context_ctr_addr(context));
+        maybe_pin_code((lispobj)*os_context_lr_addr(context));
+
 #endif
-        preserve_pointer(os_context_pc(context), (void*)1);
+        maybe_pin_code((lispobj)os_context_pc(context));
     }
 }
 #endif
 
-#if GENCGC_IS_PRECISE && !defined(reg_CODE)
+#if defined GENCGC_IS_PRECISE && defined reg_LINK_RETURN
 
 static int boxed_registers[] = BOXED_REGISTERS;
 
-/* Pin all (condemned) code objects pointed to by the chain of in-flight calls
- * based on scanning from the innermost frame pointer. This relies on an exact backtrace,
- * which some of our architectures have trouble obtaining. But it's theoretically
- * more efficient to do it this way versus looking at all stack words to see
- * whether each points to a code object. */
 static void pin_call_chain_and_boxed_registers(struct thread* th) {
+#ifdef reg_RA
+    lispobj *object_ptr;
+    // We need more information to reliably backtrace through a call
+    // chain, as these backends may generate leaf functions where the
+    // return address does not get spilled. Therefore, fall back to
+    // scanning the entire stack for potential interior code pointers.
+    for (object_ptr = th->control_stack_start;
+         object_ptr < access_control_stack_pointer(th);
+         object_ptr++)
+        maybe_pin_code(*object_ptr);
+#else
+    /* Pin all (condemned) code objects pointed to by the chain of in-flight calls
+     * based on scanning from the innermost frame pointer. This relies on an exact backtrace,
+     * which some of our architectures have trouble obtaining. But it's theoretically
+     * more efficient to do it this way versus looking at all stack words to see
+     * whether each points to a code object. */
     lispobj *cfp = access_control_frame_pointer(th);
 
     if (cfp) {
-      while (1) {
-        lispobj* ocfp = (lispobj *) cfp[0];
-        lispobj lr = cfp[1];
-        if (ocfp == 0)
-            break;
-        maybe_pin_code(lr);
-        cfp = ocfp;
-      }
+        while (1) {
+            lispobj* ocfp = (lispobj *) cfp[0];
+            lispobj lr = cfp[1];
+            if (ocfp == 0)
+                break;
+            maybe_pin_code(lr);
+            cfp = ocfp;
+        }
     }
+#endif
+
     int i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
     for (i = i - 1; i >= 0; --i) {
         os_context_t* context = nth_interrupt_context(i, th);
-        maybe_pin_code((lispobj)*os_context_register_addr(context, reg_LR));
+        maybe_pin_code((lispobj)*os_context_register_addr(context, reg_LINK_RETURN));
+#ifdef reg_RA
+        maybe_pin_code(os_context_pc(context));
+#endif
+
+#if defined LISP_FEATURE_LOONGARCH64 || defined LISP_FEATURE_SPARC
+        /* It can't call a tagged pointer directly (neither can ARM64,
+         * but it has a different call sequence for tail calls) */
+        maybe_pin_code((lispobj)*os_context_register_addr(context, reg_LIP));
+#endif
 
         for (unsigned i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
             lispobj word = *os_context_register_addr(context, boxed_registers[i]);
@@ -3148,7 +3148,6 @@ static void pin_call_chain_and_boxed_registers(struct thread* th) {
             }
         }
     }
-
 }
 #endif
 
@@ -3429,12 +3428,10 @@ garbage_collect_generation(generation_index_t generation, int raise,
              * sticky card mark on any page (in any generation)
              * referenced from the stack. */
             conservative_stack_scan(th, generation, cur_thread_approx_stackptr);
-#elif defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64
+#elif defined LISP_FEATURE_MIPS || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_PPC
             // Pin code if needed
             semiconservative_pin_stack(th, generation);
-#elif defined REG_RA
-            conservative_pin_code_from_return_addresses(th);
-#elif !defined(reg_CODE)
+#elif defined reg_LINK_RETURN
             pin_call_chain_and_boxed_registers(th);
 #endif
         }
@@ -3513,9 +3510,6 @@ garbage_collect_generation(generation_index_t generation, int raise,
     if (conservative_stack) {
         struct thread *th;
         for_each_thread(th) {
-#if !defined(LISP_FEATURE_MIPS) && defined(reg_CODE) // interrupt contexts already pinned everything they see
-            scavenge_interrupt_contexts(th);
-#endif
             scavenge_control_stack(th);
         }
 

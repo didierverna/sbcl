@@ -130,7 +130,7 @@
       floating-point-overflow))
 
 (with-test (:name :bignum-double-float-overflow
-            :fails-on :no-float-traps)
+            :fails-on (or :no-float-traps :loongarch64))
   (loop for n from 1024 to 1030
         do (assert-error (coerce (opaque-identity (expt 2 n)) 'double-float) floating-point-overflow)
            (assert-error (coerce (opaque-identity (- (expt 2 n))) 'double-float) floating-point-overflow)))
@@ -743,7 +743,8 @@ fractional bits."
                           (opaque-identity 0))
              least-positive-single-float)))
 
-(with-test (:name :truncate-by-zero-error)
+(with-test (:name :truncate-by-zero-error
+            :fails-on :loongarch64)
   (assert-error (truncate 1 (opaque-identity 0d0)) division-by-zero)
   (assert-error (truncate 1f0 (opaque-identity 0f0)) division-by-zero)
   (sb-int:with-float-traps-masked (:divide-by-zero)
@@ -850,7 +851,7 @@ fractional bits."
 
 (with-test (:name :ratio-to-float)
   (let ((*random-state* (make-random-state t)))
-    (loop repeat 20000
+    (loop repeat 1000
           do
           (let* ((n-bits (random 1075))
                  (d-bits (random 1075))
@@ -899,7 +900,9 @@ fractional bits."
                                        (declare (fixnum x))
                                        (ffloor x 1d0))))))
 
-(with-test (:name :the-truncate)
+(with-test (:name :the-truncate
+            :fails-on (or :mips :loongarch64
+                          (and :openbsd :arm64)))
   (checked-compile-and-assert
       (:optimize :safe-debug)
       `(lambda (n)

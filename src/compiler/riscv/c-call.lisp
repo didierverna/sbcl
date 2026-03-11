@@ -76,18 +76,35 @@
 
 (defun register-args-offset (index) (+ foreign-register-arg-start index))
 
-(macrolet ((def (name index-accessor)
-             `(defun ,name (state prim-type reg-sc stack-sc)
-                (let ((index (,index-accessor state)))
-                  (cond ((< index n-foreign-register-args)
-                         (setf (,index-accessor state) (1+ index))
-                         (make-wired-tn* prim-type reg-sc (register-args-offset index)))
-                        (t
-                         (let ((frame-size (arg-state-stack-frame-size state)))
-                           (setf (arg-state-stack-frame-size state) (1+ frame-size))
-                           (make-wired-tn* prim-type stack-sc frame-size))))))))
-  (def int-arg-tn arg-state-int-arg-index)
-  (def float-arg-tn arg-state-float-arg-index))
+(defun int-arg-tn (state prim-type reg-sc stack-sc)
+  (let ((index (arg-state-int-arg-index state)))
+    (cond
+     ((< index n-foreign-register-args)
+      (setf (arg-state-int-arg-index state) (1+ index))
+      (make-wired-tn* prim-type reg-sc (register-args-offset index)))
+     (t
+      (let ((frame-size (arg-state-stack-frame-size state)))
+        (setf (arg-state-stack-frame-size state) (1+ frame-size))
+        (make-wired-tn* prim-type stack-sc frame-size))))))
+
+(defun float-arg-tn (state prim-type reg-sc stack-sc)
+  (let ((index (arg-state-float-arg-index state)))
+    (cond ((< index n-foreign-register-args)
+           (setf (arg-state-float-arg-index state) (1+ index))
+           (make-wired-tn* prim-type reg-sc (register-args-offset index)))
+          ((let ((index (arg-state-int-arg-index state)))
+             (cond
+               ((< index n-foreign-register-args)
+                (setf (arg-state-int-arg-index state) (1+ index))
+                (list
+                 (make-wired-tn* 'signed-byte-64 signed-reg-sc-number (register-args-offset index))
+                 (if (eq prim-type 'single-float)
+                     'single-float-bits
+                     'double-float-bits)))
+               (t
+                (let ((frame-size (arg-state-stack-frame-size state)))
+                  (setf (arg-state-stack-frame-size state) (1+ frame-size))
+                  (make-wired-tn* prim-type stack-sc frame-size)))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
@@ -135,6 +152,12 @@
     (mapcar (lambda (type)
               (invoke-alien-type-method :result-tn type state))
             values)))
+
+(define-alien-type-method (integer :naturalize-gen) (type alien)
+  (if (and (not (alien-integer-type-signed type))
+           (= (alien-type-bits type) 32))
+      `(logand ,alien ,(1- (ash 1 (alien-type-bits type))))
+      alien))
 
 (defun make-call-out-tns (type)
   (let ((arg-state (make-arg-state)))

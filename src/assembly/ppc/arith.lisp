@@ -37,7 +37,7 @@
    (:temp flag non-descriptor-reg nl3-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp ocfp any-reg ocfp-offset))
 
   ; Clear the damned "sticky overflow" bit in :cr0 and :xer
@@ -53,6 +53,7 @@
   (inst add temp2 temp2 temp)
   (with-fixed-allocation (res flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew temp2 res bignum-digits-offset other-pointer-lowtag))
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
   DO-STATIC-FUN (tail-call-fallback-fun two-arg-+)
@@ -76,7 +77,7 @@
    (:temp temp non-descriptor-reg nl0-offset)
    (:temp temp2 non-descriptor-reg nl1-offset)
    (:temp flag non-descriptor-reg nl3-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -96,6 +97,7 @@
   (inst sub temp2 temp temp2)
   (with-fixed-allocation (res flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew temp2 res bignum-digits-offset other-pointer-lowtag))
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
   DO-STATIC-FUN (tail-call-fallback-fun two-arg--)
@@ -124,7 +126,7 @@
    (:temp lo non-descriptor-reg nl1-offset)
    (:temp hi non-descriptor-reg nl2-offset)
    (:temp pa-flag non-descriptor-reg nl3-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -168,6 +170,7 @@
       (storew lo res bignum-digits-offset other-pointer-lowtag)))
   ;; Out of here
   GO-HOME
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
   DO-STATIC-FUN (tail-call-fallback-fun two-arg-*)
@@ -285,7 +288,7 @@
 
            (:res res descriptor-reg a0-offset)
 
-           (:temp lip interior-reg lip-offset)
+           (:temp lip any-reg lip-offset)
            (:temp nargs any-reg nargs-offset)
            (:temp ocfp any-reg ocfp-offset))
 
@@ -320,7 +323,7 @@
                           (:res res descriptor-reg a0-offset)
 
                           (:temp lra descriptor-reg lra-offset)
-                          (:temp lip interior-reg lip-offset)
+                          (:temp lip any-reg lip-offset)
                           (:temp nargs any-reg nargs-offset)
                           (:temp ocfp any-reg ocfp-offset))
   (inst cmpw :cr1 x y)
@@ -332,6 +335,7 @@
 
   RETURN-NIL
   (inst mr res null-tn)
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
   DO-STATIC-FN (tail-call-fallback-fun eql)
@@ -351,7 +355,7 @@
 
    (:res res descriptor-reg a0-offset)
 
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -363,6 +367,7 @@
   (inst beq :cr1 RETURN-T)
 
   (inst mr res null-tn)
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
   DO-STATIC-FN (tail-call-fallback-fun two-arg-=)
@@ -382,7 +387,7 @@
                           (:res res descriptor-reg a0-offset)
 
                           (:temp lra descriptor-reg lra-offset)
-                          (:temp lip interior-reg lip-offset)
+                          (:temp lip any-reg lip-offset)
 
                           (:temp nargs any-reg nargs-offset)
                           (:temp ocfp any-reg ocfp-offset))
@@ -393,6 +398,7 @@
   (inst beq :cr1 RETURN-NIL)
 
   (load-symbol res t)
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
   DO-STATIC-FN (tail-call-fallback-fun two-arg-/=)

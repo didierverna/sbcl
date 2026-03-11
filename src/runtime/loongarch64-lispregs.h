@@ -18,7 +18,6 @@
 #define NREGS (32)
 
 #define reg_ZERO      REG(0)
-#define REG_RA        REG(1)
 #define reg_RA        REG(1)
 #define reg_TP        REG(2)
 #define reg_NSP       REG(3)
@@ -54,3 +53,5 @@
 #define reg_L2        REG(30)
 #endif
 #define reg_CFUNC     REG(31)
+
+#define reg_LINK_RETURN  reg_RA

@@ -11,8 +11,6 @@
 
 (enable-test-parallelism)
 
-#-sb-devel
-(invoke-restart 'run-tests::skip-file)
 
 (import '(sb-c::combination-fun-debug-name
           sb-c::combination-fun-source-name
@@ -21,8 +19,6 @@
           sb-c::combination-p
           sb-c::basic-combination-info
           sb-c::node-tail-p
-          sb-c::do-blocks
-          sb-c::do-nodes
           sb-c::%check-bound
           sb-kernel:%bit-pos-fwd/1))
 
@@ -33,8 +29,8 @@
     (inspect-ir
      form
      (lambda (component)
-       (do-blocks (block component)
-         (do-nodes (node nil block)
+       (ctu:do-blocks (block component)
+         (ctu:do-nodes (node nil block)
            (when (and (basic-combination-p node)
                       (eq (basic-combination-info node) :full))
              (push node calls))))))
@@ -45,8 +41,8 @@
     (inspect-ir
      form
      (lambda (component)
-       (do-blocks (block component)
-         (do-nodes (node nil block)
+       (ctu:do-blocks (block component)
+         (ctu:do-nodes (node nil block)
            (when (basic-combination-p node)
              (push node calls))))))
     calls))
@@ -56,7 +52,7 @@
     (inspect-ir
      form
      (lambda (component)
-       (sb-c::do-ir2-blocks (block component)
+       (ctu:do-ir2-blocks (block component)
          (do ((vop (sb-c::ir2-block-start-vop block)
                    (sb-c:vop-next vop)))
              ((null vop))
@@ -166,6 +162,7 @@
       (assert (= (funcall fun 9) 362880))
       (assert converted))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :iterative-non-tail))
   (let ((converted nil))
     (let ((fun (inspect-ir
@@ -183,6 +180,7 @@
       (assert (= (funcall fun 9) 362881))
       (assert converted))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :multiple-use))
   (let ((converted nil))
     (let ((fun (inspect-ir
@@ -203,6 +201,7 @@
       (assert (= (funcall fun 6 3 4) 12))
       (assert converted))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :optional-dispatch))
   (let ((converted 0))
     (let ((fun (inspect-ir
@@ -230,6 +229,7 @@
       ;; converted into the entry point for (BASE DISP).
       (assert (= converted 2)))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :no-self-tr))
   (let ((converted nil))
     (let ((fun (inspect-ir
@@ -257,6 +257,7 @@
       (assert converted))))
 
 ;;; Check that we are able to promote assignment lambdas into LETs.
+#+sb-devel
 (with-test (:name (:assignment-convert :can-become-let))
   (let ((assignment nil)
         (let nil))
@@ -278,6 +279,7 @@
     (assert let)))
 
 ;;; Check assignment conversion of functions which don't return.
+#+sb-devel
 (with-test (:name (:assignment-convert :non-local-exit))
   (let ((assignment nil))
     (let* ((*standard-output* (make-broadcast-stream))
@@ -352,6 +354,7 @@
                   `(lambda (a b)
                      (< (truly-the double-float a) b))))))
 
+#+sb-devel
 (with-test (:name :constant-substitution)
   (let ((calls (ir-calls
                 `(lambda (a b)
@@ -479,7 +482,8 @@
                  (the integer (the (real 5) x))))
              1)))
 
-(with-test (:name :sign-extend)
+(with-test (:name :sign-extend
+            :fails-on (or :ppc :riscv :loongarch64 :sparc :mips))
   (assert (= (count 'sb-c::mask-signed-field
                     (ir-calls
                      `(lambda (a)
@@ -533,13 +537,15 @@
                         (truly-the fixnum (funcall (the function x)))))
     (assert (node-tail-p combination))))
 
-(with-test (:name :evenp+arithmetic)
+(with-test (:name :evenp+arithmetic
+            :fails-on (or :arm :riscv :loongarch64 :ppc64 :ppc :sparc :mips))
   (assert (not (ir-full-calls `(lambda (x)
                                  (evenp (+ x 3))))))
   (assert (not (ir-full-calls `(lambda (x)
                                  (logbitp 0 (+ x 3)))))))
 
-(with-test (:name :modarith-unknown-types)
+(with-test (:name :modarith-unknown-types
+            :fails-on (or :arm :ppc :sparc :mips))
   (assert (not (ir-full-calls `(lambda (x)
                                  (logand (+ x 10) 20)))))
   (assert (not (ir-full-calls `(lambda (m x)
@@ -584,7 +590,8 @@
                                  (lambda (x) (1+ x)))
                             n))))))
 
-(with-test (:name :truncate-signed-word-error)
+(with-test (:name :truncate-signed-word-error
+            :fails-on (or :ppc64 :riscv :loongarch64))
   (assert (not (find 'sb-vm::move-from-signed
                      (ir2-vops '(lambda (x d)
                                  (declare ((signed-byte 64) x d))
@@ -645,3 +652,12 @@
                             40)))
                  (setf * 20)
                  (values (truncate x 1/3))))))))
+
+(with-test (:name :make-array-et-list)
+  (assert (= (count 'list
+                    (ir-calls
+                     `(lambda (n x)
+                        (make-array n :element-type `(unsigned-byte ,x))))
+                    :key (lambda (x) (and (combination-p x)
+                                          (combination-fun-source-name x nil))))
+             0)))

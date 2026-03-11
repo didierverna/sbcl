@@ -499,7 +499,16 @@ int sbcl_mprotect(void* addr, size_t length, int prot) {
 #endif
 
 #ifdef LISP_FEATURE_ELF
+#if defined LISP_FEATURE_SUNOS && defined LISP_FEATURE_X86_64
+#define ELF_TARGET_AMD64
+#endif
 #include <elf.h>
+#ifdef LISP_FEATURE_OPENBSD
+#include <machine/reloc.h>
+#endif
+#ifdef LISP_FEATURE_HAIKU
+#include <arch_elf.h>
+#endif
 #ifndef SHF_GNU_RETAIN
 #define SHF_GNU_RETAIN (1 << 21)
 #endif
@@ -588,12 +597,17 @@ int apply_pie_relocs(long code_space_translation,
 # define ELF_MACHINE EM_AARCH64
 # define CORE_ALIGNMENT 65536
 # define OUR_RELOC_KIND R_AARCH64_ABS64
-#else
+#elif defined LISP_FEATURE_PPC64 && defined LISP_FEATURE_LITTLE_ENDIAN /* assume abi v2 */
+# define ELF_MACHINE EM_PPC64
+# define CORE_ALIGNMENT 65536
+# define OUR_RELOC_KIND R_PPC64_ADDR64
+#elif defined LISP_FEATURE_X86_64
 # define ELF_MACHINE EM_X86_64
 # define CORE_ALIGNMENT 32768
 # define OUR_RELOC_KIND R_X86_64_64
 #endif
 
+#ifdef ELF_MACHINE
 static uint32_t add_string(char *buffer, uint32_t *current_size, const char *str) {
     uint32_t offset = *current_size;
     strcpy(buffer + offset, str);
@@ -656,7 +670,7 @@ void generate_elfcore_obj(const char *filename,
     size_t table_data_size = symbol_count * N_WORD_BYTES;
     uint64_t *table_data = calloc((unsigned int)symbol_count, 8); // Initialized to 0
     Elf64_Rela *relocs = calloc((unsigned int)symbol_count, sizeof(Elf64_Rela));
-    for (int i = 0; i < symbol_count; i++) {
+    for (long i = 0; i < symbol_count; i++) {
         relocs[i].r_offset = i * 8;
         // Syms start at index 2
         relocs[i].r_info   = ELF64_R_INFO(i + 2, OUR_RELOC_KIND);
@@ -729,5 +743,8 @@ void generate_elfcore_obj(const char *filename,
     fclose(f);
     // Should really free() some stuff but it's not a leak since this program is now exiting
 }
+#else
+void generate_elfcore_obj() { lose("Unsupported: generate_elfcore_obj"); }
+#endif /* ELF_MACHINE */
 
-#endif
+#endif /* LISP_FEATURE_ELF */

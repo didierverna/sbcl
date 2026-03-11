@@ -9,8 +9,8 @@
  * files for more information.
  */
 
-#ifdef LANGUAGE_ASSEMBLY
-#define REG(num) $ ## num
+#ifdef __ASSEMBLER__
+#define REG(num) x##num
 #else
 #define REG(num) num
 #endif
@@ -53,3 +53,5 @@
 #define reg_NULL     REG(29)
 #define reg_CODE     REG(30)
 #define reg_NARGS    REG(31)
+
+#define reg_LINK_RETURN reg_RA

@@ -12,13 +12,12 @@
 (in-package "SB-VM")
 
 
-(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant arg-count-sc (make-sc+offset any-reg-sc-number nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ra-offset))
+(defun make-return-pc-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ra-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
@@ -26,7 +25,7 @@
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
 (defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ocfp-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset descriptor-reg-sc-number ocfp-offset))
@@ -37,19 +36,21 @@
 (defun make-old-fp-save-location (env)
   (specify-save-tn
    (environment-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
-   (make-wired-tn *fixnum-primitive-type* control-stack-arg-scn ocfp-save-offset)))
+   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number ocfp-save-offset)))
 
 (defun make-return-pc-save-location (env)
   (let ((ptype *fixnum-primitive-type*))
     (specify-save-tn
-     (environment-debug-live-tn (make-normal-tn ptype) env)
-     (make-wired-tn ptype control-stack-arg-scn ra-save-offset))))
+     (environment-debug-live-tn
+      (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ra-offset)
+      env)
+     (make-wired-tn ptype control-stack-sc-number ra-save-offset))))
 
 ;;; Make a TN for the standard argument count passing location.  We
 ;;; only need to make the standard location, since a count is never
 ;;; passed when we are using non-standard conventions.
 (defun make-arg-count-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number nargs-offset))
 
 
 ;;;; Frame hackery:
@@ -103,7 +104,7 @@
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:temporary (:scs (descriptor-reg) :offset l0-offset) fn)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
@@ -348,7 +349,7 @@
   (:temporary (:scs (descriptor-reg) :from (:eval 0)) move-temp)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
   (:temporary (:sc any-reg :offset ocfp-offset :from (:eval 0)) ocfp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:ignore arg-locs args ocfp)
   (:info arg-locs callee target nvals)
   (:generator 5
@@ -384,7 +385,7 @@
   (:ignore args save)
   (:vop-var vop)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:generator 20
     (let ((label (gen-label))
           (cur-nfp (current-nfp-tn vop)))
@@ -578,7 +579,7 @@
 
        ,@(unless (eq return :tail)
            '((:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-             (:temporary (:scs (interior-reg)) lip)))
+             (:temporary (:sc any-reg :offset lip-offset) lip)))
 
        (:generator ,(+ (if named 5 0)
                        (if variable 19 1)

@@ -71,7 +71,6 @@ and submit it as a patch."
   (cond ((not (sb-vm:is-lisp-pointer (get-lisp-obj-address object))) 0)
         ((eq object nil) (ash sb-vm::sizeof-nil-in-words sb-vm:word-shift))
         ((simple-fun-p object) (code-object-size (fun-code-header object)))
-        #-(or x86 x86-64 arm64 riscv loongarch64) ((lra-p object) 1)
         (t
          (with-alien ((sizer (function unsigned unsigned) :extern "primitive_object_size"))
            (with-pinned-objects (object)
@@ -89,7 +88,7 @@ run in any thread.")
 
 ;;;; internal GC
 
-(define-alien-routine collect-garbage int (last-gen int))
+(define-alien-routine collect-garbage void (last-gen int))
 
 (define-alien-routine gc-stop-the-world void)
 (define-alien-routine gc-start-the-world void)

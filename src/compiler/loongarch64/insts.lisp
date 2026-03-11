@@ -437,8 +437,8 @@
 
 (define-instruction-format (bstr 32 :default-printer bstr-printer)
   (opcode :field (byte 10 22))
-  (lsbw :field (byte 6 16))
   (msbw :field (byte 6 10))
+  (lsbw :field (byte 6 16))
   (rj :field (byte 5 5) :type 'reg)
   (rd :field (byte 5 0) :type 'reg))
 
@@ -450,7 +450,7 @@
   (byte 5 0))
 
 (defun emit-bstr-inst (segment opcode rd rj msbw lsbw)
-     (%emit-bstr-inst segment opcode lsbw msbw (reg-tn-encoding rj) (reg-tn-encoding rd)))
+     (%emit-bstr-inst segment opcode msbw lsbw (reg-tn-encoding rj) (reg-tn-encoding rd)))
 
 (define-instruction bstrins.d (segment rd rj msbw lsbw)
   (:printer bstr ((opcode #b0000000010))
@@ -799,63 +799,76 @@
             (integer-length (integer-length value))
             (2^k (ash 1 integer-length))
             (2^.k-1 (ash 1 (1- integer-length)))
-            (complement (mod (lognot value) (ash 1 64))))
+            (complement (mod (lognot value) (ash 1 64)))
+            ;; Intermediate unboxed values might be inappropriate for a
+            ;; boxed target register
+            (tmp t7-tn))
        (cond ((zerop (logand (1+ value) value))
               ;; Common special case: the immediate is of the form #xfff...
-              (inst addi.d reg zero-tn -1)
-              (unless (= integer-length 64)
-                (inst srli.d reg reg (- 64 integer-length))))
+              (inst addi.d tmp zero-tn -1)
+              (aver (/= integer-length 64))
+              (inst srli.d reg tmp (- 64 integer-length)))
              ((let ((delta (- 2^k value)))
                 (and (typep (ash delta (- 64 integer-length)) 'short-immediate)
                      (logand delta (1- delta))))
               ;; Common special case: the immediate is of the form
               ;; #x00fff...00, where there are a small number of
               ;; zeroes at the end.
-              (inst addi.d reg zero-tn (ash (- value 2^k) (- 64 integer-length)))
-              (inst srli.d reg reg (- 64 integer-length)))
+              (inst addi.d tmp zero-tn (ash (- value 2^k) (- 64 integer-length)))
+              (inst srli.d reg tmp (- 64 integer-length)))
              ((zerop (logand complement (1+ complement)))
               ;; #xfffffff...00000
-              (inst addi.d reg zero-tn -1)
-              (inst slli.d reg reg (integer-length complement)))
+              (inst addi.d tmp zero-tn -1)
+              (inst slli.d reg tmp (integer-length complement)))
              ((typep (- value 2^k) 'short-immediate)
               ;; Common special case: loading an immediate which is a
               ;; signed 12 bit constant away from a power of 2.
               (cond ((= integer-length 64)
                      (inst addi.d reg zero-tn (- value 2^k)))
                     (t
-                     (inst addi.d reg zero-tn 1)
-                     (inst slli.d reg reg integer-length)
-                     (inst addi.d reg reg (- value 2^k)))))
+                     (inst addi.d tmp zero-tn 1)
+                     (inst slli.d tmp tmp integer-length)
+                     (inst addi.d reg tmp (- value 2^k)))))
              ((typep (- value 2^.k-1) 'short-immediate)
               ;; Common special case: loading an immediate which is a
               ;; signed 12 bit constant away from a power of 2.
-              (inst addi.d reg zero-tn 1)
-              (inst slli.d reg reg (1- integer-length))
-              (unless (= value 2^.k-1)
-                (inst addi.d reg reg (- value 2^.k-1))))
+              (inst addi.d tmp zero-tn 1)
+              (cond ((= value 2^.k-1)
+                     (inst slli.d reg tmp (1- integer-length)))
+                    (t
+                     (inst slli.d tmp tmp (1- integer-length))
+                     (inst addi.d reg tmp (- value 2^.k-1)))))
              (t
               ;; The "generic" case.
               ;; Load in the first 31 non zero most significant bits.
-              (let ((chunk (ldb (byte 12 (- integer-length 31)) value)))
-                (inst lu12i.w reg (ldb (byte 20 (- integer-length 19)) value))
-                (cond ((= (1- (ash 1 12)) chunk)
-                       (inst addi.d reg reg (1- (ash 1 11)))
-                       (inst addi.d reg reg (1- (ash 1 11)))
-                       (inst addi.d reg reg 1))
-                      ((logbitp 11 chunk)
-                       (inst addi.d reg reg (1- (ash 1 11)))
-                       (inst addi.d reg reg (- chunk (1- (ash 1 11)))))
-                      (t
-                       (inst addi.d reg reg chunk))))
-              ;; Now we need to load in the rest of the bits properly, in
-              ;; chunks of 11 to avoid sign extension.
-              (do ((i (- integer-length 31) (- i 11)))
-                  ((< i 11)
-                   (inst slli.d reg reg i)
-                   (unless (zerop (ldb (byte i 0) value))
-                     (inst addi.d reg reg (ldb (byte i 0) value))))
-                (inst slli.d reg reg 11)
-                (inst addi.d reg reg (ldb (byte 11 (- i 11)) value)))))))
+              (let ((chunk (ldb (byte 12 (- integer-length 31)) value))
+                    instructions)
+                (flet ((add-inst (m d o1 o2)
+                         ;; Gotta know which instruction is the last one
+                         ;; to put REG as its destination
+                         (push (list m d o1 o2) instructions)))
+                  (inst lu12i.w tmp (ldb (byte 20 (- integer-length 19)) value))
+                  (cond ((= (1- (ash 1 12)) chunk)
+                         (inst addi.d tmp tmp (1- (ash 1 11)))
+                         (inst addi.d tmp tmp (1- (ash 1 11)))
+                         (add-inst 'addi.d tmp tmp 1))
+                        ((logbitp 11 chunk)
+                         (inst addi.d tmp tmp (1- (ash 1 11)))
+                         (add-inst 'addi.d tmp tmp (- chunk (1- (ash 1 11)))))
+                        (t
+                         (add-inst 'addi.d tmp tmp chunk)))
+                  ;; Now we need to load in the rest of the bits properly, in
+                  ;; chunks of 11 to avoid sign extension.
+                  (do ((i (- integer-length 31) (- i 11)))
+                      ((< i 11)
+                       (add-inst 'slli.d tmp tmp i)
+                       (unless (zerop (ldb (byte i 0) value))
+                         (add-inst 'addi.d tmp tmp (ldb (byte i 0) value))))
+                    (add-inst 'slli.d tmp tmp 11)
+                    (add-inst 'addi.d tmp tmp (ldb (byte 11 (- i 11)) value)))
+                  (setf (second (car instructions)) reg)
+                  (loop for (m d o1 o2) in (reverse instructions)
+                        do (inst* m d o1 o2))))))))
     (fixup
      (inst lu12i.w reg value)
      (inst addi.d reg reg value))))

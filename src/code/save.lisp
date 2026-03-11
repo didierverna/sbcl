@@ -70,6 +70,7 @@
 (defconstant-eqx sb-kernel::+save-lisp-clobbered-globals+
     '#(sb-impl::*exit-lock*
        sb-vm::*allocator-mutex*
+       sb-vm::*tls-symbol-map*
        sb-thread::*make-thread-lock*
        sb-thread::*initial-thread*
        ;; Saving *JOINABLE-THREADS* could cause catastophic failure on restart.
@@ -324,20 +325,34 @@ sufficiently motivated to do lengthy fixes."
   #+sb-thread
   (let (error)
     (with-system-mutex (sb-thread::*make-thread-lock*)
-      (finalizer-thread-stop)
       (sb-thread::%dispose-thread-structs)
-      (let ((threads (sb-thread:list-all-threads))
-            (starting
-             (setq sb-thread::*starting-threads* ; ordinarily pruned in MAKE-THREAD
-                   (delete 0 sb-thread::*starting-threads*)))
-            (joinable sb-thread::*joinable-threads*))
-        (when (or (cdr threads) starting joinable)
-          (let* ((interactive (sb-thread::interactive-threads))
-                 (other (union (set-difference threads interactive)
-                               (union starting joinable))))
-            (setf error (make-condition 'save-with-multiple-threads-error
-                                        :interactive-threads interactive
-                                        :other-threads other))))))
+      ;; As a consequence of a discovery I made about a nasty but common pattern
+      ;; among users of doing (mapc #'some-harmful-operation (list-all-threads),
+      ;; the finalizer thread is not present in (LIST-ALL-THREADS). Better to pretend
+      ;; it doesn't exist than let users affect it (backtrace/terminate/whatever).
+      ;; The same is not true of the signal-waiter thread on #+(and unix sb-safepoint).
+      ;; Maybe it should be. But that being the case, we need to remove the sigwait
+      ;; thread from list-all-threads.
+      (let* ((userthreads
+              (remove-if #'sb-thread::thread-ephemeral-p
+                         (sb-thread:list-all-threads)))
+             (starting-userthreads
+              ;; Cleanup of *starting-threads* is normally done in START-THREAD guarded
+              ;; by *make-thread-lock*. We need to avoid racing with that.
+              (mapcan (lambda (x)
+                        (if (and (sb-thread::thread-p x)
+                                 (not (sb-thread::thread-ephemeral-p x)))
+                            (list x)))
+                      sb-thread::*starting-threads*))
+             (joinable sb-thread::*joinable-threads*))
+        (if (or (cdr userthreads) starting-userthreads joinable)
+            (let* ((interactive (sb-thread::interactive-threads))
+                   (other (union (set-difference userthreads interactive)
+                                 (union starting-userthreads joinable))))
+              (setf error (make-condition 'save-with-multiple-threads-error
+                                          :interactive-threads interactive
+                                          :other-threads other)))
+            (finalizer-thread-stop))))
     (when error (error error))
     #+allocator-metrics (setq sb-thread::*allocator-metrics* nil)
     (setq sb-thread::*sprof-data* nil))

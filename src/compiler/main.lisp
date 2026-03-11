@@ -616,41 +616,33 @@ necessary, since type inference may take arbitrarily long to converge.")
       (describe-ir2-component component *compiler-trace-output*)))
 
   (maybe-mumble "Code ")
-  (multiple-value-bind (segment text-length fun-table
-                        elsewhere-label fixup-notes alloc-points)
-      (let ((*compiler-trace-output*
-              (and (memq :vop *compile-trace-targets*)
-                   *compiler-trace-output*)))
-        (generate-code component))
-    (declare (ignorable text-length fun-table))
+  (let ((assembly
+         (let ((*compiler-trace-output*
+                (and (memq :vop *compile-trace-targets*)
+                     *compiler-trace-output*)))
+           (generate-code component))))
 
-    (let ((bytes (sb-assem:segment-contents-as-vector segment))
-          (object *compile-object*)
-          (*elsewhere-label* elsewhere-label)) ; KLUDGE
-      #-sb-xc-host
-      (when (and *compiler-trace-output*
-                 (memq :disassemble *compile-trace-targets*))
+    #-sb-xc-host
+    (when (and *compiler-trace-output* (memq :disassemble *compile-trace-targets*))
         (let ((ranges
                 (maplist (lambda (list)
                            (cons (+ (car list)
                                     (ash sb-vm:simple-fun-insts-offset
                                          sb-vm:word-shift))
-                                 (or (cadr list) text-length)))
-                         fun-table)))
+                                 (or (cadr list) (asm-text-length assembly))))
+                         (asm-fun-table assembly))))
           (format *compiler-trace-output*
                   "~|~%Disassembly of code for ~S~2%" component)
           (sb-disassem:disassemble-assem-segment
-           bytes ranges *compiler-trace-output*)))
+           (asm-bytes assembly) ranges *compiler-trace-output*)))
 
+    (let ((object *compile-object*))
       (funcall (etypecase object
                  (fasl-output (maybe-mumble "FASL") #'fasl-dump-component)
                  #-sb-xc-host         ; no compiling to core
                  (core-object (maybe-mumble "Core") #'make-core-component)
-                 (null (lambda (&rest dummies)
-                         (declare (ignore dummies)))))
-               component segment (length bytes)
-               fixup-notes alloc-points
-               object)))
+                 (null #'constantly-nil))
+               component assembly object)))
 
   ;; We're done, so don't bother keeping anything around.
   (setf (component-info component) nil)
@@ -786,14 +778,15 @@ necessary, since type inference may take arbitrarily long to converge.")
     (let ((ir1-namespace *ir1-namespace*))
       (clrhash (free-funs ir1-namespace))
       (clrhash (free-vars ir1-namespace))
-      ;; FIXME: It would make sense to clear these tables on arm64 as
-      ;; well, but it relies on the constant for NIL to stay around in
-      ;; order to assign a wired TN to it. A possible fix is to give
-      ;; arm64 NULL-SC like on other platforms.
-      #-arm64
-      (progn
-        (clrhash (eql-constants ir1-namespace))
-        (clrhash (similar-constants ir1-namespace))))))
+      (let* ((eql-constants (eql-constants ir1-namespace))
+             #+arm64
+             (nil-constant (gethash nil eql-constants)))
+        (clrhash eql-constants)
+        ;; Something might break if it's removed, unclear what.
+        #+arm64
+        (when nil-constant
+          (setf (gethash nil eql-constants) nil-constant)))
+      (clrhash (similar-constants ir1-namespace)))))
 
 ;;;; trace output
 

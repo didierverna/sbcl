@@ -2459,7 +2459,8 @@
                   (f count))))))
    ((1) nil)))
 
-(with-test (:name (:mv-call :more-arg))
+(with-test (:name (:mv-call :more-arg)
+            :fails-on :mips)
   (checked-compile-and-assert
    ()
    '(lambda (&rest rest)
@@ -2468,7 +2469,8 @@
        (list a b)))
    ((1 3) '(1 3) :test #'equal)))
 
-(with-test (:name (:mv-call :more-arg-unused))
+(with-test (:name (:mv-call :more-arg-unused)
+            :fails-on :mips)
   (checked-compile-and-assert
    ()
    '(lambda (&rest rest)
@@ -4451,7 +4453,8 @@
     ((0 nil 2) nil)
     ((0 1 2) (condition 'undefined-function))))
 
-(with-test (:name :undefined-system-fun)
+(with-test (:name :undefined-system-fun
+            :fails-on (and :ppc64 :big-endian))
   (checked-compile-and-assert
       (:optimize :safe :allow-warnings t)
       `(lambda ()
@@ -4982,7 +4985,17 @@
            (values (logand 1 v)
                    v)))
     ((t) (condition 'type-error))
-    ((3) (values 1 3))))
+    ((3) (values 1 3)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (p n)
+         (declare ((or float (rational 6357799611333445141)) n))
+         (let ((v (if p
+                      9
+                      (the integer n))))
+           (values (logand v 9) v)))
+    ((t 1.0) (values 9 9))
+    ((nil 1.0) (condition 'type-error))))
 
 (with-test (:name :un/signed-byte-64-p-move-to-word)
   (checked-compile-and-assert

@@ -15,12 +15,6 @@
   (declare (dynamic-extent predicate-fun key-fun-or-nil))
   (sort-vector vector start end predicate-fun key-fun-or-nil))
 
-;;; This is MAYBE-INLINE because it's not too hard to have an
-;;; application where sorting is a major bottleneck, and inlining it
-;;; allows the compiler to make enough optimizations that it might be
-;;; worth the (large) cost in space.
-(declaim (maybe-inline stable-sort))
-
 ;;; SORT is inlined from a transform for known sequence types.
 (defun sort (sequence predicate &rest args &key key)
   "Destructively sort SEQUENCE. PREDICATE should return non-NIL if
@@ -413,7 +407,7 @@
          (when (type= type (specifier-type 'list))
            (return-from merge (merge-lists s1 s2 pred-fun key-fun)))
          (when (eq type *empty-type*)
-           (bad-sequence-type-error nil))
+           (bad-sequence-type-error type))
          (when (type= type (specifier-type 'null))
            (if (and (null s1) (null s2))
                (return-from merge 'nil)

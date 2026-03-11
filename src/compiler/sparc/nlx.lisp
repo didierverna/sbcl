@@ -15,7 +15,7 @@
 ;;; Make a TN for the argument count passing location for a non-local
 ;;; entry.
 (defun make-nlx-entry-arg-start-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ocfp-offset))
 
 ;;; save and restore dynamic environment.
 ;;;
@@ -151,8 +151,7 @@
 
 
 (define-vop (nlx-entry)
-  (:args (sp) ; Note: we can't list an sc-restriction, 'cause any load vops
-              ; would be inserted before the LRA.
+  (:args (sp)
          (start)
          (count))
   (:results (values :more t))
@@ -161,7 +160,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
     (cond ((zerop nvals))
           ((= nvals 1)
@@ -215,7 +214,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
     (move res value)
     (load-stack-tn csp-tn sp)))
@@ -232,7 +231,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
     (let ((loop (gen-label))
           (done (gen-label)))
@@ -269,6 +268,6 @@
   (:ignore block start count)
   (:vop-var vop)
   (:generator 0
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)))
 

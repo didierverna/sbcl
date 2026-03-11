@@ -39,7 +39,7 @@
 ;;; but unfortunately UPGRADED-ARRAY-ELEMENT-TYPE is a CL: symbol
 ;;; and %UPGRADED-ARRAY-ELEMENT-TYPE is already a thing as well.
 ;;; Perhaps ARRAY-IMPLIED-ELEMENT-TYPE would be less misleading?
-(defun array-type-upgraded-element-type (type)
+(defun array-type-upgraded-element-type (type &key ignore-null)
   (typecase type
     ;; Note that this IF mightn't be satisfied even if the runtime
     ;; value is known to be a subtype of some specialized ARRAY, because
@@ -84,25 +84,27 @@
            (element-type nil)
            (element-supertypes nil))
        (dolist (union-type union-types)
-         (multiple-value-bind (cur-type cur-supertype)
-             (array-type-upgraded-element-type union-type)
-           (cond
-             ((eq element-type *wild-type*)
-              nil)
-             ((eq element-type nil)
-              (setf element-type cur-type))
-             ((or (eq cur-type *wild-type*)
-                  ;; If each of the two following tests fail, it is not
-                  ;; possible to determine the element-type of the array
-                  ;; because more than one kind of element-type was provided
-                  ;; like in '(or (array foo) (array bar)) although a
-                  ;; supertype (or foo bar) may be provided as the second
-                  ;; returned value returned. See also the KLUDGE below.
-                  (not (csubtypep cur-type element-type))
-                  (not (csubtypep element-type cur-type)))
-              (setf element-type *wild-type*)))
-           (push (or cur-supertype (type-*-to-t cur-type))
-                 element-supertypes)))
+         (unless (and ignore-null
+                      (eq union-type (specifier-type 'null)))
+          (multiple-value-bind (cur-type cur-supertype)
+              (array-type-upgraded-element-type union-type)
+            (cond
+              ((eq element-type *wild-type*)
+               nil)
+              ((eq element-type nil)
+               (setf element-type cur-type))
+              ((or (eq cur-type *wild-type*)
+                   ;; If each of the two following tests fail, it is not
+                   ;; possible to determine the element-type of the array
+                   ;; because more than one kind of element-type was provided
+                   ;; like in '(or (array foo) (array bar)) although a
+                   ;; supertype (or foo bar) may be provided as the second
+                   ;; returned value returned. See also the KLUDGE below.
+                   (not (csubtypep cur-type element-type))
+                   (not (csubtypep element-type cur-type)))
+               (setf element-type *wild-type*)))
+            (push (or cur-supertype (type-*-to-t cur-type))
+                  element-supertypes))))
        (values element-type
                (when (eq *wild-type* element-type)
                  (apply #'type-union element-supertypes)))))
@@ -2802,7 +2804,7 @@
              (truly-the (unsigned-byte 8)
                         (aref sb-vm::%%simple-array-n-bits-shifts%% widetag)))))
 
-(deftransform sb-vm::%vector-widetag-and-n-bits-shift ((type))
+(deftransform sb-vm::%vector-widetag-and-n-bits-shift ((type) * * :node node)
   (cond
     ((csubtypep (lvar-type type) (specifier-type '(member character base-char)))
      `(cond #+sb-unicode
@@ -2816,6 +2818,15 @@
                      #.(sb-vm:saetp-n-bits-shift
                         (find sb-vm:simple-base-string-widetag
                               sb-vm:*specialized-array-element-type-properties* :key #'sb-vm:saetp-typecode))))))
+    ((progn
+       (delay-ir1-transform node :ir1-phases)
+       ;; Handle (make-array n :element-type `(signed-byte ,x))
+       ;; without consing
+       (let ((args (splice-fun-args type 'list nil nil)))
+         (when args
+           (let ((vars (make-gensym-list (length args))))
+            `(lambda ,vars
+               (sb-vm::%vector-widetag-and-n-bits-shift-list ,@vars)))))))
     (t
      (give-up-ir1-transform "ELEMENT-TYPE is not constant."))))
 

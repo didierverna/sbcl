@@ -78,20 +78,35 @@
 (defun float-register-args-offset (index)
   (+ foreign-float-register-arg-start index))
 
-(macrolet ((def (name index-accessor offset-fn)
-             `(defun ,name (state prim-type reg-sc stack-sc)
-                (let ((index (,index-accessor state)))
-                  (cond ((< index n-foreign-register-args)
-                         (setf (,index-accessor state) (1+ index))
-                         (make-wired-tn*
-                          prim-type reg-sc (,offset-fn index)))
-                        (t
-                         (let ((frame-size (arg-state-stack-frame-size state)))
-                           (setf (arg-state-stack-frame-size state) (1+ frame-size))
-                           (make-wired-tn* prim-type stack-sc frame-size))))))))
-  (def int-arg-tn arg-state-int-arg-index int-register-args-offset)
-  (def float-arg-tn arg-state-float-arg-index float-register-args-offset))
+(defun int-arg-tn (state prim-type reg-sc stack-sc)
+  (let ((index (arg-state-int-arg-index state)))
+    (cond
+     ((< index n-foreign-register-args)
+      (setf (arg-state-int-arg-index state) (1+ index))
+      (make-wired-tn* prim-type reg-sc (int-register-args-offset index)))
+     (t
+      (let ((frame-size (arg-state-stack-frame-size state)))
+        (setf (arg-state-stack-frame-size state) (1+ frame-size))
+        (make-wired-tn* prim-type stack-sc frame-size))))))
 
+(defun float-arg-tn (state prim-type reg-sc stack-sc)
+  (let ((index (arg-state-float-arg-index state)))
+    (cond ((< index n-foreign-register-args)
+           (setf (arg-state-float-arg-index state) (1+ index))
+           (make-wired-tn* prim-type reg-sc (float-register-args-offset index)))
+          ((let ((index (arg-state-int-arg-index state)))
+             (cond
+               ((< index n-foreign-register-args)
+                (setf (arg-state-int-arg-index state) (1+ index))
+                (list
+                 (make-wired-tn* 'signed-byte-64 signed-reg-sc-number (int-register-args-offset index))
+                 (if (eq prim-type 'single-float)
+                     'single-float-bits
+                     'double-float-bits)))
+               (t
+                (let ((frame-size (arg-state-stack-frame-size state)))
+                  (setf (arg-state-stack-frame-size state) (1+ frame-size))
+                  (make-wired-tn* prim-type stack-sc frame-size)))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
@@ -139,6 +154,12 @@
     (mapcar (lambda (type)
               (invoke-alien-type-method :result-tn type state))
             values)))
+
+(define-alien-type-method (integer :naturalize-gen) (type alien)
+  (if (and (not (alien-integer-type-signed type))
+           (= (alien-type-bits type) 32))
+      `(logand ,alien ,(1- (ash 1 (alien-type-bits type))))
+      alien))
 
 (defun make-call-out-tns (type)
   (let ((arg-state (make-arg-state)))
@@ -316,3 +337,28 @@
                                  unsigned-long))
          sap (length buffer))
         vector))))
+
+(defknown sign-extend ((signed-byte 64) t) fixnum
+    (foldable flushable movable))
+
+(defoptimizer (sign-extend derive-type) ((x size))
+  (when (sb-c:constant-lvar-p size)
+    (specifier-type `(signed-byte ,(sb-c:lvar-value size)))))
+
+(define-vop (sign-extend)
+  (:translate sign-extend)
+  (:policy :fast-safe)
+  (:args (val :scs (signed-reg)))
+  (:arg-types signed-num (:constant fixnum))
+  (:info size)
+  (:results (res :scs (signed-reg)))
+  (:result-types fixnum)
+  (:generator 1
+    (check-type size (member 32))
+    (inst addi.w res val 0)))
+
+#-sb-xc-host
+(defun sign-extend (x size)
+  (declare (type (signed-byte 64) x))
+  (ecase size
+    (32 (sign-extend x size))))

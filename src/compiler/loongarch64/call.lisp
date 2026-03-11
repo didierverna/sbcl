@@ -11,16 +11,12 @@
 
 (in-package "SB-VM")
 
-(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant arg-count-sc (make-sc+offset any-reg-sc-number nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
-;;; Make a passing location TN for a local call return PC.  If standard is
-;;; true, then use the standard (full call) location, otherwise use any legal
-;;; location.  Even in the non-standard case, this may be restricted by a
-;;; desire to use a subroutine call instruction.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ra-offset))
+;;; Make a passing location TN for a local call return PC.
+(defun make-return-pc-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ra-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
@@ -28,7 +24,7 @@
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
 (defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ocfp-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset descriptor-reg-sc-number ocfp-offset))
@@ -39,19 +35,21 @@
 (defun make-old-fp-save-location (env)
   (specify-save-tn
    (environment-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
-   (make-wired-tn *fixnum-primitive-type* control-stack-arg-scn ocfp-save-offset)))
+   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number ocfp-save-offset)))
 
 (defun make-return-pc-save-location (env)
   (let ((ptype *fixnum-primitive-type*))
     (specify-save-tn
-     (environment-debug-live-tn (make-normal-tn ptype) env)
-     (make-wired-tn ptype control-stack-arg-scn ra-save-offset))))
+     (environment-debug-live-tn
+      (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ra-offset)
+      env)
+     (make-wired-tn ptype control-stack-sc-number ra-save-offset))))
 
 ;;; Make a TN for the standard argument count passing location.  We
 ;;; only need to make the standard location, since a count is never
 ;;; passed when we are using non-standard conventions.
 (defun make-arg-count-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number nargs-offset))
 
 ;;;; Frame hackery:
 
@@ -108,7 +106,7 @@
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:temporary (:scs (descriptor-reg) :offset l0-offset) fn)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
@@ -139,7 +137,6 @@
     (move res csp-tn)
     (let ((size (* (max 1 (sb-allocated-size 'control-stack))
                    n-word-bytes)))
-      (storew cfp-tn res ocfp-save-offset)
       (add-imm csp-tn csp-tn size 'allocate-frame tmp))
     ;; number stack frame
     (when (ir2-environment-number-stack-p callee)
@@ -161,13 +158,9 @@
   (:temporary (:sc unsigned-reg
                :unused-if (typep (* nargs n-word-bytes) 'short-immediate)) tmp)
   (:generator 2
-    (if (<= nargs register-arg-count)
-        (storew cfp-tn csp-tn ocfp-save-offset)
-        (let ((size (* nargs n-word-bytes)))
-          (move res csp-tn)
-          (storew cfp-tn res ocfp-save-offset)
-          ;; CSP += size
-          (add-imm csp-tn csp-tn size 'allocate-full-call-frame tmp)))))
+    (when (> nargs register-arg-count)
+      (move res csp-tn)
+      (add-imm csp-tn csp-tn (* nargs n-word-bytes) 'allocate-full-call-frame tmp))))
 
 
 
@@ -370,7 +363,7 @@
   (:temporary (:scs (descriptor-reg) :from (:eval 0)) move-temp)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
   (:temporary (:sc any-reg :offset ocfp-offset :from (:eval 0)) ocfp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:ignore arg-locs args ocfp)
   (:info arg-locs callee target nvals)
   (:generator 5
@@ -407,7 +400,7 @@
   (:ignore args save)
   (:vop-var vop)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:generator 20
     (let ((label (gen-label))
           (cur-nfp (current-nfp-tn vop)))
@@ -532,11 +525,6 @@
                     :to :eval)
                    return-pc-pass)
 
-        (:temporary (:sc any-reg
-             :offset t7-offset
-             :to :eval)
-            tmp)
-
        ,@(unless (eq named :direct)
          `((:temporary (:sc descriptor-reg :offset lexenv-offset
                         :from (:argument ,(if (eq return :tail) 0 1))
@@ -562,10 +550,9 @@
            '((:temporary (:scs (descriptor-reg) :from :eval) move-temp)))
 
        (:temporary (:scs (descriptor-reg) :to :eval) stepping)
-
+       (:temporary (:sc any-reg :offset lip-offset) lip)
        ,@(unless (eq return :tail)
-           '((:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-             (:temporary (:scs (interior-reg)) lip)))
+           '((:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)))
 
        (:generator ,(+ (if named 5 0)
                        (if variable 19 1)
@@ -685,10 +672,8 @@
                    (do-next-filler)
                    (return)))
              (note-this-location vop :call-site)
-             (inst addi.d tmp function (- fun-pointer-lowtag))
-             (inst jirl ,(if (eq return :tail) 'zero-tn 'ra-tn)
-                          tmp
-                          (ash simple-fun-insts-offset word-shift)))
+             (inst addi.d lip function (- (ash simple-fun-insts-offset word-shift) fun-pointer-lowtag))
+             (inst jirl ,(if (eq return :tail) 'zero-tn 'ra-tn) lip 0))
            ,@(ecase return
                (:fixed
                 '((emit-label label)

@@ -229,3 +229,13 @@
    ()
    `(lambda (x)
       (map '(vector hash-table) #'identity x))))
+
+(with-test (:name :map-type)
+  (assert-type
+   (lambda (x n m j)
+     (map `(vector ,n) x m j))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n f x)
+     (map (if n 'list 'vector) f x))
+   (or list simple-vector)))

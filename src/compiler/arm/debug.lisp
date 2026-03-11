@@ -17,7 +17,7 @@
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 1
-    (load-csp res)))
+    (move res csp-tn)))
 
 (define-vop (current-fp-sap)
   (:translate current-fp)
@@ -63,10 +63,6 @@
       (inst sub :ne temp temp (- other-pointer-lowtag lowtag)))
     (inst sub :ne code thing temp)
     (inst mov :eq code null-tn)))
-
-(define-vop (code-from-lra code-from-mumble)
-  (:translate sb-di::lra-code-header)
-  (:variant other-pointer-lowtag))
 
 (define-vop (code-from-fun code-from-mumble)
   (:translate sb-di::fun-code-header)

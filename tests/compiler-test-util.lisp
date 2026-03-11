@@ -29,7 +29,9 @@
            #:ir1-named-calls
            #:ir1-funargs
            #:disassembly-lines
-           #:vop-existsp))
+           #:do-blocks
+           #:do-nodes
+           #:do-ir2-blocks))
 
 (cl:in-package :ctu)
 
@@ -96,6 +98,13 @@
                               (sb-c::node-lvar ,node-var))))))
           (nil)
        ,@body)))
+
+(defmacro do-ir2-blocks ((block-var component &optional result)
+                         &body forms)
+  `(do ((,block-var (sb-c::block-info (sb-c::component-head ,component))
+                    (sb-c::ir2-block-next ,block-var)))
+       ((null ,block-var) ,result)
+     ,@forms))
 
 (defun ir1-named-calls (lambda-expression &optional (full t))
   (declare (ignorable lambda-expression full))
@@ -302,12 +311,3 @@
                     (disassemble fun :stream s)))
                 #\newline)))
     (sb-int:unencapsulate 'sb-disassem::add-debugging-hooks 'test)))
-
-(defun vop-existsp (name &optional (query :translate))
-  (ecase query
-    (:named
-     (gethash name sb-c::*backend-template-names*))
-    (:translate
-     (let ((info (sb-int:info :function :info name)))
-       (when info
-         (sb-c::fun-info-templates info))))))

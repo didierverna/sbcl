@@ -439,7 +439,7 @@
     (setf (gspace-free-word-index gspace) new-free-word-index)
     old-free-word-index))
 
-(defconstant min-usable-hole-size 10) ; semi-arbitrary constant to speed up the allocator
+(defconstant min-usable-hole-size 14) ; semi-arbitrary constant to speed up the allocator
 ;; Place conses and code on their respective page type.
 (defun dynamic-space-claim-n-words (gspace n-words page-type
                                     &aux (words-per-page
@@ -3246,11 +3246,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
         (destructuring-bind (name priority value suffix) const
           (unless (= prev-priority priority)
             (when (= prev-priority 1)
-  (format t "#ifdef RETURN_PC_WIDETAG
-#define embedded_obj_p(tag) (tag==RETURN_PC_WIDETAG || tag==SIMPLE_FUN_WIDETAG)
-#else
-#define embedded_obj_p(tag) (tag==SIMPLE_FUN_WIDETAG)
-#endif~%"))
+  (format t "#define embedded_obj_p(tag) (tag==SIMPLE_FUN_WIDETAG)~%"))
             (terpri)
             (setf prev-priority priority))
           (when (minusp value)
@@ -4571,7 +4567,6 @@ static inline uword_t word_has_stickymark(uword_t word) {
                 (format stream "~&#include \"~A.h\"~%"
                         (string-downcase (sb-vm:primitive-object-name obj)))))))
         ;; For purposes of the C code, cast all hash tables as general_hash_table
-        ;; even if they lack the slots for weak tables.
         (out-to "hash-table"
           (write-structure-type (layout-info (find-layout 'sb-impl::general-hash-table))
                                 stream "hash_table"))

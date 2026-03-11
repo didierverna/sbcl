@@ -202,6 +202,7 @@
   ;; bug 353: This test fails at least most of the time for x86/linux
   ;; ca. 0.8.20.16. -- WHN
   (with-test (:name (:backtrace :undefined-function :bug-353)
+              :fails-on :sparc
               :skipped-on :interpreter)
     (assert-backtrace
      (lambda () (test #'not-optimized))
@@ -210,8 +211,7 @@
            (list `(flet test :in ,*p*) #'not-optimized)))))
 
 (with-test (:name (:backtrace :interrupted-condition-wait)
-            :skipped-on (not :sb-thread)
-            :broken-on :sb-safepoint) ;; unreliable
+            :skipped-on (not :sb-thread))
   (let ((m (sb-thread:make-mutex))
         (q (sb-thread:make-waitqueue)))
     (assert-backtrace
@@ -264,7 +264,7 @@
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on (or :mips (and :sparc :linux)))
+                  :fails-on (or :arm :mips :ppc :riscv))
   (assert-backtrace #'throw-test '((throw-test))))
 
 (funcall (checked-compile
@@ -277,7 +277,7 @@
                   (bar x)
                   (bar v)))))
           :allow-style-warnings t))
-(with-test (:name (:backtrace :bug-308926) :skipped-on :interpreter)
+(with-test (:name (:backtrace :bug-308926) :skipped-on :interpreter :fails-on (:or :ppc :ppc64))
   (assert-backtrace (lambda () (bug-308926 13))
                     '(((flet bar :in bug-308926) 13)
                       (bug-308926 &rest t))))
