@@ -81,7 +81,7 @@
                       (method-specializers method)))))
       (call-next-method)))
 
-(defmethod print-object ((type method-combination-type) stream)
+(defmethod print-object ((type standard-method-combination-type) stream)
   (print-unreadable-object (type stream :type t :identity t)
     (format stream "~S ~:S"
       (slot-value-for-printing type 'type-name)
