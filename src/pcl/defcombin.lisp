@@ -153,6 +153,20 @@ The GENERIC-FUNCTION argument is ignored."
                 (funcall (method-combination-%constructor type)
                   options))))))
 
+;; A better protocol to access method combination objects.
+(defun find-method-combination-instance
+    (name &optional options (errorp t)
+          &aux (type (find-method-combination-type name errorp)))
+  "Find a method combination object of type NAME with OPTIONS.
+If ERRORP (the default), throw an error if no NAMEd method combination type is
+found. Otherwise, return NIL. Note that when a NAMEd method combination type
+exists, asking for a new set of (conformant) OPTIONS will always instantiate
+the combination again, regardless of the value of ERRORP."
+  (when type
+    (or (gethash options (method-combination-type-%instances type))
+        (setf (gethash options (method-combination-type-%instances type))
+              (funcall (method-combination-%constructor type) options)))))
+
 (defun load-defcombin
     (name new documentation &aux (old (find-method-combination-type name nil)))
   "Register NEW method combination type under NAME with DOCUMENTATION.
